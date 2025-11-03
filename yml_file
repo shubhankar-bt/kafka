@@ -1,0 +1,79 @@
+services:
+  # ---------------------
+  # 2. Kafka (Official Apache) - Configured for KRaft
+  # ---------------------
+  kafka:
+    image: apache/kafka:latest
+    container_name: kafka
+    # Depends_on zookeeper is removed
+    ports:
+      - "9092:9092"
+    environment:
+      # --- KRaft-specific configurations ---
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      # Node ID must be unique. Here we use 1.
+      KAFKA_NODE_ID: "1"
+      # Quorum voters format: [node_id]@[hostname]:[port]
+      # Using the internal service name 'kafka' and an internal port 9093 for the controller listener
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      # ADD THIS LINE: Explicitly define the controller listener name
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # --- Listener configurations ---
+      # Define all listeners
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      # Define advertised listeners for external access
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      # Map security protocols
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      # --- General Kafka configurations ---
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_OFFSET_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_LOG_RETENTION_HOURS : "168"
+      KAFKA_CFG_NUM_PARTITIONS: "1"
+      # The log directory is required for KRaft
+      KAFKA_CFG_LOG_DIRS: "/tmp/kraft-storage"
+      
+  # ---------------------
+  # 3. Kafka Connect (Debezium official)
+  # ---------------------
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:latest
+    container_name: kafka-connect
+    depends_on:
+      - kafka
+    ports:
+      - "8083:8083"
+    environment:
+      # This has been changed to match what the image expects:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092 
+      CONNECT_GROUP_ID: 1
+      CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
+      CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
+      CONNECT_STATUS_STORAGE_TOPIC: connect_status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # CONNECT_REST_PORT: 80 # This might conflict with the mapped port 8083. It's better to remove it and let it default or set it to 8083
+      CONNECT_PLUGIN_PATH: /kafka/connect,/usr/share/java,/plugins
+    volumes:
+      - ./plugins:/plugins
+
+  # ---------------------
+  # 4. Optional: Schema Registry (Confluent’s is the only one)
+  # ---------------------
+  # schema-registry:
+  #   image: confluentinc/cp-schema-registry:7.5.0
+  #   container_name: schema-registry
+  #   depends_on:
+  #     - kafka
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+  #     SCHEMA_REGISTRY_HOST_NAME: schema-registry
+  #     SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
