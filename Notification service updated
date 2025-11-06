@@ -1,0 +1,686 @@
+# --- Server Port ---
+server.port=8085
+
+# --- PostgreSQL Database Configuration ---
+spring.datasource.url=jdbc:postgresql://localhost:5432/notification_db
+spring.datasource.username=notification_user
+spring.datasource.password=notification_password
+spring.jpa.hibernate.ddl-auto=update
+
+# --- Redis Configuration ---
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+
+# --- Kafka Consumer Configuration ---
+# We connect to Kafka on the EXTERNAL listener
+spring.kafka.consumer.bootstrap-servers=localhost:9092
+spring.kafka.consumer.group-id=notification-service-group
+spring.kafka.consumer.auto-offset-reset=earliest
+
+# --- IMPORTANT: Debezium JSON Deserialization ---
+# This tells Spring Kafka to parse the incoming JSON into our Java objects (DTOs)
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.trusted.packages=*
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+# This package name MUST match your project's package structure
+spring.kafka.consumer.properties.spring.json.value.default.type=com.fincore.NotificationService.dto.DebeziumEvent
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+// This object represents the entire message from Debezium
+public class DebeziumEvent {
+    @JsonProperty("payload")
+    private Payload payload;
+
+    public Payload getPayload() { return payload; }
+    public void setPayload(Payload payload) { this.payload = payload; }
+}
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+// This object represents the "payload" block inside the Debezium message
+public class Payload {
+    
+    // "after" contains the state of the row *after* the change
+    @JsonProperty("after")
+    private NotificationOutboxEvent after;
+
+    @JsonProperty("op")
+    private String operation; // 'c' for create, 'u' for update, 'd' for delete
+
+    public NotificationOutboxEvent getAfter() { return after; }
+    public void setAfter(NotificationOutboxEvent after) { this.after = after; }
+    
+    public String getOperation() { return operation; }
+    public void setOperation(String op) { this.operation = op; }
+}
+
+
+
+
+
+
+
+package com.fincore.NotificationService.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+/**
+ * CRITICAL: This class MUST match the columns in your Oracle
+ * FTWOAHM.NOTIFICATION_TABLE.
+ * * Debezium is case-sensitive. The @JsonProperty values MUST MATCH
+ * the Oracle column names (which are usually all-caps).
+ */
+public class NotificationOutboxEvent {
+
+    @JsonProperty("EVENT_ID")
+    private String eventId; // Using String for RAW(16)
+
+    @JsonProperty("USER_ID")
+    private String userId;
+
+    @JsonProperty("MESSAGE")
+    private String message;
+    
+    @JsonProperty("LINK_URL")
+    private String linkUrl;
+
+    @JsonProperty("EVENT_SOURCE")
+    private String eventSource;
+
+    @JsonProperty("AGGREGATE_ID")
+    private String aggregateId;
+
+    // --- Getters and Setters for all fields ---
+
+    public String getEventId() { return eventId; }
+    public void setEventId(String eventId) { this.eventId = eventId; }
+
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+
+    public String getMessage() { return message; }
+    public void setMessage(String message) { this.message = message; }
+
+    public String getLinkUrl() { return linkUrl; }
+    public void setLinkUrl(String linkUrl) { this.linkUrl = linkUrl; }
+
+    public String getEventSource() { return eventSource; }
+    public void setEventSource(String eventSource) { this.eventSource = eventSource; }
+
+    public String getAggregateId() { return aggregateId; }
+    public void setAggregateId(String aggregateId) { this.aggregateId = aggregateId; }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.model;
+
+import jakarta.persistence.*;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * This is our internal representation of a notification.
+ * This is what we save in *our* PostgreSQL database.
+ */
+@Entity
+@Table(name = "notifications", indexes = {
+    @Index(name = "idx_user_id", columnList = "userId") // Index for fast lookups by user
+})
+public class Notification {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id; // Primary key
+
+    @Column(nullable = false, updatable = false)
+    private String userId; // The user this belongs to
+
+    @Column(nullable = false, length = 1024)
+    private String message; // The text to display
+
+    @Column(nullable = false)
+    private boolean isRead = false; // For the read/unread feature
+
+    @CreationTimestamp
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt; // Automatically set timestamp
+    
+    private String linkUrl; // The click-through link
+
+    // --- Constructors, Getters, and Setters ---
+    public Notification() {}
+
+    public Notification(String userId, String message, String linkUrl) {
+        this.userId = userId;
+        this.message = message;
+        this.linkUrl = linkUrl;
+    }
+    
+    // (Generate Getters and Setters for all fields)
+    public UUID getId() { return id; }
+    public void setId(UUID id) { this.id = id; }
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+    public String getMessage() { return message; }
+    public void setMessage(String message) { this.message = message; }
+    public boolean isRead() { return isRead; }
+    public void setRead(boolean read) { isRead = read; }
+    public Instant getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+    public String getLinkUrl() { return linkUrl; }
+    public void setLinkUrl(String linkUrl) { this.linkUrl = linkUrl; }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.repository;
+
+import com.fincore.NotificationService.model.Notification;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notification, UUID> {
+
+    // Used by REST API for "Notification Page"
+    Page<Notification> findByUserIdOrderByCreatedAtDesc(String userId, Pageable pageable);
+
+    // Used by REST API for "Unread Badge Count"
+    long countByUserIdAndIsReadFalse(String userId);
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.service;
+
+import com.fincore.NotificationService.model.Notification;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages all active Server-Sent Event (SSE) connections.
+ * This is how we push real-time updates to the React app.
+ */
+@Service
+public class SsePushService {
+
+    private static final Logger log = LoggerFactory.getLogger(SsePushService.class);
+
+    // Stores all active connections, mapped by userId
+    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+
+    public SseEmitter subscribe(String userId) {
+        // Create an emitter that never times out
+        SseEmitter emitter = new SseEmitter(0L); 
+
+        this.emitters.put(userId, emitter);
+        log.info("New SSE connection for user: {}", userId);
+
+        emitter.onCompletion(() -> this.emitters.remove(userId));
+        emitter.onTimeout(() -> this.emitters.remove(userId));
+        emitter.onError((e) -> this.emitters.remove(userId));
+
+        // Send a confirmation event
+        try {
+            emitter.send(SseEmitter.event().name("connected").data("Connection established"));
+        } catch (IOException e) {
+            log.warn("Could not send 'connected' event to user: {}", userId);
+        }
+
+        return emitter;
+    }
+
+    /**
+     * Pushes a new notification to a specific user, if they are connected.
+     */
+    public void pushNotification(Notification notification) {
+        String userId = notification.getUserId();
+        SseEmitter emitter = this.emitters.get(userId);
+
+        if (emitter != null) {
+            try {
+                log.info("Pushing real-time notification to user: {}", userId);
+                emitter.send(SseEmitter.event().name("new_notification").data(notification));
+            } catch (IOException e) {
+                // Connection is broken, remove it
+                log.warn("Failed to push notification to user: {}. Removing emitter.", userId);
+                this.emitters.remove(userId);
+            }
+        } else {
+            // This is normal - the user just isn't online
+            log.info("No active SSE connection for user: {}. Notification saved.", userId);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.service;
+
+import com.fincore.NotificationService.model.Notification;
+import com.fincore.NotificationService.repository.NotificationRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.UUID;
+
+/**
+ * Handles the business logic for the REST API (History, Read/Unread).
+ */
+@Service
+public class NotificationService {
+
+    private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Transactional(readOnly = true)
+    public Page<Notification> getNotificationsForUser(String userId, int page, int size) {
+        log.info("Fetching notification history for user: {}, page: {}, size: {}", userId, page, size);
+        Pageable pageable = PageRequest.of(page, size);
+        return notificationRepository.findByUserIdOrderByCreatedAtDesc(userId, pageable);
+    }
+
+    @Transactional
+    public boolean markAsRead(String userId, UUID notificationId) {
+        log.info("Marking notification as read: {} for user: {}", notificationId, userId);
+        
+        return notificationRepository.findById(notificationId)
+            .map(notification -> {
+                // Security check
+                if (!notification.getUserId().equals(userId)) {
+                    log.warn("SECURITY: User {} tried to mark notification {} as read, but it belongs to user {}",
+                             userId, notificationId, notification.getUserId());
+                    return false;
+                }
+                
+                notification.setRead(true);
+                notificationRepository.save(notification);
+                return true;
+            })
+            .orElse(false); // No notification found
+    }
+
+    @Transactional(readOnly = true)
+    public long getUnreadNotificationCount(String userId) {
+        log.info("Fetching unread count for user: {}", userId);
+        return notificationRepository.countByUserIdAndIsReadFalse(userId);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.service;
+
+import com.fincore.NotificationService.dto.DebeziumEvent;
+import com.fincore.NotificationService.dto.NotificationOutboxEvent;
+import com.fincore.NotificationService.model.Notification;
+import com.fincore.NotificationService.repository.NotificationRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * The "Brain" that connects Kafka to our system.
+ * It parses the Debezium event, saves it to the DB, and triggers the real-time push.
+ */
+@Service
+public class EventProcessorService {
+
+    private static final Logger log = LoggerFactory.getLogger(EventProcessorService.class);
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private SsePushService ssePushService;
+
+    @Transactional
+    public void processEvent(DebeziumEvent event) {
+        if (event == null || event.getPayload() == null) {
+            log.warn("Received null event or payload, skipping.");
+            return;
+        }
+
+        // We only care about new rows ("c" for create)
+        if ("c".equals(event.getPayload().getOperation())) {
+            NotificationOutboxEvent outboxEvent = event.getPayload().getAfter();
+            
+            if (outboxEvent == null) {
+                log.warn("Received 'create' event with null 'after' data, skipping.");
+                return;
+            }
+
+            log.info("Processing new notification from outbox for user: {}", outboxEvent.getUserId());
+
+            // 1. Transform DTO to our database model
+            Notification notification = new Notification(
+                outboxEvent.getUserId(),
+                outboxEvent.getMessage(),
+                outboxEvent.getLinkUrl()
+            );
+
+            // 2. Save it to our own Postgres DB
+            Notification savedNotification = notificationRepository.save(notification);
+
+            // 3. Push to real-time clients
+            ssePushService.pushNotification(savedNotification);
+            
+        } else {
+            // We ignore updates ('u') or deletes ('d') for this use case
+            log.info("Ignoring operation '{}' for event: {}", event.getPayload().getOperation(), outboxEvent.getEventId());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.service;
+
+import com.fincore.NotificationService.dto.DebeziumEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+
+/**
+ * This is the only class that talks to Kafka.
+ * It's the entry point for all new notification events.
+ */
+@Service
+public class KafkaConsumerService {
+
+    private static final Logger log = LoggerFactory.getLogger(KafkaConsumerService.class);
+    
+    @Autowired
+    private EventProcessorService eventProcessorService;
+
+    @KafkaListener(topics = "fincore.FTWOAHM.NOTIFICATION_TABLE", 
+                   containerFactory = "kafkaListenerContainerFactory") // Note: using our custom factory
+    public void listen(DebeziumEvent event) {
+        try {
+            log.info("🎉 KAFKA MESSAGE RECEIVED!");
+            eventProcessorService.processEvent(event);
+        } catch (Exception e) {
+            // This is critical for the DLQ
+            log.error("Unhandled exception in Kafka consumer: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to process event, sending to DLQ", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.controller;
+
+import com.fincore.NotificationService.model.Notification;
+import com.fincore.NotificationService.service.NotificationService;
+import com.fincore.NotificationService.service.SsePushService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * This is the main API for the React application.
+ */
+@RestController
+@RequestMapping("/api/notifications")
+@CrossOrigin(origins = "*") // Allows your React app to call this
+public class NotificationController {
+
+    @Autowired
+    private NotificationService notificationService;
+
+    @Autowired
+    private SsePushService ssePushService;
+
+    // A simple hardcoded user for testing.
+    // In a real app, you would get this from a Spring Security token.
+    private final String MOCK_USER_ID = "DEBEZIUM"; 
+
+    /**
+     * GET /api/notifications/stream
+     * The real-time SSE connection endpoint.
+     */
+    @GetMapping("/stream")
+    public SseEmitter streamNotifications() {
+        // TODO: Replace MOCK_USER_ID with the real, authenticated user ID
+        return ssePushService.subscribe(MOCK_USER_ID);
+    }
+
+    /**
+     * GET /api/notifications
+     * Fetches notification history for the user, with pagination.
+     */
+    @GetMapping
+    public ResponseEntity<Page<Notification>> getNotifications(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        
+        // TODO: Replace MOCK_USER_ID with the real, authenticated user ID
+        Page<Notification> notifications = notificationService.getNotificationsForUser(MOCK_USER_ID, page, size);
+        return ResponseEntity.ok(notifications);
+    }
+
+    /**
+     * GET /api/notifications/unread-count
+     * Gets the count for the notification bell badge.
+     */
+    @GetMapping("/unread-count")
+    public ResponseEntity<Map<String, Long>> getUnreadCount() {
+        // TODO: Replace MOCK_USER_ID with the real, authenticated user ID
+        long count = notificationService.getUnreadNotificationCount(MOCK_USER_ID);
+        return ResponseEntity.ok(Map.of("count", count));
+    }
+
+    /**
+     * POST /api/notifications/{id}/read
+     * Marks a single notification as read.
+     */
+    @PostMapping("/{id}/read")
+    public ResponseEntity<Void> markNotificationAsRead(@PathVariable("id") UUID id) {
+        // TODO: Replace MOCK_USER_ID with the real, authenticated user ID
+        boolean success = notificationService.markAsRead(MOCK_USER_ID, id);
+        
+        if (success) {
+            return ResponseEntity.ok().build();
+        } else {
+            return ResponseEntity.notFound().build();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.NotificationService.config;
+
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.util.backoff.FixedBackOff;
+
+@Configuration
+public class KafkaConfig {
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
+            ConsumerFactory<Object, Object> consumerFactory,
+            KafkaTemplate<Object, Object> kafkaTemplate) {
+
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        
+        // This is the error handler
+        factory.setCommonErrorHandler(defaultErrorHandler(kafkaTemplate));
+        
+        return factory;
+    }
+
+    @Bean
+    public DefaultErrorHandler defaultErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
+        
+        // 1. Define the DLQ
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+            (record, exception) -> new TopicPartition(
+                "fincore.FTWOAHM.NOTIFICATION_TABLE_DLQ", -1
+            )
+        );
+
+        // 2. Define the retry policy (3 retries, 1 second apart)
+        // We set 0 retries here because our listener will throw a RuntimeException for any failure,
+        // which we'll treat as non-retryable to send it to the DLQ immediately.
+        FixedBackOff backOff = new FixedBackOff(0L, 0L);
+
+        // 3. Create the error handler
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
+        
+        // Add exceptions you DON'T want to retry (e.g., parsing, validation)
+        errorHandler.addNotRetryableExceptions(RuntimeException.class);
+
+        return errorHandler;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
