@@ -1,0 +1,545 @@
+version: '3.8'
+
+services:
+  # 1. PostgreSQL Database for the Notification Service
+  postgres-db:
+    image: postgres:15
+    container_name: postgres-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: notification_user
+      POSTGRES_PASSWORD: notification_password
+      POSTGRES_DB: notification_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - fincore-network # Use our custom network
+
+  # 2. Redis for Caching and Real-time Pub/Sub Scaling
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - fincore-network # Use our custom network
+
+  # 3. Kafka (Confluent's Image - from before)
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092'
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://kafka:9093'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: '/tmp/kraft-storage'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    networks:
+      - fincore-network # Use our custom network
+
+  # 4. Kafka Connect (Confluent's Image - from before)
+  connect:
+    image: confluentinc/cp-kafka-connect:latest
+    container_name: connect
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka  # Make sure Kafka starts first
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "kafka:9092"
+      CONNECT_GROUP_ID: "connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "connect_configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "connect_offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "connect_status"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "connect"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/plugins"
+    volumes:
+      - ./plugins:/plugins
+    networks:
+      - fincore-network # Use our custom network
+
+# Define the custom network
+networks:
+  fincore-network:
+    driver: bridge
+
+# Define the persistent volume for Postgres
+volumes:
+  postgres-data:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --- Server Port ---
+server.port=8085
+
+# --- PostgreSQL Database Configuration ---
+spring.datasource.url=jdbc:postgresql://localhost:5432/notification_db
+spring.datasource.username=notification_user
+spring.datasource.password=notification_password
+spring.jpa.hibernate.ddl-auto=update
+
+# --- Redis Configuration ---
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+
+# --- Kafka Consumer Configuration ---
+# We will connect to Kafka on localhost (port-mapped from Docker)
+spring.kafka.consumer.bootstrap-servers=localhost:9092
+spring.kafka.consumer.group-id=notification-service-group
+spring.kafka.consumer.auto-offset-reset=earliest
+
+# --- IMPORTANT: Debezium JSON Deserialization ---
+# This tells Spring Kafka to parse the incoming JSON into our Java objects (DTOs)
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.trusted.packages=*
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+spring.kafka.consumer.properties.spring.json.value.default.type=com.fincore.notificationservice.dto.DebeziumEvent
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.notificationservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+// This will be our main Kafka message object
+public class DebeziumEvent {
+    @JsonProperty("payload")
+    private Payload payload;
+
+    public Payload getPayload() { return payload; }
+    public void setPayload(Payload payload) { this.payload = payload; }
+}
+
+
+
+
+package com.fincore.notificationservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class Payload {
+    @JsonProperty("after")
+    private NotificationOutboxEvent after;
+
+    @JsonProperty("op")
+    private String operation; // 'c' for create, 'u' for update, 'd' for delete
+
+    public NotificationOutboxEvent getAfter() { return after; }
+    public void setAfter(NotificationOutboxEvent after) { this.after = after; }
+    
+    public String getOperation() { return operation; }
+    public void setOperation(String op) { this.operation = op; }
+}
+
+
+
+
+
+
+
+package com.fincore.notificationservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+// This maps to the "after" block, which is a row from your table
+public class NotificationOutboxEvent {
+    //TODO: Update these fields to match your table columns exactly
+    @JsonProperty("ID")
+    private long id;
+
+    @JsonProperty("USER_ID")
+    private String userId;
+
+    @JsonProperty("MESSAGE")
+    private String message;
+    
+    @JsonProperty("LINK_URL")
+    private String linkUrl;
+
+    // --- Getters and Setters ---
+    public long getId() { return id; }
+    public void setId(long id) { this.id = id; }
+    
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+    
+    public String getMessage() { return message; }
+    public void setMessage(String message) { this.message = message; }
+    
+    public String getLinkUrl() { return linkUrl; }
+    public void setLinkUrl(String linkUrl) { this.linkUrl = linkUrl; }
+}
+
+
+
+
+
+
+
+package com.fincore.notificationservice.model;
+
+import jakarta.persistence.*;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "notifications")
+public class Notification {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id;
+
+    @Column(nullable = false, updatable = false)
+    private String userId;
+
+    @Column(nullable = false, length = 1024)
+    private String message;
+
+    @Column(nullable = false)
+    private boolean isRead = false;
+
+    @CreationTimestamp
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt;
+    
+    private String linkUrl;
+
+    // --- Constructors, Getters, and Setters ---
+    public Notification() {}
+
+    public Notification(String userId, String message, String linkUrl) {
+        this.userId = userId;
+        this.message = message;
+        this.linkUrl = linkUrl;
+    }
+    
+    // (Generate Getters and Setters for all fields)
+    public UUID getId() { return id; }
+    public void setId(UUID id) { this.id = id; }
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+    public String getMessage() { return message; }
+    public void setMessage(String message) { this.message = message; }
+    public boolean isRead() { return isRead; }
+    public void setRead(boolean read) { isRead = read; }
+    public Instant getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+    public String getLinkUrl() { return linkUrl; }
+    public void setLinkUrl(String linkUrl) { this.linkUrl = linkUrl; }
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.notificationservice.repository;
+
+import com.fincore.notificationservice.model.Notification;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notification, UUID> {
+
+    // This will be used by our REST API to get history
+    Page<Notification> findByUserIdOrderByCreatedAtDesc(String userId, Pageable pageable);
+
+    // This will be used by our REST API for the "unread" badge count
+    long countByUserIdAndIsReadFalse(String userId);
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.notificationservice.service;
+
+import com.fincore.notificationservice.dto.DebeziumEvent;
+import com.fincore.notificationservice.dto.NotificationOutboxEvent;
+import com.fincore.notificationservice.model.Notification;
+import com.fincore.notificationservice.repository.NotificationRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class EventProcessorService {
+
+    private static final Logger log = LoggerFactory.getLogger(EventProcessorService.class);
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    // TODO: Autowire the SSE/Redis service here later
+    // @Autowired
+    // private RealTimePushService realTimePushService;
+
+    @Transactional
+    public void processEvent(DebeziumEvent event) {
+        if (event == null || event.getPayload() == null) {
+            log.warn("Received null event or payload, skipping.");
+            return;
+        }
+
+        // We only care about new rows ("c" for create)
+        if ("c".equals(event.getPayload().getOperation())) {
+            NotificationOutboxEvent outboxEvent = event.getPayload().getAfter();
+            
+            if (outboxEvent == null) {
+                log.warn("Received 'create' event with null 'after' data, skipping.");
+                return;
+            }
+
+            log.info("Processing new notification for user: {}", outboxEvent.getUserId());
+
+            // 1. Transform DTO to our database model
+            Notification notification = new Notification(
+                outboxEvent.getUserId(),
+                outboxEvent.getMessage(),
+                outboxEvent.getLinkUrl()
+            );
+
+            // 2. Save it to our own Postgres DB
+            Notification savedNotification = notificationRepository.save(notification);
+
+            // 3. (Future Step) Push to real-time clients
+            // realTimePushService.pushNotification(savedNotification);
+            
+        } else {
+            // We ignore updates ('u') or deletes ('d') for this use case
+            log.info("Ignoring operation '{}'", event.getPayload().getOperation());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.notificationservice.service;
+
+import com.fincore.notificationservice.dto.DebeziumEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+
+@Service
+public class KafkaConsumerService {
+
+    private static final Logger log = LoggerFactory.getLogger(KafkaConsumerService.class);
+    
+    @Autowired
+    private EventProcessorService eventProcessorService;
+
+    // This listener consumes from our topic and uses the DLQ config we'll make next
+    @KafkaListener(topics = "fincore.FTWOAHM.NOTIFICATION_TABLE", 
+                   containerFactory = "kafkaListenerContainerFactory")
+    public void listen(DebeziumEvent event) {
+        try {
+            log.info("🎉 KAFKA MESSAGE RECEIVED!");
+            eventProcessorService.processEvent(event);
+        } catch (Exception e) {
+            log.error("Error processing message: {}", e.getMessage(), e);
+            // This throw is important to trigger the error handler (DLQ)
+            throw new RuntimeException("Error processing event", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.notificationservice.config;
+
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.util.backoff.FixedBackOff;
+
+@Configuration
+public class KafkaConfig {
+
+    // This bean configures our Kafka listener to use the Error Handler
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
+            ConsumerFactory<Object, Object> consumerFactory,
+            KafkaTemplate<Object, Object> kafkaTemplate,
+            KafkaProperties properties) {
+
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        
+        // This is the error handler
+        factory.setCommonErrorHandler(defaultErrorHandler(kafkaTemplate));
+        
+        return factory;
+    }
+
+    // This is the Error Handler Bean
+    @Bean
+    public DefaultErrorHandler defaultErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
+        
+        // 1. Define the DLQ
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+            (record, exception) -> new org.apache.kafka.common.header.internals.RecordTopicPartition(
+                "fincore.FTWOAHM.NOTIFICATION_TABLE_DLQ", -1
+            )
+        );
+
+        // 2. Define the retry policy (e.g., 3 retries, 1 second apart)
+        FixedBackOff backOff = new FixedBackOff(1000L, 2L);
+
+        // 3. Create the error handler
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
+        
+        // Don't retry on our own processing errors (we throw them)
+        errorHandler.addNotRetryableExceptions(RuntimeException.class);
+
+        return errorHandler;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- First, drop the old test table if it exists
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE FTWOAHM.NOTIFICATION_TABLE';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN
+         RAISE;
+      END IF;
+END;
+/
+
+-- Create the proper, production-ready Outbox Table
+CREATE TABLE FTWOAHM.NOTIFICATION_TABLE (
+    -- A unique ID for the event itself. Debezium needs a primary key.
+    -- Using SYS_GUID() ensures it's always unique, even if different microservices
+    -- insert at the exact same time.
+    EVENT_ID RAW(16) DEFAULT SYS_GUID() NOT NULL PRIMARY KEY,
+
+    -- (REQUIRED) Who this notification is for.
+    -- The NotificationService needs this to know who to send the push to.
+    USER_ID VARCHAR2(255) NOT NULL,
+    
+    -- (REQUIRED) The text that will be displayed to the user.
+    MESSAGE VARCHAR2(1024) NOT NULL,
+    
+    -- (OPTIONAL, but recommended) A relative URL for the React app
+    -- (e.g., /reports/12345)
+    LINK_URL VARCHAR2(1024),
+    
+    -- (REQUIRED for traceability) A simple string to identify
+    -- which service created this event.
+    EVENT_SOURCE VARCHAR2(100), -- e.g., 'REPORT_SERVICE', 'COMMON_REQUEST_SERVICE'
+    
+    -- (REQUIRED for traceability) The ID of the business object
+    -- that this event is related to (e.g., the Report ID).
+    AGGREGATE_ID VARCHAR2(255),
+    
+    -- (REQUIRED) The timestamp when the event was created.
+    EVENT_TIMESTAMP TIMESTAMP(6) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+-- Add comments to the columns for future developers
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.EVENT_ID IS 'Unique primary key for the outbox event.';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.USER_ID IS 'The ID of the user who should receive this notification.';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.MESSAGE IS 'The human-readable message to be displayed.';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.LINK_URL IS 'The relative URL the user should be taken to when clicking the notification.';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.EVENT_SOURCE IS 'The microservice that generated this event (e.g., REPORT_SERVICE).';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.AGGREGATE_ID IS 'The primary key of the business object (e.g., the Report ID).';
+COMMENT ON COLUMN FTWOAHM.NOTIFICATION_TABLE.EVENT_TIMESTAMP IS 'The timestamp when the event was created.';
+
+
+
+
+
+
+
