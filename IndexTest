@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Notifications</title>
+    <!-- 1. Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 2. React & Babel (for JSX) -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- 3. Tailwind Config -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                },
+            },
+        };
+    </script>
+</head>
+<body class="bg-gray-100 font-sans antialiased">
+    <div id="root"></div>
+
+    <!-- 4. This is your complete React Application -->
+    <script type="text/babel">
+
+        const { useState, useEffect } = React;
+
+        // --- Configuration ---
+        const API_BASE_URL = "http://localhost:8085/api/notifications";
+        
+        // This is the MOCK_USER_ID from your Spring Boot controller.
+        // In a real app, this would come from an auth token.
+        const CURRENT_USER_ID = "DEBEZIUM";
+
+        /**
+         * ======================================
+         * Main Application Component
+         * ======================================
+         */
+        function App() {
+            // State to hold all notifications (from API)
+            const [notifications, setNotifications] = useState([]);
+            // State for the unread count (from API)
+            const [unreadCount, setUnreadCount] = useState(0);
+            // State for the SSE connection status
+            const [isConnected, setIsConnected] = useState(false);
+            // State for error messages
+            const [error, setError] = useState(null);
+
+            // --- API Calls ---
+
+            // 1. Fetch historical notifications on page load
+            const fetchHistory = () => {
+                fetch(`${API_BASE_URL}?page=0&size=20`)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error("Failed to fetch notification history.");
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        setNotifications(data.content);
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        setError("Could not connect to notification history API. Is the service running?");
+                    });
+            };
+
+            // 2. Fetch the unread count on page load
+            const fetchUnreadCount = () => {
+                fetch(`${API_BASE_URL}/unread-count`)
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error("Failed to fetch unread count.");
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        setUnreadCount(data.count);
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        setError("Could not connect to unread count API.");
+                    });
+            };
+
+            // 3. Mark a specific notification as read
+            const markAsRead = (notificationId) => {
+                // Optimistic UI update: mark as read immediately
+                setNotifications(prev => 
+                    prev.map(n => 
+                        n.id === notificationId ? { ...n, read: true } : n
+                    )
+                );
+                
+                // Update the count optimistically
+                setUnreadCount(prev => Math.max(0, prev - 1));
+
+                // Send the request to the server
+                fetch(`${API_BASE_URL}/${notificationId}/read`, {
+                    method: 'POST',
+                }).catch(err => {
+                    // If it fails, roll back the UI (or just refetch)
+                    console.error("Failed to mark as read on server:", err);
+                    fetchHistory(); // Refetch to be safe
+                    fetchUnreadCount();
+                });
+            };
+
+            // --- Real-Time SSE Connection ---
+            useEffect(() => {
+                // Fetch initial data when component mounts
+                fetchHistory();
+                fetchUnreadCount();
+
+                // Establish the real-time SSE connection
+                const eventSource = new EventSource(`${API_BASE_URL}/stream`);
+
+                // Handle successful connection
+                eventSource.onopen = () => {
+                    setIsConnected(true);
+                    setError(null);
+                    console.log("SSE Connection Established!");
+                };
+
+                // Handle the "connected" event from our SsePushService
+                eventSource.addEventListener("connected", (event) => {
+                    console.log("SSE Init:", JSON.parse(event.data));
+                });
+
+                // This is the main listener for your notifications
+                eventSource.addEventListener("new_notification", (event) => {
+                    const newNotification = JSON.parse(event.data);
+                    
+                    console.log("SSE Received:", newNotification);
+
+                    // Add the new notification to the top of the list
+                    setNotifications(prev => [newNotification, ...prev]);
+                    
+                    // Increment the unread count
+                    setUnreadCount(prev => prev + 1);
+                });
+
+                // Handle any errors
+                eventSource.onerror = () => {
+                    setIsConnected(false);
+                    setError("Real-time connection failed. Retrying...");
+                    console.error("SSE Error. Connection closed.");
+                    // EventSource automatically retries, no need to do anything here
+                };
+
+                // Clean up the connection when the component unmounts
+                return () => {
+                    eventSource.close();
+                };
+            }, []);
+
+            return (
+                <div className="flex justify-center min-h-screen p-4 md:p-8">
+                    <div className="w-full max-w-2xl">
+                        
+                        <Header 
+                            unreadCount={unreadCount} 
+                            isConnected={isConnected} 
+                        />
+
+                        {error && (
+                            <ErrorMessage message={error} />
+                        )}
+
+                        <NotificationList 
+                            notifications={notifications} 
+                            onMarkAsRead={markAsRead}
+                        />
+
+                        <TestInstructions />
+
+                    </div>
+                </div>
+            );
+        }
+
+        /**
+         * ======================================
+         * Header Component
+         * ======================================
+         */
+        function Header({ unreadCount, isConnected }) {
+            return (
+                <header className="mb-6">
+                    <h1 className="text-4xl font-bold text-gray-800 mb-2">Notifications</h1>
+                    <div className="flex items-center space-x-4">
+                        <div className="flex items-center space-x-2">
+                            <span className="text-lg font-medium text-gray-700">Unread:</span>
+                            <span className="text-lg font-bold text-blue-600 bg-blue-100 rounded-full px-3 py-1">
+                                {unreadCount}
+                            </span>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                            <span className="text-lg font-medium text-gray-700">Status:</span>
+                            <span 
+                                className={`text-lg font-bold px-3 py-1 rounded-full ${
+                                    isConnected 
+                                    ? 'bg-green-100 text-green-700' 
+                                    : 'bg-red-100 text-red-700 animate-pulse'
+                                }`}
+                            >
+                                {isConnected ? '● Connected' : '● Connecting...'}
+                            </span>
+                        </div>
+                    </div>
+                </header>
+            );
+        }
+
+        /**
+         * ======================================
+         * Error Message Component
+         * ======================================
+         */
+        function ErrorMessage({ message }) {
+             return (
+                <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-md mb-6 shadow-md" role="alert">
+                    <p className="font-bold">Connection Error</p>
+                    <p>{message}</p>
+                </div>
+            );
+        }
+
+        /**
+         * ======================================
+         * Notification List Component
+         * ======================================
+         */
+        function NotificationList({ notifications, onMarkAsRead }) {
+            if (notifications.length === 0) {
+                return (
+                    <div className="bg-white p-8 rounded-lg shadow-md text-center">
+                        <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341A6.002 6.002 0 006 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                        </svg>
+                        <h3 className="mt-2 text-xl font-medium text-gray-900">No Notifications</h3>
+                        <p className="mt-1 text-gray-500">New notifications will appear here in real-time.</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="bg-white rounded-lg shadow-md overflow-hidden">
+                    <ul className="divide-y divide-gray-200">
+                        {notifications.map(notification => (
+                            <NotificationItem 
+                                key={notification.id} 
+                                notification={notification} 
+                                onMarkAsRead={onMarkAsRead}
+                            />
+                        ))}
+                    </ul>
+                </div>
+            );
+        }
+
+        /**
+         * ======================================
+         * Single Notification Item Component
+         * ======================================
+         */
+        function NotificationItem({ notification, onMarkAsRead }) {
+            const { id, message, read, createdAt, linkUrl } = notification;
+
+            const formatTime = (isoString) => {
+                const date = new Date(isoString);
+                return date.toLocaleString();
+            };
+
+            const handleClick = () => {
+                if (!read) {
+                    onMarkAsRead(id);
+                }
+                // If there's a link, navigate to it.
+                // In a real app, you'd use React Router.
+                if (linkUrl) {
+                    console.log("Navigating to:", linkUrl);
+                    // window.location.href = linkUrl; // Be careful with this
+                }
+            };
+
+            return (
+                <li 
+                    className={`p-4 transition-colors duration-150 ${!read ? 'bg-blue-50' : 'bg-white'} hover:bg-gray-50`}
+                >
+                    <div className="flex items-start space-x-4">
+                        <div className="flex-shrink-0">
+                            {!read && (
+                                <span className="flex h-3 w-3 relative">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+                                </span>
+                            )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <p className={`text-base font-medium ${!read ? 'text-gray-900' : 'text-gray-600'}`}>
+                                {message}
+                            </p>
+                            <p className="text-sm text-gray-500 mt-1">
+                                {formatTime(createdAt)}
+                            </p>
+                        </div>
+                        {!read && (
+                            <div className="flex-shrink-0">
+                                <button 
+                                    onClick={(e) => {
+                                        e.stopPropagation(); // Prevent click from bubbling
+                                        onMarkAsRead(id);
+                                    }}
+                                    className="text-xs font-medium text-blue-600 hover:text-blue-800"
+                                >
+                                    Mark as read
+                                </button>
+                            </div>
+                        )}
+                    </div>
+                </li>
+            );
+        }
+
+        /**
+         * ======================================
+         * Testing Instructions Component
+         * ======================================
+         */
+        function TestInstructions() {
+            return (
+                <div className="mt-8 p-6 bg-white rounded-lg shadow-md border border-gray-200">
+                    <h3 className="text-xl font-bold text-gray-800 mb-4">How to Test</h3>
+                    <p className="text-gray-700 mb-4">
+                        Your app is connected! To see a real-time notification, run a SQL command in your Oracle database:
+                    </p>
+                    <pre className="bg-gray-900 text-green-300 p-4 rounded-md overflow-x-auto text-sm">
+                        {`INSERT INTO FTWOAHM.NOTIFICATION_TABLE 
+(USER_ID, MESSAGE, LINK_URL, EVENT_SOURCE, AGGREGATE_ID) 
+VALUES 
+('DEBEZIUM', 'This is a live test!', '/reports/123', 'TEST', '123');
+
+COMMIT;`}
+                    </pre>
+                </div>
+            );
+        }
+
+        // --- Render the App ---
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+
+    </script>
+</body>
+</html>
+
