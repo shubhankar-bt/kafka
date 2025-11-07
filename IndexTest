@@ -5,20 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Simple Notification Tester</title>
     <style>
-        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f4; }
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f4; line-height: 1.6; }
         #status { font-size: 1.2em; font-weight: bold; }
         #history, #realtime { margin-top: 20px; }
         h2 { border-bottom: 2px solid #ccc; padding-bottom: 5px; }
-        pre { background-color: #333; color: #00ff00; padding: 10px; border-radius: 5px; }
+        pre { background-color: #333; color: #00ff00; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
     </style>
 </head>
 <body>
     <h1>Notification Tester</h1>
     <div id="status">Status: Connecting...</div>
+    
     <div id="history">
         <h2>History (from /api/notifications)</h2>
         <pre id="history-data">Loading...</pre>
     </div>
+    
     <div id="realtime">
         <h2>Real-Time Events (from /api/notifications/stream)</h2>
         <pre id="realtime-data">Waiting for events...</pre>
@@ -33,27 +35,34 @@
         // --- 1. Fetch History ---
         async function fetchHistory() {
             try {
+                // We're calling the /api/notifications endpoint
                 const response = await fetch(API_BASE_URL + "?page=0&size=20");
                 if (!response.ok) {
-                    throw new Error("Failed to fetch history. Is service running?");
+                    throw new Error("Failed to fetch history. Is service running and CORS config added?");
                 }
                 const data = await response.json();
-                // Just dump the raw JSON into the <pre> tag
+                
+                // Show the history data
                 historyEl.textContent = JSON.stringify(data.content, null, 2);
             } catch (err) {
                 console.error("History Error:", err);
                 historyEl.textContent = "Error: " + err.message;
+                statusEl.textContent = "Status: ● Connection Failed.";
+                statusEl.style.color = "red";
             }
         }
 
         // --- 2. Connect to Real-Time Stream (SSE) ---
         function connectToStream() {
+            // We're calling the /api/notifications/stream endpoint
             const eventSource = new EventSource(API_BASE_URL + "/stream");
 
             eventSource.onopen = () => {
                 console.log("SSE Connection Established!");
                 statusEl.textContent = "Status: ● Connected";
                 statusEl.style.color = "green";
+                // Now that we're connected, fetch the history
+                fetchHistory();
             };
 
             // This is the main listener for your notifications
@@ -61,21 +70,24 @@
                 console.log("SSE Received:", event.data);
                 const newNotification = JSON.parse(event.data);
                 
-                // Add the new event to the top of the <pre> tag
+                // Add the new event to the top of the real-time box
                 realtimeEl.textContent = JSON.stringify(newNotification, null, 2) + "\n\n" + realtimeEl.textContent;
+                
+                // Also add it to the history box to keep them in sync
+                historyEl.textContent = JSON.stringify(newNotification, null, 2) + "\n" + historyEl.textContent;
             });
 
             // Handle any errors
-            eventSource.onerror = () => {
-                console.error("SSE Error. Connection failed.");
+            eventSource.onerror = (err) => {
+                console.error("SSE Error:", err);
                 statusEl.textContent = "Status: ● Connection Failed. Retrying...";
                 statusEl.style.color = "red";
-                // The browser will automatically try to reconnect
+                historyEl.textContent = "Error: Could not connect to real-time stream. Is service running and CORS config added?";
+                eventSource.close();
             };
         }
 
         // --- Run Everything ---
-        fetchHistory();
         connectToStream();
 
     </script>
