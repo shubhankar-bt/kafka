@@ -1,0 +1,3628 @@
+package com.tcs.fincore.CommonRequestService.advice;
+
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+
+import com.tcs.fincore.CommonRequestService.dto.ApiResponse;
+
+/**
+ * This ControllerAdvice intercepts successful responses from any @RestController
+ * and wraps them in a standard ApiResponse format.
+ */
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // This advice applies to any method in a class annotated with @RestController
+        // that is not already returning a ResponseEntity (which gives manual control).
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+                                  Class<? extends HttpMessageConverter<?>> selectedConverterType,
+                                  ServerHttpRequest request, ServerHttpResponse response) {
+
+        // If the controller has already manually wrapped the response, do nothing.
+        if (body instanceof ApiResponse<?>) {
+            return body;
+        }
+
+        // Wrap the successful response body in the standard ApiResponse structure.
+        return ApiResponse.success(body);
+    }
+}
+
+
+
+
+
+
+
+
+
+//-----------------------
+
+  package com.tcs.fincore.CommonRequestService.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // 1. Disable CSRF, not needed for stateless REST APIs
+                .csrf(csrf -> csrf.disable())
+
+                // 2. Define authorization rules
+                .authorizeHttpRequests(authz -> authz
+                        // IMPORTANT: For now, permit all requests to solve the 401 error.
+                        // In a real application,we would secure these endpoints.
+                        // Example: .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
+                        .requestMatchers("/**").permitAll() // Allows access to all your API endpoints
+                        .requestMatchers("/actuator/**").permitAll() // Allows access to Spring Actuator
+                        .anyRequest().authenticated() // Secure any other endpoints not listed
+                )
+
+                // 3. Set session management to stateless, essential for REST APIs
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        // In a real application with JWTs, you would add your JWT filter here
+        // .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+
+
+//-----------------------------------
+
+package com.tcs.fincore.CommonRequestService.controller;
+
+import java.util.List;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.MyRequestFilterDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.service.RequestService;
+
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * @author Shubhankar [v1018405]
+ * @description todo
+ */
+@RestController
+@RequiredArgsConstructor
+@Slf4j 
+public class RequestController {
+
+	private final RequestService requestService;
+
+	@PostMapping("/create-request")
+	@ResponseStatus(HttpStatus.CREATED)
+	public CommonReq createRequest(
+			@Valid @RequestBody CreateRequestDto createRequestDto,
+			@RequestHeader("Authorization") String token
+	) throws JsonProcessingException {
+		String userId = JwtUtil.getUserIdFromToken(token);    
+		log.info("Received request creation call from user: {}", userId);
+		return requestService.createRequest(createRequestDto, userId);
+	}
+
+	/**
+	 * Fetches request created by maker. It can be filtered by requestType.
+	 *
+	 * @param filterDto : {"requestType": "SEGMENT_CODE"} or empty object {}
+	 */
+	//tab2 master screen
+	@PostMapping("/my-requests")
+	public List<CommonReq> getMyRequests(
+			@RequestHeader("Authorization") String token,
+			@RequestBody MyRequestFilterDto filterDto
+	) {
+		String userId = JwtUtil.getUserIdFromToken(token);
+		log.info("Received request for fetch data for the user: {} and request type: {}", userId,
+				filterDto.getRequestType());
+		return requestService.getMyRequests(userId, filterDto.getRequestType());
+	}
+ 
+	//accept
+	@PostMapping("/pending-requests")
+	public List<CommonReq> getPendingRequests(
+			@RequestHeader("Authorization") String authorizationHeader,
+			@RequestBody MyRequestFilterDto filterDto
+	) {
+		log.info("Received request for pending data for the request type: {}", filterDto.getRequestType());
+		return requestService.getPendingRequests(filterDto.getRequestType());
+	}
+
+	
+	@GetMapping("/all-requests")
+	public List<CommonReq> getAllRequests(
+			@RequestHeader("Authorization") String authorizationHeader
+	) {
+		return requestService.getAllRequests();
+	}
+
+	/**
+	 * Updates the status of a request (Accepts/Rejects).
+	 *
+	 * @param processRequestDto
+	 */
+	@PatchMapping("/update-request")
+	public CommonReq updateRequestStatus(
+			@RequestHeader("Authorization") String token,
+			@RequestBody ProcessRequestDto processRequestDto
+	) throws JsonProcessingException {
+		String executorId = JwtUtil.getUserIdFromToken(token);
+		// The service layer throws a ResourceNotFoundException if the optional is
+		// empty,
+		// which is caught by the GlobalExceptionHandler.
+		return requestService.updateRequestStatus(processRequestDto, executorId).get();
+	}
+}
+
+
+
+
+
+
+
+
+
+//------------------------------------
+
+//dtos
+package com.tcs.fincore.CommonRequestService.dto.payload;
+
+/**
+ * An interface for payload DTOs that have a natural primary key
+ * which can be used as the targetId in the CommonReq table.
+ * 
+ * Here we have followed 'Interface Segregation Principle'.
+ * A contract to enforce a primary key from any payload type.
+ */
+public interface KeyablePayload extends Payload {
+    /**
+     * Constructs and returns the primary key from the payload's data.
+     * 
+     * @return A string representation of the primary key.
+     */
+    String getKey();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto.payload;
+
+/**
+ * A marker interface to group different payload types together. It will build
+ * the right object from JSON.
+ * Used for polymorphic deserialization.
+ * Tha jasckson JSON Library will use it
+ */
+public interface Payload {
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Getter;
+
+import java.time.Instant;
+
+@Getter
+@JsonInclude(JsonInclude.Include.NON_NULL) // Don't include null fields in the JSON response
+public class ApiResponse<T> {
+
+    private final boolean success;
+    private final String message;
+    private final T data;
+    private final Instant timestamp;
+
+    private ApiResponse(boolean success, String message, T data) {
+        this.success = success;
+        this.message = message;
+        this.data = data;
+        this.timestamp = Instant.now();
+    }
+
+    public static <T> ApiResponse<T> success(T data, String message) {
+        return new ApiResponse<>(true, message, data);
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(true, "Operation completed successfully.", data);
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return new ApiResponse<>(false, message, null);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import java.util.Date;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+@JsonTypeName("BRANCH") // This must match the RequestType enum name
+public class BranchRequestPayloadDTO implements KeyablePayload {
+
+	@NotNull(message = "Code cannot be null.")
+	private String code;
+
+	@NotNull(message = "Name cannot be null")
+	@Size(min = 1, max = 50, message = "Name length must be between 1 and 50")
+	private String name;
+
+	@NotNull(message = "Circle Code cannot be null")
+	@Size(min = 5, max = 5, message = "Circle Code length must be between 5 and 5")
+	private String circleCode;
+
+	@NotNull(message = "State cannot be null")
+	@Size(min = 1, max = 50, message = "State length must be between 1 and 50")
+	private String state;
+
+	@NotNull(message = "City cannot be null")
+	@Size(min = 1, max = 50, message = "City length must be between 1 and 50")
+	private String city;
+
+	@NotNull(message = "Address cannot be null")
+	@Size(min = 1, max = 50, message = "Address length must be between 1 and 50")
+	private String address;
+
+	@NotNull(message = "Pincode cannot be null")
+	@Size(min = 6, max = 6, message = "Pincode length must be 6")
+	private String pinCode;
+
+	@NotNull(message = "Phone Number cannot be null")
+	@Size(min = 10, max = 10, message = "Phone Number length must be 10")
+	private String phoneNumber;
+
+	@NotNull(message = "Email ID cannot be null")
+	@Size(min = 5, max = 50, message = "Email ID length must be between 5 and 50")
+	private String emailId;
+
+	@NotNull(message = "N-M-R Code cannot be null")
+	@Size(min = 3, max = 50, message = "N-M-R Code length must be between 3 and 50")
+	private String nmrCode;
+
+	@NotNull(message = "Status cannot be null")
+	private Boolean status;
+
+	@JsonFormat(pattern = "dd/MM/yyyy")
+	@NotNull(message = "Open Date cannot be null")
+	private Date openDate;
+
+	@JsonFormat(pattern = "dd/MM/yyyy")
+	private Date closeDate;
+
+	@JsonFormat(pattern = "dd/MM/yyyy")
+	private Date mergeDate;
+
+	@Size(min = 5, max = 5, message = "Merged with Branch length must be 5")
+	private String mergedWithBranch;
+
+	@JsonFormat(pattern = "dd/MM/yyyy")
+	private Date lastChangeDate;
+
+	@NotNull(message = "CPC Flag cannot be null")
+	private Boolean cpcFlag;
+
+	@NotNull(message = "Food Credit Flag cannot be null")
+	private Boolean foodCreditFlag;
+
+	@NotNull(message = "Curr Chest Flag cannot be null")
+	private Boolean currChestFlag;
+
+	@NotNull(message = "Branch Type cannot be null")
+	@Size(min = 1, max = 1, message = "Blength must be 1")
+	@Pattern(regexp = "[AM]", message = "Branch Type can only be A or M")
+	private String branchType;
+
+	// construct the primary key
+	@Override
+	@JsonIgnore
+	public String getKey(
+	) {
+		// Construct the composite primary key
+		return code;
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.dto.payload.Payload;
+import com.tcs.fincore.CommonRequestService.validation.ValidDateRange;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.Date;
+
+@Data
+@JsonTypeName("CALENDER")
+@Builder
+@ValidDateRange(message = "Year end date must be after the year start date")
+@NoArgsConstructor
+@AllArgsConstructor
+public class CalenderConfigPayloadDto implements KeyablePayload {
+//    private Long id;
+
+    @NotNull(message = "Year start date cannot be null")
+    private LocalDate yearStartDate;
+
+    @NotNull(message = "Year end date cannot be null")
+    private LocalDate yearEndDate;
+
+    @NotNull(message = "Remarks cannot be null")
+    @Size(max = 255, message = "Remarks cannot exceed 255 characters")
+    private String remarks;
+    
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        // TODO Auto-generated method stub
+        return "Calendar";
+    }
+
+//    @NotNull(message = "Updated by cannot be null")
+//    @Size(max = 50, message = "Updated by cannot exceed 50 characters")
+//    private String updatedBy;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+@JsonTypeName("CGL_CODE") // This must match the RequestType enum name
+public class CglPayloadDto implements KeyablePayload {
+
+    @NotNull(message = "Component 1 (comp1) cannot be null.")
+    private Short comp1;
+
+    @NotNull(message = "Segment Code cannot be null.")
+    @Size(min = 1, max = 4, message = "Segment Code must be between 1 and 4 characters.")
+    private String segmentCode;
+
+    @NotNull(message = "Component 2 (comp2) cannot be null.")
+    private Short comp2;
+
+    @NotNull(message = "Description cannot be null.")
+    @Size(min = 1, max = 100, message = "Description must be between 1 and 100 characters.")
+    private String description;
+
+    @NotNull(message = "A/C Classification cannot be null.")
+    @Pattern(regexp = "[ALIEM]", message = "A/C Classification must be one of: A, L, I, E, M.")
+    private String acClassification;
+
+    @NotNull(message = "Balance Forward (balFwd) flag cannot be null.")
+    private Integer balFwd;
+
+    @NotNull(message = "Default Balance Type cannot be null.")
+    @Pattern(regexp = "[CD]", message = "Default Balance Type must be 'C' or 'D'.")
+    private String defBalType;
+
+    @NotNull(message = "Status cannot be null.")
+    private Integer status;
+
+    @NotNull(message = "Balance Compare (balCompare) flag cannot be null.")
+    private Integer balCompare;
+
+    @NotNull(message = "Manual Posting flag cannot be null.")
+    private Integer manualPosting;
+
+    // construct the primary key
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        // Construct the composite primary key
+        return "" + comp1 + segmentCode + comp2;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import java.util.Date;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+@JsonTypeName("CIRCLE")
+public class CircleRequestPayloadDTO implements KeyablePayload  {
+	
+	@NotNull(message = "Circle Code cannot be null")
+	private String circleCode;
+	
+	@NotNull(message = "Circle name cannot be null")
+	@Size(min = 1, max = 150, message = "Circle name must be between 1 and 150")
+	public String circleName;
+	
+	@NotNull(message = "Zone Code cannot be null")
+	@Size(min = 1, max = 3, message = "Code must be between 1 and 3")
+	public String zoneCode;
+
+	
+	@Override
+	@JsonIgnore
+	public String getKey(
+	) {
+		// Construct the composite primary key
+		return circleCode;
+	}
+	
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.tcs.fincore.CommonRequestService.dto.payload.Payload;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class CreateRequestDto {
+	// Jackson will convert the incoming JSON string "SEGMENT_CODE" to the enum
+	// RequestType.SEGMENT_CODE
+	@NotNull(message = "Request Type cannot be null.")
+	private RequestType requestType;
+
+	@NotNull(message = "Change Type cannot be null.")
+	private ChangeType changeType;
+
+	private String targetId;
+
+	@NotNull(message = "Payload cannot be null.")
+	@Valid // This annotation triggers the validation of the nested payload object 
+	@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.EXTERNAL_PROPERTY, // Use a sibling property
+			property = "requestType" // The field that determines the payload type
+	)
+	@JsonSubTypes({ @JsonSubTypes.Type(value = SegmentPayloadDto.class, name = "SEGMENT_CODE"),
+			@JsonSubTypes.Type(value = CglPayloadDto.class, name = "CGL_CODE"),
+			@JsonSubTypes.Type(value = BranchRequestPayloadDTO.class, name = "BRANCH"),
+			@JsonSubTypes.Type(value = CircleRequestPayloadDTO.class, name = "CIRCLE"),
+			@JsonSubTypes.Type(value = StateReqPayloadDto.class, name = "STATE"),
+			@JsonSubTypes.Type(value = CurrencyMasterDto.class, name = "CURRENCY"),
+            @JsonSubTypes.Type(value = CalenderConfigPayloadDto.class, name = "CALENDER"),
+            @JsonSubTypes.Type(value = CurrencyRateChangeDto.class, name = "CURRENCY_RATE_CHANGE")
+    })
+	private Payload payload;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+public class CurrencyMasterDto implements KeyablePayload {
+
+	@NotNull(message = "currency code cannot be null")
+	@Size(min = 3, max = 3, message = "currency code must be exactly 2 characters")
+	private String currencyCode;
+
+	@NotNull(message = "currency name cannot be null")
+
+	private String currencyName;
+
+	@NotNull(message = "currency flag cannot be null")
+
+	private Integer flag;
+
+	@NotNull(message = "currency Rate cannot be null")
+
+	private BigDecimal currencyRate;
+	private LocalDate rateDate;
+
+	@Override
+	@JsonIgnore
+	public String getKey(
+	) {
+		// TODO Auto-generated method stub
+		return this.currencyCode.toString();
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.Date;
+
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+@Data
+@JsonTypeName("CURRENCY_RATE_CHANGE")
+
+public class CurrencyRateChangeDto implements KeyablePayload{
+
+   @NotNull
+    private String currencyCode;
+
+    @NotNull
+    @Positive
+    private BigDecimal currencyRate;
+
+//    @NotNull
+    // @PastOrPresent
+    private Date rateChangeDate;
+
+@Override
+public String getKey() {
+	// TODO Auto-generated method stub
+	return this.currencyCode.toString();
+}
+
+   
+   
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.Data;
+
+/**
+ * Dto for the payload of /my-requests endpoint
+ * Allows filtering of requests by their type
+ */
+@Data
+public class MyRequestFilterDto {
+    /**
+     * The type of request to filter by.
+     * This field is optional, If null, requests of all types will be returned.
+     */
+    private RequestType requestType;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import jakarta.validation.constraints.Size;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class ProcessRequestDto {
+
+    @NotNull(message = "Request Id cannot be null")
+    private Long requestId;
+
+    @NotNull(message = "Status cannot be null")
+    private RequestStatus status;
+
+    @Size(max = 500, message = "Remarks cannot exceed 500 characters")
+    private String remarks;
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+/*
+ * Dto for validating the request of a segment code request
+ */
+@Data
+@JsonTypeName("SEGMENT_CODE")
+public class SegmentPayloadDto implements KeyablePayload {
+    @NotNull(message = "Segment Code cannot be null.")
+    @Size(min = 4, max = 4, message = "Segment Code must be exactly 4 characters.")
+    private String segmentCode;
+
+    @NotNull(message = "Description cannot be null.")
+    @Size(min = 1, max = 100, message = "Description must be between 1 and 100 characters.")
+    private String description;
+
+    // construct the primary key
+    @Override
+    @JsonIgnore // Exclude this method from JSON serialization
+    public String getKey() {
+        return this.segmentCode;
+    }
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import org.springframework.validation.annotation.Validated;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonTypeName;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+
+@Data
+@JsonTypeName("STATE")
+public class StateReqPayloadDto implements KeyablePayload {
+    @NotNull(message = "State name cannot be null.")
+    @Size(min = 3, max = 20, message = "State name cant exceed 20 characters")
+    private String stateName;
+
+    @NotNull(message = "State Code cannot be null.")
+    @Size(min = 2, max = 2, message = "State Code must be exactly 2 characters")
+    private String stateCode;
+
+    public void setStateName(String fieldName) {
+            this.stateName = fieldName.toUpperCase(); // Capitalize the value here
+        }
+
+    public void setStateCode(String fieldName) {
+            this.stateCode = fieldName.toUpperCase(); // Capitalize the value here
+        }
+
+    @Override
+    @JsonIgnore
+    public String getKey() {
+        // TODO Auto-generated method stub
+        return this.stateCode;
+    }
+    
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class UpdateRequestStatusDto {
+    // Jackson will convert the incoming JSON string "ACCEPTED" to the enum RequestStatus.ACCEPTED
+    private RequestStatus status;
+    private String remarks;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+//--------------------------------------------------
+
+package com.tcs.fincore.CommonRequestService.exception;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.dto.ApiResponse;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.stream.Collectors;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.context.request.WebRequest;
+
+import jakarta.validation.ConstraintViolationException;
+
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Object>> handleResourceNotFoundException(ResourceNotFoundException ex, WebRequest request) {
+        log.error("Resource not found: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler({JsonProcessingException.class, HttpMessageNotReadableException.class})
+    public ResponseEntity<ApiResponse<Object>> handleJsonProcessingException(Exception ex, WebRequest request) {
+        log.error("Error processing JSON payload: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format. Please check the JSON structure and data types."), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiResponse<Object>> handleDataIntegrityViolationException(DataIntegrityViolationException ex, WebRequest request) {
+        log.error("Data integrity violation: {}", ex.getMessage());
+        // Check for common unique constraint violation message
+        log.error("error: {}",ex.getMostSpecificCause().getMessage());
+        if (ex.getMostSpecificCause().getMessage().contains("unique constraint")) {
+            return new ResponseEntity<>(ApiResponse.error("A resource with the provided identifier already exists."), HttpStatus.CONFLICT);
+        }else if(ex.getMostSpecificCause().getMessage().contains("pending request")) {
+        	return new ResponseEntity<>(ApiResponse.error("A pending request is already exists."), HttpStatus.CONFLICT);
+        }
+        return new ResponseEntity<>(ApiResponse.error("Database constraint violation. A required field may be missing or a value is invalid."), HttpStatus.CONFLICT);
+    }
+
+    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
+    public ResponseEntity<ApiResponse<Object>> handleArgumentAndStateExceptions(RuntimeException ex, WebRequest request) {
+        log.error("Illegal argument or state: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Object>> handleGlobalException(Exception ex, WebRequest request) {
+        log.error("An unexpected error occurred: {}", ex.getMessage(), ex);
+        return new ResponseEntity<>(ApiResponse.error("An internal server error occurred."), HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+
+    /**
+     * Handles exceptions thrown when @Valid validation fails on a request body.
+     * Returns a 400 Bad Request with a list of validation errors.
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        // Collect all validation error messages into a single string.
+        String errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+        
+        log.warn("Validation failed for incoming request: {}", errors);
+         return new ResponseEntity<>(ApiResponse.error("Validation Failed: "+errors), HttpStatus.BAD_REQUEST);
+    }
+
+    /**
+     * Handles exceptions thrown by the Jakarta Validator, for example,
+     * when we manually trigger validation in our strategies.
+     */
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleConstraintViolationException(ConstraintViolationException ex) {
+        String errors = ex.getConstraintViolations().stream()
+                .map(cv -> cv.getPropertyPath() + ": " + cv.getMessage())
+                .collect(Collectors.joining(", "));
+                
+        log.warn("Constraint violation during processing: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: "+errors), HttpStatus.BAD_REQUEST);
+    }
+}
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+
+
+
+
+//--------------------------------------------------
+
+package com.tcs.fincore.CommonRequestService.model.converters;
+
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
+
+/**
+ * This converter handles the mapping between the ChangeType enum in Java
+ * and its single-character representation ('A', 'U', 'D') in the database.
+ */
+@Converter(autoApply = true)
+public class ChangeTypeConverter implements AttributeConverter<ChangeType, String> {
+
+    @Override
+    public String convertToDatabaseColumn(ChangeType changeType) {
+        if (changeType == null) {
+            return null;
+        }
+        return changeType.getCode();
+    }
+
+    @Override
+    public ChangeType convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+        return Stream.of(ChangeType.values())
+                .filter(c -> c.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
+    }
+}
+
+
+
+package com.tcs.fincore.CommonRequestService.model.converters;
+
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
+
+/**
+ * This converter handles the mapping between the RequestStatus enum in Java
+ * and its single-character representation ('P', 'A', 'R') in the database.
+ * The autoApply=true attribute means JPA will automatically use this converter
+ * for all fields of type RequestStatus.
+ */
+@Converter(autoApply = true)
+public class RequestStatusConverter implements AttributeConverter<RequestStatus, String> {
+
+    /**
+     * Converts the enum constant to its database character code.
+     * @param status The enum value (e.g., RequestStatus.PENDING)
+     * @return The database value (e.g., "P")
+     */
+    @Override
+    public String convertToDatabaseColumn(RequestStatus status) {
+        if (status == null) {
+            return null;
+        }
+        return status.getCode();
+    }
+
+    /**
+     * Converts the character code from the database back to the enum constant.
+     * @param code The database value (e.g., "P")
+     * @return The enum value (e.g., RequestStatus.PENDING)
+     */
+    @Override
+    public RequestStatus convertToEntityAttribute(String code) {
+        if (code == null) {
+            return null;
+        }
+        return Stream.of(RequestStatus.values())
+                .filter(c -> c.getCode().equals(code))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model.converters;
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+import java.util.stream.Stream;
+
+/**
+ * This converter handles the mapping between the RequestType enum in Java
+ * and its custom string representation ('SegmentCode', 'CGL') in the database.
+ */
+@Converter(autoApply = true)
+public class RequestTypeConverter implements AttributeConverter<RequestType, String> {
+
+    @Override
+    public String convertToDatabaseColumn(RequestType requestType) {
+        if (requestType == null) {
+            return null;
+        }
+        return requestType.getDbValue();
+    }
+
+    @Override
+    public RequestType convertToEntityAttribute(String dbValue) {
+        if (dbValue == null) {
+            return null;
+        }
+        return Stream.of(RequestType.values())
+                .filter(c -> c.getDbValue().equals(dbValue))
+                .findFirst()
+                .orElseThrow(IllegalArgumentException::new);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+//--------------------------
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+    ADD("A"),
+    UPDATE("U"),
+    DELETE("D");
+
+    private final String code;
+
+    ChangeType(String code) {
+        this.code = code;
+    }
+}
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+/**
+ * Represents the status of a request in the system.
+ */
+import lombok.Getter;
+
+@Getter
+public enum RequestStatus {
+    PENDING("P"),
+    ACCEPTED("A"),
+    REJECTED("R");
+
+    private final String code;
+
+    RequestStatus(String code) {
+        this.code = code;
+    }
+}
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+/**
+ * Defines the type of entity a request is for (e.g., Segment Code, CGL).
+ */
+
+import lombok.Getter;
+
+@Getter
+public enum RequestType {
+	// The dbValue (e.g., "SegmentCode") is used for the database.
+    SEGMENT_CODE("SEGMENT"),
+    CGL_CODE("CGL"),
+    STATE("STATE"),
+    BRANCH("BRANCH"),
+    CIRCLE("CIRCLE"),
+    CURRENCY("CURRENCY"),
+    CALENDER("CALENDER"),
+	CURRENCY_RATE_CHANGE("CURRENCY_RATE");
+
+	private final String dbValue;
+
+	RequestType(String dbValue) {
+		this.dbValue = dbValue;
+	}
+}
+
+
+
+
+
+//------------------------------
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import java.util.Date;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+@Getter
+@Setter
+@Entity
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@Table(name = "BRANCH_MASTER")
+public class BranchMaster {
+	@Id
+	@Column(name = "CODE", nullable = false, length = 5, updatable = false)
+	private String code;
+
+	@Column(name = "NAME", nullable = false, length = 50)
+	private String name;
+
+	@Column(name = "CIRCLE_CODE", nullable = false, length = 5)
+	private String circleCode;
+
+	@Column(name = "STATE", nullable = false, length = 50)
+	private String state;
+
+	@Column(name = "CITY", nullable = false, length = 50)
+	private String city;
+
+	@Column(name = "ADDRESS", nullable = false, length = 50)
+	private String address;
+
+	@Column(name = "PINCODE", nullable = false, length = 6)
+	private String pinCode;
+
+	@Column(name = "PHONE_NUMBER", nullable = false, length = 10)
+	private String phoneNumber;
+
+	@Column(name = "EMAIL_ID", nullable = false, length = 50)
+	private String emailId;
+
+	@Column(name = "NMR_CODE", nullable = false, length = 50)
+	private String nmrCode;
+
+	@Column(name = "STATUS", nullable = false)
+	private Boolean status;
+
+	@Column(name = "OPEN_DATE", nullable = false, updatable = false)
+	private Date openDate;
+
+	@Column(name = "CLOSE_DATE")
+	private Date closeDate;
+
+	@Column(name = "MERGE_DATE")
+	private Date mergeDate;
+
+	@Column(name = "MERGED_WITH_BRANCH", length = 5)
+	private String mergedWithBranch;
+
+	@Column(name = "LAST_CHANGE_DATE")
+	private Date lastChangeDate;
+
+	@Column(name = "CPC_FLAG", nullable = false)
+	private Boolean cpcFlag;
+
+	@Column(name = "FOOD_CREDIT_FLAG", nullable = false)
+	private Boolean foodCreditFlag;
+
+	@Column(name = "CURR_CHEST_FLAG", nullable = false)
+	private Boolean currChestFlag;
+
+	@Column(name = "BRANCH_TYPE", length = 1)
+	private String branchType;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "CALENDER_CONFIG")
+@Data
+public class CalenderConfigModel {
+
+    @Id
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "YEAR_START_DATE", nullable = false)
+    private LocalDate yearStartDate;
+
+    @Column(name = "YEAR_END_DATE", nullable = false)
+    private LocalDate yearEndDate;
+
+    @Column(name = "REMARKS", nullable = false, length = 255)
+    private String remarks;
+
+    @Column(name = "APPROVEDAT")
+    private LocalDateTime approvedAt;
+
+    @Column(name = "APPROVEDBY", length = 50)
+    private String approvedBy;
+
+    @Column(name = "REQUESTEDAT")
+    private LocalDateTime requestedAt;
+
+    @Column(name = "REQUESTEDBY", length = 50)
+    private String requestedBy;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.ColumnDefault;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.Generated;
+import org.hibernate.generator.EventType;
+import java.time.LocalDate;
+
+@Entity
+@Data
+@Table(name = "CGL_MASTER")
+public class CGLMaster {
+    
+    // This is a computed column, so we mark it as insertable=false, updatable=false.
+    // The database is responsible for generating its value.
+    @Id
+    @Column(name = "CGL_NUMBER", insertable = false, updatable = false)
+    @Generated(event = EventType.INSERT)  // Tells Hibernate to re-read the value after an insert
+    private String cglNumber;
+
+    @Column(name = "COMP_1", nullable = false)
+    private Short comp1;
+
+    @Column(name = "SEGMENT_CODE", nullable = false, length = 4)
+    private String segmentCode;
+
+    @Column(name = "COMP_2", nullable = false)
+    private Short comp2;
+
+    @Column(name = "DESCRIPTION", nullable = false, length = 100)
+    private String description;
+
+    @Column(name = "AC_CLASSIFICATION", nullable = false, length = 1)
+    private String acClassification;
+
+    @Column(name = "BAL_FWD", nullable = false)
+    private Integer balFwd;
+
+    @Column(name = "DEF_BAL_TYPE", nullable = false, length = 1)
+    private String defBalType;
+
+    @Column(name = "STATUS", nullable = false)
+    private Integer status;
+    
+    // The database defaults this value, so we mark it as insertable=false, updatable=false.
+    @Column(name = "OPEN_DATE", nullable = false, insertable = false, updatable = false)
+    @Generated(event = EventType.INSERT) // Tells Hibernate to re-read the value after an insert
+    private LocalDate openDate;
+
+    @Column(name = "CLOSE_DATE")
+    private LocalDate closeDate;
+
+    @Column(name = "BAL_COMPARE", nullable = false)
+    private Integer balCompare;
+
+    @Column(name = "MANUAL_POSTING", nullable = false)
+    private Integer manualPosting;
+
+    @PrePersist
+    private void computeCglNumber() {
+        this.cglNumber = String.format("%04d%s%02d", comp1, segmentCode, comp2);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+import java.util.Date;
+
+@Entity
+@Getter
+@Setter
+@Table(name="CIRCLE_MASTER")
+public class CircleMaster{
+	
+	@Id
+	@Column(name="CIRCLE_CODE" , nullable = false , length = 3)
+	public String circleCode;
+	
+	@Column(name="CIRCLE_NAME", nullable = false , length = 150)
+	public String circleName;
+	
+	@Column(name="ZONE_CODE", nullable = false , length = 3)
+	public String zoneCode;
+	
+	@Column(name="CREATED_DATE", insertable = false )
+	public Date createdDate;
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import com.fasterxml.jackson.annotation.JsonRawValue;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.LocalDateTime;
+
+/*
+ *All enum fields are now handled by their respective @Converter(autoApply = true) classes.
+ */
+@Getter
+@Setter
+@Entity
+@Table(name = "COMMON_REQ")
+public class CommonReq {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "COMMON_REQ_id_gen")
+    @SequenceGenerator(name = "COMMON_REQ_id_gen", sequenceName = "COMMON_REQ_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID", nullable = false)
+    private Long id;
+
+    @Column(name = "REQ_TYPE", nullable = false, length = 20)
+    private RequestType reqType;
+
+    @Column(name = "CHANGE_TYPE", nullable = false, length = 2)
+    private ChangeType changeType;
+
+    @Column(name = "REQ_STATUS", nullable = false, length = 2)
+    private RequestStatus reqStatus;
+
+    @CreationTimestamp
+    @Column(name = "REQ_DATE", nullable = false, updatable = false)
+    private LocalDateTime reqDate;
+
+    @Column(name = "CREATOR_ID", nullable = false, length = 12)
+    private String creatorId;
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Lob
+    @Column(name = "EXECUTION_REMARKS")
+    private String executionRemarks;
+
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    @Column(name = "EXECUTOR_REMARKS", length = 500)
+    private String executorRemarks;
+
+    @Lob
+    @Column(name = "PAYLOAD", nullable = false)
+    private String payload;
+
+    @Column(name = "TARGET_ID", length = 4000)
+    private String targetId;
+
+
+    @JsonRawValue
+    public String getPayload() {
+        return payload;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.Date;
+
+@Entity
+@Data
+@Getter
+@Setter
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@Table(name = "CURRENCY_RATE_CHANGE")
+public class Currency_Rate_Change_Model {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "id")
+    private Long id;
+
+    @Column(name = "currency_code", nullable = false, length = 3)
+    private String currencyCode;
+
+    @Column(name = "currency_rate", nullable = false, precision = 19, scale = 9)
+    private BigDecimal currencyRate;
+
+    @Column(name = "rate_change_date")
+    private Date rateChangeDate;
+
+
+    @PreUpdate
+    public void onPreUpdate() {
+        this.rateChangeDate = new Date();
+    }
+
+ 
+    @PrePersist
+    public void onPrePersist() {
+        this.rateChangeDate = new Date();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.PreUpdate;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "CURRENCY_MASTER")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+public class CurrencyMasterModel {
+
+    @Id
+    @Column(name = "CURRENCY_CODE", nullable = false, unique = true, length = 3)
+    private String currencyCode;
+
+    @Column(name = "CURRENCY_NAME", nullable = false, length = 50)
+    private String currencyName;
+
+    @Column(name = "FLAG", nullable = false)
+    private Integer flag;
+
+    @Column(name = "CURRENCY_RATE")
+    private BigDecimal currencyRate;
+
+    @Column(name = "RATE_DATE")
+    private LocalDate rateDate;
+
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(name = "UPDATED_AT")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    protected void onCreate() {
+        this.createdAt = LocalDateTime.now();
+        this.updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        this.updatedAt = LocalDateTime.now();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.Date;
+
+@Entity
+@Data
+@Getter
+@Setter
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@Table(name = "CURRENCY_RATE_CHANGE")
+public class CurrencyRateChange {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "id")
+    private Long id;
+
+    @Column(name = "currency_code", nullable = false, length = 3)
+    private String currencyCode;
+
+    @Column(name = "currency_rate", nullable = false, precision = 19, scale = 9)
+    private BigDecimal currencyRate;
+
+    @Column(name = "rate_change_date")
+    private Date rateChangeDate;
+
+
+    @PreUpdate
+    public void onPreUpdate() {
+        this.rateChangeDate = new Date();
+    }
+
+ 
+    @PrePersist
+    public void onPrePersist() {
+        this.rateChangeDate = new Date();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.util.Objects;
+
+import org.hibernate.annotations.GenericGenerator;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ */
+@Entity
+@Table(name = "notification_table")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    // Unique primary key for the outbox event.
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private String eventId;
+
+    // The ID of the user who should receive this notification.
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event (e.g., REPORT_SERVICE).
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the Report ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    @Column(name = "EVENT_TIMESTAMP", nullable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+   
+    // Getters and Setters
+
+    public String getEventId() {
+        return eventId;
+    }
+
+    public void setEventId(String eventId) {
+        this.eventId = eventId;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getMessage() {
+        return message;
+    }
+
+    public void setMessage(String message) {
+        this.message = message;
+    }
+
+    public String getLinkUrl() {
+        return linkUrl;
+    }
+
+    public void setLinkUrl(String linkUrl) {
+        this.linkUrl = linkUrl;
+    }
+
+    public String getEventSource() {
+        return eventSource;
+    }
+
+    public void setEventSource(String eventSource) {
+        this.eventSource = eventSource;
+    }
+
+    public String getAggregateId() {
+        return aggregateId;
+    }
+
+    public void setAggregateId(String aggregateId) {
+        this.aggregateId = aggregateId;
+    }
+
+    public Instant getEventTimestamp() {
+        return eventTimestamp;
+    }
+
+    public void setEventTimestamp(Instant eventTimestamp) {
+        this.eventTimestamp = eventTimestamp;
+    }
+
+    public String getTargetRole() {
+        return targetRole;
+    }
+
+    public void setTargetRole(String targetRole) {
+        this.targetRole = targetRole;
+    }
+
+  
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+@Entity
+@Table(name = "SEGMENT_CODE_MASTER")
+public class SegmentCodeMaster {
+    @Id
+    @Column(name = "SEGMENT_CODE", nullable = false, length = 4)
+    private String segmentCode;
+
+    @Column(name = "DESCRIPTION", nullable = false, length = 100)
+    private String description;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+@Entity
+@Table(name = "STATE_MASTER")
+public class StateMaster {
+
+    @Id
+    @Column(name = "STATE_CODE", nullable = false, length = 4)
+    private String stateCode;
+
+    @Column(name = "NAME", nullable = false, length = 20)
+    private String stateName;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//----------------------------------------------------
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+
+import com.tcs.fincore.CommonRequestService.model.BranchMaster;
+
+@Repository
+public interface BranchMasterRepository extends CrudRepository<BranchMaster, String> {
+
+}
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.CalenderConfigModel;
+
+import java.util.Optional;
+
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface CalenderConfigRepository extends CrudRepository<CalenderConfigModel, Long> { 
+	
+	//find latest entry
+	Optional<CalenderConfigModel> findFirstByOrderByIdDesc();
+}
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface CGLMasterRepository extends CrudRepository<CGLMaster, String> {
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import com.tcs.fincore.CommonRequestService.model.CircleMaster;
+
+@Repository
+public interface CircleMasterRepository extends JpaRepository<CircleMaster,String>{
+	
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface CommonRequestRepository extends JpaRepository<CommonReq, Long> {
+
+    /**
+     * Finds all requests created by a specific user.
+     * 
+     * @param creatorId The ID of the user.
+     * @return A list of requests.
+     */
+    List<CommonReq> findByCreatorId(String creatorId);
+
+    /**
+     * Finds requests by their status (Pending) filtered by the request
+     * type.
+     * The method signature now correctly uses the RequestStatus enum.
+     * The RequestStatusConverter will automatically handle converting the enum
+     * to its database character code ('P', 'A', 'R') for the SQL query.
+     * 
+     * @param status  The enum status to search for.
+     * @param reqType The type of request to filter by.
+     * @return A list of matching requests.
+     */
+    List<CommonReq> findByReqStatusAndReqType(RequestStatus status, RequestType reqType);
+
+    /**
+     * Finds requests for a specific creator filtered by the request type.
+     * 
+     * @param creatorId The ID of the user who created the requests.
+     * @param reqType   The type of request to filter by.
+     * @return A filtered list of matching requests.
+     */
+    List<CommonReq> findByCreatorIdAndReqType(String creatorId, RequestType reqType);
+
+    /**
+     * Finds requests by their targetId where the status is NOT the one provided.
+     * Used to check for existing PENDING or ACCEPTED requests.
+     *
+     * @param targetId The target ID (e.g., CGL Number) to check for.
+     * @param status   The status to exclude (i.e., REJECTED).
+     * @return A list of conflicting requests.
+     */
+    List<CommonReq> findByTargetIdAndReqStatus(String targetId, RequestStatus status);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.repository.CrudRepository;
+
+import com.tcs.fincore.CommonRequestService.model.CurrencyMasterModel;
+
+public interface CurrencyMasterRepository extends CrudRepository<CurrencyMasterModel , String> {
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.repository.CrudRepository;
+
+import com.tcs.fincore.CommonRequestService.model.CurrencyRateChange;
+
+public interface CurrencyRateChangeRepository extends CrudRepository<CurrencyRateChange , Long> {
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * 
+ */
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+
+/**
+ * 
+ */
+@Repository
+public interface NotificationRepository extends JpaRepository<NotificationTable, String>{
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.SegmentCodeMaster;
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface SegmentCodeMasterRepository extends CrudRepository<SegmentCodeMaster, String> {
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.stereotype.Repository;
+import com.tcs.fincore.CommonRequestService.model.StateMaster;
+import org.springframework.data.repository.CrudRepository;
+
+
+@Repository
+public interface StateMasterRepository extends CrudRepository<StateMaster, String> {
+    
+}
+
+
+
+//-----------------------------------------------------
+
+package com.tcs.fincore.CommonRequestService.service;
+
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
+
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.time.Instant;
+import java.util.Map;
+
+/**
+* A service to create and save Notification events to the database.
+* This is designed to be called from within your main @Transactional method
+* in the CommonRequestService.
+*/
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+	   private final NotificationRepository notificationRepository;
+	   private final ObjectMapper objectMapper; // Spring's default object mapper
+	   
+	   /**
+	    * Creates and saves a "Request Approved" notification.
+	    * This method is NOT @Transactional itself, it's a part of the parent transaction.
+	    *
+	    * @param request The CommonReq entity that was just approved.
+	    * @param approverId The ID of the user who approved the request.
+	    */
+	   @SneakyThrows // Handles Jackson's JsonProcessingException
+	   public void createRequestApprovedNotification(CommonReq request, String approverId) {
+		   
+	       // 1. Build the payload that downstream consumers (NotificationService) will care about.
+	       Map<String, Object> payload = Map.of(
+	               "requestId", request.getId().toString(),
+	               "requestType", request.getChangeType(),
+	               "targetId", request.getTargetId(),
+	               "status", "ACCEPTED",
+	               "approvedBy", approverId,
+	               "approvedAt", Instant.now().toString(),
+	               "makerId", request.getCreatorId(),
+	               "makerPayload", request.getPayload() // Include the original request data
+	       );
+	       
+	       // 2. Serialize the payload to a JSON string
+	       String jsonPayload = objectMapper.writeValueAsString(payload);
+	       
+	       // 3. Build the Notification entity for 'ftwoahm.notification_table'
+	       NotificationTable notification = NotificationTable.builder()
+	               .aggregateId(request.getId().toString())
+	               .userId(request.getCreatorId())
+	               .message("Request Accepted")
+	               .eventSource("CommonRequestService")
+	               .build();
+	       // 4. Save it. This will commit as part of the parent transaction.
+	       notificationRepository.save(notification);
+	       log.info("Saved 'RequestApproved' event to ftwoahm.notification_table for request: {}", request.getId());
+	   }
+	   
+	   
+	   /**
+	    * Creates and saves a "Request Rejected" notification.
+	    *
+	    * @param request The CommonReq entity that was just rejected.
+	    * @param rejectorId The ID of the user who rejected the request.
+	    * @param rejectionReason A comment for the rejection.
+	    */
+	   @SneakyThrows
+	   public void createRequestRejectedNotification(CommonReq request, String rejectorId, String rejectionReason) {
+	       Map<String, Object> payload = Map.of(
+	               "requestId", request.getId().toString(),
+	               "requestType", request.getChangeType(),
+	               "targetId", request.getTargetId(),
+	               "status", "REJECTED",
+	               "rejectedBy", request.getExecutorId(),
+	               "rejectedAt", Instant.now().toString(),
+	               "rejectionReason", request.getExecutorRemarks()
+	       );
+	       
+	       
+	       String jsonPayload = objectMapper.writeValueAsString(payload);
+	       NotificationTable notification = NotificationTable.builder()
+	    		   .aggregateId(request.getId().toString())
+	               .userId(request.getCreatorId())
+	               .message("Request Rejected By "+ request.getExecutorId())
+	               .eventSource("CommonRequestService")
+	               .build();
+	       notificationRepository.save(notification);
+	       log.info("Saved 'RequestRejected' event to ftwoahm.notification_table for request: {}", request.getId());
+	   }
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+import java.util.List;
+import java.util.Optional;
+
+public interface RequestService {
+
+    /**
+     * Creates a new request.
+     * 
+     * @param createRequestDto DTO containing request details.
+     * @param creatorId        The ID of the user creating the request.
+     * @return The saved request entity.
+     */
+    CommonReq createRequest(CreateRequestDto createRequestDto, String creatorId) throws JsonProcessingException;
+
+    /**
+     * Retrieves all requests created by a specific user (Maker).
+     * 
+     * @param userId The user's ID and requestType like : SegmentCode, CGL
+     * @return A list of their requests.
+     */
+    List<CommonReq> getMyRequests(String userId, RequestType requestType);
+
+    /**
+     * Retrieves all pending requests for Checkers.
+     * 
+     * @return A list of pending requests.
+     */
+    List<CommonReq> getPendingRequests(RequestType requestType);
+
+    /**
+     * Retrieves all requests for Checkers (Pending, Accepted, Rejected).
+     * 
+     * @return A list of all requests.
+     */
+    List<CommonReq> getAllRequests();
+
+    /**
+     * Updates the status of a request (Accept/Reject).
+     * 
+     * @param processRequestDto DTO containing the request id, new status and
+     *                          executor remarks.
+     * @param executorId        The ID of the user performing the action.
+     * @return The updated request entity.
+     */
+    Optional<CommonReq> updateRequestStatus(ProcessRequestDto processRequestDto, String executorId)
+            throws JsonProcessingException;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+	private final CommonRequestRepository commonRequestRepository;
+	private final RequestStrategyFactory strategyFactory;
+	private final ObjectMapper objectMapper;
+
+	@Override
+	@Transactional
+	public CommonReq createRequest(
+			CreateRequestDto dto,
+			String creatorId
+	) throws JsonProcessingException {
+		// The payload DTO is already validated by the controller
+		KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+		// --- PRE-FLIGHT CHECKS ---
+		// 1. Extract the targetId from the payload.
+		String targetId = payload.getKey();
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Could not determine targetId from payload.");
+		}
+		log.info("Determined targetId for new request as: {}", targetId);
+		
+
+		// 2. Check for duplicate PENDING or ACCEPTED requests for this targetId.
+		List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+				RequestStatus.PENDING);
+		
+		if (!existingRequests.isEmpty()) {
+			log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+					targetId, existingRequests.get(0).getReqStatus());
+			throw new DataIntegrityViolationException(
+					"An active or pending request for '" + targetId + "' already exists.");
+		}
+		log.info("Uniqueness check passed for targetId: {}", targetId);
+
+		// --- ALL CHECKS PASSED, PROCEED TO CREATE ---
+		CommonReq request = new CommonReq();
+		request.setCreatorId(creatorId);
+		request.setReqType(dto.getRequestType());
+		request.setChangeType(dto.getChangeType());
+		request.setPayload(objectMapper.writeValueAsString(payload));
+		request.setTargetId(targetId); // Setting the targetId at creation time.
+		request.setReqStatus(RequestStatus.PENDING);
+		log.info("payload: ", request.getPayload());
+	
+
+		log.info("Saving new, validated request for targetId {}", targetId);
+		return commonRequestRepository.save(request);
+	}
+
+	@Override
+	@Transactional(rollbackOn = RuntimeException.class)
+	public Optional<CommonReq> updateRequestStatus(
+			ProcessRequestDto dto,
+			String executorId
+	) throws JsonProcessingException {
+		Long requestId = dto.getRequestId();
+		log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+		CommonReq request = commonRequestRepository.findById(requestId)
+				.orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+		// SELF-APPROVAL CHECK
+		if (executorId.equals(request.getCreatorId())) {
+			log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+					requestId);
+			throw new IllegalStateException("User cannot approve or reject their own request.");
+		}
+
+		// Only pending requests can be processed.
+		if (request.getReqStatus() != RequestStatus.PENDING) {
+			log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+					request.getReqStatus());
+			throw new IllegalStateException("Request has already been processed and cannot be modified.");
+		}
+
+		request.setExecutorId(executorId);
+		request.setExecutorRemarks(dto.getRemarks());
+		request.setExecutionDate(LocalDateTime.now());
+		request.setReqStatus(dto.getStatus());
+
+		// IF the request status type is accepted executing the specific approval logic
+		// using the strategy pattern.
+		if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+			log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+			strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+		} else {
+			log.info("Request {} REJECTED.", dto.getRequestId());
+		}
+		
+		log.info("updation done>>>>>>>>>>>>>>>>>>>>>");
+		// now return saving the commonRequestRepository with updated request. P.N: If
+		// any of the request failed in between @transactional will rollback all the
+		// changes
+		// save other fields after succesfull execution : accept/reject only, for
+		// failure changes will be rolled back.
+		request.setExecutionDate(LocalDateTime.now());
+		request.setExecutionRemarks("success"); // as the field data type is clob,
+												// which expects a json object
+		return Optional.of(commonRequestRepository.save(request));
+	}
+
+	@Override
+	public List<CommonReq> getMyRequests(
+			String userId,
+			RequestType requestType
+	) {
+		if (requestType == null) {
+			log.info("Request type is missing, Please provide correct request type to fetch requests for user :{}",
+					userId);
+			throw new IllegalArgumentException(
+					"Request type is missing, Please provide correct request type to fetch requests.");
+		}
+		log.info("Fetching requests for user {} with type {}", userId, requestType);
+		return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+	}
+
+	@Override
+	public List<CommonReq> getPendingRequests(
+			RequestType requestType
+	) {
+		if (requestType == null) {
+			log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+			throw new IllegalArgumentException(
+					"Request type is missing, Please provide correct request type to fetch pending requests.");
+		}
+		log.info("Fetching requests for user {} with type {}", requestType);
+		return commonRequestRepository.findByReqStatusAndReqType(RequestStatus.PENDING, requestType);
+	}
+
+	@Override
+	public List<CommonReq> getAllRequests(
+	) {
+		return commonRequestRepository.findAll();
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+------------------
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CGLMasterRepository;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class CglCodeStrategy implements RequestTypeStrategy {
+
+    private final CGLMasterRepository cglMasterRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.CGL_CODE;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        switch (request.getChangeType()) {
+            case ADD:
+                handleAdd(request);
+                break;
+            case UPDATE:
+                handleUpdate(request);
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Change type " + request.getChangeType() + " is not supported.");
+        }
+    }
+
+    private void handleAdd(CommonReq request) throws JsonProcessingException {
+        CGLMaster newCgl = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+
+        // Although the DB computes the final CGL_NUMBER, we also construct it here for
+        // uniqueness
+        String potentialCglNumber = "" + newCgl.getComp1() + newCgl.getSegmentCode() + newCgl.getComp2();
+        log.info("Performing uniqueness check for potential CGL Number: {}", potentialCglNumber);
+
+        if (cglMasterRepository.existsById(potentialCglNumber)) {
+            log.error("Attempted to add a CGL that already exists: {}", potentialCglNumber);
+            throw new DataIntegrityViolationException("CGL Code '" + potentialCglNumber + "' already exists.");
+        }
+
+        CGLMaster savedCgl = cglMasterRepository.save(newCgl);
+        log.info("Successfully added new CGL with ID: {}", savedCgl.getCglNumber());
+    }
+
+    private void handleUpdate(CommonReq request) throws JsonProcessingException {
+        String targetId = request.getTargetId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+        }
+
+        log.info("Fetching existing CGL with ID: {} for update.", targetId);
+        CGLMaster existingCgl = cglMasterRepository.findById(targetId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CGL Code with ID '" + targetId + "' not found for update."));
+
+        // Deserialize the payload containing the changes
+        CGLMaster updates = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+
+        // Apply the updates to the existing entity
+        // We only update fields that are allowed to change.
+        existingCgl.setDescription(updates.getDescription());
+        existingCgl.setAcClassification(updates.getAcClassification());
+        existingCgl.setBalFwd(updates.getBalFwd());
+        existingCgl.setDefBalType(updates.getDefBalType());
+        existingCgl.setStatus(updates.getStatus());
+        existingCgl.setBalCompare(updates.getBalCompare());
+        existingCgl.setManualPosting(updates.getManualPosting());
+        // We do not update comp1, comp2, segmentCode as they form the primary key.
+
+        cglMasterRepository.save(existingCgl);
+        log.info("Successfully updated CGL with ID: {}", targetId);
+    }
+}
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+
+import org.springframework.stereotype.Component;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CircleMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CircleMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class CircleMasterStrategy  implements RequestTypeStrategy {
+
+	private final ObjectMapper objectMapper;
+	private final CircleMasterRepository circleMasterRepository;
+	
+
+	@Override
+	public RequestType getRequestType() {
+		return RequestType.CIRCLE;
+	}
+	
+	
+		
+	@Override
+	public void processApproval(CommonReq request) throws JsonProcessingException {
+	        switch (request.getChangeType()) {
+	            case ADD:
+	                handleAdd(request);
+	                break;
+	            case UPDATE:
+	                handleUpdate(request);
+	                break;
+	            case DELETE:
+	                handleDelete(request);
+	                break;
+	            default:
+	                throw new UnsupportedOperationException(
+	                        "Change type " + request.getChangeType() + " is not supported.");
+
+	        }
+	    }
+	
+
+	    private void handleAdd(CommonReq request) throws JsonProcessingException {
+	    	CircleMaster circleMaster = objectMapper.readValue(request.getPayload(), CircleMaster.class);
+	        CircleMaster saveCircleMaster = circleMasterRepository.save(circleMaster);
+	        log.info("Successfully added new Circle ");
+	    }
+
+	    
+	    private void handleUpdate(CommonReq request) throws JsonProcessingException {
+
+	        String targetId = request.getTargetId();
+
+	        if (targetId == null || targetId.isBlank()) {
+	            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+	        }
+
+
+	        log.info("Fetching existing Circle with ID: {} for update.", targetId);
+
+	        CircleMaster existingCircleMatser = circleMasterRepository.findById(targetId)
+	                .orElseThrow(() -> new ResourceNotFoundException(
+	                        "Circle Code with ID '" + targetId + "' not found for update."));
+
+	        CircleMaster updates = objectMapper.readValue(request.getPayload(), CircleMaster.class);
+
+	        existingCircleMatser.setCircleName(updates.getCircleName());
+	        existingCircleMatser.setZoneCode(updates.getZoneCode());
+	        
+
+	        circleMasterRepository.save(existingCircleMatser);
+	        log.info("Successfully Updated Circle with ID ", targetId);
+
+
+	    }
+	    
+	    
+	    private void handleDelete(CommonReq request) throws JsonProcessingException{
+	          String targetId = request.getTargetId();
+	        if (targetId == null || targetId.isBlank()) {
+	            throw new IllegalArgumentException("Target ID is required for an DELETE operation.");
+	        }
+	        CircleMaster existingCircle = circleMasterRepository.findById(targetId)
+	                .orElseThrow(() -> new ResourceNotFoundException(
+	                        "State with code: '" + targetId + "' not found for delete."));
+	        
+	        circleMasterRepository.deleteById(targetId);
+	         log.info("Successfully Deleted Circle with ID ", targetId);
+
+	    }
+
+	}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import org.springframework.stereotype.Component;
+
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+import lombok.RequiredArgsConstructor;
+
+@Component
+@RequiredArgsConstructor
+public class RequestStrategyFactory {
+
+	private final SegmentCodeStrategy segmentCodeStrategy;
+	private final CglCodeStrategy cglCodeStrategy;
+	private final BranchMasterStrategy branchCodeStrategy;
+	private final StateReqStrategy stateReqStrategy;
+	private final CurrencyMasterStrategy currencyMasterStrategy;
+    private final CalenderConfigStrategy calenderConfigStrategy;
+    private final CircleMasterStrategy circleMasterStrategy;
+    private final CurrencyRateChangeStrategy CURRENCY_RATE_CHANGE;
+
+	public RequestTypeStrategy getStrategy(RequestType requestType) {
+		switch (requestType) {
+        case CALENDER:
+            return calenderConfigStrategy;
+		case SEGMENT_CODE:
+			return segmentCodeStrategy;
+		case CGL_CODE:
+			return cglCodeStrategy;
+		case BRANCH:
+			return branchCodeStrategy;
+		case STATE:
+			return stateReqStrategy;
+		case CURRENCY:
+			return currencyMasterStrategy;
+		case CIRCLE:
+			return circleMasterStrategy;
+	    case CURRENCY_RATE_CHANGE:
+				return CURRENCY_RATE_CHANGE;
+
+		default:
+			throw new IllegalArgumentException("Unsupported request type: " + requestType);
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+/**
+ * Strategy interface to handle the processing of different request types.
+ */
+public interface RequestTypeStrategy {
+    /**
+     * Processes the request upon approval. This typically involves saving the
+     * payload data to the relevant master table.
+     *
+     * @param request The common request object containing the payload.
+     * @throws JsonProcessingException if there is an error processing the JSON payload.
+     */
+    void processApproval(CommonReq request) throws JsonProcessingException;
+
+
+    RequestType getRequestType();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.SegmentCodeMaster;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.SegmentCodeMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class SegmentCodeStrategy implements RequestTypeStrategy {
+
+    private final SegmentCodeMasterRepository segmentCodeMasterRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.SEGMENT_CODE;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        // ---- LOGIC TO HANDLE ADD vs UPDATE -----
+        switch (request.getChangeType()) {
+            case ADD:
+                handleAdd(request);
+                break;
+            case UPDATE:
+                handleUpdate(request);
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Change type " + request.getChangeType() + " is not supported for Segment Codes.");
+        }
+
+    }
+
+    private void handleAdd(CommonReq request) throws JsonProcessingException {
+        SegmentCodeMaster segmentData = objectMapper.readValue(request.getPayload(), SegmentCodeMaster.class);
+
+        String segmentCode = segmentData.getSegmentCode();
+        log.info("Performing uniqueness check for Segment Code : {}", segmentCode);
+
+        if (segmentCodeMasterRepository.existsById(segmentCode)) {
+            log.error("Attempting to add a Segment Code that already exists: {}", segmentCode);
+            throw new DataIntegrityViolationException("'Segment Code '" + segmentCode + "' already exists");
+        }
+
+        SegmentCodeMaster savedSegment = segmentCodeMasterRepository.save(segmentData);
+        log.info("Succesfully added new Segment Code: {}", savedSegment.getSegmentCode());
+    }
+
+    private void handleUpdate(CommonReq request) throws JsonProcessingException {
+        String targetId = request.getTargetId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+        }
+
+        log.info("Fetching existing Segment Code with ID: {} for update.", targetId);
+        SegmentCodeMaster existingSegment = segmentCodeMasterRepository.findById(targetId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Segment Code with ID '" + targetId + "' not found for update."));
+
+        SegmentCodeMaster updates = objectMapper.readValue(request.getPayload(), SegmentCodeMaster.class);
+
+        // For Segment Code, only the description can be updated.
+        existingSegment.setDescription(updates.getDescription());
+
+        segmentCodeMasterRepository.save(existingSegment);
+        log.info("Successfully updated Segment Code with ID: {}", targetId);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.BranchMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.BranchMasterRepository;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class BranchMasterStrategy implements RequestTypeStrategy {
+
+	private final BranchMasterRepository branchMasterRepository;
+	private final ObjectMapper objectMapper;
+
+	@Override
+	public RequestType getRequestType() {
+		return RequestType.BRANCH;
+	}
+
+	@Override
+	public void processApproval(CommonReq request) throws JsonProcessingException {
+		// ---- LOGIC TO HANDLE ADD vs UPDATE -----
+		switch (request.getChangeType()) {
+		case ADD:
+			handleAdd(request);
+			break;
+		case UPDATE:
+			handleUpdate(request);
+			break;
+		default:
+			throw new UnsupportedOperationException(
+					"Change type " + request.getChangeType() + " is not supported for branch master.");
+		}
+
+	}
+
+	private void handleAdd(CommonReq request) throws JsonProcessingException {
+		BranchMaster payload = objectMapper.readValue(request.getPayload(), BranchMaster.class);
+
+		String code = payload.getCode();
+		log.info("Performing uniqueness check for Branch Code : {}", code);
+
+		if (branchMasterRepository.existsById(code)) {
+			log.error("Attempting to add a Branch Code that already exists: {}", code);
+			throw new DataIntegrityViolationException("'Branch Code '" + code + "' already exists");
+		}
+
+		BranchMaster saved = branchMasterRepository.save(payload);
+		log.info("Succesfully added new Branch with code: {}", saved.getCode());
+	}
+
+	private void handleUpdate(CommonReq request) throws JsonProcessingException {
+		String targetId = request.getTargetId();
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+		}
+
+		log.info("Fetching existing Branch with ID: {} for update.", targetId);
+		BranchMaster existing = branchMasterRepository.findById(targetId).orElseThrow(
+				() -> new ResourceNotFoundException("Branch Code with ID '" + targetId + "' not found for update."));
+
+		BranchMaster updated = objectMapper.readValue(request.getPayload(), BranchMaster.class);
+
+		// Set all fields which can be updated
+		existing.setName(updated.getName());
+		existing.setCircleCode(updated.getCircleCode());
+		existing.setState(updated.getState());
+		existing.setCity(updated.getCity());
+		existing.setAddress(updated.getAddress());
+		existing.setPinCode(updated.getPinCode());
+		existing.setPhoneNumber(updated.getPhoneNumber());
+		existing.setEmailId(updated.getEmailId());
+		existing.setNmrCode(updated.getNmrCode());
+		existing.setStatus(updated.getStatus());
+		existing.setCloseDate(updated.getCloseDate());
+		existing.setMergeDate(updated.getMergeDate());
+		existing.setMergedWithBranch(updated.getMergedWithBranch());
+		existing.setLastChangeDate(updated.getLastChangeDate());
+		existing.setCpcFlag(updated.getCpcFlag());
+		existing.setFoodCreditFlag(updated.getFoodCreditFlag());
+		existing.setCurrChestFlag(updated.getCurrChestFlag());
+		existing.setBranchType(updated.getBranchType());
+
+		branchMasterRepository.save(existing);
+		log.info("Successfully updated Branch with Code: {}", targetId);
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CalenderConfigModel;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.SegmentCodeMaster;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CalenderConfigRepository;
+//import com.tcs.fincore.CommonRequestService.repository.calenderConfigRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class CalenderConfigStrategy implements RequestTypeStrategy {
+
+    private final CalenderConfigRepository calenderConfigRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.CALENDER;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        switch (request.getChangeType()) {
+//            case ADD:
+//                handleAdd(request);
+//                break;
+            case UPDATE:
+                handleUpdate(request);
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Change type " + request.getChangeType() + " is not supported.");
+        }
+    }
+
+
+//    private void handleAdd(CommonReq request) throws JsonProcessingException {
+//        CalenderConfigModel calenderConfigModel = objectMapper.readValue(request.getPayload(), CalenderConfigModel.class);
+//        calenderConfigModel.setApprovedBy(request.getExecutorId());
+//        calenderConfigModel.setApprovedAt(request.getExecutionDate());
+//        calenderConfigModel.setRequestedBy(request.getCreatorId());
+//        calenderConfigModel.setRequestedAt(request.getReqDate());
+//        
+//        log.info(calenderConfigModel.getRemarks());
+//        CalenderConfigModel savedCalenderConfig = calenderConfigRepository.save(calenderConfigModel);
+//        log.info("Succesfully added new calender config: {}", savedCalenderConfig.getYearStartDate() + " " + savedCalenderConfig.getYearEndDate());
+//    }
+
+    private void handleUpdate(CommonReq request) throws JsonProcessingException {
+        String targetId = request.getTargetId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+        }
+
+        log.info("{}","Fetching existing entry");
+        CalenderConfigModel existingCalenderConfig = calenderConfigRepository.findFirstByOrderByIdDesc()
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Entry Not Found"));
+
+        CalenderConfigModel updates = objectMapper.readValue(request.getPayload(), CalenderConfigModel.class);
+
+
+        existingCalenderConfig.setYearStartDate(updates.getYearStartDate());
+        existingCalenderConfig.setYearEndDate(updates.getYearEndDate());
+        existingCalenderConfig.setRemarks(updates.getRemarks());
+        existingCalenderConfig.setApprovedBy(request.getExecutorId());
+        existingCalenderConfig.setApprovedAt(request.getExecutionDate());
+        existingCalenderConfig.setRequestedBy(request.getCreatorId());
+        existingCalenderConfig.setRequestedAt(request.getReqDate());
+
+        calenderConfigRepository.save(existingCalenderConfig);
+        log.info("{}","Successfully updated Calender Configuration");
+    }
+
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+
+import org.springframework.stereotype.Component;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CircleMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CircleMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class CircleMasterStrategy  implements RequestTypeStrategy {
+
+	private final ObjectMapper objectMapper;
+	private final CircleMasterRepository circleMasterRepository;
+	
+
+	@Override
+	public RequestType getRequestType() {
+		return RequestType.CIRCLE;
+	}
+	
+	
+		
+	@Override
+	public void processApproval(CommonReq request) throws JsonProcessingException {
+	        switch (request.getChangeType()) {
+	            case ADD:
+	                handleAdd(request);
+	                break;
+	            case UPDATE:
+	                handleUpdate(request);
+	                break;
+	            case DELETE:
+	                handleDelete(request);
+	                break;
+	            default:
+	                throw new UnsupportedOperationException(
+	                        "Change type " + request.getChangeType() + " is not supported.");
+
+	        }
+	    }
+	
+
+	    private void handleAdd(CommonReq request) throws JsonProcessingException {
+	    	CircleMaster circleMaster = objectMapper.readValue(request.getPayload(), CircleMaster.class);
+	        CircleMaster saveCircleMaster = circleMasterRepository.save(circleMaster);
+	        log.info("Successfully added new Circle ");
+	    }
+
+	    
+	    private void handleUpdate(CommonReq request) throws JsonProcessingException {
+
+	        String targetId = request.getTargetId();
+
+	        if (targetId == null || targetId.isBlank()) {
+	            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+	        }
+
+
+	        log.info("Fetching existing Circle with ID: {} for update.", targetId);
+
+	        CircleMaster existingCircleMatser = circleMasterRepository.findById(targetId)
+	                .orElseThrow(() -> new ResourceNotFoundException(
+	                        "Circle Code with ID '" + targetId + "' not found for update."));
+
+	        CircleMaster updates = objectMapper.readValue(request.getPayload(), CircleMaster.class);
+
+	        existingCircleMatser.setCircleName(updates.getCircleName());
+	        existingCircleMatser.setZoneCode(updates.getZoneCode());
+	        
+
+	        circleMasterRepository.save(existingCircleMatser);
+	        log.info("Successfully Updated Circle with ID ", targetId);
+
+
+	    }
+	    
+	    
+	    private void handleDelete(CommonReq request) throws JsonProcessingException{
+	          String targetId = request.getTargetId();
+	        if (targetId == null || targetId.isBlank()) {
+	            throw new IllegalArgumentException("Target ID is required for an DELETE operation.");
+	        }
+	        CircleMaster existingCircle = circleMasterRepository.findById(targetId)
+	                .orElseThrow(() -> new ResourceNotFoundException(
+	                        "State with code: '" + targetId + "' not found for delete."));
+	        
+	        circleMasterRepository.deleteById(targetId);
+	         log.info("Successfully Deleted Circle with ID ", targetId);
+
+	    }
+
+	}
+
+
+
+
+
+
+//-------------------------
+
+package com.tcs.fincore.CommonRequestService.validation;
+
+import jakarta.validation.Constraint;
+import jakarta.validation.Payload;
+import java.lang.annotation.Documented;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Documented
+@Constraint(validatedBy = ValidDateRangeValidator.class)
+@Target({ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ValidDateRange {
+    String message() default "Invalid date range";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.validation;
+
+import com.tcs.fincore.CommonRequestService.dto.CalenderConfigPayloadDto;
+import jakarta.validation.ConstraintValidator;
+import jakarta.validation.ConstraintValidatorContext;
+import java.time.LocalDate;
+
+public class ValidDateRangeValidator implements ConstraintValidator<ValidDateRange, CalenderConfigPayloadDto> {
+
+    @Override
+    public boolean isValid(CalenderConfigPayloadDto dto, ConstraintValidatorContext context) {
+        if (dto == null) {
+            return true;
+        }
+
+        final LocalDate yearStartDate = dto.getYearStartDate();
+        final LocalDate yearEndDate = dto.getYearEndDate();
+
+        // The @NotNull annotations already handle null checks
+        if (yearStartDate == null || yearEndDate == null) {
+            return true;
+        }
+
+        return yearEndDate.isAfter(yearStartDate);
+    }
+}
+
+//------------------------
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class CommonRequestServiceApplication {
+	public static void main(String[] args) {
+		System.setProperty("spring.classformat.ignore", "true");
+		SpringApplication.run(CommonRequestServiceApplication.class, args);
+	}
+
+}
+
+
+
+
+
+
+//-------------------------------------------
+
+
+
+spring.application.name=CommonRequestService
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.profiles.active=dev
+server.port=9000
+
+#todo Expose all actuator endpoints over HTTP.
+management.endpoints.web.exposure.include=*
+
+# Always show full details on the health endpoint (e.g., database connection status)
+management.endpoint.health.show-details=always
+
+# Add some custom info to the /info endpoint
+info.app.name=CommonRequestService
+info.app.description=Service for managing Different Screen requests. [ex: SegmentRequest, CGL etc]
+info.app.version=1.0.0
+
+spring.jackson.date-format=dd/MM/yyyy
+spring.jackson.serialization.write-dates-as-timestamps=false
+
+
+
+
+
+
+//--------------------------
+
+// db table : 
+
+REQ_ID	NUMBER	No	"FTWOAHM"."COMMON_REQ_SEQ"."NEXTVAL" 	1	Unique PK.
+REQ_TYPE	VARCHAR2(20 BYTE)	No		2	Which type of request it. SegmentCode, CGL.
+CHANGE_TYPE	VARCHAR2(2 BYTE)	No		3	What type of change it is. A: Add, U: Update, D: Delete.
+REQ_STATUS	VARCHAR2(2 BYTE)	No	'P'                                  	4	Status of the request. P: Pending, A: Accepted, R: Rejected.
+REQ_DATE	DATE	No	SYSDATE                              	5	When this request was created.
+CREATOR_ID	VARCHAR2(12 BYTE)	No		6	User id of the user who created this request.
+EXECUTION_DATE	DATE	Yes		7	Timestamp when the request was actually applied to the target table.
+EXECUTION_REMARKS	CLOB	Yes		8	JSON string containing details about the execution (e.g., success/failure message, errors).
+EXECUTOR_ID	VARCHAR2(12 BYTE)	Yes		9	User id of the user who accepted/rejected this request.
+EXECUTOR_REMARKS	VARCHAR2(500 BYTE)	Yes		10	Remarks added by executor.
+PAYLOAD	CLOB	Yes		11	Actual change request data to be updated to the target table. Can be null id delete request.
+TARGET_ID	VARCHAR2(4000 BYTE)	Yes		12	Target table row id of this request. Can be null if add request.
