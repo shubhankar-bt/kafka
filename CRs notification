@@ -1,0 +1,425 @@
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * UPDATED: Added @CreationTimestamp for automatic timestamping.
+ */
+@Entity
+@Table(name = "notification_table")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    // Unique primary key for the outbox event.
+    // Using UUID strategy is correct for Oracle's SYS_GUID() or RAW(16)
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private String eventId;
+
+    // The ID of the user who should receive this notification (for 1-to-1).
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event.
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the CommonReq ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    // *** THIS IS THE FIX ***
+    // Hibernate will now automatically set this to the current time on creation.
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+   
+    // --- Getters and Setters (Lombok generates these) ---
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    /**
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
+     */
+    @Transactional(propagation = Propagation.MANDATORY) // Ensures this is only called from within an existing transaction
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+        
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+             log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+             // Throwing an exception ensures the parent transaction rolls back.
+             throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        NotificationTable notification = NotificationTable.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+        
+        // The EVENT_ID (UUID) and EVENT_TIMESTAMP (CreationTimestamp)
+        // will be set automatically by the NotificationTable entity.
+        
+        notificationRepository.save(notification);
+
+        if (userId != null) {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        } else {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * UPDATED:
+ * - Injected NotificationWriterService.
+ * - `createRequest` now also writes a 1-to-many notification for Checkers.
+ * - `updateRequestStatus` now also writes a 1-to-1 notification for the Maker.
+ * - All operations are atomic within their @Transactional boundaries.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+	private final CommonRequestRepository commonRequestRepository;
+	private final RequestStrategyFactory strategyFactory;
+	private final ObjectMapper objectMapper;
+	private final NotificationWriterService notificationWriterService; // Injected the service
+	private static final String EVENT_SOURCE = "CommonRequestService";
+
+	@Override
+	@Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+	public CommonReq createRequest(
+			CreateRequestDto dto,
+			String creatorId
+	) throws JsonProcessingException {
+		
+		KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+		// --- PRE-FLIGHT CHECKS ---
+		String targetId = payload.getKey();
+		if (targetId == null || targetId.isBlank()) {
+			throw new IllegalArgumentException("Could not determine targetId from payload.");
+		}
+		log.info("Determined targetId for new request as: {}", targetId);
+		
+		List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+				RequestStatus.PENDING);
+		
+		if (!existingRequests.isEmpty()) {
+			log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+					targetId, existingRequests.get(0).getReqStatus());
+			throw new DataIntegrityViolationException(
+					"An active or pending request for '" + targetId + "' already exists.");
+		}
+		log.info("Uniqueness check passed for targetId: {}", targetId);
+
+		// --- CREATE AND SAVE REQUEST ---
+		CommonReq request = new CommonReq();
+		request.setCreatorId(creatorId);
+		request.setReqType(dto.getRequestType());
+		request.setChangeType(dto.getChangeType());
+		request.setPayload(objectMapper.writeValueAsString(payload));
+		request.setTargetId(targetId); 
+		request.setReqStatus(RequestStatus.PENDING);
+
+		log.info("Saving new, validated request for targetId {}", targetId);
+		CommonReq savedRequest = commonRequestRepository.save(request);
+
+		// --- ATOMICALLY CREATE NOTIFICATION FOR CHECKERS ---
+		// This runs within the same transaction. If this fails, the request is rolled back.
+		try {
+			String targetRole = getCheckerRoleFor(savedRequest.getReqType());
+			String message = "A new " + savedRequest.getReqType().name() + " request (" + savedRequest.getTargetId() + ") is pending your approval.";
+			String linkUrl = "/pending-requests/" + savedRequest.getReqType().name(); // Example link to pending queue
+			
+			notificationWriterService.createNotification(
+					null,                     // userId (it's for a role)
+					targetRole,               // targetRole
+					message,
+					linkUrl,
+					savedRequest.getId().toString(), // aggregateId (the request ID)
+					EVENT_SOURCE
+			);
+		} catch (Exception e) {
+			// Log the error and re-throw as a RuntimeException to force a rollback.
+			log.error("CRITICAL: Failed to create 'pending' notification for request: {}. Rolling back transaction.", savedRequest.getId(), e);
+			throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
+		}
+
+		return savedRequest;
+	}
+
+	@Override
+	@Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+	public Optional<CommonReq> updateRequestStatus(
+			ProcessRequestDto dto,
+			String executorId
+	) throws JsonProcessingException {
+		Long requestId = dto.getRequestId();
+		log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+		CommonReq request = commonRequestRepository.findById(requestId)
+				.orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+		// SELF-APPROVAL CHECK
+		if (executorId.equals(request.getCreatorId())) {
+			log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+					requestId);
+			throw new IllegalStateException("User cannot approve or reject their own request.");
+		}
+
+		if (request.getReqStatus() != RequestStatus.PENDING) {
+			log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+					request.getReqStatus());
+			throw new IllegalStateException("Request has already been processed and cannot be modified.");
+		}
+
+		// --- UPDATE REQUEST STATE ---
+		request.setExecutorId(executorId);
+		request.setExecutorRemarks(dto.getRemarks());
+		request.setExecutionDate(LocalDateTime.now());
+		request.setReqStatus(dto.getStatus());
+
+		String notificationMessage;
+		String notificationLink = "/my-requests/history/" + request.getId(); // Link to the maker's history
+
+		// --- PROCESS BUSINESS LOGIC (STRATEGY) & PREPARE NOTIFICATION ---
+		if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+			log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+			// 1. Execute the business logic (e.g., save to master table)
+			strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+			
+			// 2. Prepare the success notification message
+			notificationMessage = "Your " + request.getReqType().name() + " request for '" + request.getTargetId() + "' has been approved.";
+			request.setExecutionRemarks("Successfully processed approval.");
+
+		} else {
+			log.info("Request {} REJECTED.", dto.getRequestId());
+			// 1. No business logic to execute for rejection.
+			// 2. Prepare the rejection notification message
+			notificationMessage = "Your " + request.getReqType().name() + " request for '" + request.getTargetId() + "' was rejected.";
+			if (dto.getRemarks() != null && !dto.getRemarks().isBlank()) {
+				notificationMessage += " Reason: " + dto.getRemarks();
+			}
+			request.setExecutionRemarks("Request rejected by user.");
+		}
+
+		// --- SAVE THE UPDATED REQUEST ---
+		CommonReq updatedRequest = commonRequestRepository.save(request);
+		
+		// --- ATOMICALLY CREATE NOTIFICATION FOR MAKER ---
+		// This runs in the same transaction. If it fails, the update rolls back.
+		try {
+			notificationWriterService.createNotification(
+					request.getCreatorId(),   // userId (the original maker)
+					null,                     // targetRole
+					notificationMessage,
+					notificationLink,
+					request.getId().toString(), // aggregateId
+					EVENT_SOURCE
+			);
+		} catch (Exception e) {
+			// Log the error and re-throw to force a rollback.
+			log.error("CRITICAL: Failed to create 'approval/rejection' notification for request: {}. Rolling back transaction.", request.getId(), e);
+			throw new RuntimeException("Failed to create notification event, rolling back request update.", e);
+		}
+
+		return Optional.of(updatedRequest);
+	}
+
+	@Override
+	public List<CommonReq> getMyRequests(
+			String userId,
+			RequestType requestType
+	) {
+		if (requestType == null) {
+			log.info("Request type is missing, Please provide correct request type to fetch requests for user :{}",
+					userId);
+			throw new IllegalArgumentException(
+					"Request type is missing, Please provide correct request type to fetch requests.");
+		}
+		log.info("Fetching requests for user {} with type {}", userId, requestType);
+		return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+	}
+
+	@Override
+	public List<CommonReq> getPendingRequests(
+			RequestType requestType
+	) {
+		if (requestType == null) {
+			log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+			throw new IllegalArgumentException(
+					"Request type is missing, Please provide correct request type to fetch pending requests.");
+		}
+		log.info("Fetching requests for user {} with type {}", requestType);
+		return commonRequestRepository.findByReqStatusAndReqType(RequestStatus.PENDING, requestType);
+	}
+
+	@Override
+	public List<CommonReq> getAllRequests(
+	) {
+		return commonRequestRepository.findAll();
+	}
+
+	/**
+	 * Helper method to determine the target role for checker notifications.
+	 * This can be externalized to a config map or a separate table later.
+	 */
+	private String getCheckerRoleFor(RequestType requestType) {
+		// This is a convention. Your NotificationService must be able to resolve
+		// this role name into a list of user IDs.
+		// E.g., "ROLE_CHECKER_SEGMENT_CODE", "ROLE_CHECKER_CGL_CODE"
+		return "CHECKER_" + requestType.name();
+	}
+}
+
