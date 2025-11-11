@@ -1,0 +1,82 @@
+package com.fincore.NotificationService.controller;
+
+import com.fincore.NotificationService.model.Notification;
+import com.fincore.NotificationService.service.NotificationService;
+import com.fincore.NotificationService.service.SsePushService;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Page;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * This is the main API for the React application.
+ */
+@Slf4j
+@RestController
+@RequestMapping("/notifications")
+public class NotificationController {
+
+    private final NotificationService notificationService;
+
+    private final SsePushService ssePushService;
+
+    public NotificationController(NotificationService notificationService, SsePushService ssePushService) {
+        this.notificationService = notificationService;
+        this.ssePushService = ssePushService;
+    }
+
+    /**
+     * GET /notifications/stream
+     * The real-time SSE connection endpoint.
+     */
+    @GetMapping("/stream")
+    public SseEmitter streamNotifications(@RequestHeader("Authorization") String token) {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        return ssePushService.subscribe(userId);
+    }
+
+    /**
+     * GET /notifications
+     * Fetches notification history for the user, with pagination.
+     */
+    @GetMapping
+    public ResponseEntity<Page<Notification>> getNotifications(@RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "20") int size, @RequestHeader("Authorization") String token) {
+
+        String userId = JwtUtil.getUserIdFromToken(token);
+        Page<Notification> notifications = notificationService.getNotificationsForUser(userId, page, size);
+        return ResponseEntity.ok(notifications);
+    }
+
+    /**
+     * GET /notifications/unread-count
+     * Gets the count for the notification bell badge.
+     */
+    @GetMapping("/unread-count")
+    public ResponseEntity<Map<String, Long>> getUnreadCount(@RequestHeader("Authorization") String token) {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        long count = notificationService.getUnreadNotificationCount(userId);
+        return ResponseEntity.ok(Map.of("count", count));
+    }
+
+    /**
+     * POST /notifications/{id}/read
+     * Marks a single notification as read.
+     */
+    @PostMapping("/{id}/read")
+    public ResponseEntity<Void> markNotificationAsRead(@RequestHeader("Authorization") String token, @PathVariable("id") UUID id) {
+        String userId = JwtUtil.getUserIdFromToken(token);
+        boolean success = notificationService.markAsRead(userId, id);
+
+        if (success) {
+            return ResponseEntity.ok().build();
+        } else {
+            return ResponseEntity.notFound().build();
+        }
+    }
+}
