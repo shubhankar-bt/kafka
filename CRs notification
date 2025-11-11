@@ -78,72 +78,116 @@ public class UserService {
 
 package com.fincore.NotificationService.service;
 
-import com.fincore.NotificationService.model.UserRole;
-import com.fincore.NotificationService.repository.UserRoleRepository;
+import com.fincore.NotificationService.config.RedisConfig;
+import com.fincore.NotificationService.dto.DebeziumEvent;
+import com.fincore.NotificationService.dto.DispatchEvent;
+import com.fincore.NotificationService.dto.NotificationOutboxEvent;
+import com.fincore.NotificationService.model.Notification;
+import com.fincore.NotificationService.repository.NotificationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.cache.annotation.Cacheable;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 @Service
-public class UserService {
-    private static final Logger log = LoggerFactory.getLogger(UserService.class);
+public class EventProcessorService {
 
-    private final UserRoleRepository userRoleRepository;
+    private static final Logger log = LoggerFactory.getLogger(EventProcessorService.class);
 
-    public UserService(UserRoleRepository userRoleRepository) {
-        this.userRoleRepository = userRoleRepository;
-    }
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private KafkaTemplate<String, Object> kafkaTemplate; // Used for Internal Dispatch
+
+    @Autowired
+    private UserService userService;
+
+    private static final String DISPATCH_TOPIC = "notification.dispatch";
 
     /**
-     * Determines target users based on a generic target string.
-     * Supports:
-     * 1. Single Role: "55"
-     * 2. Multiple Roles: "55,52,53"
-     * 3. All Users: "ALL_USERS"
+     * STEP 1: THE SPLITTER
+     * Receives the Debezium event, resolves targets, and dispatches 
+     * lightweight tasks to the internal Kafka topic.
      */
-    public List<String> resolveTargetUsers(String targetRoleString) {
-        if (targetRoleString == null || targetRoleString.isEmpty()) {
-            return Collections.emptyList();
+    @Transactional
+    public void processDebeziumEvent(DebeziumEvent event) {
+        if (event == null || event.getPayload() == null || "d".equals(event.getPayload().getOperation())) {
+            return; 
         }
 
-        // SCENARIO: ALL USERS
-        if ("ALL_USERS".equalsIgnoreCase(targetRoleString)) {
-            log.info("Target is ALL_USERS. Fetching all users from DB...");
-            return userRoleRepository.findAllUserIds();
-        }
+        NotificationOutboxEvent outbox = event.getPayload().getAfter();
+        if (outbox == null) return;
 
-        // SCENARIO: MULTIPLE ROLES (Comma Separated)
-        if (targetRoleString.contains(",")) {
-            List<String> roleIds = Arrays.stream(targetRoleString.split(","))
-                    .map(String::trim)
-                    .collect(Collectors.toList());
+        String userId = outbox.getUserId();
+        String targetRoleStr = outbox.getTargetRole();
+
+        if (userId != null && !userId.isBlank()) {
+            // CASE 1: Direct 1-to-1
+            sendToDispatchTopic(userId, outbox);
+        } 
+        else if (targetRoleStr != null && !targetRoleStr.isBlank()) {
+            // CASE 2: Dynamic Resolution (Single Role, Multi Role, or ALL_USERS)
+            log.info("Resolving targets for string: {}", targetRoleStr);
+            List<String> targets = userService.resolveTargetUsers(targetRoleStr);
             
-            log.info("Target contains multiple roles: {}", roleIds);
-            // We don't cache this complex query easily, hitting DB is safer here
-            return userRoleRepository.findByRoleIdIn(roleIds)
-                    .stream()
-                    .map(UserRole::getUserId)
-                    .distinct() // Remove duplicates if a user has multiple roles
-                    .collect(Collectors.toList());
+            log.info("Fan-out: Dispatching {} messages to internal topic.", targets.size());
+            
+            // --- THE FAN-OUT ---
+            // We loop here ONLY to produce Kafka messages. This is extremely fast.
+            // 10,000 users takes milliseconds to dispatch.
+            for (String targetUser : targets) {
+                sendToDispatchTopic(targetUser, outbox);
+            }
         }
-
-        // SCENARIO: SINGLE ROLE (Cached)
-        return findUserIdsByRole(targetRoleString);
     }
 
-    @Cacheable(value = "roles", key = "#roleId")
-    public List<String> findUserIdsByRole(String roleId) {
-        log.info("Cache miss for role: {}. Querying local Postgres DB...", roleId);
-        return userRoleRepository.findByRoleId(roleId)
-                .stream()
-                .map(UserRole::getUserId)
-                .collect(Collectors.toList());
+    private void sendToDispatchTopic(String userId, NotificationOutboxEvent outbox) {
+        DispatchEvent dispatchEvent = DispatchEvent.builder()
+                .userId(userId)
+                .message(outbox.getMessage())
+                .linkUrl(outbox.getLinkUrl())
+                .sourceEventId(outbox.getEventId())
+                .build();
+        
+        // The key is userId, ensuring order per user (if needed)
+        kafkaTemplate.send(DISPATCH_TOPIC, userId, dispatchEvent);
+    }
+
+
+    /**
+     * STEP 2: THE WORKER
+     * This is called by the NEW Internal Listener.
+     * It does the heavy lifting: DB Save + Redis Broadcast.
+     */
+    @Transactional
+    public void processDispatchEvent(DispatchEvent event) {
+        log.debug("Worker processing notification for user: {}", event.getUserId());
+
+        Notification notification = new Notification(
+                event.getUserId(),
+                event.getMessage(),
+                event.getLinkUrl()
+        );
+        notification.setSourceEventId(event.getSourceEventId());
+
+        // 1. Save to Postgres
+        Notification savedNotification = notificationRepository.saveAndFlush(notification);
+
+        // 2. Push to Redis (for SSE)
+        try {
+            redisTemplate.convertAndSend(RedisConfig.NOTIFICATION_TOPIC, savedNotification);
+        } catch (Exception e) {
+            log.error("Failed to publish to Redis for user {}", event.getUserId(), e);
+        }
     }
 }
 
