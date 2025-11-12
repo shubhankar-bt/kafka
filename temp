@@ -1,147 +1,37 @@
-package com.fincore.NotificationService.config;
+Roles TAble:
+ROLE_ID	NUMBER(10,0)	No	"FTWOAHM"."ROLE_ID_SEQUENCE"."NEXTVAL" 	1	 Unique identifier for the role
+ROLE_NAME	VARCHAR2(50 BYTE)	No		2	 Name of the role
+DESCRIPTION	VARCHAR2(150 BYTE)	Yes		3	 Description of the role
+ROLE_STATUS	VARCHAR2(20 BYTE)	No	'ACTIVE' 	4	Status of the role ( Active/Blocked)
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.NotificationService.dto.DispatchEvent;
-import com.fincore.NotificationService.dto.UserRoleEventDto;
-import org.apache.kafka.clients.admin.NewTopic;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.apache.kafka.common.serialization.StringSerializer;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
-import org.springframework.kafka.config.TopicBuilder;
-import org.springframework.kafka.core.*;
-import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
-import org.springframework.kafka.listener.DefaultErrorHandler;
-import org.springframework.kafka.support.serializer.JsonDeserializer;
-import org.springframework.kafka.support.serializer.JsonSerializer;
-import org.springframework.util.backoff.FixedBackOff;
-
-import java.util.Map;
-
-@Configuration
-public class KafkaConfig {
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    // --- 1. PRODUCER CONFIGURATION ---
-    @Bean
-    public ProducerFactory<String, Object> producerFactory(KafkaProperties kafkaProperties) {
-        Map<String, Object> props = kafkaProperties.buildProducerProperties(null);
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
-        return new DefaultKafkaProducerFactory<>(props);
-    }
-
-    @Bean
-    public KafkaTemplate<String, Object> kafkaTemplate(ProducerFactory<String, Object> producerFactory) {
-        return new KafkaTemplate<>(producerFactory);
-    }
-
-    // --- 2. DEFAULT CONSUMER FACTORY (MISSING IN YOUR FILE - RESTORED HERE) ---
-    // This is required for Bean A to work correctly
-    @Bean
-    public ConsumerFactory<Object, Object> consumerFactory(KafkaProperties kafkaProperties) {
-        Map<String, Object> props = kafkaProperties.buildConsumerProperties(null);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        return new DefaultKafkaConsumerFactory<>(props);
-    }
-
-    // --- BEAN A: General Notifications Factory ---
-    @Bean
-    public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
-            ConsumerFactory<Object, Object> consumerFactory,
-            KafkaTemplate<String, Object> kafkaTemplate) { // String, Object is correct
-
-        ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory);
-        factory.setCommonErrorHandler(defaultErrorHandler(kafkaTemplate));
-        return factory;
-    }
-
-    // --- BEAN B: General Error Handler ---
-    @Bean
-    public DefaultErrorHandler defaultErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) {
-        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
-                (record, exception) -> new TopicPartition(
-                        "fincore.FTWOAHM.NOTIFICATION_TABLE_DLQ", -1
-                )
-        );
-        FixedBackOff backOff = new FixedBackOff(1000L, 2L);
-        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
-        errorHandler.addNotRetryableExceptions(RuntimeException.class);
-        return errorHandler;
-    }
-
-    // --- BEAN C: For UserRoles ---
-    @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, UserRoleEventDto> userRoleListenerContainerFactory(KafkaProperties properties) {
-        var props = properties.buildConsumerProperties(null);
-        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
-        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
-        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fincore.NotificationService.dto.UserRoleEventDto");
-        
-        JsonDeserializer<UserRoleEventDto> deserializer = new JsonDeserializer<>(UserRoleEventDto.class, this.objectMapper);
-        var consumerFactory = new DefaultKafkaConsumerFactory<>(
-                props,
-                new StringDeserializer(),
-                deserializer
-        );
-        ConcurrentKafkaListenerContainerFactory<String, UserRoleEventDto> factory = new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory);
-        return factory;
-    }
-
-    // --- BEAN D: For Internal Dispatch Events ---
-    @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> internalKafkaListenerContainerFactory(
-            KafkaProperties properties,
-            KafkaTemplate<String, Object> kafkaTemplate) {
-        
-        var props = properties.buildConsumerProperties(null);
-        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
-        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
-        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fincore.NotificationService.dto.DispatchEvent");
-
-        JsonDeserializer<DispatchEvent> deserializer = new JsonDeserializer<>(DispatchEvent.class, this.objectMapper);
-        var consumerFactory = new DefaultKafkaConsumerFactory<>(
-                props,
-                new StringDeserializer(),
-                deserializer
-        );
-
-        ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> factory = new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory);
-        factory.setCommonErrorHandler(internalErrorHandler(kafkaTemplate));
-        return factory;
-    }
-
-    // --- BEAN E: Internal Error Handler ---
-    @Bean
-    public DefaultErrorHandler internalErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) {
-        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
-                (record, exception) -> new TopicPartition(
-                        "notification.dispatch.DLQ", -1
-                )
-        );
-        FixedBackOff backOff = new FixedBackOff(1000L, 2L);
-        return new DefaultErrorHandler(recoverer, backOff);
-    }
-
-    // --- BEAN F: Topic Creation (MISSING IN YOUR FILE - RESTORED HERE) ---
-    @Bean
-    public NewTopic dispatchTopic() {
-        return TopicBuilder.name("notification.dispatch")
-                .partitions(3)
-                .replicas(1)
-                .build();
-    }
-}
+sample one row for above table : 51	UCO	users will be responsible for managing user access	ACTIVE
 
 
+permissions table:
+MENU_ID	NUMBER(38,0)	No	"FTWOAHM"."MENU_ITEMS_SEQ"."NEXTVAL"	1	
+MENU_TITLE	VARCHAR2(100 BYTE)	No		2	
+MENU_ICON	VARCHAR2(100 BYTE)	Yes		3	
+MENU_SUBMENU	VARCHAR2(100 BYTE)	Yes		4	
+MENU_ACTION	VARCHAR2(200 BYTE)	No	NULL 	5	
+MENU_URL	VARCHAR2(200 BYTE)	No		6	
+MENU_COMPONENT_PATH	VARCHAR2(200 BYTE)	No		7	
+MENU_DESCRIPTION	VARCHAR2(255 BYTE)	No		8	
+MENU_DEPENDANT	NUMBER(38,0)	Yes		9	
+
+sample data for the above table :
+9	Branch Master	AccountBalance		create|modify|delete|cancel	/branch-master	user/pages/branch/BranchMaster	To edit update branches and to check pending branch update requests	
+10	Branch Requests	AssuredWorkload		approve|reject	/branch-requests	common/CommonRequestScreen	To approve/accept or cancel/reject branch update requests	
+24	User Management	People	User Requests Audit	view	/user-management/user-audit	user/pages/UserLogs	Shows user audit requests	
+
+
+role_permission table : 
+ROLE_ID	NUMBER(10,0)	No		1	Foreign key to the ROLES table.
+PERMISSION_ID	NUMBER(10,0)	No		2	Foreign key to the PERMISSIONS table.
+PERMISSION_ORDER	NUMBER	Yes		3	Storing permission order against each role.
+
+sample data for the above :
+51	33	33
+56	33	33
+56	26	26
+51	35	1
+51	22	21
