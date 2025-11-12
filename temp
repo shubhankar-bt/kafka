@@ -1,6 +1,8 @@
 package com.fincore.NotificationService.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.NotificationService.dto.DispatchEvent;
+import com.fincore.NotificationService.dto.UserRoleEventDto;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -19,9 +21,7 @@ import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.support.serializer.JsonDeserializer;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 import org.springframework.util.backoff.FixedBackOff;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.util.HashMap;
 import java.util.Map;
 
 @Configuration
@@ -30,11 +30,10 @@ public class KafkaConfig {
     @Autowired
     private ObjectMapper objectMapper;
 
-    // --- 1. PRODUCER CONFIGURATION (Fixes your ClassCastException) ---
+    // --- 1. PRODUCER CONFIGURATION ---
     @Bean
     public ProducerFactory<String, Object> producerFactory(KafkaProperties kafkaProperties) {
         Map<String, Object> props = kafkaProperties.buildProducerProperties(null);
-        // Force the producer to use JSON for values
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
         return new DefaultKafkaProducerFactory<>(props);
@@ -45,11 +44,12 @@ public class KafkaConfig {
         return new KafkaTemplate<>(producerFactory);
     }
 
-    // --- 2. DEFAULT CONSUMER (For Debezium Events) ---
+
+    // --- BEAN A: General Notifications Factory (Fixed) ---
     @Bean
     public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
             ConsumerFactory<Object, Object> consumerFactory,
-            KafkaTemplate<Object, Object> kafkaTemplate) {
+            KafkaTemplate<String, Object> kafkaTemplate) { // Changed to String, Object
 
         ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory);
@@ -57,30 +57,9 @@ public class KafkaConfig {
         return factory;
     }
 
-    // --- 3. INTERNAL CONSUMER (For DispatchEvent) ---
-    // This is needed because your global properties are set to DebeziumEvent.
-    // This factory specifically handles DispatchEvent.
+    // --- BEAN B: General Error Handler (Fixed) ---
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> internalKafkaListenerContainerFactory(KafkaProperties kafkaProperties) {
-        Map<String, Object> props = kafkaProperties.buildConsumerProperties(null);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
-        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fincore.NotificationService.dto.DispatchEvent");
-        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
-
-        ConsumerFactory<String, DispatchEvent> cf = new DefaultKafkaConsumerFactory<>(
-                props,
-                new StringDeserializer(),
-                new JsonDeserializer<>(DispatchEvent.class, objectMapper)
-        );
-
-        ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> factory = new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(cf);
-        return factory;
-    }
-
-    // --- 4. ERROR HANDLING ---
-    @Bean
-    public DefaultErrorHandler defaultErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
+    public DefaultErrorHandler defaultErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) { // Changed to String, Object
         DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
                 (record, exception) -> new TopicPartition(
                         "fincore.FTWOAHM.NOTIFICATION_TABLE_DLQ", -1
@@ -92,59 +71,63 @@ public class KafkaConfig {
         return errorHandler;
     }
 
-    // --- 5. TOPICS ---
+    // --- BEAN C: For UserRoles (Uses a custom consumerFactory) ---
     @Bean
-    public NewTopic dispatchTopic() {
-        return TopicBuilder.name("notification.dispatch")
-                .partitions(3)
-                .replicas(1)
-                .build();
+    public ConcurrentKafkaListenerContainerFactory<String, UserRoleEventDto> userRoleListenerContainerFactory(KafkaProperties properties) {
+        // ... (This bean doesn't use the generic KafkaTemplate, so it's fine) ...
+        var props = properties.buildConsumerProperties(null);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fincore.NotificationService.dto.UserRoleEventDto");
+        JsonDeserializer<UserRoleEventDto> deserializer = new JsonDeserializer<>(UserRoleEventDto.class, this.objectMapper);
+        var consumerFactory = new DefaultKafkaConsumerFactory<>(
+                props,
+                new org.apache.kafka.common.serialization.StringDeserializer(),
+                deserializer
+        );
+        ConcurrentKafkaListenerContainerFactory<String, UserRoleEventDto> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        return factory;
+    }
+
+    // --- BEAN D: For Internal Dispatch Events ---
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> internalKafkaListenerContainerFactory(
+            KafkaProperties properties,
+            KafkaTemplate<String, Object> kafkaTemplate) { // Ensure types match your bean
+        
+        var props = properties.buildConsumerProperties(null);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, "com.fincore.NotificationService.dto.DispatchEvent");
+
+        // Custom deserializer with ObjectMapper
+        JsonDeserializer<DispatchEvent> deserializer = new JsonDeserializer<>(DispatchEvent.class, this.objectMapper);
+        var consumerFactory = new DefaultKafkaConsumerFactory<>(
+                props,
+                new StringDeserializer(),
+                deserializer
+        );
+
+        ConcurrentKafkaListenerContainerFactory<String, DispatchEvent> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        // Apply the error handler (which now accepts KafkaTemplate<String, Object>)
+        factory.setCommonErrorHandler(internalErrorHandler(kafkaTemplate));
+        return factory;
+    }
+
+    // --- BEAN E: Internal Error Handler  ---
+    @Bean
+    public DefaultErrorHandler internalErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) { // Ensure types match your bean
+
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, exception) -> new TopicPartition(
+                        "notification.dispatch.DLQ", -1 // Example DLQ topic name
+                )
+        );
+
+        // Simple retry policy
+        FixedBackOff backOff = new FixedBackOff(1000L, 2L);
+        return new DefaultErrorHandler(recoverer, backOff);
     }
 }
-
-
-
-
-
-
-
-
-
-
-package com.fincore.NotificationService.service;
-
-import com.fincore.NotificationService.dto.DispatchEvent;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.stereotype.Service;
-
-@Service
-@Slf4j
-public class InternalNotificationListener {
-
-    @Autowired
-    private EventProcessorService eventProcessorService;
-
-    /**
-     * WORKER CONSUMER
-     * Listens to 'notification.dispatch'.
-     * Uses 'internalKafkaListenerContainerFactory' to correctly deserialize DispatchEvent.
-     */
-    @KafkaListener(
-            topics = "notification.dispatch", 
-            groupId = "notification-dispatch-workers",
-            containerFactory = "internalKafkaListenerContainerFactory" // <--- UPDATED FACTORY NAME
-    )
-    public void consumeDispatchEvent(ConsumerRecord<String, DispatchEvent> record) {
-        try {
-            DispatchEvent event = record.value();
-            eventProcessorService.processDispatchEvent(event);
-        } catch (Exception e) {
-            log.error("Error processing dispatch event: {}", e.getMessage(), e);
-        }
-    }
-}
-
-
