@@ -1,99 +1,241 @@
-Roles TAble:
-ROLE_ID	NUMBER(10,0)	No	"FTWOAHM"."ROLE_ID_SEQUENCE"."NEXTVAL" 	1	 Unique identifier for the role
-ROLE_NAME	VARCHAR2(50 BYTE)	No		2	 Name of the role
-DESCRIPTION	VARCHAR2(150 BYTE)	Yes		3	 Description of the role
-ROLE_STATUS	VARCHAR2(20 BYTE)	No	'ACTIVE' 	4	Status of the role ( Active/Blocked)
+package com.tcs.fincore.CommonRequestService.service;
 
-sample row for above table : 
-51	UCO	users will be responsible for managing user access	ACTIVE
-52	PSO 	will be monitoring the applications day-to-day activities, start/kill any job/activity (maker/checker can be added for critical activities)	ACTIVE
-53	FRT 	for whole bank	ACTIVE
-54	Branch 	existing branch users rights	ACTIVE
-55	Support 	for providing technical support for the application	ACTIVE
-56	GLIF 	TCS glif / impl teams	ACTIVE
-57	F1/BOG 	existing rights	ACTIVE
-58	External users	for providing access to other application through API's etc	ACTIVE
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import java.time.Instant;
+import java.util.Map;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * GENERIC METHOD: Can be used for 1-to-1 (userId provided) or 1-to-Many (targetRole provided).
+     */
+    @SneakyThrows
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+        
+        NotificationTable notification = NotificationTable.builder()
+                .eventId(java.util.UUID.randomUUID()) // Generate UUID here
+                .userId(userId)          // Can be null if targetRole is set
+                .targetRole(targetRole)  // Can be null if userId is set
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        notificationRepository.save(notification);
+        log.info("Outbox: Written notification for AggregateID: {}", aggregateId);
+    }
+
+    // ... Keep your existing helper methods (createRequestApprovedNotification, etc.) if you want, 
+    // or replace them with calls to the generic method above.
+    
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        createNotification(
+            request.getCreatorId(), 
+            null, 
+            "Your request " + request.getTargetId() + " was Approved", 
+            "/my-requests", // Or specific link
+            request.getId().toString(), 
+            "CommonRequestService"
+        );
+    }
+
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        createNotification(
+            request.getCreatorId(), 
+            null, 
+            "Your request " + request.getTargetId() + " was Rejected: " + reason, 
+            "/my-requests", 
+            request.getId().toString(), 
+            "CommonRequestService"
+        );
+    }
+}
 
 
-permissions table:
-MENU_ID	NUMBER(38,0)	No	"FTWOAHM"."MENU_ITEMS_SEQ"."NEXTVAL"	1	
-MENU_TITLE	VARCHAR2(100 BYTE)	No		2	
-MENU_ICON	VARCHAR2(100 BYTE)	Yes		3	
-MENU_SUBMENU	VARCHAR2(100 BYTE)	Yes		4	
-MENU_ACTION	VARCHAR2(200 BYTE)	No	NULL 	5	
-MENU_URL	VARCHAR2(200 BYTE)	No		6	
-MENU_COMPONENT_PATH	VARCHAR2(200 BYTE)	No		7	
-MENU_DESCRIPTION	VARCHAR2(255 BYTE)	No		8	
-MENU_DEPENDANT	NUMBER(38,0)	Yes		9	
-
-sample data for the above table :
-9	Branch Master	AccountBalance		create|modify|delete|cancel	/branch-master	user/pages/branch/BranchMaster	To edit update branches and to check pending branch update requests	
-10	Branch Requests	AssuredWorkload		approve|reject	/branch-requests	common/CommonRequestScreen	To approve/accept or cancel/reject branch update requests	
-16	State Master	Domain		create|modify|delete|cancel	/state-master	user/pages/StateMaster	This is demo description	
-17	State Requests	DomainVerification		approve|reject	/state-requests	common/CommonRequestScreen	This is demo description	
-15	Calendar Config Requests	EventAvailable		approve|reject	/calendar-config-requests	common/CommonRequestScreen	This is demo description	
-18	Currency Master	LocalAtm		create|modify|delete|cancel	/currency-master	user/pages/CurrencyMaster	This is demo description	
-19	Currency Requests	CreditScore		approve|reject	/currency-requests	common/CommonRequestScreen	This is demo description	
-20	Currency Rate Change	PriceChange		create|modify|delete|cancel	/currency-rate-change	user/pages/CurrencyRateChange	This is demo description	
-21	Currency Rate Requests	CurrencyRupee		approve|reject	/currency-rate-requests	common/CommonRequestScreen	This is demo description	
-24	User Management	People	User Requests Audit	view	/user-management/user-audit	user/pages/UserLogs	Shows user audit requests	
-25	Process Status	Memory		view	/process-status	process-status/ProcessStatusPage	This is demo description	
-35	Dashboard	GridView		view	/dashboard	user/pages/Dashboard	Sample Dashboard screen MUI	
-23	Role Management Requests	Elevator		approve|reject	/role-management-requests	user/pages/RoleApprovals	This is demo description	
-32	Journal Posting Status	Ballot		Cansel Reqest | Status	/Journal-Posting-Status	user/pages/JournalPostingStatus	to cansel there own Request	
-22	Role Management	Badge		create|modify|delete|cancel	/role-management	user/pages/RoleManagement	This is demo description	
-11	Downloads	Download		download	/download	user/pages/SegmentMaster	This is demo description	
-12	User Management	People	User Creation	create|modify|delete|cancel	/user-management/create	user/pages/UserManagement	For creating new user	
-13	User Management	WorkspacePremium	User Requests	approve|reject	/user-management/requests	user/pages/UserApprovals	To approve or reject user requests	
-26	GLIF Reports	Summarize		view	/glif-reports	user/pages/GlifReports	This is demo description	
-31	Journal Authrization	Ballot		approve|reject	/Journal-Authrization	user/pages/MOCRequests	This is demo description	
-34	Transaction Enquiry	ReceiptLong		view	/transaction-enquiry	transaction-enquiry/TransactionEnquiry	This is demo description	
-30	Journal Posting	EditCalendar		Create MOC	/Journal-Posting	user/pages/MOCPosting	This is demo description	
-1	Circle Master	AccountTree		create|modify|delete|cancel	/circle-master	user/pages/CircleMaster	This is demo description	
-33	Balance Enquiry	AccountBalance		view	/balance-enquiry	user/pages/BalanceEnquiryScreen	This provides closing balance for each day according to selected range.	
-5	CGL Master	Casino		create|modify|delete|cancel	/cgl-master	user/pages/CGLMaster	To edit or update active CGLs and to view pending cgl requests	
 
 
-role_permission table : 
-ROLE_ID	NUMBER(10,0)	No		1	Foreign key to the ROLES table.
-PERMISSION_ID	NUMBER(10,0)	No		2	Foreign key to the PERMISSIONS table.
-PERMISSION_ORDER	NUMBER	Yes		3	Storing permission order against each role.
 
-sample data for the above :
-51	33	33
-56	33	33
-56	26	26
-51	35	1
-51	22	21
-51	23	22
-51	19	34
-51	11	2
-51	2	3
-51	1	4
-51	10	5
-51	25	6
-51	5	7
-51	13	8
-51	14	9
-51	6	10
-51	9	11
-51	8	12
-51	7	13
-51	12	14
-51	15	15
-51	16	16
-51	17	17
-51	18	18
-51	20	19
-51	21	20
-51	24	23
-51	26	24
-51	30	25
-51	31	26
-51	32	27
-51	34	28
-58	19	1
-58	11	2
-58	2	3
-58	1	4
-58	10	5
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService; // Caching Service
+
+    @Override
+    @Transactional
+    public CommonReq createRequest(CreateRequestDto dto, String creatorId) throws JsonProcessingException {
+        // ... (Your existing create logic) ...
+        
+        // Validation & Save
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+        String targetId = payload.getKey();
+        // ... uniqueness checks ...
+        
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+        
+        CommonReq savedRequest = commonRequestRepository.save(request);
+
+        // --- NOTIFICATION: NEW PENDING REQUEST ---
+        try {
+            // 1. Fetch Config (Cached - Fast)
+            NotificationConfigDto config = permissionConfigService.getConfig(dto.getRequestType().name());
+
+            // 2. Send to Group (1-to-Many)
+            notificationWriterService.createNotification(
+                null,                       
+                config.getTargetRoles(),    
+                "New " + dto.getChangeType() + " request (" + targetId + ") pending approval",
+                config.getTargetUrl(),      
+                savedRequest.getId().toString(),
+                "CommonRequestService"
+            );
+        } catch (Exception e) {
+            log.error("Failed to send creation notification", e);
+        }
+
+        return savedRequest;
+    }
+
+    @Override
+    @Transactional(rollbackOn = RuntimeException.class)
+    public Optional<CommonReq> updateRequestStatus(ProcessRequestDto dto, String executorId) throws JsonProcessingException {
+        Long requestId = dto.getRequestId();
+        log.info("Processing request ID: {} by executor: {}", requestId, executorId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request not found."));
+
+        // 1. Validation
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Request has already been processed.");
+        }
+
+        // 2. Update Entity
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setReqStatus(dto.getStatus());
+
+        // 3. Execute Strategy (Business Logic)
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+            request.setExecutionRemarks("Success");
+            
+            // Notify Maker: Approved
+            notificationWriterService.createRequestApprovedNotification(request, executorId);
+        } else {
+            request.setExecutionRemarks("Rejected");
+            
+            // Notify Maker: Rejected
+            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
+        }
+
+        // 4. CLOSURE NOTIFICATION (To the Group)
+        // We wrap this in Try/Catch because if this fails, we do NOT want to rollback the actual Approval.
+        // The approval is critical data; the "FYI" notification to the group is secondary.
+        try {
+            // A. Get Group Config from Cache (Zero DB Cost)
+            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
+            
+            // B. Prepare Message
+            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
+            String closureMessage = "Request " + request.getTargetId() + " was " + action + " by " + executorId;
+
+            // C. Send to Group (1-to-Many)
+            notificationWriterService.createNotification(
+                null,                       // userId null -> Targeting Group
+                config.getTargetRoles(),    // The same roles that received the Pending alert
+                closureMessage,
+                config.getTargetUrl(),      // Link to history
+                request.getId().toString(),
+                "CommonRequestService"
+            );
+            log.info("Sent closure notification to group for Request ID: {}", requestId);
+
+        } catch (Exception e) {
+            // Log error but allow transaction to commit
+            log.error("Failed to send closure notification for Request ID: {}", requestId, e);
+        }
+
+        return Optional.of(commonRequestRepository.save(request));
+    }
+
+    // ... other getters ...
+    @Override
+    public List<CommonReq> getMyRequests(String userId, RequestType requestType) {
+        if (requestType == null) throw new IllegalArgumentException("Request type is missing.");
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(RequestType requestType) {
+        if (requestType == null) throw new IllegalArgumentException("Request type is missing.");
+        return commonRequestRepository.findByReqStatusAndReqType(RequestStatus.PENDING, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getAllRequests() {
+        return commonRequestRepository.findAll();
+    }
+}
+
+
