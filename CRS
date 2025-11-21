@@ -3626,3 +3626,1067 @@ EXECUTOR_ID	VARCHAR2(12 BYTE)	Yes		9	User id of the user who accepted/rejected t
 EXECUTOR_REMARKS	VARCHAR2(500 BYTE)	Yes		10	Remarks added by executor.
 PAYLOAD	CLOB	Yes		11	Actual change request data to be updated to the target table. Can be null id delete request.
 TARGET_ID	VARCHAR2(4000 BYTE)	Yes		12	Target table row id of this request. Can be null if add request.
+
+
+
+
+
+// new updated files after integreting notification service: 
+
+
+
+package com.tcs.fincore.CommonRequestService.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
+
+@Configuration
+@EnableCaching
+public class RedisConfig {
+//    @Bean
+//    public RedisConnectionFactory redisConnectionFactory() {
+//        return new LettuceConnectionFactory(); // host + port auto-read from application.properties
+//    }
+
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
+        ObjectMapper redisObjectMapper = new ObjectMapper();
+        redisObjectMapper.registerModule(new JavaTimeModule());
+        // --- THIS IS THE FIX ---
+        // We explicitly verify and enable "Type Info" so Redis saves the class name.
+        redisObjectMapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        // -----------------------
+        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
+        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(24))
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(cacheConfig)
+                .build();
+    }
+
+    // Ensure ObjectMapper handles Java 8 Dates (LocalDate, Instant) correctly in Redis
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        return mapper;
+    }
+
+    // This bean configures our RedisTemplate to use the fixed ObjectMapper
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        Jackson2JsonRedisSerializer<Object> serializer =
+                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
+
+        template.setValueSerializer(serializer);
+        template.setKeySerializer(new StringRedisSerializer());
+
+        return template;
+    }
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+
+    private String targetUrl;
+
+    private String targetRoles; // Comma separated string: "51,52,55"
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * UPDATED: Added @CreationTimestamp for automatic timestamping.
+ */
+@Entity
+@Table(name = "notifications")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    // Unique primary key for the outbox event.
+    // Using UUID strategy is correct for Oracle's SYS_GUID() or RAW(16
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    // The ID of the user who should receive this notification (for 1-to-1).
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event.
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the CommonReq ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.*;
+
+@Entity
+@Table(name = "PERMISSIONS")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class Permissions {
+
+
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.repository;
+
+import com.tcs.fincore.CommonRequestService.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    /**
+     * Fetches both the Target URL and the authorized Role IDs in a single database call.
+     * * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return A list of arrays where index [0] is MENU_URL (String) and index [1] is ROLE_ID (Number)
+     */
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM PERMISSIONS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+
+    @Query(value = "SELECT MENU_URL FROM PERMISSIONS WHERE MAPPED_REQUEST_TYPE = :requestType AND ROWNUM = 1", nativeQuery = true)
+    String findUrlByRequestType(@Param("requestType") String requestType);
+
+    /**
+     * INVALIDATION QUERY (Used by RoleManagementService):
+     * Used to find which Cache Key to evict when a Permission (Menu ID) is updated.
+     * * @param permissionId The Menu ID being modified
+     * @return The cache key (e.g., 'CGL_CODE') or null
+     */
+    @Query(value = "SELECT MAPPED_REQUEST_TYPE FROM PERMISSIONS WHERE MENU_ID = :permissionId", nativeQuery = true)
+    String findRequestTypeByPermissionId(@Param("permissionId") Long permissionId);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * 
+ */
+package com.tcs.fincore.CommonRequestService.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+
+import java.util.UUID;
+
+/**
+ * 
+ */
+@Repository
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID>{
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.NotificationTable;
+import com.tcs.fincore.CommonRequestService.repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    /**
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
+     */
+    @Transactional(propagation = Propagation.MANDATORY) // Ensures this is only called from within an existing transaction
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            // Throwing an exception ensures the parent transaction rolls back.
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        NotificationTable notification = NotificationTable.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        // The EVENT_ID (UUID) and EVENT_TIMESTAMP (CreationTimestamp)
+        // will be set automatically by the NotificationTable entity.
+
+        notificationRepository.save(notification);
+
+        if (targetRole != null) {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        } else {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        }
+    }
+
+
+    @SneakyThrows
+    public void createRequestApprovedNotification(CommonReq request, String approverId) {
+        // 2. Prepare the success notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' has been approved by " + approverId;
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests", // Or specific link
+                request.getId().toString(),
+                "CommonRequestService"
+        );
+    }
+
+    @SneakyThrows
+    public void createRequestRejectedNotification(CommonReq request, String rejectorId, String reason) {
+        // 2. Prepare the rejection notification message
+        String notificationMessage = "Your " + request.getReqType().name().toLowerCase() +" "+request.getChangeType().name()
+                + " request for '" + request.getTargetId() + "' was rejected by " + rejectorId;
+        if (reason != null && reason.isBlank()) {
+            notificationMessage += " Reason: " + reason;
+        }
+
+        createNotification(
+                request.getCreatorId(),
+                null,
+                notificationMessage,
+                "/my-requests",
+                request.getId().toString(),
+                "CommonRequestService"
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+
+import com.tcs.fincore.CommonRequestService.repository.PermissionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    /**
+     * This method is Cached.
+     * - First call: Hits DB (approx 10ms).
+     * - Subsequent calls: Hits Memory
+     * - Key: The RequestType string (e.g., "SEGMENT_CODE").
+     */
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for type: {}", requestType);
+
+        // 1. Single DB Call
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            // Return default fallback logic if no config found
+            log.info("No URL and roles found for request type {}. Using defaults, need to change this in code later", requestType);
+            return new NotificationConfigDto("/dashboard", "ALL_USERS");
+        }
+
+        log.info("Fetched Url and roles from db for the request type {} : {}", requestType, results.getFirst()[0]);
+
+        // 2. Process logic in Java
+        // The URL is the same for all rows (index 0)
+        String url = (String) results.get(0)[0];
+
+        if (url == null) url = "/dashboard";
+        // Collect all Role IDs (index 1) into a comma-separated string.
+
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) // Role ID
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) roles = "ALL_USERS";
+
+        return new NotificationConfigDto(url, roles);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import java.util.List;
+import java.util.Optional;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+
+public interface RequestService {
+
+	/**
+	 * Creates a new request.
+	 * 
+	 * @param createRequestDto DTO containing request details.
+	 * @param creatorId        The ID of the user creating the request.
+	 * @return The saved request entity.
+	 */
+	CommonReq createRequest(
+			CreateRequestDto createRequestDto,
+			String creatorId
+	) throws JsonProcessingException;
+
+	/**
+	 * Retrieves all requests created by a specific user (Maker).
+	 * 
+	 * @param userId The user's ID and requestType like : SegmentCode, CGL
+	 * @return A list of their requests.
+	 */
+	List<CommonReq> getMyRequests(
+			String userId,
+			RequestType requestType
+	);
+
+	/**
+	 * Retrieves all pending requests for Checkers.
+	 * 
+	 * @return A list of pending requests.
+	 */
+	List<CommonReq> getPendingRequests(
+			String userId,
+			RequestType requestType
+	);
+
+	/**
+	 * Retrieves all requests for Checkers (Pending, Accepted, Rejected).
+	 * 
+	 * @return A list of all requests.
+	 */
+	List<CommonReq> getAllRequests();
+
+	/**
+	 * Updates the status of a request (Accept/Reject).
+	 * 
+	 * @param processRequestDto DTO containing the request id, new status and
+	 *                          executor remarks.
+	 * @param executorId        The ID of the user performing the action.
+	 * @return The updated request entity.
+	 */
+	Optional<CommonReq> updateRequestStatus(
+			ProcessRequestDto processRequestDto,
+			String executorId
+	) throws JsonProcessingException;
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
+import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * - Injected NotificationWriterService.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private static final String EVENT_SOURCE = "CommonRequestService";
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public CommonReq createRequest(
+            CreateRequestDto dto,
+            String creatorId
+    ) throws JsonProcessingException {
+
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+
+        // --- PRE CHECKS ---
+        String targetId = payload.getKey();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+        log.info("Determined targetId for new request as: {}", targetId);
+
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+                RequestStatus.PENDING);
+
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+                    targetId, existingRequests.get(0).getReqStatus());
+            throw new DataIntegrityViolationException(
+                    "An active or pending request for '" + targetId + "' already exists.");
+        }
+        log.info("Uniqueness check passed for targetId: {}", targetId);
+
+        // --- CREATE AND SAVE REQUEST ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+
+        log.info("Saving new, validated request for targetId {}", targetId);
+        CommonReq savedRequest = commonRequestRepository.save(request);
+
+        try {
+            // --- NOTIFICATION LOGIC ---
+
+            // 1. Fetch Config from CACHE (Fast)
+            String requestTypeKey = dto.getRequestType().name(); // e.g., "SEGMENT_CODE"
+            log.info("Request Type String to fetch role ids from PERMISSIONS: {}", requestTypeKey);
+
+            NotificationConfigDto config = permissionConfigService.getConfig(requestTypeKey);
+
+            // 2. Customize Message
+            String action = dto.getChangeType().name(); // ADD, UPDATE, DELETE
+            String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
+
+            // 3. Send to Group (1-to-Many via Outbox)
+            notificationWriterService.createNotification(
+                    creatorId,                  // USER ID TO EXCLUDE FROM ROLES, IN THIS CASE ROLE WILL BE USED TO TARGET USER
+                    config.getTargetRoles(),    // Group to SEND TO "51,55" (Fetched from Cache/DB)
+                    message,
+                    config.getTargetUrl(),      // "/segment-requests" (Fetched from Cache/DB)
+                    savedRequest.getId().toString(),
+                    EVENT_SOURCE
+            );
+
+        } catch (Exception e) {
+            // Log the error and re-throw as a RuntimeException to force a rollback.
+            log.error("CRITICAL: Failed to create 'pending' notification for request: {}. Rolling back transaction.", savedRequest.getId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
+        }
+        return savedRequest;
+    }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public Optional<CommonReq> updateRequestStatus(
+            ProcessRequestDto dto,
+            String executorId
+    ) throws JsonProcessingException {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
+
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // SELF-APPROVAL CHECK
+        if (executorId.equals(request.getCreatorId())) {
+            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+                    requestId);
+            throw new IllegalStateException("User cannot approve or reject their own request.");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+                    request.getReqStatus());
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        // --- UPDATE REQUEST STATE ---
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now());
+        request.setReqStatus(dto.getStatus());
+
+        // --- PROCESS BUSINESS LOGIC (STRATEGY) & PREPARE NOTIFICATION 1: TO MAKER (1-to-1) ---
+        // This is a 1-to-1, so USER_ID is the recipient, TARGET_ROLE is null.
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+            // 1. Execute the business logic (e.g., save to master table)
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+
+            // Notify Maker: Approved
+            notificationWriterService.createRequestApprovedNotification(request, executorId);
+            request.setExecutionRemarks("Successfully processed approval.");
+
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+
+            // Notify Maker: Rejected
+            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
+            request.setExecutionRemarks("Request rejected by user.");
+        }
+
+        // --- NOTIFICATION 2: CLOSURE (1-to-Many, Filtered) ---
+        // We wrap this in Try/Catch because if this fails, we do NOT want to roll back the actual Approval.
+        // The approval is critical data; the "FYI" notification to the group is secondary.
+        try {
+            // A. Get Group Config from Cache (Zero DB Cost)
+            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
+
+            // B. Prepare Message
+            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
+            String closureMessage = "CLOSURE: Request " + request.getTargetId() + " was " + action + " by " + executorId;
+
+            // C. Send to Group (1-to-Many)
+            // Pass the CHECKER'S ID as the exclusion ID.
+            notificationWriterService.createNotification(
+                    executorId,                 // User to EXCLUDE
+                    config.getTargetRoles(),    // // Group to SEND TO -> The same roles that received the Pending alert excluding the executor
+                    closureMessage,
+                    config.getTargetUrl(),      // Link to history
+                    request.getId().toString(),
+                    "CommonRequestService"
+            );
+            log.info("Sent closure notification to group for Request ID: {}", requestId);
+
+        } catch (Exception e) {
+            // Log error but allow transaction to commit
+            log.error("Failed to send closure notification for Request ID: {}", requestId, e);
+        }
+
+        // --- SAVE THE UPDATED REQUEST ---
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+
+        return Optional.of(updatedRequest);
+    }
+
+    @Override
+    public List<CommonReq> getMyRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch requests for user : {}",
+                    userId);
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch requests.");
+        }
+        log.info("Fetching my requests for user {} with type {}", userId, requestType);
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch pending requests."
+            );
+        }
+        log.info("Fetching pending requests for user :  {} with type : {}",userId, requestType);
+        return commonRequestRepository
+                .findByCreatorIdNotAndReqStatusAndReqType(userId, RequestStatus.PENDING, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getAllRequests(
+    ) {
+        return commonRequestRepository.findAll();
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+
+@SpringBootApplication
+@EnableCaching
+public class CommonRequestServiceApplication {
+	public static void main(String[] args) {
+		System.setProperty("spring.classformat.ignore", "true");
+		SpringApplication.run(CommonRequestServiceApplication.class, args);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+spring.application.name=CommonRequestService
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.profiles.active=dev
+server.port=9000
+
+#todo Expose all actuator endpoints over HTTP.
+management.endpoints.web.exposure.include=*
+
+# Always show full details on the health endpoint (e.g., database connection status)
+management.endpoint.health.show-details=always
+
+# Add some custom info to the /info endpoint
+info.app.name=CommonRequestService
+info.app.description=Service for managing Different Screen requests. [ex: SegmentRequest, CGL etc]
+info.app.version=1.0.0
+
+spring.jackson.date-format=dd/MM/yyyy
+spring.jackson.serialization.write-dates-as-timestamps=false
+
+
+# --- Redis Configuration ---
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+spring.cache.type=redis
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+
+
+
+
+
+
+
+
+
+permissions table schema :
+
+MENU_ID	NUMBER(38,0)	No	"FINCORE"."MENU_ITEMS_SEQ"."NEXTVAL"	1	
+MENU_TITLE	VARCHAR2(100 BYTE)	No		2	
+MENU_ICON	VARCHAR2(100 BYTE)	Yes		3	
+MENU_SUBMENU	VARCHAR2(100 BYTE)	Yes		4	
+MENU_ACTION	VARCHAR2(200 BYTE)	No	NULL	5	
+MENU_URL	VARCHAR2(200 BYTE)	No		6	
+MENU_COMPONENT_PATH	VARCHAR2(200 BYTE)	No		7	
+MENU_DESCRIPTION	VARCHAR2(255 BYTE)	No		8	
+MENU_DEPENDANT	NUMBER(38,0)	Yes		9	
+MAPPED_REQUEST_TYPE	VARCHAR2(50 BYTE)	Yes		10	
+
+data :
+
+9	Branch Master	AccountBalance		create|modify|delete|cancel	/branch-master	branch/BranchMaster	To edit update branches and to check pending branch update requests		
+10	Branch Requests	AssuredWorkload		approve|reject	/branch-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for branch master.		BRANCH
+16	State Master	Domain		create|modify|delete|cancel	/state-master	state/StateMaster	To manage states in application		
+17	State Requests	DomainVerification		approve|reject	/state-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for state master.		STATE
+15	Calendar Config Requests	EventAvailable		approve|reject	/calendar-config-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for calender config master.		CALENDER
+18	Currency Management	LocalAtm		create|modify|delete|cancel	/currency-management	currency/CurrencyMaster	To manage currency in application		
+19	Currency Requests	CreditScore		approve|reject	/currency-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for currency master.		CURRENCY
+20	Currency Rate Change	PriceChange		create|modify|delete|cancel	/currency-rate-change	currency/CurrencyRateChange	To manage currency rate in application		
+21	Currency Rate Requests	CurrencyRupee		approve|reject	/currency-rate-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for currency rate master.		CURRENCY_RATE_CHANGE
+24	User Management	People	User Requests Audit	view	/user-management/user-audit	user/pages/UserLogs	Shows user audit requests		
+25	Process Status	Memory		view	/process-status	process-status/ProcessStatusPage	This is demo description		
+35	Dashboard	GridView		view	/dashboard	user/pages/Dashboard	Sample Dashboard screen MUI		
+23	Role Management Requests	Elevator		approve|reject	/role-management-requests	role/RoleApprovals	To approve/reject role management related requests.		ROLE_MANAGEMENT
+32	Journal Posting Status	Ballot		Cansel Reqest | Status	/journal-posting-status	journal/JournalPostingStatus	to cansel there own Request		
+22	Role Management	Badge		create|modify|delete|cancel	/role-management	role/RoleManagement	To manage roles in application		
+11	Downloads	Download		download	/download	branch/BranchMaster	This is demo description		
+12	User Management	People	User Creation	create|modify|delete|cancel	/user-management/create	user/pages/UserManagement	For creating new user		
+13	User Management	WorkspacePremium	User Requests	approve|reject	/user-management/requests	user/pages/UserApprovals	To approve or reject user requests		USER_MANAGEMENT
+26	GLIF Reports	Summarize		view	/glif-Reports	glifReports/GlifReports	This is demo description		
+31	Journal Authrization	Ballot		approve|reject	/journal-authrization	journal/JournalAuthrization	This is demo description		JOURNAL_AUTH
+34	Transaction Enquiry	ReceiptLong		view	/transaction-enquiry	transaction-enquiry/TransactionEnquiry	This is demo description		
+30	Journal Posting	EditCalendar		Create MOC	/journal-posting	journal/JournalPosting	This is demo description		
+1	Circle Master	AccountTree		create|modify|delete|cancel	/circle-master	circle/CircleMaster	To manage circles in application		
+33	Balance Enquiry	AccountBalance		view	/balance-enquiry	balanceEnquiry/BalanceEnquiryScreen	This provides closing balance for each day according to selected range.		
+5	CGL Master	Casino		create|modify|delete|cancel	/cgl-master	cgl/CGLMaster	To edit or update active CGLs and to view pending cgl requests		
+6	CGL Requests	WorkspacePremium		approve|reject	/cgl-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for cgl master.		CGL_CODE
+7	Segment Master	Segment		create|modify|delete|cancel	/segment-master	segment/SegmentMaster	To manage segments in application		
+8	Segment Requests	Grading		approve|reject	/segment-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for segment master.		SEGMENT_CODE
+14	Calendar Configuration	EditCalendar		create|modify|delete|cancel	/calendar-config	calendarConfig/CalendarConfig	To manage financial calender configuration in application		
+2	Circle Requests	Ballot		approve|reject	/circle-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for circle master.		CIRCLE
+
+
+role_permissions table schema : 
+ROLE_ID	NUMBER(10,0)	No		1	Foreign key to the ROLES table.
+PERMISSION_ID	NUMBER(10,0)	No		2	Foreign key to the PERMISSIONS table.
+PERMISSION_ORDER	NUMBER	Yes		3	Storing permission order against each role.
+
+
+
+
+samplem data :
+51	33	19
+56	33	2
+56	26	1
+53	25	12
+51	35	1
+51	22	13
+53	23	9
+53	19	11
+51	11	2
+
+
+
+
+
+
+
+
+roles table : 
+
+ROLE_ID	NUMBER(10,0)	No	"FINCORE"."ROLE_ID_SEQUENCE"."NEXTVAL"	1	 Unique identifier for the role
+ROLE_NAME	VARCHAR2(50 BYTE)	No		2	 Name of the role
+DESCRIPTION	VARCHAR2(150 BYTE)	Yes		3	 Description of the role
+ROLE_STATUS	VARCHAR2(20 BYTE)	No	"'ACTIVE'
+   "	4	Status of the role ( Active/Blocked)
+
+
+
+notifications table :
+
+EVENT_ID	RAW	No	SYS_GUID()	1	Unique primary key for the outbox event.
+USER_ID	VARCHAR2(255 BYTE)	Yes		2	The ID of the user who should receive this notification.
+MESSAGE	VARCHAR2(1024 BYTE)	No		3	The human-readable message to be displayed.
+LINK_URL	VARCHAR2(1024 BYTE)	Yes		4	The relative URL the user should be taken to when clicking the notification.
+EVENT_SOURCE	VARCHAR2(100 BYTE)	Yes		5	The microservice that generated this event (e.g., REPORT_SERVICE).
+AGGREGATE_ID	VARCHAR2(255 BYTE)	Yes		6	The primary key of the business object (e.g., the Report ID).
+EVENT_TIMESTAMP	TIMESTAMP(6) WITH TIME ZONE	No	CURRENT_TIMESTAMP	7	The timestamp when the event was created.
+TARGET_ROLE	VARCHAR2(100 BYTE)	Yes		8	For 1-to-Many notifications. If USER_ID is null, this role is used.
