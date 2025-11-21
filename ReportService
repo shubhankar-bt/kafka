@@ -1,0 +1,1719 @@
+package com.fincore.ReportService.advice;
+
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+import com.fincore.ReportService.dto.ApiResponse;
+
+
+/**
+ * This ControllerAdvice intercepts successful responses from any @RestController
+ * and wraps them in a standard ApiResponse format.
+ */
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // This advice applies to any method in a class annotated with @RestController
+        // that is not already returning a ResponseEntity (which gives manual control).
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+                                  Class<? extends HttpMessageConverter<?>> selectedConverterType,
+                                  ServerHttpRequest request, ServerHttpResponse response) {
+
+        // If the controller has already manually wrapped the response, do nothing.
+        if (body instanceof ApiResponse<?>) {
+            return body;
+        }
+
+        // Wrap the successful response body in the standard ApiResponse structure.
+        return ApiResponse.success(body);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // 1. Disable CSRF, not needed for stateless REST APIs
+                .csrf(csrf -> csrf.disable())
+
+                // 2. Define authorization rules
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/reports/**").permitAll() // Allows access to only /reports API endpoints
+                        .requestMatchers("/actuator/**").permitAll() // Allows access to Spring Actuator
+                        .anyRequest().denyAll() // Secure any other endpoints not listed
+                )
+
+                // 3. Set session management to stateless, essential for REST APIs
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+        // In a real application with JWTs, you would add your JWT filter here
+        // .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.controller;
+
+import java.util.List;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.fincore.ReportService.decrypt.JwtDecoder;
+import com.fincore.ReportService.dto.ReportDownloadRequest;
+import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.service.ReportService;
+
+
+/**
+ * @author Shubhankar(V101805)
+ * @description REST controller for handling all report-related requests 
+ * within the ReportService. It provides role-based
+ * access to downloadable report files from the file system.
+ * todo replace JWTDecoder with api-gateway once it is ready...  
+ */
+@RestController
+@RequestMapping("/reports") 
+public class ReportController {
+
+    private final ReportService reportService;
+    
+    public ReportController(ReportService reportService) {
+        this.reportService = reportService;
+    }
+
+
+    @PostMapping("/types")
+    public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
+        return reportService.getReportTypes(JwtDecoder.getUserRole(token));
+    }
+   
+    /**
+    *
+    */
+    @PostMapping("/download")
+    public List<ReportFileDto> downloadReport(@RequestHeader("Authorization") String token, @RequestBody ReportDownloadRequest request) {
+        return reportService.getReport(request.getFileName(), request.getDate(), JwtDecoder.getUserRole(token),JwtDecoder.getUserId(token));
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.decrypt;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Map;
+
+import org.springframework.stereotype.Component;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+
+@Component
+public class JwtDecoder {
+    private static final ObjectMapper OBJECT_MAPPER= new ObjectMapper();
+
+    private static Map<String, Object> decodePayload(String frontendToken){
+
+        try{
+            if(frontendToken == null || frontendToken.trim().isEmpty()){
+                throw new IllegalArgumentException("Token is missing");
+            }
+
+            String token = frontendToken.startsWith("Bearer ") ? frontendToken.substring(7) : frontendToken;
+
+            String[] parts = token.split("\\.");
+            if(parts.length<2){
+                throw new IllegalArgumentException("Invalid JWT format");
+            }
+            String payloadJson= new String(Base64.getUrlDecoder().decode(parts[1]),StandardCharsets.UTF_8);
+
+            return OBJECT_MAPPER.readValue(payloadJson,  new TypeReference<Map<String, Object>>(){});
+
+        } catch (JsonProcessingException e){
+            throw new RuntimeException( "Failed to decode JWT: " + e.getMessage());
+        }
+    } 
+
+    public static int getUserRole(String frontendToken){
+        Map<String, Object> payload = decodePayload(frontendToken);
+
+        Object role = payload.get("role");
+        if(role==null){
+            throw new RuntimeException("Role key not found in JWT payload");
+        }
+
+        if(role instanceof Number){
+            return ((Number )role).intValue();
+        }else{
+            throw new RuntimeException("Role value is not Numeric");
+        }
+    }
+
+    public static String getUserId(String frontendToken){
+        Map<String, Object> payload = decodePayload(frontendToken);
+
+        Object userId = payload.get("userId");
+        if(userId==null) throw new RuntimeException("User ID key not found in JWT payload");
+        return String.valueOf(userId);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Getter;
+
+import java.time.Instant;
+
+@Getter
+@JsonInclude(JsonInclude.Include.NON_NULL) // Don't include null fields in the JSON response
+public class ApiResponse<T> {
+
+    private final boolean success;
+    private final String message;
+    private final T data;
+    private final Instant timestamp;
+
+    private ApiResponse(boolean success, String message, T data) {
+        this.success = success;
+        this.message = message;
+        this.data = data;
+        this.timestamp = Instant.now();
+    }
+
+    public static <T> ApiResponse<T> success(T data, String message) {
+        return new ApiResponse<>(true, message, data);
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(true, "Operation completed successfully.", data);
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return new ApiResponse<>(false, message, null);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+
+import org.springframework.format.annotation.DateTimeFormat;
+
+import java.time.LocalDate;
+
+import lombok.Data;
+
+/**
+ * DTO for the request body of the "download report" endpoint.
+ */
+@Data
+public class ReportDownloadRequest {
+    /**
+     * The unique name of the report.
+     * - @NotBlank: Ensures the string is not null and not just whitespace.
+     */
+    @NotBlank(message = "file name must not be blank")
+    private String fileName;
+
+    /**
+     * The date for which the report is requested.
+     * - @NotNull: Ensures the date field is present.
+     * - @DateTimeFormat: Ensures the string is in 'yyyy-MM-dd' format.
+     */
+    @NotNull(message = "date must not be null")
+    @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
+    private LocalDate date;
+
+
+    /**
+     * roleID will bne used to verify authorization for the download
+     * - @NotNull: Ensures the field is present in the JSON payload.
+     * - @Positive: Ensures the role ID is a number greater than zero.
+     */
+    @NotNull(message = "roleId must not be null")
+    @Positive(message = "roleId must be a positive number")
+    private int roleId;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * A DTO (Data Transfer Object) to hold the structured file data
+ * that will be sent back to the client in a JSON format.
+ */
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ReportFileDto {
+
+    /**
+     * The full name of the file, including the extension.
+     * Example: "balance_compare_report_15102025.xlsx"
+     */
+    private String fileName;
+
+    /**
+     * The MIME type of the file. This is crucial for the frontend
+     * to know how to handle the content.
+     * Example: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+     */
+    private String fileType;
+
+    /**
+     * The raw content of the file, encoded as a Base64 string.
+     * The frontend will decode this back into a file.
+     */
+    private String fileContent;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.dto;
+
+import java.time.LocalDate;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ReportTypeDto {
+
+    private String reportName;
+
+    private String fileName;
+
+    private LocalDate selectedDate;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.dto;
+
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+/**
+ * DTO (Data Transfer Object) for the request body of the "get report types" endpoint.
+ * It uses validation annotations to ensure the payload is correct.
+ */
+@Data
+public class ReportTypesRequest {
+
+    /**
+     * The unique identifier for the user's role.
+     * - @NotNull: Ensures the field is present in the JSON payload.
+     * - @Positive: Ensures the role ID is a number greater than zero.
+     */
+    @NotNull(message = "roleId must not be null")
+    @Positive(message = "roleId must be a positive number")
+    private int roleId;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.exception;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.stream.Collectors;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.context.request.WebRequest;
+
+import com.fincore.ReportService.dto.ApiResponse;
+
+import jakarta.validation.ConstraintViolationException;
+
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Object>> handleResourceNotFoundException(ResourceNotFoundException ex, WebRequest request) {
+        log.error("Report not found: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler({JsonProcessingException.class, HttpMessageNotReadableException.class})
+    public ResponseEntity<ApiResponse<Object>> handleJsonProcessingException(Exception ex, WebRequest request) {
+        log.error("Error processing JSON payload: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Invalid request payload format. Please check the JSON structure and data types."), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiResponse<Object>> handleDataIntegrityViolationException(DataIntegrityViolationException ex, WebRequest request) {
+        log.error("Data integrity violation: {}", ex.getMessage());
+        // Check for common unique constraint violation message
+        if (ex.getMostSpecificCause().getMessage().contains("already exists")) {
+            return new ResponseEntity<>(ApiResponse.error("A resource with the provided identifier already exists."), HttpStatus.CONFLICT);
+        }
+        return new ResponseEntity<>(ApiResponse.error("Database constraint violation. A required field may be missing or a value is invalid."), HttpStatus.CONFLICT);
+    }
+
+    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
+    public ResponseEntity<ApiResponse<Object>> handleArgumentAndStateExceptions(RuntimeException ex, WebRequest request) {
+        log.error("Illegal argument or state: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error(ex.getMessage()), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Object>> handleGlobalException(Exception ex, WebRequest request) {
+        log.error("An unexpected error occurred: {}", ex.getMessage(), ex);
+        return new ResponseEntity<>(ApiResponse.error("An internal server error occurred."), HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+
+    /**
+     * Handles exceptions thrown when @Valid validation fails on a request body.
+     * Returns a 400 Bad Request with a list of validation errors.
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        // Collect all validation error messages into a single string.
+        String errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+        
+        log.warn("Validation failed for incoming request: {}", errors);
+         return new ResponseEntity<>(ApiResponse.error("Validation Failed: "+errors), HttpStatus.BAD_REQUEST);
+    }
+
+    /**
+     * Handles exceptions thrown by the Jakarta Validator, for example,
+     * when we manually trigger validation in our strategies.
+     */
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ResponseEntity<ApiResponse<Object>> handleConstraintViolationException(ConstraintViolationException ex) {
+        String errors = ex.getConstraintViolations().stream()
+                .map(cv -> cv.getPropertyPath() + ": " + cv.getMessage())
+                .collect(Collectors.joining(", "));
+                
+        log.warn("Constraint violation during processing: {}", errors);
+        return new ResponseEntity<>(ApiResponse.error("Validation Failed: "+errors), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiResponse<Object>> handleAccessDeniedException(AccessDeniedException ex, WebRequest request) {
+        log.error("Access Denied: {}", ex.getMessage());
+        return new ResponseEntity<>(ApiResponse.error("Report Not Found or You are not authorized to perform this action."), HttpStatus.NOT_FOUND);
+    }
+    
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+
+@Entity
+@Table(name = "APP_CONFIG")
+@Getter
+@Setter
+public class AppConfig {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+
+    @Column(name = "CONFIG_KEY", nullable = false, unique = true)
+    private String configKey;
+
+    @Column(name = "CONFIG_VALUE", nullable = false)
+    private String configValue;
+
+    @Column(name = "DESCRIPTION")
+    private String description;
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * UPDATED: Added @CreationTimestamp for automatic timestamping.
+ */
+@Entity
+@Table(name = "Notifications")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class Notifications implements Serializable {
+
+    // Unique primary key for the outbox event.
+    // Using UUID strategy is correct for Oracle's SYS_GUID() or RAW(16)
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    // The ID of the user who should receive this notification (for 1-to-1).
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event.
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the CommonReq ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Notifications that = (Notifications) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.model;
+
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.ToString;
+
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.Instant;
+import java.util.Set;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Entity
+@Table(name = "REPORT_TYPES")
+@Getter
+@Setter
+public class ReportType {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private int id;
+
+    @Column(name = "REPORT_NAME", nullable = false, unique = true)
+    private String reportName;
+
+    @CreationTimestamp
+    @Column(name = "CREATED_AT", updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "FILE_NAME")    
+    private String fileName;
+
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+            name = "REPORT_ROLE_MAPPING",
+            joinColumns = @JoinColumn(name = "report_type_id"),
+            inverseJoinColumns = @JoinColumn(name = "role_id")
+    )
+    private Set<Role> roles;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.model;
+
+import java.util.Set;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.ManyToMany;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name = "ROLES")
+public class Role {
+    
+    @Id
+    @Column(name = "ROLE_ID" )
+    private Integer roleId;
+
+    @Column(name = "ROLE_NAME")
+    private String roleName;
+
+    @Column(name = "DESCRIPTION")
+    private String description;
+
+    @Column(name = "ROLE_STATUS")
+    private String role_status;
+
+    @ManyToMany(mappedBy = "roles")
+    private Set<ReportType> reportTypes;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.repository;
+
+import java.util.Optional;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import com.fincore.ReportService.model.AppConfig;
+
+public interface AppConfigRepository extends JpaRepository<AppConfig, Integer> {
+
+    Optional<AppConfig> findByConfigKey(String configKey);
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.ReportService.model.Notifications;
+
+import java.util.UUID;
+
+/**
+ * 
+ */
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, UUID>{
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.repository;
+
+import java.util.List;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.ReportService.model.ReportType;
+
+@Repository
+public interface ReportTypeRepository extends JpaRepository<ReportType, Integer> {
+
+    /**
+     * Finds all report types and orders them by their REPORT_NAME for a better user experience.
+     * @return A list of ReportType entities.
+     */
+    // This method is still useful for admins or internal tools.
+    List<ReportType> findAllByOrderByReportNameAsc();
+
+    /**
+     * Finds all report types accessible by a specific role ID.
+     * This query joins ReportType with its roles and filters by the role's primary key.
+     * The result is ordered by the reportName to ensure a consistent and user-friendly order in the dropdown.
+     *
+     * @param roleId The primary key ID of the role.
+     * @return A list of accessible ReportType entities.
+     */
+    @Query("SELECT rt FROM ReportType rt JOIN rt.roles r WHERE r.roleId = :roleId ORDER BY rt.reportName ASC")
+    List<ReportType> findByRoleId(@Param("roleId") int roleId);
+
+    // Optional<ReportType> findByFileName(String fileName);
+    
+    boolean existsByFileNameAndRoles_roleId(String fileName, int roleId); 
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.service;
+
+
+import com.fincore.ReportService.model.Notifications;
+import com.fincore.ReportService.repository.NotificationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * A service to create and save Notification events to the outbox table.
+ * This is designed to be called from within a parent @Transactional method
+ * in RequestServiceImpl to ensure atomic operations.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    /**
+     * Creates and saves a notification outbox event.
+     * This method joins the existing transaction from the calling service.
+     *
+     * @param userId       The specific user to notify (for 1-to-1). Null if using targetRole.
+     * @param targetRole   The role to notify (for 1-to-many). Null if using userId.
+     * @param message      The human-readable message.
+     * @param linkUrl      The frontend link for the notification.
+     * @param aggregateId  The ID of the business object (e.g., the CommonReq ID).
+     * @param eventSource  The name of this service.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW) // Ensures this is only called from within an existing transaction
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            // In a real scenario, you might want to throw an exception here
+            // if one of them is strictly required, to roll back the parent transaction.
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            // Throwing an exception ensures the parent transaction rolls back.
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        Notifications notification = Notifications.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        // The EVENT_ID (UUID) and EVENT_TIMESTAMP (CreationTimestamp)
+        // will be set automatically by the NotificationTable entity.
+
+        notificationRepository.save(notification);
+
+        if (userId != null) {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        } else {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.service;
+
+import org.springframework.core.io.Resource;
+import java.time.LocalDate;
+import java.util.List;
+
+import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportTypeDto;
+
+public interface ReportService {
+
+    /**
+     * Retrieves all report types accessible by a specific user role ID.
+     *
+     * @param roleId The ID of the user's role.
+     * @return A list of {@link ReportTypeDto}.
+     */
+    List<ReportTypeDto> getReportTypes(int roleId);
+
+    /**
+     * Loads a specific report file as a resource after verifying the user's authorization.
+     *
+     * @param fileName The unique name of the report.
+     * @param date The date for which to fetch the report.
+     * @param userRoleId  user's role ID for an authorization check.
+     * @return The report file as a {@link ReportFileDto}.
+     */
+    List<ReportFileDto> getReport(String fileName, LocalDate date, int userRoleId , String userId);
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.service;
+
+import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.exception.ResourceNotFoundException;
+import com.fincore.ReportService.model.AppConfig;
+import com.fincore.ReportService.repository.AppConfigRepository;
+import com.fincore.ReportService.repository.ReportTypeRepository;
+import jakarta.transaction.Transactional;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * Service implementation for handling business logic related to GLIF reports.
+ */
+@Service
+@Slf4j
+public class ReportServiceImpl implements ReportService {
+
+    private final ReportTypeRepository reportTypeRepository;
+    private final Path reportsBasePath;
+    private final AppConfigRepository appConfigRepository;
+    private final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
+    private final NotificationWriterService notificationWriterService;
+
+    public ReportServiceImpl(ReportTypeRepository reportTypeRepository, @Value("${glif.reports.base-path}") String basePath, AppConfigRepository appConfigRepository, NotificationWriterService notificationWriterService) {
+        this.reportTypeRepository = reportTypeRepository;
+        this.reportsBasePath = Paths.get(basePath);
+        this.appConfigRepository = appConfigRepository;
+        this.notificationWriterService = notificationWriterService;
+    }
+
+    /**
+     * Retrieves a list of report types that are explicitly mapped to the given
+     * roleId AND start date from app_config table
+     *
+     * @param roleId The ID of the user's role.
+     * @return A list of DTOs representing the available reports and start date.
+     */
+    @Override
+    public List<ReportTypeDto> getReportTypes(int roleId) {
+        if (roleId <= 0) {
+            throw new IllegalArgumentException("Payload structure is not correct.");
+        }
+        log.info("Fetching GLIF report types for roleId: {}", roleId);
+
+        // Fetch the date from appConfig to validate the start date of date-picker
+        LocalDate startDate = getStartDateFromAppConfig();
+
+        return reportTypeRepository.findByRoleId(roleId).stream().map(reportType -> new ReportTypeDto(reportType.getReportName(), reportType.getFileName(), startDate)).collect(Collectors.toList());
+    }
+
+    @Transactional
+    @Override
+    public List<ReportFileDto> getReport(String fileName, LocalDate date, int userRoleId, String userId) {
+        // Step 1: Perform a authorization check
+        boolean isAuthorized = reportTypeRepository.existsByFileNameAndRoles_roleId(fileName, userRoleId);
+
+        if (!isAuthorized) {
+            log.info("Report '" + fileName + "' not found or user : " + userRoleId + " is not authorized to access this report.");
+            throw new AccessDeniedException("You do not have permission to access this report '" + fileName + "'.");
+        }
+        log.info("Report '" + fileName + "' found and user : " + userRoleId + " is authorized to access this report.");
+
+        // Step 2: Construct the search directory and the  prefix.filename
+        // Create a custom DateTimeFormatter for the "yyyy-MM-dd" format to handle the date received from client.
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        String formattedDate = date.format(formatter);
+
+        // Resolve the formatted date string to the reportsBasePath.
+        Path searchDirectory = reportsBasePath.resolve(formattedDate);
+        log.info("searchDirectory  : {}", searchDirectory);
+
+        String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+        log.info("fileNamePrefix  : {}", fileNamePrefix);
+
+        // Step 3: Search the directory for a file matching the prefix.
+        List<ReportFileDto> reportFiles = new ArrayList<>();
+
+        try (Stream<Path> files = Files.list(searchDirectory)) {
+            List<Path> matchedFiles = files.filter(path -> path.getFileName().toString().startsWith(fileNamePrefix)).collect(Collectors.toList());
+
+            if (matchedFiles.isEmpty()) {
+                throw new ResourceNotFoundException("No report file found for the selected type and date.");
+            }
+
+            //Loop through all matched files
+            for (Path filePath : matchedFiles) {
+                // Path filePath = foundFile.get();
+                String fullFilename = filePath.getFileName().toString();
+                String extension = getFileExtension(fullFilename);
+                String mimeType = getMimeType(extension);
+                byte[] fileBytes = Files.readAllBytes(filePath);
+                String encodedContent = Base64.getEncoder().encodeToString(fileBytes);
+
+                ReportFileDto dto = new ReportFileDto(fullFilename, mimeType, encodedContent);
+                reportFiles.add(dto);
+
+            }
+
+            //Creates and logs a notification for a user after a report has been fetched successfully.
+            try {
+                String message = "Report fetched successfully for the selected date : " + date;
+                String linkUrl = "/glif-reports"; // link to glif reports page access their reports
+                String aggregateId = fileName + "_" + date; // Business Object ID for this specific notification event
+                String eventSource = "ReportService"; // Source of the notification
+
+                notificationWriterService.createNotification(userId, null, message, linkUrl, aggregateId, eventSource);
+                log.info("Notification created for user {} for report {}", userId, aggregateId);
+            } catch (Exception e) {
+                log.error("Failed to create notification for user {} for report {} : {}", userId, fileName, e.getMessage());
+            }
+            return reportFiles;
+        } catch (IOException e) {
+            try {
+                //Creates and logs a notification for a user when a report is not fetched.
+                String message = "Report not available for the selected date : " + date;
+                String linkUrl = "/glif-reports";  // link to glif reports page access their reports
+                String aggregateId = fileName + "_" + date; // Business Object ID for this specific notification event
+                String eventSource = "ReportService";// Source of the notification
+
+                notificationWriterService.createNotification(userId, null, message, linkUrl, aggregateId, eventSource);
+                log.info("Notification created for missing - directory for user {} for report {}", userId, aggregateId);
+            } catch (Exception ex) {
+                log.error("Failed to create notification for missing - directory for user {} for report {} : {}", userId, fileName, e.getMessage());
+            }
+            throw new ResourceNotFoundException("No report file directory exists for the selected date: " + date.format(DateTimeFormatter.ofPattern("dd/MM/yyyy")));
+        }
+    }
+
+    /*
+     * Helper Fuctions
+     */
+    private String getFileExtension(String filename) {
+        return Optional.ofNullable(filename).filter(f -> f.contains(".")).map(f -> f.substring(f.lastIndexOf(".") + 1)).orElse("");
+    }
+
+    private String getMimeType(String extension) {
+        return switch (extension.toLowerCase()) {
+            case "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+            case "xls" -> "application/vnd.ms-excel";
+            case "csv" -> "text/csv";
+            case "pdf" -> "application/pdf";
+            case "txt" -> "text/plain";
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            default -> "application/octet-stream";
+        };
+    }
+
+    /**
+     * @return LocalDate
+     * @author: v1022518 [Niharika]
+     * @description Function to retun the date received from app config
+     */
+    private LocalDate getStartDateFromAppConfig() {
+        Optional<AppConfig> appConfig = appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY);
+
+        if (appConfig.isEmpty()) {
+            log.info("Required App Configurations is missing : {}", appConfig.get());
+            throw new ResourceNotFoundException("Required App Configurations is missing in DB to get the start date {}");
+        }
+        LocalDate date = LocalDate.parse(appConfig.get().getConfigValue());
+        return date;
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ReportServiceApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(ReportServiceApplication.class, args);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService;
+
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.servlet.support.SpringBootServletInitializer;
+
+public class ServletInitializer extends SpringBootServletInitializer {
+
+	@Override
+	protected SpringApplicationBuilder configure(SpringApplicationBuilder application) {
+		return application.sources(ReportServiceApplication.class);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+{"properties": [{
+  "name": "glif.reports.base-path",
+  "type": "java.lang.String",
+  "description": "A description for 'glif.reports.base-path'"
+}]}
+
+
+
+
+
+
+
+spring.application.name=ReportService
+
+
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.profiles.active=dev
+
+# ===================================================================
+# SERVER CONFIGURATION
+# ===================================================================
+server.port=9005
+
+#todo Expose all actuator endpoints over HTTP.
+management.endpoints.web.exposure.include=*
+
+# Always show full details on the health endpoint (e.g., database connection status)
+management.endpoint.health.show-details=always
+
+# Add some custom info to the /info endpoint
+info.app.name=ReportService
+info.app.description=Service to manage and retrieve different reports
+info.app.version=1.0.0
+
+
+
+
+# ===================================================================
+# JPA / HIBERNATE CONFIGURATION
+# ===================================================================
+spring.jpa.database-platform=org.hibernate.dialect.OracleDialect
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+spring.jpa.properties.hibernate.format_sql=false
+logging.level.org.hibernate.SQL=OFF
+logging.level.org.hibernate.orm.jdbc.bind=OFF
+
+# ===================================================================
+# CUSTOM APPLICATION PROPERTIES
+# ===================================================================
+# IMPORTANT: This is the base directory path where reports are stored. [absolute path]
+# The application will look for date-named folders (e.g., "2025-10-15") inside this path.
+glif.reports.base-path=E:/media/Fincore/glif-reports
+
+
+
+
+
+
+
+
+
+# ===================================================================
+# SPRING DATASOURCE (ORACLE)
+# ===================================================================
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+
+
+
+
+
+
+
+
+
+
+
+
+// TESTS 
+
+package com.fincore.ReportService.repository;
+
+import com.fincore.ReportService.model.AppConfig;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import java.util.Optional;
+
+@DataJpaTest
+@AutoConfigureTestDatabase(replace=AutoConfigureTestDatabase.Replace.NONE)//use your real db
+class AppConfigRepositoryTest{
+
+    @Autowired
+    private AppConfigRepository appConfigRepository;
+
+    @Test  
+    void checkFetch(){
+        Optional<AppConfig> config = appConfigRepository.findByConfigKey("REPORTS_START_DATE");
+        if(config.isPresent()){
+            System.out.println("Data fetched successfully");
+            System.out.println("Key:"+config.get().getConfigKey());
+            System.out.println("Value:"+config.get().getConfigValue());
+            System.out.println("Description:"+config.get().getDescription());
+        }
+        else{
+            System.out.println("No Data Found for REPORTS_START_DATE");
+        }
+    }
+
+
+}
+
+
+
+
+package com.fincore.ReportService.service;
+
+import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.exception.ResourceNotFoundException;
+import com.fincore.ReportService.model.AppConfig;
+import com.fincore.ReportService.model.Notifications;
+import com.fincore.ReportService.model.ReportType;
+import com.fincore.ReportService.model.Role;
+import com.fincore.ReportService.repository.AppConfigRepository;
+import com.fincore.ReportService.repository.NotificationRepository;
+import com.fincore.ReportService.repository.ReportTypeRepository;
+import org.springframework.transaction.annotation.Transactional;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@SpringBootTest
+@Transactional
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+public class ReportServiceImplTest {
+
+    @Autowired
+    private ReportServiceImpl reportService;
+
+    @Autowired
+    private ReportTypeRepository reportTypeRepository;
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private AppConfigRepository appConfigRepository;
+
+    // this must be in sync with ReportsServiceImpl.REPORTS_START_DATE_KEY
+    private static final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
+
+   // random test --delete later
+    @Test
+    public void sanityTest() {
+        System.out.println("JUnit + SpringBootTest are working");
+    }
+
+    /**
+     * For every roleId present in DB, verifies that getReportTypes(roleId)
+     * returns exactly the report types mapped to that role via the join table.
+     */
+    @Test
+    public void testGetReportTypes_ForEachRoleIdMatchesDbMapping() {
+        List<ReportType> allReportTypes = reportTypeRepository.findAll();
+        System.out.println("Total report types in DB: " + allReportTypes.size());
+
+        // Collecting all distinct roleIds from the mapping table (via entity relationship)
+        Set<Integer> allRoleIds = allReportTypes.stream()
+                .flatMap(rt -> rt.getRoles().stream())
+                .map(r -> r.getRoleId())
+                .collect(Collectors.toSet());
+
+        assertFalse(allRoleIds.isEmpty(), "No role mappings found in report types table.");
+
+        for (Integer roleId : allRoleIds) {
+            System.out.println("\n=== Testing getReportTypes for roleId: " + roleId + " ===");
+
+            //all report types that have this role mapped
+            Set<String> expectedFileNames = allReportTypes.stream()
+                    .filter(rt -> rt.getRoles().stream().anyMatch(r -> r.getRoleId() == roleId))
+                    .map(ReportType::getFileName)
+                    .collect(Collectors.toSet());
+
+            System.out.println("Expected report types from DB for roleId " + roleId + ": " + expectedFileNames);
+
+            List<ReportTypeDto> actualDtos = reportService.getReportTypes(roleId);
+            Set<String> actualFileNames = actualDtos.stream()
+                    .map(ReportTypeDto::getFileName)
+                    .collect(Collectors.toSet());
+
+            System.out.println("Actual report types from service for roleId " + roleId + ": " + actualFileNames);
+
+            // The service should return exactly what DB mapping says
+            assertEquals(expectedFileNames, actualFileNames,
+                    "Mismatch between DB mapping and service result for roleId " + roleId);
+        }
+    }
+
+    /**
+     * For every (reportType, roleId) mapping in DB:
+     *  - if the role is mapped to the report, getReport(...) must not fail unexpectedly
+     *  - if files exist for given date, they must be returned consistently
+     *  - if files do not exist, service can throw ResourceNotFound or return empty list
+     */
+    @Test
+    public void testGetReport_ForAllMappedReportTypeAndRoleCombinations() {
+        List<ReportType> allReportTypes = reportTypeRepository.findAll();
+        assertFalse(allReportTypes.isEmpty(), "No report types found in DB.");
+
+        String userId = notificationRepository.findAll().stream()
+                .findFirst()
+                .map(Notifications::getUserId)
+                .orElse("test-user");
+
+        LocalDate testDate = getReportsStartDateFromConfig();
+
+        int testCaseCount = 0;
+
+        for (ReportType reportType : allReportTypes) {
+            String fileName = reportType.getFileName();
+
+            for (Role role : reportType.getRoles()) {
+                int roleId = role.getRoleId();
+                testCaseCount++;
+
+                System.out.println("\n--- Executing getReport test case #" + testCaseCount +
+                        " for fileName: " + fileName +
+                        ", roleId: " + roleId +
+                        ", date: " + testDate +
+                        ", userId: " + userId + " ---");
+
+                try {
+                    List<ReportFileDto> files =
+                            reportService.getReport(fileName, testDate, roleId, userId);
+
+                    if (files == null || files.isEmpty()) {
+                        System.out.println("Result: No report files found for this combination (this may be valid if no physical files exist).");
+                    } else {
+                        System.out.println("Result: " + files.size() + " report file(s) fetched successfully.");
+
+                        // Basic sanity checks on returned DTOs
+                        files.forEach(dto -> {
+                            assertNotNull(dto.getFileName(), "File name should not be null.");
+                            assertTrue(dto.getFileName().startsWith(fileName),
+                                    "Returned file should belong to requested report type.");
+                            assertNotNull(dto.getFileContent(), "File content should not be null.");
+                            assertTrue(dto.getFileContent().length() > 0,
+                                    "File content should not be empty.");
+                        });
+                    }
+                } catch (ResourceNotFoundException ex) {
+                    // no physical file present.
+                    System.out.println("Result: No physical file found for this combination: " + ex.getMessage());
+                } catch (Exception ex) {
+                    fail("Unexpected exception for fileName " + fileName +
+                            ", roleId " + roleId + ": " + ex.getMessage());
+                }
+            }
+        }
+
+        System.out.println("\nComprehensive getReport test finished. Total cases run: " + testCaseCount);
+    }
+
+    /**
+     * Helper to get the report start date from app_config, same as service.
+     */
+    private LocalDate getReportsStartDateFromConfig() {
+        Optional<AppConfig> cfgOpt = appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY);
+        assertTrue(cfgOpt.isPresent(), "App configuration for report start date is missing in DB.");
+        return LocalDate.parse(cfgOpt.get().getConfigValue());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+OLD SERVICEHELP.MD FILE NEED TO BE UPDATED :-
+
+# ReportService: Backend Dev Documentation
+
+## 1. Overview
+
+The ReportService is a Spring Boot microservice responsible for providing role-based access to downloadable report files. It acts as a secure gateway between users and a file system where reports are stored, ensuring that users can only access reports permitted by their assigned roles.
+
+## 2. Architecture
+
+The service follows a standard layered architecture model to separate concerns and improve maintainability.
+
+- **Controller Layer (ReportController):** Exposes the REST API endpoints. It is responsible for handling HTTP requests, validating incoming data (DTOs), and delegating business logic to the service layer.
+- **Service Layer (ReportServiceImpl):** Contains the core business logic. This includes user authorization, constructing file paths, interacting with the file system, and preparing data for the response.
+- **Repository Layer (ReportTypeRepository):** Manages data persistence using Spring Data JPA. It defines the methods for interacting with the database, including the custom query for the authorization check.
+- **Model/Entities (ReportType, Role):** JPA entities that map to the database tables and define their relationships.
+- **DTOs (dto package):** Data Transfer Objects used to define the "shape" of data for API requests and responses. They include validation annotations (`@NotNull`, etc.).
+- **Configuration (config package):** Contains configuration classes, such as `SecurityConfig`, for setting up application behavior.
+- **Exception Handling (advice, exception packages):** Centralized handling of exceptions to ensure consistent and informative API error responses.
+
+## 3. Database Schema
+
+The database consists of three main tables to manage reports and role-based permissions.
+
+- **ROLES:** Stores information about user roles.
+  ○ ROLE_ID (PK): Unique identifier for the role.
+  ○ ROLE_NAME: The name of the role (e.g., "GLIF", "Auditor").
+- **REPORT_TYPES:** Stores metadata for each type of report.
+  ○ ID (PK): Unique identifier for the report type.
+  ○ REPORT_NAME: The user-friendly display name (e.g., "Daily Balance Sheet").
+  ○ FILE_NAME: The system-level file name pattern used for searching (e.g., "daily_balance_sheet").
+- **REPORT_ROLE_MAPPING:** A join table that manages the many-to-many relationship between REPORT_TYPES and ROLES.
+  ○ REPORT_TYPE_ID (FK): Foreign key to REPORT_TYPES.ID.
+  ○ ROLE_ID (FK): Foreign key to ROLES.ROLE_ID.
+
+This structure allows a single report to be assigned to multiple roles, and a single role to have access to multiple reports.
+
+## 4. Logic
+
+### 4.1 Authorization and File Retrieval (`getReport` method)
+
+The process for downloading a report is optimized for both security and performance.
+
+1.  **Authorization Check**:
+
+    - **Repository Method**: `boolean existsByFileNameAndRoles_role_id(String fileName, int roleId);`
+    - **Conceptual SQL**: `SELECT 1 FROM report_types rt JOIN report_role_mapping rrm ON rt.id = rrm.report_type_id WHERE rt.file_name = ? AND rrm.role_id = ?`
+    - **Result**: This query returns a simple `true` or `false` to confirm authorization.
+
+2.  **Security Obfuscation**: If the authorization query returns `false`, the service immediately throws an `AccessDeniedException`.
+
+3.  **Dynamic File Path Construction**:
+
+    - The base path for all reports is configured via the `glif.reports.base-path` property in `application.properties`.
+    - The service dynamically constructs the full path by appending the request date (e.g., `.../glif-reports/2025-10-15`).
+    - A file name prefix is then created using the report's `fileName` and the formatted date (e.g., `daily_balance_sheet_15102025`).
+
+4.  **File Search and Encoding**: The service streams the contents of the target directory, finds the first file matching the generated prefix, reads its bytes, and encodes them into a Base64 string for inclusion in the JSON response.
+
+### 4.2 API Responses
+
+- **`ApiResponseWrapper`**: This `ResponseBodyAdvice` intercepts all successful responses from any `@RestController`. It wraps the original return value inside the standard `ApiResponse` object, ensuring a consistent success format across the API without requiring repetitive code in controllers.
+- **`GlobalExceptionHandler`**: This `@ControllerAdvice` catches predefined exceptions (e.g., `ResourceNotFoundException`, `MethodArgumentNotValidException`) and formats them into the standard `ApiResponse` structure with `success: false`. This centralizes error handling and guarantees a consistent error format.
+
+## 5. Configuration
+
+Key configuration properties are located in `src/main/resources/application.properties`.
+
+- **`glif.reports.base-path`**: (Crucial) The absolute path to the root directory where reports are stored. This path must be configured correctly for each environment (dev, staging, prod).
+- **`server.port`**: The port on which the application runs.
+- **`spring.datasource.*`**: Standard Spring Data source configuration for connecting to the database.
+
+## 6. Security
+
+### Current Implementation
+
+- The `SecurityConfig` class is configured to be stateless (`SessionCreationPolicy.STATELESS`), which is appropriate for a REST API.
+- Currently, all endpoints under `/reports/**` are publicly accessible (`.permitAll()`). **This is suitable for development but must be changed for production.**
+
+### Future Work
+
+The current mechanism of passing `roleId` in the request body is insecure. It should be replaced with a token-based authentication system (e.g., JWT).
+
+1.  **Implement JWT Validation**: Add a filter to `SecurityConfig` that intercepts incoming requests, validates the JWT from the `Authorization` header, and populates the `SecurityContext`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
