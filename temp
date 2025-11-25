@@ -1,33 +1,151 @@
-package com.fincore.UserService.dto;
+global:
+  scrape_interval: 5s # Poll every 5 seconds
+
+scrape_configs:
+  - job_name: 'notification_service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      # 'host.docker.internal' allows the Docker container to talk to your
+      # Java app running on the Host machine (IntelliJ/Eclipse).
+      # If you deploy Java inside Docker later, change this to the container name.
+      - targets: ['host.docker.internal:9010'] 
+        labels:
+          application: 'NotificationService'
+
+
+
+
+
+version: '3.8'
+
+services:
+  # ------------------------------------------------------------------
+  # 1. DATABASE & CACHE
+  # ------------------------------------------------------------------
+  postgres-db:
+    image: bitnami/postgresql:latest
+    container_name: postgres-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: notification_user
+      POSTGRES_PASSWORD: notification_password
+      POSTGRES_DB: notification_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - kafka-net
+
+  redis:
+    image: bitnami/redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    networks:
+      - kafka-net
+
+  # ------------------------------------------------------------------
+  # 2. KAFKA INFRASTRUCTURE
+  # ------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - kafka-net
+
+  connect:
+    image: confluentinc/cp-kafka-connect:latest
+    container_name: connect
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "kafka:29092"
+      CONNECT_GROUP_ID: "connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "connect-configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "connect-offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "connect-status"
+      CONNECT_REPLICATION_FACTOR: 1
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "connect"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/plugins"
+    volumes:
+      - ./plugins:/plugins
+    networks:
+      - kafka-net
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.Data;
+  # ------------------------------------------------------------------
+  # 3. MONITORING STACK
+  # ------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    networks:
+      - kafka-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
-@Data
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class RolePermissionEventDto {
-    @JsonProperty("payload")
-    private Payload payload;
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - kafka-net
 
-    @Data
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class Payload {
-        private DataBlock after;  // State after change
-        private DataBlock before; // State before change (for deletes)
-        private String op;        // 'c', 'u', 'd'
-    }
+networks:
+  kafka-net:
+    driver: bridge
 
-    @Data
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class DataBlock {
-        @JsonProperty("ROLE_ID")
-        private Long roleId;
+volumes:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
 
-        @JsonProperty("PERMISSION_ID")
-        private Long permissionId;
-    }
-}
 
 
 
@@ -35,335 +153,74 @@ public class RolePermissionEventDto {
 
 
 
-package com.fincore.UserService.dto;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.Data;
 
-@Data
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class PermissionEventDto {
-    @JsonProperty("payload")
-    private Payload payload;
 
-    @Data
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class Payload {
-        private DataBlock after;
-        private DataBlock before;
-        private String op;
-    }
 
-    @Data
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class DataBlock {
-        @JsonProperty("MENU_ID")
-        private Long menuId;
-        
-        // Other fields if needed, but ID is enough to trigger refresh
-    }
-}
 
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+    <scope>runtime</scope>
+</dependency>
 
+**`application.properties`**
+```properties
+management.endpoints.web.exposure.include=health,info,prometheus
+management.endpoint.prometheus.enabled=true
+management.metrics.tags.application=${spring.application.name}
 
+**Sanity Check:**
+Run your Java app and visit `http://localhost:9010/actuator/prometheus`. You must see text output.
 
+---
 
+### 5. Start and Verify Infrastructure
 
+1.  **Start Docker:**
+    ```bash
+    docker-compose up -d
+    2.  **Check Prometheus Target:**
+    * Open `http://localhost:9090/targets`
+    * Look for `notification_service`.
+    * **Status must be UP (Green).**
+    * *If it is RED:* It means Prometheus can't talk to your Java app. Check if `host.docker.internal` is working or firewall rules.
 
+---
 
+### 6. Setting up Grafana Dashboards
 
+Now for the fun part: Visualizing the data.
 
-package com.fincore.UserService.repository;
+1.  **Login:** Open `http://localhost:3000`. Login with `admin` / `admin`.
+2.  **Connect Data Source:**
+    * Go to **Configuration (Gear Icon) > Data Sources**.
+    * Click **Add data source**.
+    * Select **Prometheus**.
+    * **URL:** `http://prometheus:9090` (Since they are in the same Docker network).
+    * Click **Save & Test**. You should see green success message.
 
-import com.fincore.UserService.model.Permissions;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
+3.  **Import JVM Dashboard (The "Micrometer" Dashboard):**
+    * Go to **Dashboards (Square Icon) > Import**.
+    * You can upload JSON or use an ID. Use ID **4701** (JVM (Micrometer)).
+    * Select your Prometheus data source.
+    * Click **Import**.
+    * **Result:** You will see graphs for Heap Memory, CPU usage, Garbage Collection, and Uptime.
 
-import java.util.List;
+4.  **Create Custom "Notification Latency" Panel:**
+    * Go to **Dashboards > New Dashboard**.
+    * Click **Add a new panel**.
+    * **Query:** `http_server_requests_seconds_max{uri="/notifications/create-request"}`
+    * This will plot the max latency of your endpoint.
 
-@Repository
-public interface PermissionRepository extends JpaRepository<Permissions, Long> {
+You now have a professional monitoring stack running alongside your application.
 
-    // Joins ROLES -> ROLE_PERMISSIONS -> PERMISSIONS
-    @Query(value = """
-        SELECT p.* FROM PERMISSIONS p
-        JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
-        WHERE rp.ROLE_ID = :roleId
-    """, nativeQuery = true)
-    List<Permissions> findAllByRoleId(@Param("roleId") Long roleId);
-}
-
-
-
-
 
 
 
 
-package com.fincore.UserService.service;
-
-import com.fincore.UserService.model.Permissions;
-import com.fincore.UserService.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionCacheService {
-
-    private final PermissionRepository permissionRepository;
-    private final StringRedisTemplate redisTemplate;
-
-    /**
-     * Refreshes the Redis cache for a specific Role ID.
-     * Call this on Startup and whenever a Role is updated.
-     */
-    @Transactional(readOnly = true)
-    public void refreshRolePermissions(Long roleId) {
-        log.info("♻️ Refreshing Redis Permissions for Role ID: {}", roleId);
-        
-        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
-        String redisKey = "RBAC::PERMISSIONS::" + roleId;
-        
-        // 1. Clear old permissions
-        redisTemplate.delete(redisKey);
-
-        Set<String> redisValues = new HashSet<>();
-
-        for (Permissions p : perms) {
-            String url = p.getMenuUrl(); 
-            String action = p.getMenuAction(); // "create|modify", "approve|reject"
-            String context = p.getMappedRequestType(); // "SEGMENT_CODE", "CGL_CODE"
-
-            // Default context to "*" if null (for non-generic services)
-            String contextSuffix = (context == null || context.isEmpty()) ? "*" : context;
-
-            // --- CRS GENERIC MAPPING LOGIC ---
-            // If the permission has a Mapped Request Type or URL implies a request
-            if (context != null && !context.isEmpty()) {
-                
-                // MAKER ACTIONS: create, modify, delete, cancel
-                // Maps to: POST /create-request (Handles Add/Update/Delete via ChangeType)
-                if (containsAny(action, "create", "modify", "delete", "cancel")) {
-                    redisValues.add("POST:/create-request|" + contextSuffix);
-                }
-                
-                // CHECKER ACTIONS: approve, reject
-                // Maps to: PATCH /update-request (To take action) AND POST /pending-requests (To view list)
-                if (containsAny(action, "approve", "reject")) {
-                    redisValues.add("PATCH:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/pending-requests|" + contextSuffix);
-                }
-                
-                // VIEW ACTION: view
-                // Maps to: POST /my-requests (Maker view)
-                if (action.contains("view")) {
-                    redisValues.add("POST:/my-requests|" + contextSuffix);
-                    // Also allow getting all requests if needed
-                    redisValues.add("GET:/all-requests|" + contextSuffix);
-                }
-            } 
-            
-            // --- STANDARD REST MAPPING (Reports, User Mgmt, etc.) ---
-            else {
-                // Wildcard context |* allows access regardless of X-Request-Type header
-                
-                if (action.contains("create")) redisValues.add("POST:" + url + "|*");
-                if (action.contains("modify")) {
-                    redisValues.add("PUT:" + url + "|*");
-                    redisValues.add("PATCH:" + url + "|*");
-                }
-                if (action.contains("delete")) redisValues.add("DELETE:" + url + "|*");
-                
-                // View typically maps to GET
-                if (action.contains("view")) redisValues.add("GET:" + url + "|*");
-                
-                // Special case for Report Download (It's a POST in your ReportService)
-                if (action.contains("download")) redisValues.add("POST:" + url + "|*");
-            }
-        }
 
-        // 2. Push to Redis
-        if (!redisValues.isEmpty()) {
-            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
-        }
-        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
-    }
 
-    private boolean containsAny(String input, String... keywords) {
-        if (input == null) return false;
-        for (String keyword : keywords) {
-            if (input.contains(keyword)) return true;
-        }
-        return false;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.UserService.config;
-
-import com.fincore.UserService.service.PermissionCacheService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.stereotype.Component;
-import org.springframework.jdbc.core.JdbcTemplate;
-
-import java.util.List;
-
-@Component
-@RequiredArgsConstructor
-@Slf4j
-public class CacheWarmer {
-
-    private final PermissionCacheService permissionCacheService;
-    private final JdbcTemplate jdbcTemplate;
-
-    /**
-     * Runs once when the application starts.
-     * Iterates over ALL Role IDs and refreshes their permissions in Redis.
-     */
-    @EventListener(ApplicationReadyEvent.class)
-    public void onStartup() {
-        log.info("🚀 Startup: Warming Permission Cache...");
-
-        // Fetch all Role IDs (using JDBC for speed/simplicity)
-        List<Long> roleIds = jdbcTemplate.queryForList("SELECT ROLE_ID FROM ROLES", Long.class);
-
-        for (Long roleId : roleIds) {
-            try {
-                permissionCacheService.refreshRolePermissions(roleId);
-            } catch (Exception e) {
-                log.error("Failed to refresh permissions for Role {}", roleId, e);
-            }
-        }
-        log.info("🏁 Cache Warming Complete. Processed {} roles.", roleIds.size());
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-    // ... existing refreshRolePermissions method ...
-
-    /**
-     * Called when a PERMISSION definition changes (e.g. URL update).
-     * Finds all roles using this permission and refreshes them.
-     */
-    @Transactional(readOnly = true)
-    public void refreshRolesByPermissionId(Long permissionId) {
-        // Query DB: Find all Role IDs associated with this Permission ID
-        // You'll need to add this query to your Repository
-        List<Long> affectedRoleIds = rolePermissionRepository.findRoleIdsByPermissionId(permissionId);
-        
-        log.info("Permission {} changed. Refreshing {} affected roles.", permissionId, affectedRoleIds.size());
-        
-        for (Long roleId : affectedRoleIds) {
-            refreshRolePermissions(roleId);
-        }
-    }
-
-
-
-
-
-
-
-
-package com.fincore.UserService.service;
-
-import com.fincore.UserService.dto.PermissionEventDto;
-import com.fincore.UserService.dto.RolePermissionEventDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.stereotype.Service;
-
-@Service
-@Slf4j
-@RequiredArgsConstructor
-public class RbacEventListener {
-
-    private final PermissionCacheService cacheService;
-
-    /**
-     * Scenario 1: A Role is assigned/unassigned a Permission.
-     * Table: ROLE_PERMISSIONS
-     */
-    @KafkaListener(topics = "fincore.FINCORE.ROLE_PERMISSIONS", groupId = "rbac-cache-group")
-    public void handleRolePermissionChange(RolePermissionEventDto event) {
-        if (event == null || event.getPayload() == null) return;
-
-        String op = event.getPayload().getOp();
-        Long roleId = null;
-
-        // If Create or Update, use 'after'
-        if ("c".equals(op) || "u".equals(op)) {
-            roleId = event.getPayload().getAfter().getRoleId();
-        } 
-        // If Delete, use 'before'
-        else if ("d".equals(op)) {
-            roleId = event.getPayload().getBefore().getRoleId();
-        }
-
-        if (roleId != null) {
-            log.info("⚡ Real-time RBAC Update: Role {} permissions changed.", roleId);
-            cacheService.refreshRolePermissions(roleId);
-        }
-    }
-
-    /**
-     * Scenario 2: A Permission definition itself changes (e.g. URL update).
-     * Table: PERMISSIONS
-     */
-    @KafkaListener(topics = "fincore.FINCORE.PERMISSIONS", groupId = "rbac-cache-group")
-    public void handlePermissionDefinitionChange(PermissionEventDto event) {
-        if (event == null || event.getPayload() == null) return;
-
-        String op = event.getPayload().getOp();
-        Long menuId = null;
-
-        if ("c".equals(op) || "u".equals(op)) {
-            menuId = event.getPayload().getAfter().getMenuId();
-        } else if ("d".equals(op)) {
-            menuId = event.getPayload().getBefore().getMenuId();
-        }
-
-        if (menuId != null) {
-            log.info("⚡ Real-time RBAC Update: Permission Definition {} changed.", menuId);
-            cacheService.refreshRolesByPermissionId(menuId);
-        }
-    }
-}
 
 
 
