@@ -1,150 +1,109 @@
-global:
-  scrape_interval: 5s # Poll every 5 seconds
+package com.tcs.fincore.CommonRequestService.config;
 
-scrape_configs:
-  - job_name: 'notification_service'
-    metrics_path: '/actuator/prometheus'
-    static_configs:
-      # 'host.docker.internal' allows the Docker container to talk to your
-      # Java app running on the Host machine (IntelliJ/Eclipse).
-      # If you deploy Java inside Docker later, change this to the container name.
-      - targets: ['host.docker.internal:9010'] 
-        labels:
-          application: 'NotificationService'
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+@Import(RedisConfig.class) // Import Redis Config from Library
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            
+            // LOCK DOWN ENDPOINTS
+            .authorizeHttpRequests(authz -> authz
+                    .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                    // All other requests MUST pass the ContextRbacFilter
+                    .anyRequest().authenticated() 
+            )
+            
+            // INSERT THE GUARD
+            // This filter does two things:
+            // 1. Validates JWT & Sets User Context
+            // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+            .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
 
 
 
 
 
-version: '3.8'
 
-services:
-  # ------------------------------------------------------------------
-  # 1. DATABASE & CACHE
-  # ------------------------------------------------------------------
-  postgres-db:
-    image: bitnami/postgresql:latest
-    container_name: postgres-db
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_USER: notification_user
-      POSTGRES_PASSWORD: notification_password
-      POSTGRES_DB: notification_db
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - kafka-net
+package com.tcs.fincore.CommonRequestService.config;
 
-  redis:
-    image: bitnami/redis:latest
-    container_name: redis
-    ports:
-      - "6379:6379"
-    environment:
-      - ALLOW_EMPTY_PASSWORD=yes
-    networks:
-      - kafka-net
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
-  # ------------------------------------------------------------------
-  # 2. KAFKA INFRASTRUCTURE
-  # ------------------------------------------------------------------
-  zookeeper:
-    image: confluentinc/cp-zookeeper:latest
-    container_name: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    networks:
-      - kafka-net
+@Configuration
+@EnableWebSecurity
+@Import(RedisConfig.class) // Import Redis Config from Library
+public class SecurityConfig {
 
-  kafka:
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka
-    ports:
-      - "9092:9092"
-    depends_on:
-      - zookeeper
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    networks:
-      - kafka-net
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    @Autowired
+    private JwtUtil jwtUtil;
 
-  connect:
-    image: confluentinc/cp-kafka-connect:latest
-    container_name: connect
-    ports:
-      - "8083:8083"
-    depends_on:
-      - kafka
-    environment:
-      CONNECT_BOOTSTRAP_SERVERS: "kafka:29092"
-      CONNECT_GROUP_ID: "connect-cluster"
-      CONNECT_CONFIG_STORAGE_TOPIC: "connect-configs"
-      CONNECT_OFFSET_STORAGE_TOPIC: "connect-offsets"
-      CONNECT_STATUS_STORAGE_TOPIC: "connect-status"
-      CONNECT_REPLICATION_FACTOR: 1
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      CONNECT_REST_ADVERTISED_HOST_NAME: "connect"
-      CONNECT_PLUGIN_PATH: "/usr/share/java,/plugins"
-    volumes:
-      - ./plugins:/plugins
-    networks:
-      - kafka-net
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            
+            // LOCK DOWN ENDPOINTS
+            .authorizeHttpRequests(authz -> authz
+                    .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                    // All other requests MUST pass the ContextRbacFilter
+                    .anyRequest().authenticated() 
+            )
+            
+            // INSERT THE GUARD
+            // This filter does two things:
+            // 1. Validates JWT & Sets User Context
+            // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+            .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
 
-  # ------------------------------------------------------------------
-  # 3. MONITORING STACK
-  # ------------------------------------------------------------------
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-    networks:
-      - kafka-net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    depends_on:
-      - prometheus
-    volumes:
-      - grafana-data:/var/lib/grafana
-    networks:
-      - kafka-net
-
-networks:
-  kafka-net:
-    driver: bridge
-
-volumes:
-  postgres-data:
-  prometheus-data:
-  grafana-data:
+        return http.build();
+    }
+}
 
 
 
@@ -156,64 +115,56 @@ volumes:
 
 
 
+package com.tcs.fincore.CommonRequestService.config;
 
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
-<dependency>
-    <groupId>io.micrometer</groupId>
-    <artifactId>micrometer-registry-prometheus</artifactId>
-    <scope>runtime</scope>
-</dependency>
+@Configuration
+@EnableWebSecurity
+@Import(RedisConfig.class) // Import Redis Config from Library
+public class SecurityConfig {
 
-**`application.properties`**
-```properties
-management.endpoints.web.exposure.include=health,info,prometheus
-management.endpoint.prometheus.enabled=true
-management.metrics.tags.application=${spring.application.name}
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    @Autowired
+    private JwtUtil jwtUtil;
 
-**Sanity Check:**
-Run your Java app and visit `http://localhost:9010/actuator/prometheus`. You must see text output.
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            
+            // LOCK DOWN ENDPOINTS
+            .authorizeHttpRequests(authz -> authz
+                    .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                    // All other requests MUST pass the ContextRbacFilter
+                    .anyRequest().authenticated() 
+            )
+            
+            // INSERT THE GUARD
+            // This filter does two things:
+            // 1. Validates JWT & Sets User Context
+            // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+            .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
 
----
-
-### 5. Start and Verify Infrastructure
-
-1.  **Start Docker:**
-    ```bash
-    docker-compose up -d
-    2.  **Check Prometheus Target:**
-    * Open `http://localhost:9090/targets`
-    * Look for `notification_service`.
-    * **Status must be UP (Green).**
-    * *If it is RED:* It means Prometheus can't talk to your Java app. Check if `host.docker.internal` is working or firewall rules.
-
----
-
-### 6. Setting up Grafana Dashboards
-
-Now for the fun part: Visualizing the data.
-
-1.  **Login:** Open `http://localhost:3000`. Login with `admin` / `admin`.
-2.  **Connect Data Source:**
-    * Go to **Configuration (Gear Icon) > Data Sources**.
-    * Click **Add data source**.
-    * Select **Prometheus**.
-    * **URL:** `http://prometheus:9090` (Since they are in the same Docker network).
-    * Click **Save & Test**. You should see green success message.
-
-3.  **Import JVM Dashboard (The "Micrometer" Dashboard):**
-    * Go to **Dashboards (Square Icon) > Import**.
-    * You can upload JSON or use an ID. Use ID **4701** (JVM (Micrometer)).
-    * Select your Prometheus data source.
-    * Click **Import**.
-    * **Result:** You will see graphs for Heap Memory, CPU usage, Garbage Collection, and Uptime.
-
-4.  **Create Custom "Notification Latency" Panel:**
-    * Go to **Dashboards > New Dashboard**.
-    * Click **Add a new panel**.
-    * **Query:** `http_server_requests_seconds_max{uri="/notifications/create-request"}`
-    * This will plot the max latency of your endpoint.
-
-You now have a professional monitoring stack running alongside your application.
+        return http.build();
+    }
+}
 
 
 
@@ -226,6 +177,55 @@ You now have a professional monitoring stack running alongside your application.
 
 
 
+package com.tcs.fincore.CommonRequestService.config;
 
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+@Import(RedisConfig.class) // Import Redis Config from Library
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            
+            // LOCK DOWN ENDPOINTS
+            .authorizeHttpRequests(authz -> authz
+                    .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                    // All other requests MUST pass the ContextRbacFilter
+                    .anyRequest().authenticated() 
+            )
+            
+            // INSERT THE GUARD
+            // This filter does two things:
+            // 1. Validates JWT & Sets User Context
+            // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+            .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
 
 
