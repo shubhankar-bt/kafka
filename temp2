@@ -1,356 +1,123 @@
-NotificationService :
+package com.fincore.UserService.service;
 
-@Slf4j
-@RestController
-@RequestMapping("/notifications")
-public class NotificationController {
-
-    private final NotificationService notificationService;
-
-    private final SsePushService ssePushService;
-
-    private final JwtUtil jwtUtil;
-
-    public NotificationController(NotificationService notificationService, SsePushService ssePushService, JwtUtil jwtUtil) {
-        this.notificationService = notificationService;
-        this.ssePushService = ssePushService;
-        this.jwtUtil = jwtUtil;
-    }
-
-    /**
-     * GET /notifications/stream
-     * The real-time SSE connection endpoint.
-     */
-    @GetMapping("/stream")
-    public SseEmitter streamNotifications(@RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return ssePushService.subscribe(userId);
-    }
-
-    /**
-     * GET /notifications
-     * Fetches notification history for the user, with pagination.
-     */
-    @GetMapping
-    public ResponseEntity<Page<Notification>> getNotifications(@RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "10") int size, @RequestHeader("Authorization") String token) {
-
-        String userId = jwtUtil.getUserIdFromToken(token);
-        Page<Notification> notifications = notificationService.getNotificationsForUser(userId, page, size);
-        return ResponseEntity.ok(notifications);
-    }
-
-    /**
-     * GET /notifications/unread-count
-     * Gets the count for the notification bell badge.
-     */
-    @GetMapping("/unread-count")
-    public ResponseEntity<Map<String, Long>> getUnreadCount(@RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        long count = notificationService.getUnreadNotificationCount(userId);
-        return ResponseEntity.ok(Map.of("count", count));
-    }
-
-    /**
-     * POST /notifications/{id}/read
-     * Marks a single notification as read.
-     */
-    @PostMapping("/{id}/read")
-    public ResponseEntity<Boolean> markNotificationAsRead(@RequestHeader("Authorization") String token, @PathVariable("id") UUID id) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        boolean success = notificationService.markAsRead(userId, id);
-
-        if (success) {
-            return ResponseEntity.ok(true);
-        } else {
-            return ResponseEntity.notFound().build();
-        }
-    }
-
-    /**
-     * POST /notifications/read-all
-     * Mark all notifications as read for the particular user
-     * */
-    @PostMapping("/read-all")
-    public ResponseEntity<Boolean> markAllAsRead(@RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        notificationService.markAllAsRead(userId);
-        return ResponseEntity.ok(true);
-    }
-}
-
-
-
-
-
-
-
-
-
-ProcessStatusService :-
-
-@Slf4j
-@RequiredArgsConstructor
-@RestController
-public class ProcessStatusController {
-
-	private final ProcessStatusService processStatusService;
-
-	@PostMapping("/processes")
-	public ResponseEntity<ResponseVO<ProcessStatus>> insert(
-			@Valid @RequestBody InsertDTO insertDTO
-	) {
-		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.insert(insertDTO);
-		return responseEntity;
-	}
-
-	@PatchMapping("/processes")
-	public ResponseEntity<ResponseVO<ProcessStatus>> update(@Valid @RequestBody UpdateDTO updateDTO) {
-		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.update(updateDTO);
-		return responseEntity;
-	}
-
-	@GetMapping(path = "/processes", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-	public SseEmitter getProcessData() throws JsonProcessingException {
-		return processStatusService.getProcessDataSSE();
-	}
-}
-
-
-
-
-ReportService :-
-
-@Slf4j
-@RestController
-@RequestMapping("/reports") 
-public class ReportController {
-
-    private final ReportService reportService;
-    private final JwtUtil jwtUtil; // Declare an instance field
-    
-    public ReportController(ReportService reportService, JwtUtil jwtUtil) {
-        this.reportService = reportService;
-        this.jwtUtil = jwtUtil;
-    }
-
-    @PostMapping("/types")
-    public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
-        log.info("role and user id from token  : {},  {}", jwtUtil.getUserRoleFromToken(token), jwtUtil.getUserIdFromToken(token));
-        return reportService.getReportTypes(jwtUtil.getUserRoleFromToken(token));
-    }
-   
-    /**
-    *
-    */
-    @PostMapping("/download")
-    public List<ReportFileDto> downloadReport(@RequestHeader("Authorization") String token, @RequestBody ReportDownloadRequest request) {
-        return reportService.getReport(request.getFileName(), request.getDate(), jwtUtil.getUserRoleFromToken(token), jwtUtil.getUserIdFromToken(token));
-    }
-
-}
-
-
-
-
-
-
-TransactionsService :-
-
-package com.fincore.transactions_service.controller;
-
-import java.io.IOException;
-import java.util.Map;
-
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RestController;
-
-import com.fincore.transactions_service.dto.GetPayloadDTO;
-import com.fincore.transactions_service.service.TransactionsService;
-
-import jakarta.validation.Valid;
+import com.fincore.UserService.model.Permissions;
+import com.fincore.UserService.repository.PermissionRepository;
 import lombok.RequiredArgsConstructor;
-
-@RestController
-@RequiredArgsConstructor
-public class TransactionsController {
-
-	public final TransactionsService transactionsService;
-
-	@PostMapping("/transactions")
-	public Map<String, Object> getTransactionsData(@RequestBody @Valid GetPayloadDTO getPayloadDTO) {
-		return transactionsService.getTransactionsData(getPayloadDTO);
-	}
-
-	@PostMapping("/transactions-download")
-	public byte[] getTransactionsFile(@RequestBody @Valid GetPayloadDTO getPayloadDTO) throws IOException {
-		return transactionsService.getTransactionsFile(getPayloadDTO);
-	}
-}
-
-
-
-
-
-
-UserService :
-
-@RestController()
-@RequestMapping("/role") //context path
-public class RoleRequestController {
-
-	private final RoleRequestService roleRequestService;
-    private final JwtUtil jwtUtil;
-
-	public RoleRequestController(RoleRequestService roleRequestService, JwtUtil jwtUtil) {
-		this.roleRequestService = roleRequestService;
-        this.jwtUtil = jwtUtil;
-	}
-
-	@GetMapping("/get-roles") //end point
-	public ResponseEntity getAllRoles(@RequestParam Map<String, Object> requestParams) {
-		return roleRequestService.getAllRoles(requestParams);
-	}
-
-	@PostMapping("/create-role-request")//end point
-	public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization")String token) {
-		String userId = jwtUtil.getUserIdFromToken(token);
-		return roleRequestService.createNewRoleRequest(request, userId);
-	}
-
-	@GetMapping("/pending-role-requests")//end point
-	public ResponseEntity getPendingRequests(@RequestHeader("Authorization") String token) {
-		String userId = jwtUtil.getUserIdFromToken(token);
-		return roleRequestService.getPendingRoleRequests(userId);
-	}
-
-	@PostMapping("/role-request-action")//end point
-	public ResponseEntity acceptRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
-		String userId = jwtUtil.getUserIdFromToken(token);
-		return roleRequestService.acceptOrRejectRoleRequest(request, userId);
-	}
-
-	@GetMapping("/my-role-requests")//end point
-	public ResponseEntity getMyRequests(@RequestHeader("Authorization") String token) {
-		String userId = jwtUtil.getUserIdFromToken(token);
-		return roleRequestService.getMyRoleRequests(userId);
-	}
-
-	@PostMapping("/cancel-role-request")//end point
-	public ResponseEntity cancelRoleRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
-		return roleRequestService.cancelRoleRequest(request, jwtUtil.getUserIdFromToken(token));
-	}
-
-	@GetMapping("/get-all-permissions")//end point
-	public ResponseEntity getRoleWisePermissions() {
-		return roleRequestService.getAllPermissions();
-	}
-	
-	@PatchMapping("/save-permission-order")
-	public ResponseEntity savePermissionOrder(@RequestBody PermissionOrderDto payload) {
-		return roleRequestService.savePermissionOrder(payload);
-	}
-
-}
-
-
-
-
-
-
-
-
-
-
-package com.tcs.userservice.controller;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.tcs.userservice.dto.UserLogsDto;
-import com.tcs.userservice.dto.UserRequestDto;
-import com.tcs.userservice.service.UserLogsService;
-import com.tcs.userservice.service.UserRequestService;
-import com.tcs.userservice.utility.RequestUtility;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 
+@Service
+@RequiredArgsConstructor
 @Slf4j
-@RestController()
-@RequestMapping("/user")
-public class UserRequestController {
+public class PermissionCacheService {
 
+    private final PermissionRepository permissionRepository;
+    private final StringRedisTemplate redisTemplate;
 
-    @Autowired
-    private UserRequestService userRequestService;
+    @Transactional(readOnly = true)
+    public void refreshRolePermissions(Long roleId) {
+        log.info("♻️ Refreshing Redis Permissions for Role ID: {}", roleId);
+        
+        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+        String redisKey = "RBAC::PERMISSIONS::" + roleId;
+        
+        redisTemplate.delete(redisKey);
 
-    @Autowired
-    private UserLogsService userLogsService;
+        Set<String> redisValues = new HashSet<>();
 
-    @Autowired
-    private JwtUtil jwtUtil;
+        for (Permissions p : perms) {
+            String url = p.getMenuUrl(); 
+            String action = p.getMenuAction(); 
+            String context = p.getMappedRequestType(); 
 
-    @PostMapping("/create-request")
-    public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return userRequestService.createNewRequest(request, userId);
+            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+            // --- A. GENERIC CRS MAPPING ---
+            if ((context != null && !context.isEmpty()) || url.contains("-requests")) {
+                // MAKER
+                if (containsAny(action, "create", "modify", "delete", "cancel")) {
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix); 
+                }
+                // CHECKER
+                if (containsAny(action, "approve", "reject")) {
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/pending-requests|" + contextSuffix);
+                }
+                // VIEW
+                if (containsAny(action, "view", "create")) {
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                    redisValues.add("GET:/all-requests|" + contextSuffix);
+                }
+            } 
+            
+            // --- B. STANDARD REST MAPPING (Notifications, Reports, etc.) ---
+            else {
+                // OPTIMIZATION 1: Auto-Wildcard
+                // If the URL is "/notifications", we treat it as "/notifications/**" 
+                // to allow access to sub-resources like /notifications/stream
+                String effectiveUrl = url.endsWith("/**") ? url : url + "/**";
+
+                // CREATE -> POST
+                if (action.contains("create")) {
+                    redisValues.add("POST:" + effectiveUrl + "|*");
+                }
+                
+                // MODIFY -> PUT, PATCH, AND POST (Fix for NotificationController)
+                if (action.contains("modify")) {
+                    redisValues.add("PUT:" + effectiveUrl + "|*");
+                    redisValues.add("PATCH:" + effectiveUrl + "|*");
+                    redisValues.add("POST:" + effectiveUrl + "|*"); // Added to support POST updates
+                }
+                
+                // DELETE -> DELETE
+                if (action.contains("delete")) {
+                    redisValues.add("DELETE:" + effectiveUrl + "|*");
+                }
+                
+                // VIEW -> GET
+                if (action.contains("view")) {
+                    redisValues.add("GET:" + effectiveUrl + "|*");
+                }
+                
+                // DOWNLOAD -> POST (For Reports)
+                if (action.contains("download")) {
+                    redisValues.add("POST:" + effectiveUrl + "|*");
+                }
+            }
+        }
+
+        if (!redisValues.isEmpty()) {
+            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+        }
+        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
     }
 
-    @GetMapping("/pending-user-requests")
-    public ResponseEntity getPendingRequests(@RequestParam Map<String, Object> params) {
-        return userRequestService.getPendingRequests(params);
+    private boolean containsAny(String input, String... keywords) {
+        if (input == null) return false;
+        for (String keyword : keywords) {
+            if (input.contains(keyword)) return true;
+        }
+        return false;
     }
-
-    @PostMapping("/accept-request")
-    public ResponseEntity acceptRequest(ServerHttpRequest request, @RequestBody UserRequestDto userRequest) {
-        String clientIp = RequestUtility.getClientIp(request);
-        return userRequestService.acceptOrRejectUserRequest(userRequest, clientIp);
+    
+    /**
+     * Called when a PERMISSION definition changes (e.g. URL update).
+     * Finds all roles using this permission and refreshes them.
+     */
+    @Transactional(readOnly = true)
+    public void refreshRolesByPermissionId(Long permissionId) {
+       // Assuming you have this method in RolePermissionRepository
+       // List<Long> affectedRoleIds = rolePermissionRepository.findRoleIdsByPermissionId(permissionId);
+       // for (Long roleId : affectedRoleIds) refreshRolePermissions(roleId);
+       // (Placeholder to remind you to keep this logic if implemented)
     }
-
-
-    @GetMapping("/user-details")
-    public ResponseEntity getUserDetails(@RequestParam Map<String, String> request) {
-        return userRequestService.getUserDetails(request);
-    }
-
-    @GetMapping("/my-requests")
-    public ResponseEntity getMyRequests(@RequestParam Map<String, String> params) {
-        return userRequestService.getMyRequests(params);
-    }
-
-    @PostMapping("/cancel-request")
-    public ResponseEntity cancelRequest(@RequestBody Map<String, Object> request) {
-        return userRequestService.cancelRequest(request);
-    }
-
-
-    @PostMapping("/logs-batch")
-    public ResponseEntity<List<UserLogsDto>> createLogsBatch(@RequestBody List<UserLogsDto> payload) {
-        List<UserLogsDto> savedLogs = (List<UserLogsDto>) userLogsService.saveLogs(payload);
-
-        // Returning the saved DTOs with the CREATED status
-        return new ResponseEntity<>(savedLogs, HttpStatus.CREATED);
-    }
-
-    // GET API to fetch all user logs
-    @GetMapping("/all-logs")
-    public ResponseEntity<List<UserLogsDto>> findAllLogs() {
-        List<UserLogsDto> logs = userLogsService.findAllLogs();
-        return ResponseEntity.ok(logs);
-    }
-
-    // GET API to fetch a user log by ID
-    @GetMapping("/{id}")
-    public ResponseEntity<UserLogsDto> findLogById(@PathVariable Integer id) {
-        UserLogsDto log = userLogsService.findLogById(id);
-        return ResponseEntity.ok(log);
-    }
-
 }
+
 
