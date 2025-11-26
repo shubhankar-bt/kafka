@@ -22,102 +22,186 @@ public class PermissionCacheService {
 
     @Transactional(readOnly = true)
     public void refreshRolePermissions(Long roleId) {
-        log.info("♻️ Refreshing Redis Permissions for Role ID: {}", roleId);
-        
+        // 1. Fetch all permissions assigned to this Role
         List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+        
         String redisKey = "RBAC::PERMISSIONS::" + roleId;
         
+        // 2. Clear existing cache to avoid stale data
         redisTemplate.delete(redisKey);
 
         Set<String> redisValues = new HashSet<>();
 
         for (Permissions p : perms) {
-            String url = p.getMenuUrl(); 
+            String dbUrl = p.getMenuUrl(); 
             String action = p.getMenuAction(); 
             String context = p.getMappedRequestType(); 
 
+            // 3. TRANSLATION LAYER
+            // Convert "Frontend URL" -> "Backend API Path"
+            String apiPath = mapDbUrlToApiPath(dbUrl); 
+            
+            // Context Normalization: If null, use "*" (Wildcard for standard services)
             String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
 
-            // --- A. GENERIC CRS MAPPING ---
-            if ((context != null && !context.isEmpty()) || url.contains("-requests")) {
-                // MAKER
+            // --- LOGIC A: GENERIC MAKER-CHECKER SERVICES (CRS) ---
+            // Identified by having a Context (e.g. SEGMENT_CODE) OR being a generic URL
+            if ((context != null && !context.isEmpty()) || apiPath.contains("-requests")) {
+                
+                // MAKER Actions (Create/Edit) -> Generic Create/Update API
                 if (containsAny(action, "create", "modify", "delete", "cancel")) {
                     redisValues.add("POST:/create-request|" + contextSuffix);
                     redisValues.add("POST:/update-request|" + contextSuffix); 
+                    redisValues.add("POST:/cancel-request|" + contextSuffix);
                 }
-                // CHECKER
+                
+                // CHECKER Actions (Approve/Reject) -> Generic Approval API
                 if (containsAny(action, "approve", "reject")) {
                     redisValues.add("PATCH:/update-request|" + contextSuffix);
                     redisValues.add("POST:/pending-requests|" + contextSuffix);
                 }
-                // VIEW
+                
+                // VIEW Actions -> Generic Fetch API
                 if (containsAny(action, "view", "create")) {
                     redisValues.add("POST:/my-requests|" + contextSuffix);
                     redisValues.add("GET:/all-requests|" + contextSuffix);
                 }
+                
+                // SPECIAL: User/Role Management is handled by UserService but uses Context logic
+                if ("USER_MANAGEMENT".equals(context)) {
+                     redisValues.add("POST:/user/create-request|*"); // Specific override
+                     redisValues.add("GET:/user/**|*");
+                }
+                if ("ROLE_MANAGEMENT".equals(context)) {
+                     redisValues.add("POST:/role/create-role-request|*");
+                     redisValues.add("GET:/role/**|*");
+                }
             } 
             
-            // --- B. STANDARD REST MAPPING (Notifications, Reports, etc.) ---
+            // --- LOGIC B: STANDARD REST SERVICES (Reports, Transactions, etc.) ---
             else {
-                // OPTIMIZATION 1: Auto-Wildcard
-                // If the URL is "/notifications", we treat it as "/notifications/**" 
-                // to allow access to sub-resources like /notifications/stream
-                String effectiveUrl = url.endsWith("/**") ? url : url + "/**";
+                // Append /** to allow sub-paths (e.g., /notifications -> /notifications/stream)
+                String effectiveUrl = apiPath.endsWith("/**") ? apiPath : apiPath + "/**";
 
                 // CREATE -> POST
-                if (action.contains("create")) {
-                    redisValues.add("POST:" + effectiveUrl + "|*");
-                }
+                if (action.contains("create")) redisValues.add("POST:" + effectiveUrl + "|*");
                 
-                // MODIFY -> PUT, PATCH, AND POST (Fix for NotificationController)
+                // MODIFY -> PUT, PATCH, and POST (Many of your update APIs use POST)
                 if (action.contains("modify")) {
                     redisValues.add("PUT:" + effectiveUrl + "|*");
                     redisValues.add("PATCH:" + effectiveUrl + "|*");
-                    redisValues.add("POST:" + effectiveUrl + "|*"); // Added to support POST updates
+                    redisValues.add("POST:" + effectiveUrl + "|*"); 
                 }
                 
                 // DELETE -> DELETE
-                if (action.contains("delete")) {
-                    redisValues.add("DELETE:" + effectiveUrl + "|*");
+                if (action.contains("delete")) redisValues.add("DELETE:" + effectiveUrl + "|*");
+                
+                // VIEW -> GET (Standard) AND POST (For Search APIs with bodies)
+                if (action.contains("view")) {
+                    redisValues.add("GET:" + effectiveUrl + "|*");
+                    redisValues.add("POST:" + effectiveUrl + "|*"); // Fix for Transaction/Balance Search
                 }
                 
-                // VIEW -> GET
-                if (action.contains("view")) {
+                // DOWNLOAD -> POST/GET
+                if (action.contains("download")) {
+                    redisValues.add("POST:" + effectiveUrl + "|*");
                     redisValues.add("GET:" + effectiveUrl + "|*");
                 }
                 
-                // DOWNLOAD -> POST (For Reports)
-                if (action.contains("download")) {
-                    redisValues.add("POST:" + effectiveUrl + "|*");
+                // BULK UPLOAD -> POST
+                if (action.contains("Upload")) {
+                     redisValues.add("POST:" + effectiveUrl + "|*");
                 }
             }
         }
 
+        // 4. Push to Redis
         if (!redisValues.isEmpty()) {
             redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
         }
-        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
+        log.info("✅ Refreshed Role {}: {} permissions cached.", roleId, redisValues.size());
+    }
+
+    /**
+     * THE MAPPER: Bridges the gap between DB URLs and Controller Paths.
+     * If you add a new service, check if it needs an entry here.
+     */
+    private String mapDbUrlToApiPath(String dbUrl) {
+        if (dbUrl == null) return "";
+        
+        // 1. Report Service
+        // DB: /glif-Reports -> Controller: /reports
+        if (dbUrl.equalsIgnoreCase("/glif-Reports")) return "/reports";
+        
+        // 2. Transaction Service
+        // DB: /transaction-enquiry -> Controller: /transactions
+        if (dbUrl.equalsIgnoreCase("/transaction-enquiry")) return "/transactions";
+        
+        // 3. Balance Service
+        // DB: /balance-enquiry -> Controller: /balance
+        if (dbUrl.equalsIgnoreCase("/balance-enquiry")) return "/balance";
+        
+        // 4. User/Role Management (Frontend routes vs Controller routes)
+        if (dbUrl.startsWith("/role-management")) return "/role";
+        if (dbUrl.startsWith("/user-management")) return "/user";
+        
+        // 5. Process Status
+        if (dbUrl.startsWith("/process-status")) return "/processes";
+        
+        // 6. Journal Bulk Upload
+        if (dbUrl.contains("journal-bulk-upload")) return "/journal-bulk-upload";
+
+        // Default: Assume DB URL matches Controller (e.g., /notifications, /circle-management)
+        return dbUrl;
     }
 
     private boolean containsAny(String input, String... keywords) {
         if (input == null) return false;
-        for (String keyword : keywords) {
-            if (input.contains(keyword)) return true;
-        }
+        for (String k : keywords) if (input.contains(k)) return true;
         return false;
     }
-    
-    /**
-     * Called when a PERMISSION definition changes (e.g. URL update).
-     * Finds all roles using this permission and refreshes them.
-     */
-    @Transactional(readOnly = true)
-    public void refreshRolesByPermissionId(Long permissionId) {
-       // Assuming you have this method in RolePermissionRepository
-       // List<Long> affectedRoleIds = rolePermissionRepository.findRoleIdsByPermissionId(permissionId);
-       // for (Long roleId : affectedRoleIds) refreshRolePermissions(roleId);
-       // (Placeholder to remind you to keep this logic if implemented)
-    }
 }
+
+3. Detailed Dry Runs (How it works in practice)
+Let's trace exactly what happens for different request types.
+Example A: Transaction Enquiry (The Mismatch)
+ * DB Row: MENU_URL: /transaction-enquiry, ACTION: view
+ * Controller: @PostMapping("/transactions")
+ * The Flow:
+   * mapDbUrlToApiPath("/transaction-enquiry") returns /transactions.
+   * Logic B sees action="view".
+   * It adds GET:/transactions/**|* AND POST:/transactions/**|*.
+   * Redis: Contains POST:/transactions/**|*.
+ * Runtime: Frontend calls POST /transactions. Filter matches wildcard POST permission. ACCESS GRANTED.
+Example B: Segment Master (The CRS Generic)
+ * DB Row: URL: /segment-management, ACTION: create, TYPE: SEGMENT_CODE
+ * Controller: @PostMapping("/create-request")
+ * The Flow:
+   * Logic A detects TYPE=SEGMENT_CODE.
+   * It sees action="create".
+   * It adds POST:/create-request|SEGMENT_CODE.
+   * Redis: Contains POST:/create-request|SEGMENT_CODE.
+ * Runtime: Frontend calls POST /create-request with Header X-Request-Type: SEGMENT_CODE. Filter checks exact match. ACCESS GRANTED.
+Example C: Balance Enquiry (The Path Fix)
+ * DB Row: URL: /balance-enquiry, ACTION: view
+ * Controller: @RequestMapping("/balance"), @PostMapping("/enquirys") -> Full path /balance/enquirys
+ * The Flow:
+   * mapDbUrlToApiPath converts /balance-enquiry to /balance.
+   * Logic B appends /**. Result: /balance/**.
+   * It adds POST:/balance/**|* (because of view->POST mapping).
+ * Runtime: Frontend calls /balance/enquirys. Filter checks /balance/**. ACCESS GRANTED.
+4. Future-Proofing: How to Add New Things
+If you add a new feature next month, follow this guide to ensure "Smooth" integration.
+Scenario 1: Adding a New Service (e.g., "Audit Service")
+ * Controller: Create AuditController with @RequestMapping("/audit").
+ * DB Permission: Insert MENU_URL = '/audit' and ACTION = 'view'.
+ * Result: Since /audit matches /audit, the default mapper works. The logic adds GET:/audit/**. Works Instantly.
+Scenario 2: Adding a complex URL mismatch
+ * Controller: @RequestMapping("/api/v1/external-data").
+ * DB Permission: Frontend route is /external-view.
+ * Action: You MUST update mapDbUrlToApiPath in PermissionCacheService.java:
+   if (dbUrl.equals("/external-view")) return "/api/v1/external-data";
+
+
 
 
