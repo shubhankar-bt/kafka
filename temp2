@@ -1,173 +1,172 @@
-package com.fincore.commonutilities.security;
+package com.fincore.UserService.service;
 
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
+import com.fincore.UserService.model.Permissions;
+import com.fincore.UserService.repository.PermissionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.io.IOException;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-@Slf4j
+@Service
 @RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
+@Slf4j
+public class PermissionCacheService {
 
+    private final PermissionRepository permissionRepository;
     private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
-    private static final Set<String> GENERIC_ENDPOINTS = Set.of(
-            "/create-request", "/update-request", "/my-requests", "/pending-requests", "/all-requests"
-    );
-
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
-    );
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-
-        // 1. SKIP WHITELIST
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        // 2. EXTRACT & VALIDATE TOKEN
-        String token = request.getHeader("Authorization");
-        try {
-            if (token == null || !jwtUtil.isTokenValid(token)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        } catch (Exception e) {
-            // Handle ExpiredJwtException or others gracefully
-            filterChain.doFilter(request, response);
-            return;
-        }
-
-        // 3. SET SECURITY CONTEXT
-        String userId = jwtUtil.getUserIdFromToken(token);
-        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-        String roleId = String.valueOf(roleIdInt);
-
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
-
-        // 4. DETERMINE CONTEXT
-        String contextHeader = request.getHeader("X-Request-Type");
-        String requestContext = (contextHeader == null || contextHeader.trim().isEmpty()) ? "*" : contextHeader;
-
-        // 5. VALIDATE GENERIC ENDPOINTS
-        boolean isGenericEndpoint = GENERIC_ENDPOINTS.stream().anyMatch(uri::endsWith);
-        if (isGenericEndpoint && requestContext.equals("*")) {
-            response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing Header: X-Request-Type is required");
-            return;
-        }
-
-        // 6. REDIS LOOKUP (PATTERN MATCHING FIX)
+    @Transactional(readOnly = true)
+    public void refreshRolePermissions(Long roleId) {
+        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
         String redisKey = "RBAC::PERMISSIONS::" + roleId;
         
-        // Fetch ALL permissions for this role
-        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
-        boolean isAuthorized = false;
+        redisTemplate.delete(redisKey);
 
-        if (permissions != null) {
-            for (String perm : permissions) {
-                // Format: "METHOD:URL_PATTERN|CONTEXT"
-                // Example: "GET:/notifications/**|*"
+        Set<String> redisValues = new HashSet<>();
+
+        for (Permissions p : perms) {
+            String dbUrl = p.getMenuUrl(); 
+            String action = p.getMenuAction(); 
+            String context = p.getMappedRequestType(); 
+
+            String apiPath = mapDbUrlToApiPath(dbUrl); 
+            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+            // --- LOGIC A: CONTEXT-BASED MAPPING (CRS + CMS) ---
+            // If a permission has a Context (e.g. SEGMENT_CODE), it implies access to 
+            // BOTH the Generic Write APIs (CRS) AND the Specific Read APIs (CMS).
+            if (context != null && !context.isEmpty()) {
                 
-                String[] parts = perm.split("\\|"); // Split by pipe first
-                if (parts.length < 2) continue;
-
-                String methodAndUrl = parts[0]; // "GET:/notifications/**"
-                String allowedContext = parts[1]; // "*" or "SEGMENT_CODE"
-
-                // 1. Check Context Match
-                if (!allowedContext.equals("*") && !allowedContext.equals(requestContext)) {
-                    continue; // Context mismatch
+                // 1. MAP COMMON REQUEST SERVICE (Writes)
+                if (containsAny(action, "create", "modify", "delete", "cancel", "approve", "reject")) {
+                    // Maker Actions
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix); 
+                    redisValues.add("POST:/cancel-request|" + contextSuffix);
+                    
+                    // Checker Actions
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/pending-requests|" + contextSuffix);
                 }
-
-                String[] muParts = methodAndUrl.split(":", 2);
-                if (muParts.length < 2) continue;
                 
-                String allowedMethod = muParts[0];
-                String allowedUrlPattern = muParts[1];
+                // 2. MAP COMMON MASTER SERVICE (Reads)
+                // Even if DB action is just "create", you need to SEE the table to create/edit.
+                // So we implicitly grant GET access to the relevant Master Data endpoints.
+                addCommonMasterPermissions(redisValues, context, contextSuffix);
 
-                // 2. Check Method Match
-                if (!allowedMethod.equals(method)) {
-                    continue;
+                // 3. MAP GENERIC VIEWS (My Requests)
+                if (containsAny(action, "view", "create", "approve")) {
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                    redisValues.add("GET:/all-requests|" + contextSuffix);
                 }
+                
+                // 4. USER/ROLE MANAGEMENT EXCEPTIONS
+                if ("USER_MANAGEMENT".equals(context)) {
+                     redisValues.add("POST:/user/create-request|*"); 
+                     redisValues.add("GET:/user/**|*");
+                }
+                if ("ROLE_MANAGEMENT".equals(context)) {
+                     redisValues.add("POST:/role/create-role-request|*");
+                     redisValues.add("GET:/role/**|*");
+                }
+            } 
+            
+            // --- LOGIC B: STANDARD REST MAPPING (Non-Context) ---
+            else {
+                String effectiveUrl = apiPath.endsWith("/**") ? apiPath : apiPath + "/**";
 
-                // 3. Check URL Pattern Match (CRITICAL FIX)
-                // /notifications/stream matches /notifications/**
-                if (pathMatcher.match(allowedUrlPattern, uri)) {
-                    isAuthorized = true;
-                    break; // Found a match, stop looping
+                if (action.contains("create")) redisValues.add("POST:" + effectiveUrl + "|*");
+                
+                if (action.contains("modify")) {
+                    redisValues.add("PUT:" + effectiveUrl + "|*");
+                    redisValues.add("PATCH:" + effectiveUrl + "|*");
+                    redisValues.add("POST:" + effectiveUrl + "|*"); 
+                }
+                
+                if (action.contains("delete")) redisValues.add("DELETE:" + effectiveUrl + "|*");
+                
+                if (action.contains("view")) {
+                    redisValues.add("GET:" + effectiveUrl + "|*");
+                    redisValues.add("POST:" + effectiveUrl + "|*"); 
+                }
+                
+                if (action.contains("download")) {
+                    redisValues.add("POST:" + effectiveUrl + "|*");
+                    redisValues.add("GET:" + effectiveUrl + "|*");
                 }
             }
         }
 
-        // 7. ENFORCE DECISION
-        if (isAuthorized) {
-            filterChain.doFilter(request, response);
-        } else {
-            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
-            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied");
+        if (!redisValues.isEmpty()) {
+            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
         }
+        log.info("✅ Refreshed Role {}: {} permissions cached.", roleId, redisValues.size());
+    }
+
+    /**
+     * Expands a Context (e.g. SEGMENT_CODE) into the specific CMS GET endpoints.
+     * This fixes the issue where "/segment-codes" was denied.
+     */
+    private void addCommonMasterPermissions(Set<String> redisValues, String context, String suffix) {
+        switch (context) {
+            case "SEGMENT_CODE":
+                redisValues.add("GET:/segment-codes|" + suffix);
+                break;
+            case "CGL_CODE":
+                redisValues.add("GET:/cgls|" + suffix);
+                redisValues.add("GET:/cgl-code-description-only|" + suffix);
+                redisValues.add("GET:/cgl-codes|" + suffix);
+                break;
+            case "BRANCH":
+                redisValues.add("GET:/branches|" + suffix);
+                redisValues.add("GET:/branches-code-name-only|" + suffix);
+                break;
+            case "STATE":
+                redisValues.add("GET:/states|" + suffix);
+                break;
+            case "CIRCLE":
+                redisValues.add("GET:/circle-codes|" + suffix);
+                // Zone is often needed with Circle
+                redisValues.add("GET:/zone-codes|" + suffix); 
+                break;
+            case "CURRENCY":
+                redisValues.add("GET:/currency-master|" + suffix);
+                redisValues.add("GET:/currency-code-name-only|" + suffix);
+                redisValues.add("GET:/currency|" + suffix);
+                break;
+            case "CALENDER":
+                redisValues.add("GET:/calendar-configuration|" + suffix);
+                break;
+            case "CURRENCY_RATE_CHANGE":
+                redisValues.add("GET:/currency-rate-change|" + suffix);
+                break;
+            default:
+                log.debug("No specific CMS endpoints mapped for context: {}", context);
+        }
+    }
+
+    private String mapDbUrlToApiPath(String dbUrl) {
+        if (dbUrl == null) return "";
+        if (dbUrl.equalsIgnoreCase("/glif-Reports")) return "/reports";
+        if (dbUrl.equalsIgnoreCase("/transaction-enquiry")) return "/transactions";
+        if (dbUrl.equalsIgnoreCase("/balance-enquiry")) return "/balance";
+        if (dbUrl.startsWith("/role-management")) return "/role";
+        if (dbUrl.startsWith("/user-management")) return "/user";
+        if (dbUrl.startsWith("/process-status")) return "/processes";
+        if (dbUrl.contains("journal-bulk-upload")) return "/journal-bulk-upload";
+        return dbUrl;
+    }
+
+    private boolean containsAny(String input, String... keywords) {
+        if (input == null) return false;
+        for (String k : keywords) if (input.contains(k)) return true;
+        return false;
     }
 }
-
-Action: Update this file in common-utilities and run mvn clean install. Then update the common-utilities dependency in Notification Service (rebuild it).
-Step 2: Fix PermissionCacheService in UserService
-We need to make the logic case-insensitive to ensure view, View, or VIEW all generate the GET key.
-File: com/fincore/UserService/service/PermissionCacheService.java
-    // ... inside refreshRolePermissions method ...
-
-    for (Permissions p : perms) {
-        String dbUrl = p.getMenuUrl(); 
-        String actionRaw = p.getMenuAction(); // Raw from DB
-        String action = (actionRaw != null) ? actionRaw.toLowerCase() : ""; // FORCE LOWERCASE
-        String context = p.getMappedRequestType(); 
-
-        // ... normalization logic ...
-
-        // --- LOGIC B: STANDARD REST MAPPING ---
-        else {
-            String effectiveUrl = apiPath.endsWith("/**") ? apiPath : apiPath + "/**";
-
-            // Using lowercase 'action' variable here guarantees matches
-            if (action.contains("view")) {
-                redisValues.add("GET:" + effectiveUrl + "|*");
-                redisValues.add("POST:" + effectiveUrl + "|*"); 
-            }
-            
-            // ... rest of your logic ...
-        }
-    }
 
 
