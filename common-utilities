@@ -1,3 +1,33 @@
+package com.fincore.commonutilities.config;
+
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+@Configuration
+public class RedisConfig {
+
+    /**
+     * Provides a StringRedisTemplate if the main application hasn't defined one.
+     * This is crucial for the RbacFilter to work out-of-the-box.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
+    }
+}
+
+
+
+
+
+
+
+
 package com.fincore.commonutilities.jwt;
 
 import io.jsonwebtoken.Claims;
@@ -18,12 +48,12 @@ import java.util.function.Function;
 public class JwtUtil {
 
     // Reads 'jwt.secret' from the HOST application (CRS, ReportService, etc.)
-    // Default value provided just in case, but YOU MUST OVERRIDE THIS in application.properties
-    @Value("${jwt.secret:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}") 
+    // Default value provided just in case, but we MUST OVERRIDE THIS in application.properties
+    @Value("${jwt.secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
     private String secretKey;
 
     /**
-     * Legacy Method Support: Extracts User ID from "Bearer <token>"
+     * Extracts User ID from "Bearer <token>"
      */
     public String getUserIdFromToken(String token) {
         String cleanToken = removeBearerPrefix(token);
@@ -31,13 +61,13 @@ public class JwtUtil {
     }
 
     /**
-     * Legacy Method Support: Extracts Role ID as integer from "Bearer <token>"
+     * Extracts Role ID as integer from "Bearer <token>"
      */
     public int getUserRoleFromToken(String token) {
         String cleanToken = removeBearerPrefix(token);
         // Extracts "role" claim and converts to Integer
         return extractClaim(cleanToken, claims -> {
-            Object role = claims.get("role"); // Ensure your Login Service sends key "role"
+            Object role = claims.get("role");
             if (role instanceof Number) {
                 return ((Number) role).intValue();
             }
@@ -89,11 +119,11 @@ public class JwtUtil {
     }
 
     private SecretKey getSigningKey() {
-        // Decodes your Base64 encoded secret key
         byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
 
-
+}
 
 
 
@@ -134,19 +164,24 @@ public class ContextRbacFilter extends OncePerRequestFilter {
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
     private static final Set<String> GENERIC_ENDPOINTS = Set.of(
-            "/create-request", "/update-request", "/my-requests", "/pending-requests"
+            "/create-request", "/update-request", "/my-requests", "/pending-requests", "/all-requests"
     );
 
     private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**"
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
     );
 
     @Override
-    protected void doFilterInternal(@NonNull HttpServletRequest request, @NonNull HttpServletResponse response, @NonNull FilterChain filterChain) throws ServletException, IOException {
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
 
         String uri = request.getRequestURI();
-        
-        // 1. Skip Whitelist
+        String method = request.getMethod().toUpperCase();
+
+        // 1. SKIP WHITELIST
         for (String pattern : WHITELIST) {
             if (pathMatcher.match(pattern, uri)) {
                 filterChain.doFilter(request, response);
@@ -154,15 +189,20 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             }
         }
 
+        // 2. EXTRACT & VALIDATE TOKEN
         String token = request.getHeader("Authorization");
-
-        // 2. Validate Token (Fail open if missing, let SecurityConfig handle 401)
-        if (token == null || !jwtUtil.isTokenValid(token)) {
+        try {
+            if (token == null || !jwtUtil.isTokenValid(token)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+        } catch (Exception e) {
+            // Handle ExpiredJwtException or others gracefully
             filterChain.doFilter(request, response);
             return;
         }
 
-        // 3. Set Security Context (So you can use @AuthenticationPrincipal later)
+        // 3. SET SECURITY CONTEXT
         String userId = jwtUtil.getUserIdFromToken(token);
         int roleIdInt = jwtUtil.getUserRoleFromToken(token);
         String roleId = String.valueOf(roleIdInt);
@@ -174,33 +214,77 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             SecurityContextHolder.getContext().setAuthentication(authToken);
         }
 
-        // 4. Context Logic
-        String context = request.getHeader("X-Request-Type");
-        if (context == null || context.trim().isEmpty()) {
-            context = "*";
-        }
+        // 4. DETERMINE CONTEXT
+        // 1. Get Header (Default to "*" if missing)
+        String contextHeader = request.getHeader("X-Request-Type");
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty())
+                ? contextHeader
+                : "*";
 
+        // 2. Identify if this is a Generic Endpoint
         boolean isGenericEndpoint = GENERIC_ENDPOINTS.stream().anyMatch(uri::endsWith);
-        if (isGenericEndpoint && context.equals("*")) {
+
+        // 3. Enforce Mandatory Header for Generic Endpoints
+        if (isGenericEndpoint && requestContext.equals("*")) {
             response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing Header: X-Request-Type is required");
             return;
         }
 
-        // 5. Redis Check
-        String method = request.getMethod().toUpperCase();
+        // 4. Redis Check
         String redisKey = "RBAC::PERMISSIONS::" + roleId;
-        String specificKey = method + ":" + uri + "|" + context;
-        String wildcardKey = method + ":" + uri + "|*";
+        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
+        boolean isAuthorized = false;
 
-        boolean isAuthorized = Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(redisKey, specificKey));
-        if (!isAuthorized) {
-            isAuthorized = Boolean.TRUE.equals(redisTemplate.opsForSet().isMember(redisKey, wildcardKey));
+        if (permissions != null) {
+            for (String perm : permissions) {
+                // Format: "METHOD:URL_PATTERN|CONTEXT"
+                // Example: "GET:/segment-codes|SEGMENT_CODE"
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+
+                String methodAndUrl = parts[0];
+                String allowedContext = parts[1]; // Value from DB (e.g. SEGMENT_CODE)
+
+                // --- MATCHING LOGIC ---
+                boolean contextMatches = false;
+
+                // A. Exact Context Match (Best Case)
+                // Request: SEGMENT_CODE == Allowed: SEGMENT_CODE
+                if (allowedContext.equals(requestContext)) {
+                    contextMatches = true;
+                }
+                // B. Wildcard Permission Match
+                // Allowed: * (Access to all)
+                else if (allowedContext.equals("*")) {
+                    contextMatches = true;
+                }
+                // C. Implicit Context Match (THE FIX)
+                // Request: * (No Header) AND Allowed: SEGMENT_CODE AND Endpoint is NOT Generic
+                // This implies URL /segment-codes is unique enough to skip header check.
+                else if (requestContext.equals("*") && !isGenericEndpoint) {
+                    contextMatches = true;
+                }
+
+                if (!contextMatches) continue;
+
+                // Check Method & URL Pattern
+                String[] muParts = methodAndUrl.split(":", 2);
+                if (muParts.length < 2) continue;
+
+                String allowedMethod = muParts[0];
+                String allowedUrlPattern = muParts[1];
+
+                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
         }
 
         if (isAuthorized) {
             filterChain.doFilter(request, response);
         } else {
-            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, context);
+            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
             response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied");
         }
     }
@@ -212,47 +296,10 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
 
 
-
-
-package com.fincore.commonutilities.config;
-
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.StringRedisTemplate;
-
-@Configuration
-public class RedisConfig {
-
-    @Bean
-    @ConditionalOnMissingBean
-    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
-        return new StringRedisTemplate(connectionFactory);
-    }
-}
+spring.application.name=CommonUtilities
 
 
 
-
-
-
-
-
-<dependency>
-    <groupId>com.fincore</groupId>
-    <artifactId>common-utilities</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-</dependency>
-4.  **Configure Properties (CRITICAL):**
-Open `application.properties` in **CRS**, **ReportService**, and **NotificationService** and add:
-```properties
-# MUST MATCH LOGIN SERVICE KEY EXACTLY
-jwt.secret=YOUR_ACTUAL_SECRET_KEY_FROM_LOGIN_SERVICE_HERE
-
-# REDIS CONFIG
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
 
 
 
