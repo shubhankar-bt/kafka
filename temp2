@@ -1,169 +1,3 @@
-package com.fincore.commonutilities.security;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
-
-import java.io.IOException;
-import java.util.Set;
-
-@Slf4j
-@RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
-
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
-
-    // 1. GENERIC ENDPOINTS (Strict Context Required)
-    private static final Set<String> GENERIC_ENDPOINTS = Set.of(
-            "/create-request", "/update-request", "/my-requests", "/pending-requests", "/all-requests"
-    );
-
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
-    );
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-
-        // Check Whitelist
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        // Validate Token
-        String token = request.getHeader("Authorization");
-        try {
-            if (token == null || !jwtUtil.isTokenValid(token)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        } catch (Exception e) {
-            filterChain.doFilter(request, response);
-            return;
-        }
-
-        // Set Auth Context
-        String userId = jwtUtil.getUserIdFromToken(token);
-        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-        String roleId = String.valueOf(roleIdInt);
-
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
-
-        // --- CONTEXT LOGIC START ---
-        
-        // 1. Get Header (Default to "*" if missing)
-        String contextHeader = request.getHeader("X-Request-Type");
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) 
-                                ? contextHeader 
-                                : "*";
-
-        // 2. Identify if this is a Generic Endpoint
-        boolean isGenericEndpoint = GENERIC_ENDPOINTS.stream().anyMatch(uri::endsWith);
-
-        // 3. Enforce Mandatory Header for Generic Endpoints
-        if (isGenericEndpoint && requestContext.equals("*")) {
-            response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing Header: X-Request-Type is required");
-            return;
-        }
-
-        // 4. Redis Check
-        String redisKey = "RBAC::PERMISSIONS::" + roleId;
-        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
-        boolean isAuthorized = false;
-
-        if (permissions != null) {
-            for (String perm : permissions) {
-                // Format: "METHOD:URL_PATTERN|CONTEXT"
-                // Example: "GET:/segment-codes|SEGMENT_CODE"
-                String[] parts = perm.split("\\|"); 
-                if (parts.length < 2) continue;
-
-                String methodAndUrl = parts[0];
-                String allowedContext = parts[1]; // Value from DB (e.g. SEGMENT_CODE)
-
-                // --- MATCHING LOGIC ---
-                boolean contextMatches = false;
-
-                // A. Exact Context Match (Best Case)
-                // Request: SEGMENT_CODE == Allowed: SEGMENT_CODE
-                if (allowedContext.equals(requestContext)) {
-                    contextMatches = true;
-                }
-                // B. Wildcard Permission Match
-                // Allowed: * (Access to all)
-                else if (allowedContext.equals("*")) {
-                    contextMatches = true;
-                }
-                // C. Implicit Context Match (THE FIX)
-                // Request: * (No Header) AND Allowed: SEGMENT_CODE AND Endpoint is NOT Generic
-                // This implies URL /segment-codes is unique enough to skip header check.
-                else if (requestContext.equals("*") && !isGenericEndpoint) {
-                    contextMatches = true;
-                }
-
-                if (!contextMatches) continue;
-
-                // Check Method & URL Pattern
-                String[] muParts = methodAndUrl.split(":", 2);
-                if (muParts.length < 2) continue;
-                
-                String allowedMethod = muParts[0];
-                String allowedUrlPattern = muParts[1];
-
-                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
-                    isAuthorized = true;
-                    break;
-                }
-            }
-        }
-
-        if (isAuthorized) {
-            filterChain.doFilter(request, response);
-        } else {
-            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
-            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied");
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.UserService.service;
 
 import com.fincore.UserService.model.Permissions;
@@ -197,16 +31,16 @@ public class PermissionCacheService {
 
         for (Permissions p : perms) {
             String dbUrl = p.getMenuUrl(); 
-            String action = (p.getMenuAction() == null) ? "" : p.getMenuAction().toLowerCase();
+            String action = (p.getMenuAction() == null) ? "" : p.getMenuAction().toLowerCase(); 
             String context = p.getMappedRequestType(); 
 
             String apiPath = mapDbUrlToApiPath(dbUrl); 
             String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
 
-            // --- A. CONTEXT-BASED MAPPING (Segment, Branch, etc.) ---
+            // --- A. CONTEXT-BASED MAPPING ---
             if (!contextSuffix.equals("*")) {
                 
-                // 1. GENERIC WRITES (Locked to Specific Context)
+                // 1. GENERIC WRITE APIS (CRS) - Strict Context
                 if (containsAny(action, "create", "modify", "delete", "cancel", "approve", "reject")) {
                     redisValues.add("POST:/create-request|" + contextSuffix);
                     redisValues.add("POST:/update-request|" + contextSuffix); 
@@ -215,25 +49,29 @@ public class PermissionCacheService {
                     redisValues.add("POST:/pending-requests|" + contextSuffix);
                 }
                 
-                // 2. SPECIFIC READS (Locked to Specific Context)
-                // Redis will store: GET:/segment-codes|SEGMENT_CODE
-                // The Filter's "Implicit Match" logic will handle the missing header case.
-                addCommonMasterPermissions(redisValues, contextSuffix, contextSuffix); 
+                // 2. SPECIFIC READ APIS (CMS) - Wildcard Context (*)
+                // Allows access even if FE sends "Context: SEGMENT_CODE" or "Context: *"
+                addCommonMasterPermissions(redisValues, contextSuffix, "*"); 
 
-                // 3. GENERIC READS (Locked to Specific Context)
+                // 3. GENERIC READ APIS (My Requests) - Strict Context
                 if (containsAny(action, "view", "create", "approve")) {
                     redisValues.add("POST:/my-requests|" + contextSuffix);
                     redisValues.add("GET:/all-requests|" + contextSuffix);
                 }
                 
-                // 4. USER/ROLE MGMT
+                // 4. USER MANAGEMENT (Specific Exception)
                 if ("USER_MANAGEMENT".equals(context)) {
-                     redisValues.add("POST:/user/create-request|*"); 
+                     // Grant full access to /user/** path if any permission exists
+                     redisValues.add("POST:/user/**|*"); 
                      redisValues.add("GET:/user/**|*");
+                     redisValues.add("PATCH:/user/**|*");
                 }
+                
+                // 5. ROLE MANAGEMENT (Specific Exception)
                 if ("ROLE_MANAGEMENT".equals(context)) {
-                     redisValues.add("POST:/role/create-role-request|*");
+                     redisValues.add("POST:/role/**|*");
                      redisValues.add("GET:/role/**|*");
+                     redisValues.add("PATCH:/role/**|*");
                 }
             } 
             
@@ -244,23 +82,24 @@ public class PermissionCacheService {
                 if (action.contains("create")) redisValues.add("POST:" + effectiveUrl + "|*");
                 if (action.contains("delete")) redisValues.add("DELETE:" + effectiveUrl + "|*");
                 
-                // Modify -> PUT, PATCH, POST
                 if (action.contains("modify")) {
                     redisValues.add("PUT:" + effectiveUrl + "|*");
                     redisValues.add("PATCH:" + effectiveUrl + "|*");
                     redisValues.add("POST:" + effectiveUrl + "|*"); 
                 }
                 
-                // View -> GET, POST
                 if (action.contains("view")) {
                     redisValues.add("GET:" + effectiveUrl + "|*");
-                    redisValues.add("POST:" + effectiveUrl + "|*"); 
+                    redisValues.add("POST:" + effectiveUrl + "|*"); // For Search APIs
                 }
                 
-                // Download -> POST, GET
                 if (action.contains("download")) {
                     redisValues.add("POST:" + effectiveUrl + "|*");
                     redisValues.add("GET:" + effectiveUrl + "|*");
+                }
+                
+                if (action.contains("upload")) {
+                    redisValues.add("POST:" + effectiveUrl + "|*");
                 }
             }
         }
@@ -271,10 +110,6 @@ public class PermissionCacheService {
         log.info("✅ Refreshed Role {}: {} permissions cached.", roleId, redisValues.size());
     }
 
-    /**
-     * Helper to add specific master data endpoints.
-     * Uses specific contextSuffix to ensure strict matching if needed.
-     */
     private void addCommonMasterPermissions(Set<String> redisValues, String context, String suffix) {
         switch (context) {
             case "SEGMENT_CODE":
@@ -308,7 +143,6 @@ public class PermissionCacheService {
                 redisValues.add("GET:/currency-rate-change|" + suffix);
                 break;
             default:
-                // No specific endpoints
         }
     }
 
@@ -317,6 +151,7 @@ public class PermissionCacheService {
         if (dbUrl.equalsIgnoreCase("/glif-Reports")) return "/reports";
         if (dbUrl.equalsIgnoreCase("/transaction-enquiry")) return "/transactions";
         if (dbUrl.equalsIgnoreCase("/balance-enquiry")) return "/balance";
+        // User/Role Fix
         if (dbUrl.startsWith("/role-management")) return "/role";
         if (dbUrl.startsWith("/user-management")) return "/user";
         if (dbUrl.startsWith("/process-status")) return "/processes";
@@ -332,59 +167,8 @@ public class PermissionCacheService {
     
     @Transactional(readOnly = true)
     public void refreshRolesByPermissionId(Long permissionId) {
-        // Logic to refresh
+        // Implementation for Debezium listener
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-user is on a screen like "Segment Master" or "CGL Master" and performs a Write Operation (Create, Update, Approve), you MUST send the header.
-• API Calls: /create-request, /update-request, /my-requests
-• Header: X-Request-Type: SEGMENT_CODE (or CGL_CODE, etc.)
-2. Specific Read Screens
-When the screen loads the list of data, you can OPTIONALLY send the header. It will work either way.
-• API Calls: /segment-codes, /cgls
-• Header: Not required (but good practice to send it if you have it).
-3. Standard Screens
-For Reports, Transactions, Notifications, User Management:
-• Header: NEVER required. The system handles them automatically.
-
-
-
-
-
-
-
-MENU_URL
-• Value: The base path of your Spring Boot Controller (class-level @RequestMapping).
-• Format: Start with /, do not end with /.
-• Example: /transaction-enquiry
-B. MENU_ACTION
-Define what the user can do. The system automatically maps these keywords to HTTP Verbs
-
-
-
-
-
-
-Syntax: Use pipes to separate actions: view|create|modify
-C. MAPPED_REQUEST_TYPE (The Context)
-• NULL: For Standard Services (Reports, Notifications, Transactions, User Mgmt).
-• Most new screens will use NULL.
-• VALUE (e.g., DEPARTMENT): ONLY for Generic Master Screens handled by CommonRequestService (CRS).
-• Use this only if you are using the "Maker-Checker" strategy pattern.
 
