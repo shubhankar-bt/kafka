@@ -1,4 +1,2036 @@
 
+package com.tcs.userservice.advice;
+
+import com.tcs.userservice.dto.ApiResponse;
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+
+/**
+ * This ControllerAdvice intercepts successful responses from
+ * any @RestController
+ * and wraps them in a standard ApiResponse format.
+ */
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+	
+	static {
+		System.setProperty("spring.classformat.ignore", "true");
+	}
+
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // This advice applies to any method in a class annotated with @RestController
+        // that is not already returning a ResponseEntity (which gives manual control).
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+            Class<? extends HttpMessageConverter<?>> selectedConverterType,
+            ServerHttpRequest request, ServerHttpResponse response) {
+
+        // If the controller has already manually wrapped the response, do nothing.
+        if (body instanceof ApiResponse<?>) {
+            return body;
+        }
+
+        // Wrap the successful response body in the standard ApiResponse structure.
+        return ApiResponse.success(body);
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.config;
+
+import com.tcs.userservice.service.PermissionCacheService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import java.util.List;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class CacheWarmer {
+
+    private final PermissionCacheService permissionCacheService;
+    private final JdbcTemplate jdbcTemplate;
+
+    /**
+     * Runs once when the application starts.
+     * Iterates over ALL Role IDs and refreshes their permissions in Redis.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void onStartup() {
+        log.info("Startup: Warming Permission Cache...");
+
+        // Fetch all Role IDs (using JDBC for speed/simplicity)
+        List<Long> roleIds = jdbcTemplate.queryForList("SELECT ROLE_ID FROM ROLES", Long.class);
+
+        for (Long roleId : roleIds) {
+            try {
+                permissionCacheService.refreshRolePermissions(roleId);
+            } catch (Exception e) {
+                log.error("Failed to refresh permissions for Role {}", roleId, e);
+            }
+        }
+        log.info("🏁 Cache Warming Complete. Processed {} roles.", roleIds.size());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
+
+@Configuration
+@EnableCaching
+public class RedisConfig {
+
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
+        ObjectMapper redisObjectMapper = new ObjectMapper();
+        redisObjectMapper.registerModule(new JavaTimeModule());
+        // --- THIS IS THE FIX ---
+        // We explicitly verify and enable "Type Info" so Redis saves the class name.
+        redisObjectMapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        // -----------------------
+        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
+        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(24))
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(cacheConfig)
+                .build();
+    }
+
+    // Ensure ObjectMapper handles Java 8 Dates (LocalDate, Instant) correctly in Redis
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        return mapper;
+    }
+
+    // This bean configures our RedisTemplate to use the fixed ObjectMapper
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        Jackson2JsonRedisSerializer<Object> serializer =
+                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
+
+        template.setValueSerializer(serializer);
+        template.setKeySerializer(new StringRedisSerializer());
+
+        return template;
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.config;
+
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+/**
+ * Global security configuration for the application.
+ * This class uses Spring Security's Java configuration to define security rules,
+ * such as disabling CSRF, making the session stateless, and defining authorization policies.
+ *
+ * The `@Configuration` annotation marks this class as a source of bean definitions.
+ * The `@EnableWebSecurity` annotation enables Spring Security's web security support and provides
+ * the integration with the Spring MVC.
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class}) // Import Redis Config from Library
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // LOCK DOWN ENDPOINTS
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/**").permitAll() // Allows access to all your API endpoints
+                        .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                        // All other requests MUST pass the ContextRbacFilter
+                        .anyRequest().authenticated()
+                )
+
+                // ======== INSERTING THE GUARD HERE =======
+                // This filter does two things:
+                // 1. Validates JWT & Sets User Context
+                // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+                .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.controller;
+ 
+
+import com.fincore.commonutilities.jwt.JwtUtil; 
+import com.tcs.userservice.dto.PermissionOrderDto;
+import com.tcs.userservice.service.RoleRequestService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController()
+@RequestMapping("/role") //context path
+public class RoleRequestController {
+
+	private final RoleRequestService roleRequestService;
+    private final JwtUtil jwtUtil;
+
+	public RoleRequestController(RoleRequestService roleRequestService, JwtUtil jwtUtil) {
+		this.roleRequestService = roleRequestService;
+        this.jwtUtil = jwtUtil;
+	}
+
+	@GetMapping("/get-roles") //end point
+	public ResponseEntity getAllRoles(@RequestParam Map<String, Object> requestParams) {
+		return roleRequestService.getAllRoles(requestParams);
+	}
+
+	@PostMapping("/create-role-request")//end point
+	public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization")String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.createNewRoleRequest(request, userId);
+	}
+
+	@GetMapping("/pending-role-requests")//end point
+	public ResponseEntity getPendingRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getPendingRoleRequests(userId);
+	}
+
+	@PostMapping("/role-request-action")//end point
+	public ResponseEntity acceptRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.acceptOrRejectRoleRequest(request, userId);
+	}
+
+	@GetMapping("/my-role-requests")//end point
+	public ResponseEntity getMyRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getMyRoleRequests(userId);
+	}
+
+	@PostMapping("/cancel-role-request")//end point
+	public ResponseEntity cancelRoleRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		return roleRequestService.cancelRoleRequest(request, jwtUtil.getUserIdFromToken(token));
+	}
+
+	@GetMapping("/get-all-permissions")//end point
+	public ResponseEntity getRoleWisePermissions() {
+		return roleRequestService.getAllPermissions();
+	}
+	
+	@PatchMapping("/save-permission-order")
+	public ResponseEntity savePermissionOrder(@RequestBody PermissionOrderDto payload) {
+		return roleRequestService.savePermissionOrder(payload);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.userservice.dto.UserLogsDto;
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.service.UserLogsService;
+import com.tcs.userservice.service.UserRequestService;
+import com.tcs.userservice.utility.RequestUtility;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@RestController()
+@RequestMapping("/user")
+public class UserRequestController {
+
+
+    @Autowired
+    private UserRequestService userRequestService;
+
+    @Autowired
+    private UserLogsService userLogsService;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @PostMapping("/create-request")
+    public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return userRequestService.createNewRequest(request, userId);
+    }
+
+    @GetMapping("/pending-user-requests")
+    public ResponseEntity getPendingRequests(@RequestParam Map<String, Object> params) {
+        return userRequestService.getPendingRequests(params);
+    }
+
+    @PostMapping("/accept-request")
+    public ResponseEntity acceptRequest(ServerHttpRequest request, @RequestBody UserRequestDto userRequest) {
+        String clientIp = RequestUtility.getClientIp(request);
+        return userRequestService.acceptOrRejectUserRequest(userRequest, clientIp);
+    }
+
+
+    @GetMapping("/user-details")
+    public ResponseEntity getUserDetails(@RequestParam Map<String, String> request) {
+        return userRequestService.getUserDetails(request);
+    }
+
+    @GetMapping("/my-requests")
+    public ResponseEntity getMyRequests(@RequestParam Map<String, String> params) {
+        return userRequestService.getMyRequests(params);
+    }
+
+    @PostMapping("/cancel-request")
+    public ResponseEntity cancelRequest(@RequestBody Map<String, Object> request) {
+        return userRequestService.cancelRequest(request);
+    }
+
+
+    @PostMapping("/logs-batch")
+    public ResponseEntity<List<UserLogsDto>> createLogsBatch(@RequestBody List<UserLogsDto> payload) {
+        List<UserLogsDto> savedLogs = (List<UserLogsDto>) userLogsService.saveLogs(payload);
+
+        // Returning the saved DTOs with the CREATED status
+        return new ResponseEntity<>(savedLogs, HttpStatus.CREATED);
+    }
+
+    // GET API to fetch all user logs
+    @GetMapping("/all-logs")
+    public ResponseEntity<List<UserLogsDto>> findAllLogs() {
+        List<UserLogsDto> logs = userLogsService.findAllLogs();
+        return ResponseEntity.ok(logs);
+    }
+
+    // GET API to fetch a user log by ID
+    @GetMapping("/{id}")
+    public ResponseEntity<UserLogsDto> findLogById(@PathVariable Integer id) {
+        UserLogsDto log = userLogsService.findLogById(id);
+        return ResponseEntity.ok(log);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Getter;
+
+import java.time.Instant;
+
+@Getter
+@JsonInclude(JsonInclude.Include.NON_NULL) // Don't include null fields in the JSON response
+public class ApiResponse<T> {
+
+    private final boolean success;
+    private final String message;
+    private final T data;
+    private final Instant timestamp;
+
+    private ApiResponse(boolean success, String message, T data) {
+        this.success = success;
+        this.message = message;
+        this.data = data;
+        this.timestamp = Instant.now();
+    }
+
+    public static <T> ApiResponse<T> success(T data, String message) {
+        return new ApiResponse<>(true, message, data);
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(true, "Operation completed successfully.", data);
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return new ApiResponse<>(false, message, null);
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ChildMenu {
+    
+	private int id;
+    
+	private String title;
+    
+	private String route;
+    
+	private ScreenDetails screenDetails;
+	
+}
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class MenuResponse {
+    private List<RootMenu> root_menus;
+}
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+
+    private String targetUrl;
+
+    private String targetRoles; // Comma separated string: "51,52,55"
+
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+import lombok.AllArgsConstructor; 
+import lombok.Builder; 
+import lombok.Data; 
+import lombok.NoArgsConstructor;
+
+@Data 
+@NoArgsConstructor 
+@AllArgsConstructor
+@Builder 
+public class PermissionDto { 
+	private Integer id; // MENU_ID 
+	private String title; // MENU_TITLE
+	private String icon; // MENU_ICON
+	private String description; // MENU_ORDER 
+	private int order;
+    private String menuSubmenu; // new addition - v1018405
+
+}
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PermissionEventDto {
+    @JsonProperty("payload")
+    private Payload payload;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Payload {
+        private DataBlock after;
+        private DataBlock before;
+        private String op;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DataBlock {
+        @JsonProperty("MENU_ID")
+        private Long menuId;
+
+    }
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.Data;
+
+@Data
+public class PermissionList {
+
+	public int id;
+
+	public String title;
+
+	public String icon;
+
+	public int order;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.util.List;
+
+import lombok.Data;
+
+@Data
+public class PermissionOrderDto {
+	
+	private int selectedRole;
+	
+	private List<PermissionOrderListDto> permissions;
+
+}
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionOrderListDto {
+
+	private int id;
+
+	private String title;
+
+	private String icon;
+
+	private String description;
+
+	private int order;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionsDto {
+
+    private int menuId;
+
+    private String menuTitle;
+
+    private String menuIcon;
+
+    private String menuSubmenu;
+
+    private String menuAction;
+
+    private String menuUrl;
+
+    private String menuComponentPath;
+
+    private String menuOrder;
+
+    private int menuDependant;
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class RoleDto {
+	private Integer roleId;
+	
+	private String roleName;
+	
+	private String description;
+	
+	private String roleStatus;
+	
+	@Builder.Default
+	private List permissions = new ArrayList<>();
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class RolePermissionEventDto {
+
+    @JsonProperty("payload")
+    private Payload payload;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Payload {
+        private DataBlock after;  // State after change
+        private DataBlock before; // State before change (for deletes)
+        private String op;        // 'c', 'u', 'd'
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DataBlock {
+        @JsonProperty("ROLE_ID")
+        private Long roleId;
+
+        @JsonProperty("PERMISSION_ID")
+        private Long permissionId;
+    }
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.util.List;
+
+import lombok.Data;
+
+@Data
+public class RoleRequestPayload {
+
+
+    public String roleId;
+
+	public String roleName;
+
+	public String description;
+
+    public String roleStatus;
+
+	public List<PermissionList> permissions;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class RootMenu {
+
+
+        private int id;
+        private String title;
+        private String icon;
+        private String route;
+        private boolean hasChildren;
+        private ScreenDetails screenDetails;
+        private String menuDescription;
+        private List<ChildMenu> children;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ScreenDetails {
+    private String screenId;
+    private String screenTitle;
+    private String componentPath;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.Data;
+
+@Data
+public class UserCrudRequestDto {
+
+    private Integer targetUserId;
+
+    private String requestType;
+
+    private UserDetailsDto requestPayload;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import jakarta.persistence.Column;
+import lombok.Data;
+
+@Data
+public class UserDetailsDto {
+
+    private String userId;
+
+    private String firstName;
+
+    private String middleName;
+
+    private String lastName;
+
+    private String email;
+
+    private String phoneNumber;
+
+    private String roleName;
+
+}
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class UserDto {
+
+    private int userId;
+
+    private int userRole;
+
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.sql.Timestamp;
+
+import lombok.Data;
+@Data
+public class UserLogsDto {
+	
+	private Integer logId;
+
+	private String actionType;
+
+	private String changeType;
+
+	private Timestamp actionTime;
+
+	private Integer userId;
+
+	private String oldValue;
+
+	private String newValue;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class UserRequestDto {
+
+    private long requestId;
+
+    private String approverUserId;
+
+    private String oldValue;
+
+    private String remarks;
+
+    private String actionFlag;
+
+    private String requestType;
+
+    private String requesterUserId;
+}
+
+
+
+package com.tcs.userservice.dto;
+
+import java.sql.Timestamp;
+
+public interface UserRequestProjection {
+	
+	String getRequestorUserId();
+
+	String getRequestStatus();
+	
+	String getRequestId();
+	
+	String getRequestType();
+	
+	Timestamp getRequestDate();
+
+	String getRequestPayload();
+
+}
+
+
+
+
+package com.tcs.userservice.mapper;
+
+import com.tcs.userservice.dto.UserLogsDto;
+import com.tcs.userservice.model.UserLogs;
+
+public class UserLogsMapper {
+
+    /**
+     * This function is for mapping database to network layer
+     *
+     * @param: UserLogs : Entity
+     * @Author: Deepshikha Biswas
+     */
+    public static UserLogsDto toDto(UserLogs userLogs) {
+
+        UserLogsDto userLogsDto = new UserLogsDto();
+        userLogsDto.setLogId(userLogs.getLogId());
+        userLogsDto.setActionType(userLogs.getActionType());
+        userLogsDto.setChangeType(userLogs.getChangeType());
+        userLogsDto.setActionTime(userLogs.getActionTime());
+        userLogsDto.setUserId(userLogs.getUserId());
+        userLogsDto.setOldValue(userLogs.getOldValue());
+        userLogsDto.setNewValue(userLogs.getNewValue());
+
+        return userLogsDto;
+    }
+
+    public static UserLogs toEntity(UserLogsDto userLogsDto) {
+        UserLogs userLogs = new UserLogs();
+        userLogs.setLogId(userLogsDto.getLogId());
+        userLogs.setActionType(userLogsDto.getActionType());
+        userLogs.setChangeType(userLogsDto.getChangeType());
+        userLogs.setActionTime(userLogsDto.getActionTime());
+        userLogs.setUserId(userLogsDto.getUserId());
+        userLogs.setOldValue(userLogsDto.getOldValue());
+        userLogs.setNewValue(userLogsDto.getNewValue());
+
+        return userLogs;
+    }
+}
+
+
+
+
+
+
+
+// model
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+import java.sql.Timestamp;
+
+@Entity
+@Table(name = "AUDIT_LOG")
+@Data
+public class AuditLog {
+
+    @Id
+    @Column(name="LOG_ID")
+    private long logId;
+    @Column(name="REQUEST_ID")
+    private long requestId;
+    @Column(name="USER_ID")
+    private String userId;
+    @Column(name="ACTION_TYPE")
+    private String actionType;
+    @Column(name="CHANGE_TYPE")
+    private String changeType;
+    @Column(name="OLD_VALUE")
+    private String oldValue;
+    @Column(name="NEW_VALUE")
+    private String newValue;
+    @Column(name="IP_ADDRESS")
+    private String ipAddress;
+    @Column(name="ACTION_TIME")
+    private Timestamp actionTime;
+
+
+
+}
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * UPDATED: Added @CreationTimestamp for automatic timestamping.
+ */
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    // Unique primary key for the outbox event.
+    // Using UUID strategy is correct for Oracle's SYS_GUID() or RAW(16
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    // The ID of the user who should receive this notification (for 1-to-1).
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event.
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the CommonReq ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionForRole {
+
+	@Id
+	@Column(name = "MENU_ID")
+	private Integer menuId;
+
+	@Column(name = "MENU_TITLE")
+	private String menuTitle;
+
+	@Column(name = "MENU_ORDER")
+	private String menuOrder;
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Permissions {
+
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    @Column(name = "MENU_TITLE")
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON")
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU")
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION")
+    private String menuAction;
+
+    @Column(name = "MENU_URL")
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH")
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION")
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private Integer menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE")
+    private String mappedRequestType;
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.math.BigDecimal;
+
+@Entity
+@Table(name = "MENU_ITEMS") // Assuming the table name is MENU_ITEMS
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class PermissionsForNotification {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
+    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "MENU_ITEMS_SEQ", allocationSize = 1)
+    @Column(name = "MENU_ID", nullable = false)
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Table(name = "ROLES")
+public class Role {
+
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "ROLE_ID")
+	private int roleId;
+
+	@Column(name = "ROLE_NAME")
+	private String roleName;
+
+	@Column(name = "DESCRIPTION")
+	private String description;
+
+	@Column(name = "ROLE_STATUS")
+	private String status;
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.io.Serializable;
+import java.util.Objects;
+
+import jakarta.persistence.Embeddable;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Embeddable
+@NoArgsConstructor
+@AllArgsConstructor
+@Data
+public class RolePermissionId implements Serializable {
+	
+	
+	private int roleId;
+	
+    private int permissionId;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.Value;
+
+@Entity
+@Data
+@Table(name = "ROLE_PERMISSIONS")
+public class RolePermissions {
+
+	@EmbeddedId
+	private RolePermissionId id;
+
+	@Column(name = "PERMISSION_ORDER")
+	int permissionOrder;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.sql.Timestamp;
+
+@Entity
+@Data
+@Table(name = "ROLE_REQUESTS")
+public class RoleRequest {
+
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "REQUEST_ID")
+	private int requestId;
+
+	@Column(name = "REQUEST_TYPE")
+	private String requestType;
+
+	@Column(name = "REQUESTOR_USER_ID")
+	private String requestorUserId;
+
+	@Column(name = "TARGET_ROLE_ID")
+	private int targetRoleId;
+
+	@Column(name = "REQUEST_PAYLOAD")
+	private String requestPayload;
+
+	@Column(name = "REQUEST_STATUS")
+	private String requestStatus;
+
+	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
+	private Timestamp requestDate;
+
+	@Column(name = "APPROVAL_DATE")
+	private Timestamp approvalDate;
+
+	@Column(name = "APPROVER_USER_ID")
+	private String approverUserId;
+
+	@Column(name = "REASON_FOR_REJECTION")
+	private String reasonForRejection;
+
+	@Column(name = "EXECUTION_DATE")
+	private Timestamp executionDate;
+
+	@Column(name = "EXECUTION_DETAILS")
+	private String executionDetails;
+
+}
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.util.List;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.ElementCollection;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Table(name="ROLES")
+public class RoleWithPermissions {
+    @Id
+    @Column(name="ROLE_ID")
+    private int roleId;
+
+    @Column(name="ROLE_NAME")
+    private String roleName;
+
+    @Column(name="DESCRIPTION")
+    private String description;
+
+    @Column(name="ROLE_STATUS")
+    private String status;
+
+    @Column(name="PERMISSIONS")
+    @Transient
+    private List<PermissionForRole> permissions;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.sql.Timestamp;
+
+@Entity
+@Getter
+@Setter
+@Table(name="users")
+public class User {
+
+    @Id
+    @Column(name="USER_ID")
+    private String userId;
+
+    @Column(name="FIRST_NAME")
+    private String firstName;
+    @Column(name="MIDDLE_NAME")
+    private String middleName;
+    @Column(name="LAST_NAME")
+    private String lastName;
+    @Column(name="PHONE_NUMBER")
+    private String phoneNumber;
+    @Column(name="EMAIL")
+    private String email;
+    @Column(name="PASSWORD_HASH")
+    private String passwordHash;
+    @Column(name="ACCOUNT_STATUS")
+    private String accountStatus;
+    @Column(name="CREATED_AT")
+    private Timestamp createdAt;
+    @Column(name="UPDATED_AT")
+    private Timestamp updatedAt;
+    @Column(name="LAST_LOGIN_AT")
+    private Timestamp lastLoginAt;
+
+    @Column(name="IS_DELETED")
+    private char isDeleted;
+    @Column(name="DELETED_AT")
+    private Timestamp deletedAt;
+
+    @Column(name="TEMP_PASSWORD_SET_AT")
+    private Timestamp tempPasswordSetAt;
+
+    @Column(name="USER_WRONG_PASSWORD_COUNT")
+    private int userWrongPasswordCount;
+
+    @Column(name="BRANCH")
+    private int branch;
+}
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.sql.Timestamp;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name="User_logs")
+
+// Main model for the entire log entry
+public class UserLogs {
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name="LOG_ID")
+	private Integer logId;
+	
+	@Column(name="ACTION_TYPE")
+	private String actionType;
+	
+	@Column(name="CHANGE_TYPE")
+	private String changeType;
+	
+	@Column(name="ACTION_TIME")
+	private Timestamp actionTime;
+	
+	@Column(name="USER_ID")
+	private Integer userId;
+
+    @Lob
+	@Column(name="OLD_VALUE")
+	private String oldValue;
+
+    @Lob
+	@Column(name="NEW_VALUE")
+	private String newValue;
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
+
+import java.sql.Timestamp;
+
+@Entity
+@Getter
+@Setter
+@ToString
+/*
+ * @Table(name="USER_CHANGES_REQUEST_TRACK") public class UserRequest {
+ * 
+ * @Id
+ * 
+ * @GeneratedValue(strategy = GenerationType.IDENTITY)
+ * 
+ * @Column(name="REQUEST_ID") private int requestId;
+ * 
+ * @Column(name="REQUEST_STATUS") private String requestStatus;
+ * 
+ * @Column(name="REQUEST_RAISED_BY") private String requestRaisedBy;
+ * 
+ * @Column(name="REQUEST_RAISED_AT",nullable=false,updatable=false,insertable=
+ * false) private Timestamp requestRaisedAt;
+ * 
+ * @Column(name="REQUEST_REVIEWED_BY") private String requestReviewedBy;
+ * 
+ * @Column(name="REQUEST_REVIEWED_AT") private Timestamp requestReviewedAt;
+ * 
+ * @Column(name="REQUEST_FLAG") private String requestFlag;
+ * 
+ * @Column(name="REQUEST_CATEGORIES") private String requestCategories;
+ * 
+ * @Column(name="USER_ID") private String userId;
+ * 
+ * @Column(name="UPDATED_FIRST_NAME") private String updatedFirstName;
+ * 
+ * @Column(name="UPDATED_MIDDLE_NAME") private String updatedMiddleName;
+ * 
+ * @Column(name="UPDATED_LAST_NAME") private String updatedLastName;
+ * 
+ * @Column(name="UPDATED_PHONE_NUMBER") private String updatedPhoneNumber;
+ * 
+ * @Column(name="UPDATED_EMAIL") private String updatedEmail;
+ * 
+ * @Column(name="UPDATED_ROLE") private int updatedRole;
+ * 
+ * @Column(name="REQUEST_REMARKS") private String requestRemarks; }
+ */
+@Table(name = "USER_REQUESTS")
+public class UserRequest {
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "REQUEST_ID")
+	private int requestId;
+	
+	@Column(name = "REQUEST_TYPE")
+	private String requestType;
+	
+	@Column(name = "REQUESTOR_USER_ID")
+	private String requestorUserId;
+	
+	@Column(name = "TARGET_USER_ID")
+	private String targetUserId;
+	
+	@Column(name = "REQUEST_PAYLOAD")
+	private String requestPayload;
+	
+	@Column(name = "REQUEST_STATUS")
+	private String requestStatus;
+	
+	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
+	private Timestamp requestDate;
+	
+	@Column(name = "APPROVAL_DATE")
+	private Timestamp approvalDate;
+	
+	@Column(name = "APPROVER_USER_ID")
+	private String approverUserId;
+	
+	@Column(name = "REASON_FOR_REJECTION")
+	private String reasonForRejection;
+	
+	@Column(name = "EXECUTION_DATE")
+	private Timestamp executionDate;
+	
+	@Column(name = "EXECUTION_DETAILS")
+	private String executionDetails;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name = "USER_ROLES")
+public class UserRole {
+    
+    @Id
+    @Column(name = "USER_ID")
+    private String userId;
+
+    @Column(name = "ROLE_ID")
+    private int roleId;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.UUID;
+
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID> {
+}
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.UUID;
+
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID> {
+}
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.List;
+import java.util.Set;
+
+public interface PermissionsRepository extends JpaRepository<Permissions, Integer> {
+
+    List<Permissions> findAll();
+
+    /**
+     * Retrieves a list of mapped request type keys for a given set of menu IDs.
+     */
+    @Query("SELECT p.mappedRequestType FROM Permissions p WHERE p.menuId IN :incomingIds")
+    List<String> findMappedRequestTypeByMenuId(@Param("incomingIds") Set<Integer> incomingIds);
+
+    /**
+     * Fetches both the Target URL and the authorized Role IDs in a single database call.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return A list of arrays where index [0] is MENU_URL (String) and index [1] is ROLE_ID (Number)
+     */
+    @Query(value = """
+            SELECT p.MENU_URL, rp.ROLE_ID
+            FROM PERMISSIONS p
+            JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+            JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+            WHERE p.MAPPED_REQUEST_TYPE = :requestType
+            AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+            AND r.ROLE_STATUS = 'ACTIVE'
+            """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+
+    /**
+     * Joins ROLES -> ROLE_PERMISSIONS -> PERMISSIONS
+     *
+     * @return all permissions assigned specific to role id
+     */
+    @Query(value = """
+                SELECT p.* FROM PERMISSIONS p
+                JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+                WHERE rp.ROLE_ID = :roleId
+            """, nativeQuery = true)
+    List<Permissions> findAllByRoleId(@Param("roleId") Long roleId);
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+import com.tcs.userservice.model.Role;
+
+import java.util.List;
+
+@Repository
+public interface RolePermissionRepository extends CrudRepository<Role, Integer> {
+	// Native query that returns role columns +
+	// permission columns. Aliases and column order
+	// must match mapping below.
+	@Query(value = """
+            SELECT
+                r.role_id,
+                r.role_name,
+                r.description,
+                r.role_status,
+                p.menu_id,
+                p.menu_title,
+                p.menu_icon,
+                p.MENU_DESCRIPTION,
+                rp.PERMISSION_ORDER,
+                p.MENU_SUBMENU
+            FROM
+                roles r
+                LEFT JOIN role_permissions rp ON r.role_id = rp.role_id
+                LEFT JOIN permissions     p ON rp.permission_id = p.menu_id
+            ORDER BY
+                r.role_id,
+            	rp.PERMISSION_ORDER
+            """, nativeQuery = true)
+	List<Object[]> findAllRolesWithPermissionsRaw();
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import java.util.List;
+
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import com.tcs.userservice.model.RolePermissionId;
+import com.tcs.userservice.model.RolePermissions;
+
+public interface RolePermissionsRepository extends JpaRepository<RolePermissions, RolePermissionId> {
+
+	/**
+	 * Function for getting permission based on role id used for modification of
+	 * permissions
+	 * 
+	 * @param : roleId : must be a valid role id
+	 */
+	@Query(nativeQuery = true, value = """
+			SELECT
+			    p.MENU_ID,
+			    p.MENU_TITLE,
+			    p.MENU_ICON,
+			    p.MENU_SUBMENU,
+			    p.MENU_ACTION,
+			    p.MENU_URL,
+			    p.MENU_COMPONENT_PATH,
+			    p.MENU_ORDER,
+			    p.MENU_DEPENDANT
+			FROM
+			    PERMISSIONS p
+			INNER JOIN
+			    ROLE_PERMISSIONS rp
+			ON
+			    p.MENU_ID = rp.PERMISSION_ID
+			WHERE
+			    rp.ROLE_ID = :roleId
+
+						""")
+	List<Permissions> findAllByRole(@Param("roleId") String roleId);
+
+	List<RolePermissions> findByIdRoleIdAndIdPermissionIdIn(int roleId, List<Integer> permissionIds);
+
+	List<RolePermissions> findByIdRoleId(int roleId);
+
+    @Query(value = "SELECT ROLE_ID FROM ROLE_PERMISSIONS WHERE permission_id = :permissionId", nativeQuery = true)
+    List<Long> findRoleIdsByPermissionId(Long permissionId);
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import com.tcs.userservice.model.Role;
+
+public interface RoleRepository extends JpaRepository<Role, Integer> {
+
+	Role findRoleByRoleId(int roleId);
+
+	Role findRoleByRoleName(String roleName);
+}
 
 
 
