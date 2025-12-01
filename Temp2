@@ -794,3 +794,175 @@ public class PermissionCacheService {
 
 
 
+
+
+&:&:&:&:&&:&:&:&:&:&:&&:&/&/&/
+
+
+
+
+// =========================================================
+// 1. UPDATE CACHE SERVICE (UserService Project)
+// File: com/tcs/userservice/service/PermissionCacheService.java
+// =========================================================
+
+// ... imports ...
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType; // Ensure enum is accessible
+
+// Inside PermissionCacheService class...
+
+@Transactional(readOnly = true)
+public void refreshRolePermissions(Long roleId) {
+    List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+    String redisKey = "RBAC::PERMISSIONS::" + roleId;
+    
+    redisTemplate.delete(redisKey);
+    Set<String> redisValues = new HashSet<>();
+
+    for (Permissions p : perms) {
+        String apiPattern = p.getApiResourcePattern();
+        String action = (p.getMenuAction() != null) ? p.getMenuAction().toLowerCase() : "";
+        String context = p.getMappedRequestType(); // e.g. "CGL_CODE"
+        String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+        // --- EXISTING URL PERMISSIONS LOGIC (Logic A & B) ---
+        // ... (Paste the logic from the previous step here for URL caching) ...
+        // ... (Logic for "POST:/create-request..." etc.) ...
+
+        // --- NEW: PAYLOAD INTENT VALIDATION (Layer 2 Security) ---
+        // If this is a specific Context (e.g. CGL_CODE), we define exactly WHAT they can do.
+        if (!contextSuffix.equals("*")) {
+            String opsKey = "RBAC::OPS::" + roleId + "::" + contextSuffix;
+            Set<String> allowedOps = new HashSet<>();
+
+            // Map DB Action Strings -> Enum ChangeTypes
+            if (action.contains("create")) allowedOps.add("ADD");
+            if (action.contains("modify")) allowedOps.add("UPDATE");
+            if (action.contains("delete")) allowedOps.add("DELETE");
+            
+            // GRANULAR PERMISSIONS
+            if (action.contains("block")) allowedOps.add("BLOCK");
+            if (action.contains("unblock")) allowedOps.add("UNBLOCK");
+
+            if (!allowedOps.isEmpty()) {
+                // Store allowed operations in Redis
+                // Example Key: RBAC::OPS::52::CGL_CODE -> ["BLOCK", "UNBLOCK"]
+                redisTemplate.opsForSet().add(opsKey, allowedOps.toArray(new String[0]));
+                log.info("🔒 Cached OPS for Role {} Context {}: {}", roleId, contextSuffix, allowedOps);
+            }
+        }
+    }
+    
+    // Save the URL permissions
+    if (!redisValues.isEmpty()) {
+        redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+    }
+}
+
+// =========================================================
+// 2. CREATE SECURITY VALIDATOR (CommonRequestService Project)
+// File: com/tcs/fincore/CommonRequestService/service/BusinessSecurityService.java
+// =========================================================
+
+package com.tcs.fincore.CommonRequestService.service;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BusinessSecurityService {
+
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+
+    /**
+     * Checks if the user has specific permission for the INTENT (ChangeType).
+     * @param token JWT Token
+     * @param requestType e.g., CGL_CODE
+     * @param changeType e.g., BLOCK
+     */
+    public void validateUserAction(String token, RequestType requestType, ChangeType changeType) {
+        
+        // 1. Get Role from Token
+        int roleId = jwtUtil.getUserRoleFromToken(token);
+        
+        // 2. Construct Redis Key (Must match UserService logic)
+        String opsKey = "RBAC::OPS::" + roleId + "::" + requestType.name();
+
+        // 3. Check Redis: Does the set contain this specific operation?
+        Boolean isAllowed = redisTemplate.opsForSet().isMember(opsKey, changeType.name());
+
+        if (Boolean.FALSE.equals(isAllowed)) {
+            log.warn("SECURITY ALERT: User (Role {}) tried to perform restricted action {} on {}. Access Denied.", 
+                     roleId, changeType, requestType);
+            throw new AccessDeniedException("You do not have permission to perform '" + changeType + "' actions on this screen.");
+        }
+        
+        log.debug("Action {} on {} allowed for Role {}", changeType, requestType, roleId);
+    }
+}
+
+// =========================================================
+// 3. UPDATE CONTROLLER (CommonRequestService Project)
+// File: com/tcs/fincore/CommonRequestService/controller/RequestController.java
+// =========================================================
+
+// Update method signature to pass 'token' to service
+@PostMapping("/create-request")
+@ResponseStatus(HttpStatus.CREATED)
+public CommonReq createRequest(
+        @Valid @RequestBody CreateRequestDto createRequestDto,
+        @RequestHeader("Authorization") String token // Pass this down
+) throws JsonProcessingException {
+    String userId = JwtUtil.getUserIdFromToken(token);    
+    log.info("Received request creation call from user: {}", userId);
+    // CHANGE: Pass 'token' as 3rd argument
+    return requestService.createRequest(createRequestDto, userId, token);
+}
+
+// =========================================================
+// 4. UPDATE SERVICE IMPL (CommonRequestService Project)
+// File: com/tcs/fincore/CommonRequestService/service/RequestServiceImpl.java
+// =========================================================
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
+
+    private final BusinessSecurityService businessSecurityService; // Inject new service
+    // ... other dependencies ...
+
+    @Override
+    @Transactional
+    public CommonReq createRequest(
+            CreateRequestDto dto,
+            String creatorId,
+            String token // New Argument
+    ) throws JsonProcessingException {
+        
+        // --- STEP 1: LAYER 2 SECURITY CHECK ---
+        // Validate that the user is allowed to perform this SPECIFIC ChangeType (e.g. BLOCK)
+        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
+
+        // ... The rest of your existing logic ...
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+        // ...
+        
+        // Note: Update the RequestService INTERFACE signature as well!
+    }
+}
+
+
+
+
+
+
