@@ -1,0 +1,616 @@
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Set;
+
+@Slf4j
+@RequiredArgsConstructor
+public class ContextRbacFilter extends OncePerRequestFilter {
+
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    // Whitelist can remain hardcoded or moved to properties
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
+    );
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+
+        // 1. SKIP WHITELIST
+        for (String pattern : WHITELIST) {
+            if (pathMatcher.match(pattern, uri)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+        }
+
+        // 2. VALIDATE TOKEN
+        String token = request.getHeader("Authorization");
+        if (token == null || !jwtUtil.isTokenValid(token)) {
+            // Let Spring Security handle the 401 later if authentication is missing
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        // 3. SET SECURITY CONTEXT
+        String userId = jwtUtil.getUserIdFromToken(token);
+        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+        String roleId = String.valueOf(roleIdInt);
+
+        if (SecurityContextHolder.getContext().getAuthentication() == null) {
+            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+            );
+            SecurityContextHolder.getContext().setAuthentication(authToken);
+        }
+
+        // 4. DETERMINE CONTEXT (Header)
+        String contextHeader = request.getHeader("X-Request-Type");
+        // Normalize: If header is missing, treat as "*" (Global Context)
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
+
+        // 5. REDIS AUTHORIZATION CHECK
+        String redisKey = "RBAC::PERMISSIONS::" + roleId;
+        // Optimization: In high load, use isMember instead of fetching all, 
+        // but since we have wildcards, fetching members is necessary.
+        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
+        
+        boolean isAuthorized = false;
+
+        if (permissions != null) {
+            for (String perm : permissions) {
+                // Format: "METHOD:URL_PATTERN|CONTEXT"
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+
+                String methodAndUrl = parts[0];
+                String allowedContext = parts[1];
+
+                // --- A. CONTEXT CHECK ---
+                // 1. Exact Match: Header "SEGMENT_CODE" matches Permission "SEGMENT_CODE"
+                // 2. Wildcard Match: Permission has "*" (e.g. Reports), allows any header (or no header)
+                if (!allowedContext.equals(requestContext) && !allowedContext.equals("*")) {
+                    continue; 
+                }
+
+                // --- B. URL & METHOD CHECK ---
+                String[] muParts = methodAndUrl.split(":", 2);
+                if (muParts.length < 2) continue;
+
+                String allowedMethod = muParts[0];
+                String allowedUrlPattern = muParts[1];
+
+                // Method Match AND URL Pattern Match
+                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
+        }
+
+        if (isAuthorized) {
+            filterChain.doFilter(request, response);
+        } else {
+            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
+            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied: Insufficient Permissions");
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+// =========================================================
+// 1. UPDATE ENUM (CommonRequestService Project)
+// File: com/tcs/fincore/CommonRequestService/model/enums/ChangeType.java
+// =========================================================
+
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+    ADD("A"),
+    UPDATE("U"),
+    DELETE("D"),
+    // --- NEW ADDITIONS FOR GRANULAR RBAC ---
+    BLOCK("B"),
+    UNBLOCK("UB"); // Use 2 chars if your DB column allows (VARCHAR2(2)), else use 'K'/'L'
+
+    private final String code;
+
+    ChangeType(String code) {
+        this.code = code;
+    }
+}
+
+// =========================================================
+// 2. UPDATE CACHE LOGIC (UserService Project)
+// File: com/tcs/userservice/service/PermissionCacheService.java
+// =========================================================
+
+/**
+ * REPLACING the old logic with the new Data-Driven + Block/Unblock support
+ */
+@Transactional(readOnly = true)
+public void refreshRolePermissions(Long roleId) {
+    List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+    String redisKey = "RBAC::PERMISSIONS::" + roleId;
+
+    redisTemplate.delete(redisKey);
+    Set<String> redisValues = new HashSet<>();
+
+    for (Permissions p : perms) {
+        // 1. Get the Data-Driven Endpoint from DB (e.g., "/cgls" or "/role/**")
+        String apiPattern = p.getApiResourcePattern(); 
+        String action = (p.getMenuAction() != null) ? p.getMenuAction().toLowerCase() : "";
+        String context = p.getMappedRequestType(); // e.g., "CGL_CODE"
+        
+        // Context Suffix: Used for Maker-Checker (e.g., |CGL_CODE) or Standard (|*)
+        String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+        // --- LOGIC A: MAKER-CHECKER (Write Actions) ---
+        // If a context is defined (like CGL_CODE), we grant access to the GENERIC endpoints
+        if (!contextSuffix.equals("*")) {
+            
+            // MAKER: Create/Modify/Delete/Cancel
+            if (containsAny(action, "create", "modify", "delete", "cancel")) {
+                redisValues.add("POST:/create-request|" + contextSuffix);
+                redisValues.add("POST:/update-request|" + contextSuffix); // Often used for soft-updates
+                redisValues.add("POST:/cancel-request|" + contextSuffix);
+                redisValues.add("POST:/my-requests|" + contextSuffix);
+            }
+
+            // *** NEW: STATUS MANAGER (Block/Unblock) ***
+            // Explicitly maps 'block' actions to the SAME endpoints as Maker
+            if (containsAny(action, "block", "unblock")) {
+                redisValues.add("POST:/create-request|" + contextSuffix); // Blocking is a "Request"
+                redisValues.add("POST:/update-request|" + contextSuffix);
+                redisValues.add("POST:/my-requests|" + contextSuffix);
+            }
+
+            // CHECKER: Approve/Reject
+            if (containsAny(action, "approve", "reject")) {
+                redisValues.add("PATCH:/update-request|" + contextSuffix); // The Approval Endpoint
+                redisValues.add("POST:/pending-requests|" + contextSuffix);
+            }
+        }
+
+        // --- LOGIC B: RESOURCE ENDPOINTS (Read Actions) ---
+        // This grants access to the specific API (e.g., GET /cgls) based on the DB Pattern
+        if (apiPattern != null && !apiPattern.isEmpty()) {
+            String effectiveUrl = apiPattern;
+
+            // VIEW allows GET (and POST for search)
+            if (action.contains("view") || action.contains("read")) {
+                redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
+                redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); 
+            }
+            // For CGL, Maker/Blocker usually need to VIEW the list to select items
+            // So if they have create/block, we implicitly grant read access to the resource
+            if (containsAny(action, "create", "modify", "block", "unblock")) {
+                 redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
+            }
+        }
+    }
+
+    if (!redisValues.isEmpty()) {
+        redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+    }
+    log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
+}
+
+// =========================================================
+// 3. DATABASE MIGRATION (SQL Script)
+// Run this to split the permissions for Roles 51, 52, 55
+// =========================================================
+
+-- 1. Create the granular permission definitions
+-- Existing ID 5 becomes "CGL Core" (Role 51)
+UPDATE FINCORE.PERMISSIONS 
+SET MENU_TITLE = 'CGL Maintenance',
+    MENU_ACTION = 'create|modify|delete|cancel',
+    API_RESOURCE_PATTERN = '/cgls',
+    MAPPED_REQUEST_TYPE = 'CGL_CODE'
+WHERE MENU_ID = 5;
+
+-- Existing ID 6 remains "CGL Checker" (Role 55)
+UPDATE FINCORE.PERMISSIONS 
+SET MENU_TITLE = 'CGL Approvals',
+    MENU_ACTION = 'approve|reject',
+    API_RESOURCE_PATTERN = '/cgls',
+    MAPPED_REQUEST_TYPE = 'CGL_CODE'
+WHERE MENU_ID = 6;
+
+-- Create NEW ID 105 for "CGL Status" (Role 52)
+-- Note: We use the same URL/Component Path so they see the same screen, 
+-- but the Frontend will hide buttons based on 'MENU_ACTION'
+INSERT INTO FINCORE.PERMISSIONS (
+    MENU_ID, MENU_TITLE, MENU_ICON, MENU_SUBMENU, 
+    MENU_ACTION, MENU_URL, MENU_COMPONENT_PATH, 
+    MENU_DESCRIPTION, MAPPED_REQUEST_TYPE, API_RESOURCE_PATTERN
+) VALUES (
+    105, 'CGL Status Ops', 'Casino', NULL,
+    'block|unblock', '/cgl-management', 'cgl/CGLMaster', 
+    'To block or unblock CGL codes', 'CGL_CODE', '/cgls'
+);
+
+-- 2. Clean up existing role assignments for CGL
+-- Remove all CGL permissions for the relevant roles to start fresh
+DELETE FROM FINCORE.ROLE_PERMISSIONS 
+WHERE PERMISSION_ID IN (5, 6, 105) 
+  AND ROLE_ID IN (51, 52, 55);
+
+-- 3. Assign Granular Permissions
+-- Role 51 (Maker) -> ID 5 (Create/Modify)
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
+VALUES (51, 5, 1);
+
+-- Role 52 (Status Manager) -> ID 105 (Block/Unblock)
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
+VALUES (52, 105, 1);
+
+-- Role 55 (Checker) -> ID 6 (Approve/Reject)
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
+VALUES (55, 6, 1);
+
+COMMIT;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+------/
+package com.tcs.fincore.CommonRequestService.model.enums;
+
+import lombok.Getter;
+
+@Getter
+public enum ChangeType {
+    ADD("A"),
+    UPDATE("U"),
+    DELETE("D"),
+    // --- NEW: Add support for Status Operations ---
+    BLOCK("B"),   
+    UNBLOCK("UB"); 
+
+    private final String code;
+
+    ChangeType(String code) {
+        this.code = code;
+    }
+}
+```eor
+
+#### **File 2: Update `CglCodeStrategy.java`**
+*Location: `com.tcs.fincore.CommonRequestService.service.strategy`*
+You need to tell the system what to do when a "BLOCK" request is approved.
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CGLMasterRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class CglCodeStrategy implements RequestTypeStrategy {
+
+    private final CGLMasterRepository cglMasterRepository;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    public RequestType getRequestType() {
+        return RequestType.CGL_CODE;
+    }
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+        switch (request.getChangeType()) {
+            case ADD:
+                handleAdd(request);
+                break;
+            case UPDATE:
+                handleUpdate(request);
+                break;
+            // --- NEW HANDLERS ---
+            case BLOCK:
+                handleStatusChange(request, 0); // Assuming 0 = Inactive/Blocked
+                break;
+            case UNBLOCK:
+                handleStatusChange(request, 1); // Assuming 1 = Active
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Change type " + request.getChangeType() + " is not supported for Segment Codes.");
+        }
+    }
+
+    // ... handleAdd and handleUpdate remain the same ...
+
+    /**
+     * Logic to Block or Unblock a CGL
+     */
+    private void handleStatusChange(CommonReq request, Integer newStatus) {
+        String targetId = request.getTargetId();
+        log.info("Processing Status Change ({}) for CGL ID: {}", newStatus, targetId);
+
+        CGLMaster existingCgl = cglMasterRepository.findById(targetId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CGL Code with ID '" + targetId + "' not found for status update."));
+
+        // Update the status
+        existingCgl.setStatus(newStatus);
+        
+        cglMasterRepository.save(existingCgl);
+        log.info("Successfully updated CGL Status to {} for ID: {}", newStatus, targetId);
+    }
+}
+```eor
+
+---
+
+### **2. Java Changes: User Service**
+
+You must update the cache logic to understand that "block" and "unblock" actions in the database map to the `create-request` API endpoint.
+
+#### **File 3: Update `PermissionCacheService.java`**
+*Location: `com.tcs.userservice.service`*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.tcs.userservice.model.Permissions;
+import com.tcs.userservice.repository.PermissionsRepository;
+import com.tcs.userservice.repository.RolePermissionsRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionCacheService {
+
+    private final PermissionsRepository permissionRepository;
+    private final StringRedisTemplate redisTemplate;
+    private final RolePermissionsRepository rolePermissionsRepository;
+
+    @Transactional(readOnly = true)
+    public void refreshRolePermissions(Long roleId) {
+        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+        String redisKey = "RBAC::PERMISSIONS::" + roleId;
+
+        redisTemplate.delete(redisKey);
+        Set<String> redisValues = new HashSet<>();
+
+        for (Permissions p : perms) {
+            // Get data-driven path (e.g. "/cgls")
+            String apiPattern = p.getApiResourcePattern(); 
+            String actionRaw = p.getMenuAction();
+            String action = (actionRaw != null) ? actionRaw.toLowerCase() : "";
+            String context = p.getMappedRequestType(); 
+
+            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+            // --- 1. MAKER-CHECKER PERMISSIONS ---
+            if (!contextSuffix.equals("*")) {
+                
+                // ROLE 51: Maker (Create/Modify)
+                if (containsAny(action, "create", "modify", "delete", "cancel")) {
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix); 
+                    redisValues.add("POST:/cancel-request|" + contextSuffix);
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                }
+
+                // ROLE 52: Status Manager (Block/Unblock)
+                // They use the SAME "create-request" endpoint to submit the Block request
+                if (containsAny(action, "block", "unblock")) {
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                }
+
+                // ROLE 55: Checker (Approve/Reject)
+                if (containsAny(action, "approve", "reject")) {
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/pending-requests|" + contextSuffix);
+                }
+            }
+
+            // --- 2. RESOURCE READ PERMISSIONS ---
+            if (apiPattern != null && !apiPattern.isEmpty()) {
+                String effectiveUrl = apiPattern;
+
+                // Grant GET access if they have VIEW, READ, or any WRITE permission
+                // (You can't block a CGL if you can't see the list of CGLs first)
+                if (containsAny(action, "view", "read", "create", "modify", "block", "unblock")) {
+                    redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
+                    redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); // For Search APIs
+                }
+            }
+        }
+
+        if (!redisValues.isEmpty()) {
+            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+        }
+        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
+    }
+    
+    // ... include refreshRolesByPermissionId and containsAny helper methods here ...
+    private boolean containsAny(String input, String... keywords) {
+        if (input == null) return false;
+        for (String keyword : keywords) {
+            if (input.contains(keyword)) return true;
+        }
+        return false;
+    }
+}
+```eor
+
+---
+
+### **3. Database Changes: SQL Script**
+
+This script splits the "CGL" screen into 3 permissions and assigns them to the roles.
+
+**Logic:**
+1.  **ID 5 (CGL Maintenance):** Assigned to Role 51. Has actions `create|modify`.
+2.  **ID 6 (CGL Approval):** Assigned to Role 55. Has actions `approve|reject`.
+3.  **ID 105 (CGL Status):** Assigned to Role 52. Has actions `block|unblock`. *Note: It uses the same `MENU_URL` so they see the same screen.*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- 1. Setup API Patterns (If not done)
+UPDATE FINCORE.PERMISSIONS SET API_RESOURCE_PATTERN = '/cgls' WHERE MENU_ID IN (5, 6);
+
+-- 2. Define MAKER Permission (Role 51)
+UPDATE FINCORE.PERMISSIONS 
+SET MENU_TITLE = 'CGL Maintenance',
+    MENU_ACTION = 'create|modify|delete|cancel',
+    API_RESOURCE_PATTERN = '/cgls',
+    MAPPED_REQUEST_TYPE = 'CGL_CODE'
+WHERE MENU_ID = 5;
+
+-- 3. Define CHECKER Permission (Role 55)
+UPDATE FINCORE.PERMISSIONS 
+SET MENU_TITLE = 'CGL Approvals',
+    MENU_ACTION = 'approve|reject',
+    API_RESOURCE_PATTERN = '/cgls',
+    MAPPED_REQUEST_TYPE = 'CGL_CODE'
+WHERE MENU_ID = 6;
+
+-- 4. Create BLOCKER Permission (Role 52)
+-- Uses the same URL (/cgl-management) but different ACTION
+INSERT INTO FINCORE.PERMISSIONS (
+    MENU_ID, MENU_TITLE, MENU_ICON, MENU_SUBMENU, 
+    MENU_ACTION, MENU_URL, MENU_COMPONENT_PATH, 
+    MENU_DESCRIPTION, MAPPED_REQUEST_TYPE, API_RESOURCE_PATTERN
+) VALUES (
+    105, 'CGL Status Ops', 'Casino', NULL,
+    'block|unblock', '/cgl-management', 'cgl/CGLMaster', 
+    'Status operations for CGL', 'CGL_CODE', '/cgls'
+);
+
+-- 5. Clear old assignments for these roles/permissions
+DELETE FROM FINCORE.ROLE_PERMISSIONS 
+WHERE PERMISSION_ID IN (5, 6, 105) 
+  AND ROLE_ID IN (51, 52, 55);
+
+-- 6. Assign Roles
+-- Role 51 (Maker) -> CGL Maintenance
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (51, 5, 1);
+
+-- Role 52 (Blocker) -> CGL Status Ops
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (52, 105, 1);
+
+-- Role 55 (Checker) -> CGL Approvals
+INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (55, 6, 1);
+
+COMMIT;
+
+
