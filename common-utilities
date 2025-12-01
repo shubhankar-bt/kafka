@@ -133,7 +133,6 @@ public class JwtUtil {
 
 
 
-
 package com.fincore.commonutilities.security;
 
 import com.fincore.commonutilities.jwt.JwtUtil;
@@ -146,8 +145,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.lang.NonNull;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.util.AntPathMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -163,10 +162,7 @@ public class ContextRbacFilter extends OncePerRequestFilter {
     private final JwtUtil jwtUtil;
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
-    private static final Set<String> GENERIC_ENDPOINTS = Set.of(
-            "/create-request", "/update-request", "/my-requests", "/pending-requests", "/all-requests"
-    );
-
+    // Whitelist
     private static final Set<String> WHITELIST = Set.of(
             "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
     );
@@ -189,15 +185,10 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             }
         }
 
-        // 2. EXTRACT & VALIDATE TOKEN
+        // 2. VALIDATE TOKEN
         String token = request.getHeader("Authorization");
-        try {
-            if (token == null || !jwtUtil.isTokenValid(token)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        } catch (Exception e) {
-            // Handle ExpiredJwtException or others gracefully
+        if (token == null || !jwtUtil.isTokenValid(token)) {
+            // Let Spring Security handle the 401 later if authentication is missing
             filterChain.doFilter(request, response);
             return;
         }
@@ -214,66 +205,43 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             SecurityContextHolder.getContext().setAuthentication(authToken);
         }
 
-        // 4. DETERMINE CONTEXT
-        // 1. Get Header (Default to "*" if missing)
+        // 4. DETERMINE CONTEXT (Header)
         String contextHeader = request.getHeader("X-Request-Type");
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty())
-                ? contextHeader
-                : "*";
+        // Normalize: If header is missing, treat as "*" (Global Context)
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
 
-        // 2. Identify if this is a Generic Endpoint
-        boolean isGenericEndpoint = GENERIC_ENDPOINTS.stream().anyMatch(uri::endsWith);
-
-        // 3. Enforce Mandatory Header for Generic Endpoints
-        if (isGenericEndpoint && requestContext.equals("*")) {
-            response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing Header: X-Request-Type is required");
-            return;
-        }
-
-        // 4. Redis Check
+        // 5. REDIS AUTHORIZATION CHECK
         String redisKey = "RBAC::PERMISSIONS::" + roleId;
+        // Optimization: In high load, use isMember instead of fetching all,
+        // but since we have wildcards, fetching members is necessary.
         Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
+
         boolean isAuthorized = false;
 
         if (permissions != null) {
             for (String perm : permissions) {
                 // Format: "METHOD:URL_PATTERN|CONTEXT"
-                // Example: "GET:/segment-codes|SEGMENT_CODE"
                 String[] parts = perm.split("\\|");
                 if (parts.length < 2) continue;
 
                 String methodAndUrl = parts[0];
-                String allowedContext = parts[1]; // Value from DB (e.g. SEGMENT_CODE)
+                String allowedContext = parts[1];
 
-                // --- MATCHING LOGIC ---
-                boolean contextMatches = false;
-
-                // A. Exact Context Match (Best Case)
-                // Request: SEGMENT_CODE == Allowed: SEGMENT_CODE
-                if (allowedContext.equals(requestContext)) {
-                    contextMatches = true;
-                }
-                // B. Wildcard Permission Match
-                // Allowed: * (Access to all)
-                else if (allowedContext.equals("*")) {
-                    contextMatches = true;
-                }
-                // C. Implicit Context Match (THE FIX)
-                // Request: * (No Header) AND Allowed: SEGMENT_CODE AND Endpoint is NOT Generic
-                // This implies URL /segment-codes is unique enough to skip header check.
-                else if (requestContext.equals("*") && !isGenericEndpoint) {
-                    contextMatches = true;
+                // --- A. CONTEXT CHECK ---
+                // 1. Exact Match: Header "SEGMENT_CODE" matches Permission "SEGMENT_CODE"
+                // 2. Wildcard Match: Permission has "*" (e.g. Reports), allows any header (or no header)
+                if (!allowedContext.equals(requestContext) && !allowedContext.equals("*")) {
+                    continue;
                 }
 
-                if (!contextMatches) continue;
-
-                // Check Method & URL Pattern
+                // --- B. URL & METHOD CHECK ---
                 String[] muParts = methodAndUrl.split(":", 2);
                 if (muParts.length < 2) continue;
 
                 String allowedMethod = muParts[0];
                 String allowedUrlPattern = muParts[1];
 
+                // Method Match AND URL Pattern Match
                 if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
                     isAuthorized = true;
                     break;
@@ -285,10 +253,11 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
         } else {
             log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
-            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied");
+            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied: Insufficient Permissions");
         }
     }
 }
+
 
 
 
