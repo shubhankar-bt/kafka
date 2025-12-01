@@ -1,336 +1,52 @@
-package com.fincore.commonutilities.security;
 
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
+package com.tcs.userservice.advice;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Set;
-
-@Slf4j
-@RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
-
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
-
-    // Whitelist can remain hardcoded or moved to properties
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
-    );
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-
-        // 1. SKIP WHITELIST
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        // 2. VALIDATE TOKEN
-        String token = request.getHeader("Authorization");
-        if (token == null || !jwtUtil.isTokenValid(token)) {
-            // Let Spring Security handle the 401 later if authentication is missing
-            filterChain.doFilter(request, response);
-            return;
-        }
-
-        // 3. SET SECURITY CONTEXT
-        String userId = jwtUtil.getUserIdFromToken(token);
-        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-        String roleId = String.valueOf(roleIdInt);
-
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
-
-        // 4. DETERMINE CONTEXT (Header)
-        String contextHeader = request.getHeader("X-Request-Type");
-        // Normalize: If header is missing, treat as "*" (Global Context)
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
-
-        // 5. REDIS AUTHORIZATION CHECK
-        String redisKey = "RBAC::PERMISSIONS::" + roleId;
-        // Optimization: In high load, use isMember instead of fetching all, 
-        // but since we have wildcards, fetching members is necessary.
-        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
-        
-        boolean isAuthorized = false;
-
-        if (permissions != null) {
-            for (String perm : permissions) {
-                // Format: "METHOD:URL_PATTERN|CONTEXT"
-                String[] parts = perm.split("\\|");
-                if (parts.length < 2) continue;
-
-                String methodAndUrl = parts[0];
-                String allowedContext = parts[1];
-
-                // --- A. CONTEXT CHECK ---
-                // 1. Exact Match: Header "SEGMENT_CODE" matches Permission "SEGMENT_CODE"
-                // 2. Wildcard Match: Permission has "*" (e.g. Reports), allows any header (or no header)
-                if (!allowedContext.equals(requestContext) && !allowedContext.equals("*")) {
-                    continue; 
-                }
-
-                // --- B. URL & METHOD CHECK ---
-                String[] muParts = methodAndUrl.split(":", 2);
-                if (muParts.length < 2) continue;
-
-                String allowedMethod = muParts[0];
-                String allowedUrlPattern = muParts[1];
-
-                // Method Match AND URL Pattern Match
-                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
-                    isAuthorized = true;
-                    break;
-                }
-            }
-        }
-
-        if (isAuthorized) {
-            filterChain.doFilter(request, response);
-        } else {
-            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
-            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied: Insufficient Permissions");
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-// =========================================================
-// 1. UPDATE ENUM (CommonRequestService Project)
-// File: com/tcs/fincore/CommonRequestService/model/enums/ChangeType.java
-// =========================================================
-
-package com.tcs.fincore.CommonRequestService.model.enums;
-
-import lombok.Getter;
-
-@Getter
-public enum ChangeType {
-    ADD("A"),
-    UPDATE("U"),
-    DELETE("D"),
-    // --- NEW ADDITIONS FOR GRANULAR RBAC ---
-    BLOCK("B"),
-    UNBLOCK("UB"); // Use 2 chars if your DB column allows (VARCHAR2(2)), else use 'K'/'L'
-
-    private final String code;
-
-    ChangeType(String code) {
-        this.code = code;
-    }
-}
-
-// =========================================================
-// 2. UPDATE CACHE LOGIC (UserService Project)
-// File: com/tcs/userservice/service/PermissionCacheService.java
-// =========================================================
+import com.tcs.userservice.dto.ApiResponse;
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
 
 /**
- * REPLACING the old logic with the new Data-Driven + Block/Unblock support
+ * This ControllerAdvice intercepts successful responses from
+ * any @RestController
+ * and wraps them in a standard ApiResponse format.
  */
-@Transactional(readOnly = true)
-public void refreshRolePermissions(Long roleId) {
-    List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
-    String redisKey = "RBAC::PERMISSIONS::" + roleId;
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+	
+	static {
+		System.setProperty("spring.classformat.ignore", "true");
+	}
 
-    redisTemplate.delete(redisKey);
-    Set<String> redisValues = new HashSet<>();
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // This advice applies to any method in a class annotated with @RestController
+        // that is not already returning a ResponseEntity (which gives manual control).
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
 
-    for (Permissions p : perms) {
-        // 1. Get the Data-Driven Endpoint from DB (e.g., "/cgls" or "/role/**")
-        String apiPattern = p.getApiResourcePattern(); 
-        String action = (p.getMenuAction() != null) ? p.getMenuAction().toLowerCase() : "";
-        String context = p.getMappedRequestType(); // e.g., "CGL_CODE"
-        
-        // Context Suffix: Used for Maker-Checker (e.g., |CGL_CODE) or Standard (|*)
-        String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+            Class<? extends HttpMessageConverter<?>> selectedConverterType,
+            ServerHttpRequest request, ServerHttpResponse response) {
 
-        // --- LOGIC A: MAKER-CHECKER (Write Actions) ---
-        // If a context is defined (like CGL_CODE), we grant access to the GENERIC endpoints
-        if (!contextSuffix.equals("*")) {
-            
-            // MAKER: Create/Modify/Delete/Cancel
-            if (containsAny(action, "create", "modify", "delete", "cancel")) {
-                redisValues.add("POST:/create-request|" + contextSuffix);
-                redisValues.add("POST:/update-request|" + contextSuffix); // Often used for soft-updates
-                redisValues.add("POST:/cancel-request|" + contextSuffix);
-                redisValues.add("POST:/my-requests|" + contextSuffix);
-            }
-
-            // *** NEW: STATUS MANAGER (Block/Unblock) ***
-            // Explicitly maps 'block' actions to the SAME endpoints as Maker
-            if (containsAny(action, "block", "unblock")) {
-                redisValues.add("POST:/create-request|" + contextSuffix); // Blocking is a "Request"
-                redisValues.add("POST:/update-request|" + contextSuffix);
-                redisValues.add("POST:/my-requests|" + contextSuffix);
-            }
-
-            // CHECKER: Approve/Reject
-            if (containsAny(action, "approve", "reject")) {
-                redisValues.add("PATCH:/update-request|" + contextSuffix); // The Approval Endpoint
-                redisValues.add("POST:/pending-requests|" + contextSuffix);
-            }
+        // If the controller has already manually wrapped the response, do nothing.
+        if (body instanceof ApiResponse<?>) {
+            return body;
         }
 
-        // --- LOGIC B: RESOURCE ENDPOINTS (Read Actions) ---
-        // This grants access to the specific API (e.g., GET /cgls) based on the DB Pattern
-        if (apiPattern != null && !apiPattern.isEmpty()) {
-            String effectiveUrl = apiPattern;
-
-            // VIEW allows GET (and POST for search)
-            if (action.contains("view") || action.contains("read")) {
-                redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
-                redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); 
-            }
-            // For CGL, Maker/Blocker usually need to VIEW the list to select items
-            // So if they have create/block, we implicitly grant read access to the resource
-            if (containsAny(action, "create", "modify", "block", "unblock")) {
-                 redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
-            }
-        }
-    }
-
-    if (!redisValues.isEmpty()) {
-        redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
-    }
-    log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
-}
-
-// =========================================================
-// 3. DATABASE MIGRATION (SQL Script)
-// Run this to split the permissions for Roles 51, 52, 55
-// =========================================================
-
--- 1. Create the granular permission definitions
--- Existing ID 5 becomes "CGL Core" (Role 51)
-UPDATE FINCORE.PERMISSIONS 
-SET MENU_TITLE = 'CGL Maintenance',
-    MENU_ACTION = 'create|modify|delete|cancel',
-    API_RESOURCE_PATTERN = '/cgls',
-    MAPPED_REQUEST_TYPE = 'CGL_CODE'
-WHERE MENU_ID = 5;
-
--- Existing ID 6 remains "CGL Checker" (Role 55)
-UPDATE FINCORE.PERMISSIONS 
-SET MENU_TITLE = 'CGL Approvals',
-    MENU_ACTION = 'approve|reject',
-    API_RESOURCE_PATTERN = '/cgls',
-    MAPPED_REQUEST_TYPE = 'CGL_CODE'
-WHERE MENU_ID = 6;
-
--- Create NEW ID 105 for "CGL Status" (Role 52)
--- Note: We use the same URL/Component Path so they see the same screen, 
--- but the Frontend will hide buttons based on 'MENU_ACTION'
-INSERT INTO FINCORE.PERMISSIONS (
-    MENU_ID, MENU_TITLE, MENU_ICON, MENU_SUBMENU, 
-    MENU_ACTION, MENU_URL, MENU_COMPONENT_PATH, 
-    MENU_DESCRIPTION, MAPPED_REQUEST_TYPE, API_RESOURCE_PATTERN
-) VALUES (
-    105, 'CGL Status Ops', 'Casino', NULL,
-    'block|unblock', '/cgl-management', 'cgl/CGLMaster', 
-    'To block or unblock CGL codes', 'CGL_CODE', '/cgls'
-);
-
--- 2. Clean up existing role assignments for CGL
--- Remove all CGL permissions for the relevant roles to start fresh
-DELETE FROM FINCORE.ROLE_PERMISSIONS 
-WHERE PERMISSION_ID IN (5, 6, 105) 
-  AND ROLE_ID IN (51, 52, 55);
-
--- 3. Assign Granular Permissions
--- Role 51 (Maker) -> ID 5 (Create/Modify)
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
-VALUES (51, 5, 1);
-
--- Role 52 (Status Manager) -> ID 105 (Block/Unblock)
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
-VALUES (52, 105, 1);
-
--- Role 55 (Checker) -> ID 6 (Approve/Reject)
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER)
-VALUES (55, 6, 1);
-
-COMMIT;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-------/
-package com.tcs.fincore.CommonRequestService.model.enums;
-
-import lombok.Getter;
-
-@Getter
-public enum ChangeType {
-    ADD("A"),
-    UPDATE("U"),
-    DELETE("D"),
-    // --- NEW: Add support for Status Operations ---
-    BLOCK("B"),   
-    UNBLOCK("UB"); 
-
-    private final String code;
-
-    ChangeType(String code) {
-        this.code = code;
+        // Wrap the successful response body in the standard ApiResponse structure.
+        return ApiResponse.success(body);
     }
 }
-```eor
-
-#### **File 2: Update `CglCodeStrategy.java`**
-*Location: `com.tcs.fincore.CommonRequestService.service.strategy`*
-You need to tell the system what to do when a "BLOCK" request is approved.
 
 
 
@@ -339,454 +55,46 @@ You need to tell the system what to do when a "BLOCK" request is approved.
 
 
 
-package com.tcs.fincore.CommonRequestService.service.strategy;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
-import com.tcs.fincore.CommonRequestService.model.CGLMaster;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import com.tcs.fincore.CommonRequestService.repository.CGLMasterRepository;
+package com.tcs.userservice.config;
+
+import com.tcs.userservice.service.PermissionCacheService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
+import org.springframework.jdbc.core.JdbcTemplate;
 
-@Slf4j
+import java.util.List;
+
 @Component
 @RequiredArgsConstructor
-public class CglCodeStrategy implements RequestTypeStrategy {
+@Slf4j
+public class CacheWarmer {
 
-    private final CGLMasterRepository cglMasterRepository;
-    private final ObjectMapper objectMapper;
-
-    @Override
-    public RequestType getRequestType() {
-        return RequestType.CGL_CODE;
-    }
-
-    @Override
-    public void processApproval(CommonReq request) throws JsonProcessingException {
-        switch (request.getChangeType()) {
-            case ADD:
-                handleAdd(request);
-                break;
-            case UPDATE:
-                handleUpdate(request);
-                break;
-            // --- NEW HANDLERS ---
-            case BLOCK:
-                handleStatusChange(request, 0); // Assuming 0 = Inactive/Blocked
-                break;
-            case UNBLOCK:
-                handleStatusChange(request, 1); // Assuming 1 = Active
-                break;
-            default:
-                throw new UnsupportedOperationException(
-                        "Change type " + request.getChangeType() + " is not supported for Segment Codes.");
-        }
-    }
-
-    // ... handleAdd and handleUpdate remain the same ...
+    private final PermissionCacheService permissionCacheService;
+    private final JdbcTemplate jdbcTemplate;
 
     /**
-     * Logic to Block or Unblock a CGL
+     * Runs once when the application starts.
+     * Iterates over ALL Role IDs and refreshes their permissions in Redis.
      */
-    private void handleStatusChange(CommonReq request, Integer newStatus) {
-        String targetId = request.getTargetId();
-        log.info("Processing Status Change ({}) for CGL ID: {}", newStatus, targetId);
+    @EventListener(ApplicationReadyEvent.class)
+    public void onStartup() {
+        log.info("Startup: Warming Permission Cache...");
 
-        CGLMaster existingCgl = cglMasterRepository.findById(targetId)
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "CGL Code with ID '" + targetId + "' not found for status update."));
+        // Fetch all Role IDs (using JDBC for speed/simplicity)
+        List<Long> roleIds = jdbcTemplate.queryForList("SELECT ROLE_ID FROM ROLES", Long.class);
 
-        // Update the status
-        existingCgl.setStatus(newStatus);
-        
-        cglMasterRepository.save(existingCgl);
-        log.info("Successfully updated CGL Status to {} for ID: {}", newStatus, targetId);
-    }
-}
-```eor
-
----
-
-### **2. Java Changes: User Service**
-
-You must update the cache logic to understand that "block" and "unblock" actions in the database map to the `create-request` API endpoint.
-
-#### **File 3: Update `PermissionCacheService.java`**
-*Location: `com.tcs.userservice.service`*
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.tcs.userservice.service;
-
-import com.tcs.userservice.model.Permissions;
-import com.tcs.userservice.repository.PermissionsRepository;
-import com.tcs.userservice.repository.RolePermissionsRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionCacheService {
-
-    private final PermissionsRepository permissionRepository;
-    private final StringRedisTemplate redisTemplate;
-    private final RolePermissionsRepository rolePermissionsRepository;
-
-    @Transactional(readOnly = true)
-    public void refreshRolePermissions(Long roleId) {
-        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
-        String redisKey = "RBAC::PERMISSIONS::" + roleId;
-
-        redisTemplate.delete(redisKey);
-        Set<String> redisValues = new HashSet<>();
-
-        for (Permissions p : perms) {
-            // Get data-driven path (e.g. "/cgls")
-            String apiPattern = p.getApiResourcePattern(); 
-            String actionRaw = p.getMenuAction();
-            String action = (actionRaw != null) ? actionRaw.toLowerCase() : "";
-            String context = p.getMappedRequestType(); 
-
-            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
-
-            // --- 1. MAKER-CHECKER PERMISSIONS ---
-            if (!contextSuffix.equals("*")) {
-                
-                // ROLE 51: Maker (Create/Modify)
-                if (containsAny(action, "create", "modify", "delete", "cancel")) {
-                    redisValues.add("POST:/create-request|" + contextSuffix);
-                    redisValues.add("POST:/update-request|" + contextSuffix); 
-                    redisValues.add("POST:/cancel-request|" + contextSuffix);
-                    redisValues.add("POST:/my-requests|" + contextSuffix);
-                }
-
-                // ROLE 52: Status Manager (Block/Unblock)
-                // They use the SAME "create-request" endpoint to submit the Block request
-                if (containsAny(action, "block", "unblock")) {
-                    redisValues.add("POST:/create-request|" + contextSuffix);
-                    redisValues.add("POST:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/my-requests|" + contextSuffix);
-                }
-
-                // ROLE 55: Checker (Approve/Reject)
-                if (containsAny(action, "approve", "reject")) {
-                    redisValues.add("PATCH:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/pending-requests|" + contextSuffix);
-                }
-            }
-
-            // --- 2. RESOURCE READ PERMISSIONS ---
-            if (apiPattern != null && !apiPattern.isEmpty()) {
-                String effectiveUrl = apiPattern;
-
-                // Grant GET access if they have VIEW, READ, or any WRITE permission
-                // (You can't block a CGL if you can't see the list of CGLs first)
-                if (containsAny(action, "view", "read", "create", "modify", "block", "unblock")) {
-                    redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
-                    redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); // For Search APIs
-                }
+        for (Long roleId : roleIds) {
+            try {
+                permissionCacheService.refreshRolePermissions(roleId);
+            } catch (Exception e) {
+                log.error("Failed to refresh permissions for Role {}", roleId, e);
             }
         }
-
-        if (!redisValues.isEmpty()) {
-            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
-        }
-        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
-    }
-    
-    // ... include refreshRolesByPermissionId and containsAny helper methods here ...
-    private boolean containsAny(String input, String... keywords) {
-        if (input == null) return false;
-        for (String keyword : keywords) {
-            if (input.contains(keyword)) return true;
-        }
-        return false;
-    }
-}
-```eor
-
----
-
-### **3. Database Changes: SQL Script**
-
-This script splits the "CGL" screen into 3 permissions and assigns them to the roles.
-
-**Logic:**
-1.  **ID 5 (CGL Maintenance):** Assigned to Role 51. Has actions `create|modify`.
-2.  **ID 6 (CGL Approval):** Assigned to Role 55. Has actions `approve|reject`.
-3.  **ID 105 (CGL Status):** Assigned to Role 52. Has actions `block|unblock`. *Note: It uses the same `MENU_URL` so they see the same screen.*
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
--- 1. Setup API Patterns (If not done)
-UPDATE FINCORE.PERMISSIONS SET API_RESOURCE_PATTERN = '/cgls' WHERE MENU_ID IN (5, 6);
-
--- 2. Define MAKER Permission (Role 51)
-UPDATE FINCORE.PERMISSIONS 
-SET MENU_TITLE = 'CGL Maintenance',
-    MENU_ACTION = 'create|modify|delete|cancel',
-    API_RESOURCE_PATTERN = '/cgls',
-    MAPPED_REQUEST_TYPE = 'CGL_CODE'
-WHERE MENU_ID = 5;
-
--- 3. Define CHECKER Permission (Role 55)
-UPDATE FINCORE.PERMISSIONS 
-SET MENU_TITLE = 'CGL Approvals',
-    MENU_ACTION = 'approve|reject',
-    API_RESOURCE_PATTERN = '/cgls',
-    MAPPED_REQUEST_TYPE = 'CGL_CODE'
-WHERE MENU_ID = 6;
-
--- 4. Create BLOCKER Permission (Role 52)
--- Uses the same URL (/cgl-management) but different ACTION
-INSERT INTO FINCORE.PERMISSIONS (
-    MENU_ID, MENU_TITLE, MENU_ICON, MENU_SUBMENU, 
-    MENU_ACTION, MENU_URL, MENU_COMPONENT_PATH, 
-    MENU_DESCRIPTION, MAPPED_REQUEST_TYPE, API_RESOURCE_PATTERN
-) VALUES (
-    105, 'CGL Status Ops', 'Casino', NULL,
-    'block|unblock', '/cgl-management', 'cgl/CGLMaster', 
-    'Status operations for CGL', 'CGL_CODE', '/cgls'
-);
-
--- 5. Clear old assignments for these roles/permissions
-DELETE FROM FINCORE.ROLE_PERMISSIONS 
-WHERE PERMISSION_ID IN (5, 6, 105) 
-  AND ROLE_ID IN (51, 52, 55);
-
--- 6. Assign Roles
--- Role 51 (Maker) -> CGL Maintenance
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (51, 5, 1);
-
--- Role 52 (Blocker) -> CGL Status Ops
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (52, 105, 1);
-
--- Role 55 (Checker) -> CGL Approvals
-INSERT INTO FINCORE.ROLE_PERMISSIONS (ROLE_ID, PERMISSION_ID, PERMISSION_ORDER) VALUES (55, 6, 1);
-
-COMMIT;
-
-
-
-
-
-
-
-
-********************
-
-
-package com.tcs.userservice.service;
-
-import com.tcs.userservice.model.Permissions;
-import com.tcs.userservice.repository.PermissionsRepository;
-import com.tcs.userservice.repository.RolePermissionsRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionCacheService {
-
-    private final PermissionsRepository permissionRepository;
-    private final StringRedisTemplate redisTemplate;
-    private final RolePermissionsRepository rolePermissionsRepository;
-
-    @Transactional(readOnly = true)
-    public void refreshRolePermissions(Long roleId) {
-        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
-        String redisKey = "RBAC::PERMISSIONS::" + roleId;
-
-        redisTemplate.delete(redisKey);
-        Set<String> redisValues = new HashSet<>();
-
-        for (Permissions p : perms) {
-            String apiPattern = p.getApiResourcePattern(); // e.g. "/user/**" or "/cgl*"
-            String actionRaw = p.getMenuAction();
-            String action = (actionRaw != null) ? actionRaw.toLowerCase() : "";
-            String context = p.getMappedRequestType(); // e.g. "CGL_CODE" or "USER_MANAGEMENT"
-
-            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
-
-            // ==========================================================================================
-            // LOGIC BLOCK A: MAKER-CHECKER & GENERIC REQUESTS (CommonRequestService + Status Ops)
-            // ==========================================================================================
-            if (!contextSuffix.equals("*")) {
-                
-                // DRY RUN: Role 51 (CGL Maker). Action="create|modify". Context="CGL_CODE".
-                // Controller: RequestController. Endpoint: POST /create-request, POST /update-request.
-                // VERDICT: GRANTED.
-                if (containsAny(action, "create", "modify", "delete", "cancel")) {
-                    redisValues.add("POST:/create-request|" + contextSuffix);
-                    redisValues.add("POST:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/cancel-request|" + contextSuffix);
-                    // Endpoint: /my-requests (MyRequestFilterDto)
-                    redisValues.add("POST:/my-requests|" + contextSuffix); 
-                }
-
-                // DRY RUN: Role 52 (CGL Blocker). Action="block". Context="CGL_CODE".
-                // Controller: RequestController. Endpoint: POST /create-request (Blocking is a request).
-                // VERDICT: GRANTED.
-                if (containsAny(action, "block", "unblock")) {
-                    redisValues.add("POST:/create-request|" + contextSuffix);
-                    redisValues.add("POST:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/my-requests|" + contextSuffix);
-                }
-
-                // DRY RUN: Role 55 (CGL Checker). Action="approve". Context="CGL_CODE".
-                // Controller: RequestController. Endpoint: PATCH /update-request (ProcessRequestDto).
-                // VERDICT: GRANTED.
-                if (containsAny(action, "approve", "reject")) {
-                    redisValues.add("PATCH:/update-request|" + contextSuffix);
-                    redisValues.add("POST:/pending-requests|" + contextSuffix);
-                }
-            }
-
-            // ==========================================================================================
-            // LOGIC BLOCK B: RESOURCE ENDPOINTS (User, Role, Reports, Masters, Notifications)
-            // ==========================================================================================
-            if (apiPattern != null && !apiPattern.isEmpty()) {
-                
-                // Handle comma-separated patterns (e.g., Circle needs /circle-codes AND /zone-codes)
-                String[] patterns = apiPattern.split(",");
-
-                for (String effectiveUrl : patterns) {
-                    effectiveUrl = effectiveUrl.trim();
-
-                    // --- READ ACCESS ---
-                    // DRY RUN: Role 51 (Maker). Needs to see CGL list to edit.
-                    // Controller: CommonMasterController. Endpoint: GET /cgls.
-                    // VERDICT: GRANTED (Implicitly via 'create'/'modify' check).
-                    //
-                    // DRY RUN: Dashboard (All Users). Action="view". Pattern="/notifications/**".
-                    // Controller: NotificationController. Endpoint: GET /notifications.
-                    // VERDICT: GRANTED.
-                    if (containsAny(action, "view", "read", "create", "modify", "block", "unblock")) {
-                        redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
-                        // DRY RUN: Transactions/Balance. These use POST to search/view.
-                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); 
-                    }
-
-                    // --- WRITE ACCESS (Create) ---
-                    // DRY RUN: User Mgmt (ID 12). Action="create". Pattern="/user/**".
-                    // Controller: UserRequestController. Endpoint: POST /user/create-request.
-                    // VERDICT: GRANTED.
-                    if (action.contains("create")) {
-                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
-                    }
-
-                    // --- WRITE ACCESS (Modify/Approve) ---
-                    // DRY RUN: Role Mgmt (ID 22). Action="modify". Pattern="/role/**".
-                    // Controller: RoleRequestController. Endpoint: PATCH /save-permission-order.
-                    // VERDICT: GRANTED.
-                    if (action.contains("modify") || action.contains("approve")) {
-                        redisValues.add("PUT:" + effectiveUrl + "|" + contextSuffix);
-                        redisValues.add("PATCH:" + effectiveUrl + "|" + contextSuffix);
-                        // Some update APIs use POST (e.g. /user/accept-request)
-                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
-                    }
-
-                    // --- WRITE ACCESS (Delete/Cancel) ---
-                    // DRY RUN: User Mgmt. Action="cancel". Pattern="/user/**".
-                    // Controller: UserRequestController. Endpoint: POST /user/cancel-request.
-                    // VERDICT: GRANTED.
-                    if (action.contains("delete") || action.contains("cancel")) {
-                        redisValues.add("DELETE:" + effectiveUrl + "|" + contextSuffix);
-                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix); 
-                    }
-
-                    // --- WRITE ACCESS (Download/Upload) ---
-                    // DRY RUN: Reports (ID 26). Action="download". Pattern="/reports/**".
-                    // Controller: ReportController. Endpoint: POST /reports/download.
-                    // VERDICT: GRANTED.
-                    // DRY RUN: Journal Upload (ID 36). Action="Bulk Upload". Pattern="/journal-bulk-upload/**".
-                    // VERDICT: GRANTED.
-                    if (action.contains("download") || action.contains("upload")) {
-                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
-                    }
-                }
-            }
-        }
-
-        if (!redisValues.isEmpty()) {
-            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
-        }
-        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
-    }
-
-    /**
-     * Helper to refresh by Permission ID when a definition changes.
-     */
-    @Transactional(readOnly = true)
-    public void refreshRolesByPermissionId(Long permissionId) {
-        List<Long> affectedRoleIds = rolePermissionsRepository.findRoleIdsByPermissionId(permissionId);
-        log.info("Permission {} changed. Refreshing {} affected roles.", permissionId, affectedRoleIds.size());
-        for (Long roleId : affectedRoleIds) {
-            refreshRolePermissions(roleId);
-        }
-    }
-
-    private boolean containsAny(String input, String... keywords) {
-        if (input == null) return false;
-        for (String keyword : keywords) {
-            if (input.contains(keyword)) return true;
-        }
-        return false;
+        log.info("🏁 Cache Warming Complete. Processed {} roles.", roleIds.size());
     }
 }
 
@@ -796,168 +104,1130 @@ public class PermissionCacheService {
 
 
 
-&:&:&:&:&&:&:&:&:&:&:&&:&/&/&/
 
 
 
 
-// =========================================================
-// 1. UPDATE CACHE SERVICE (UserService Project)
-// File: com/tcs/userservice/service/PermissionCacheService.java
-// =========================================================
 
-// ... imports ...
-import com.tcs.fincore.CommonRequestService.model.enums.ChangeType; // Ensure enum is accessible
+package com.tcs.userservice.config;
 
-// Inside PermissionCacheService class...
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 
-@Transactional(readOnly = true)
-public void refreshRolePermissions(Long roleId) {
-    List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
-    String redisKey = "RBAC::PERMISSIONS::" + roleId;
-    
-    redisTemplate.delete(redisKey);
-    Set<String> redisValues = new HashSet<>();
+import java.time.Duration;
 
-    for (Permissions p : perms) {
-        String apiPattern = p.getApiResourcePattern();
-        String action = (p.getMenuAction() != null) ? p.getMenuAction().toLowerCase() : "";
-        String context = p.getMappedRequestType(); // e.g. "CGL_CODE"
-        String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+@Configuration
+@EnableCaching
+public class RedisConfig {
 
-        // --- EXISTING URL PERMISSIONS LOGIC (Logic A & B) ---
-        // ... (Paste the logic from the previous step here for URL caching) ...
-        // ... (Logic for "POST:/create-request..." etc.) ...
-
-        // --- NEW: PAYLOAD INTENT VALIDATION (Layer 2 Security) ---
-        // If this is a specific Context (e.g. CGL_CODE), we define exactly WHAT they can do.
-        if (!contextSuffix.equals("*")) {
-            String opsKey = "RBAC::OPS::" + roleId + "::" + contextSuffix;
-            Set<String> allowedOps = new HashSet<>();
-
-            // Map DB Action Strings -> Enum ChangeTypes
-            if (action.contains("create")) allowedOps.add("ADD");
-            if (action.contains("modify")) allowedOps.add("UPDATE");
-            if (action.contains("delete")) allowedOps.add("DELETE");
-            
-            // GRANULAR PERMISSIONS
-            if (action.contains("block")) allowedOps.add("BLOCK");
-            if (action.contains("unblock")) allowedOps.add("UNBLOCK");
-
-            if (!allowedOps.isEmpty()) {
-                // Store allowed operations in Redis
-                // Example Key: RBAC::OPS::52::CGL_CODE -> ["BLOCK", "UNBLOCK"]
-                redisTemplate.opsForSet().add(opsKey, allowedOps.toArray(new String[0]));
-                log.info("🔒 Cached OPS for Role {} Context {}: {}", roleId, contextSuffix, allowedOps);
-            }
-        }
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        // 1. Create a specialized ObjectMapper for Redis
+        ObjectMapper redisObjectMapper = new ObjectMapper();
+        redisObjectMapper.registerModule(new JavaTimeModule());
+        // --- THIS IS THE FIX ---
+        // We explicitly verify and enable "Type Info" so Redis saves the class name.
+        redisObjectMapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        // -----------------------
+        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
+        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(24))
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(cacheConfig)
+                .build();
     }
-    
-    // Save the URL permissions
-    if (!redisValues.isEmpty()) {
-        redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+
+    // Ensure ObjectMapper handles Java 8 Dates (LocalDate, Instant) correctly in Redis
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        return mapper;
     }
+
+    // This bean configures our RedisTemplate to use the fixed ObjectMapper
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        Jackson2JsonRedisSerializer<Object> serializer =
+                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
+
+        template.setValueSerializer(serializer);
+        template.setKeySerializer(new StringRedisSerializer());
+
+        return template;
+    }
+
 }
 
-// =========================================================
-// 2. CREATE SECURITY VALIDATOR (CommonRequestService Project)
-// File: com/tcs/fincore/CommonRequestService/service/BusinessSecurityService.java
-// =========================================================
 
-package com.tcs.fincore.CommonRequestService.service;
 
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.config;
+
+import com.fincore.commonutilities.config.RedisConfig; // Ensures Redis Template is loaded
 import com.fincore.commonutilities.jwt.JwtUtil;
-import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.stereotype.Service;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class BusinessSecurityService {
+/**
+ * Global security configuration for the application.
+ * This class uses Spring Security's Java configuration to define security rules,
+ * such as disabling CSRF, making the session stateless, and defining authorization policies.
+ *
+ * The `@Configuration` annotation marks this class as a source of bean definitions.
+ * The `@EnableWebSecurity` annotation enables Spring Security's web security support and provides
+ * the integration with the Spring MVC.
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class}) // Import Redis Config from Library
+public class SecurityConfig {
 
-    private final StringRedisTemplate redisTemplate;
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(cors -> {}) // Enable CORS (uses your existing WebConfig)
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // LOCK DOWN ENDPOINTS
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/**").permitAll() // Allows access to all your API endpoints
+                        .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                        // All other requests MUST pass the ContextRbacFilter
+                        .anyRequest().authenticated()
+                )
+
+                // ======== INSERTING THE GUARD HERE =======
+                // This filter does two things:
+                // 1. Validates JWT & Sets User Context
+                // 2. Checks Redis for Permissions (e.g. "POST:/create-request|SEGMENT_CODE")
+                .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.controller;
+ 
+
+import com.fincore.commonutilities.jwt.JwtUtil; 
+import com.tcs.userservice.dto.PermissionOrderDto;
+import com.tcs.userservice.service.RoleRequestService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController()
+@RequestMapping("/role") //context path
+public class RoleRequestController {
+
+	private final RoleRequestService roleRequestService;
     private final JwtUtil jwtUtil;
 
-    /**
-     * Checks if the user has specific permission for the INTENT (ChangeType).
-     * @param token JWT Token
-     * @param requestType e.g., CGL_CODE
-     * @param changeType e.g., BLOCK
-     */
-    public void validateUserAction(String token, RequestType requestType, ChangeType changeType) {
-        
-        // 1. Get Role from Token
-        int roleId = jwtUtil.getUserRoleFromToken(token);
-        
-        // 2. Construct Redis Key (Must match UserService logic)
-        String opsKey = "RBAC::OPS::" + roleId + "::" + requestType.name();
+	public RoleRequestController(RoleRequestService roleRequestService, JwtUtil jwtUtil) {
+		this.roleRequestService = roleRequestService;
+        this.jwtUtil = jwtUtil;
+	}
 
-        // 3. Check Redis: Does the set contain this specific operation?
-        Boolean isAllowed = redisTemplate.opsForSet().isMember(opsKey, changeType.name());
+	@GetMapping("/get-roles") //end point
+	public ResponseEntity getAllRoles(@RequestParam Map<String, Object> requestParams) {
+		return roleRequestService.getAllRoles(requestParams);
+	}
 
-        if (Boolean.FALSE.equals(isAllowed)) {
-            log.warn("SECURITY ALERT: User (Role {}) tried to perform restricted action {} on {}. Access Denied.", 
-                     roleId, changeType, requestType);
-            throw new AccessDeniedException("You do not have permission to perform '" + changeType + "' actions on this screen.");
-        }
-        
-        log.debug("Action {} on {} allowed for Role {}", changeType, requestType, roleId);
+	@PostMapping("/create-role-request")//end point
+	public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization")String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.createNewRoleRequest(request, userId);
+	}
+
+	@GetMapping("/pending-role-requests")//end point
+	public ResponseEntity getPendingRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getPendingRoleRequests(userId);
+	}
+
+	@PostMapping("/role-request-action")//end point
+	public ResponseEntity acceptRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.acceptOrRejectRoleRequest(request, userId);
+	}
+
+	@GetMapping("/my-role-requests")//end point
+	public ResponseEntity getMyRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getMyRoleRequests(userId);
+	}
+
+	@PostMapping("/cancel-role-request")//end point
+	public ResponseEntity cancelRoleRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		return roleRequestService.cancelRoleRequest(request, jwtUtil.getUserIdFromToken(token));
+	}
+
+	@GetMapping("/get-all-permissions")//end point
+	public ResponseEntity getRoleWisePermissions() {
+		return roleRequestService.getAllPermissions();
+	}
+	
+	@PatchMapping("/save-permission-order")
+	public ResponseEntity savePermissionOrder(@RequestBody PermissionOrderDto payload) {
+		return roleRequestService.savePermissionOrder(payload);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.userservice.dto.UserLogsDto;
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.service.UserLogsService;
+import com.tcs.userservice.service.UserRequestService;
+import com.tcs.userservice.utility.RequestUtility;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@RestController()
+@RequestMapping("/user")
+public class UserRequestController {
+
+
+    @Autowired
+    private UserRequestService userRequestService;
+
+    @Autowired
+    private UserLogsService userLogsService;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @PostMapping("/create-request")
+    public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return userRequestService.createNewRequest(request, userId);
+    }
+
+    @GetMapping("/pending-user-requests")
+    public ResponseEntity getPendingRequests(@RequestParam Map<String, Object> params) {
+        return userRequestService.getPendingRequests(params);
+    }
+
+    @PostMapping("/accept-request")
+    public ResponseEntity acceptRequest(ServerHttpRequest request, @RequestBody UserRequestDto userRequest) {
+        String clientIp = RequestUtility.getClientIp(request);
+        return userRequestService.acceptOrRejectUserRequest(userRequest, clientIp);
+    }
+
+
+    @GetMapping("/user-details")
+    public ResponseEntity getUserDetails(@RequestParam Map<String, String> request) {
+        return userRequestService.getUserDetails(request);
+    }
+
+    @GetMapping("/my-requests")
+    public ResponseEntity getMyRequests(@RequestParam Map<String, String> params) {
+        return userRequestService.getMyRequests(params);
+    }
+
+    @PostMapping("/cancel-request")
+    public ResponseEntity cancelRequest(@RequestBody Map<String, Object> request) {
+        return userRequestService.cancelRequest(request);
+    }
+
+
+    @PostMapping("/logs-batch")
+    public ResponseEntity<List<UserLogsDto>> createLogsBatch(@RequestBody List<UserLogsDto> payload) {
+        List<UserLogsDto> savedLogs = (List<UserLogsDto>) userLogsService.saveLogs(payload);
+
+        // Returning the saved DTOs with the CREATED status
+        return new ResponseEntity<>(savedLogs, HttpStatus.CREATED);
+    }
+
+    // GET API to fetch all user logs
+    @GetMapping("/all-logs")
+    public ResponseEntity<List<UserLogsDto>> findAllLogs() {
+        List<UserLogsDto> logs = userLogsService.findAllLogs();
+        return ResponseEntity.ok(logs);
+    }
+
+    // GET API to fetch a user log by ID
+    @GetMapping("/{id}")
+    public ResponseEntity<UserLogsDto> findLogById(@PathVariable Integer id) {
+        UserLogsDto log = userLogsService.findLogById(id);
+        return ResponseEntity.ok(log);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Getter;
+
+import java.time.Instant;
+
+@Getter
+@JsonInclude(JsonInclude.Include.NON_NULL) // Don't include null fields in the JSON response
+public class ApiResponse<T> {
+
+    private final boolean success;
+    private final String message;
+    private final T data;
+    private final Instant timestamp;
+
+    private ApiResponse(boolean success, String message, T data) {
+        this.success = success;
+        this.message = message;
+        this.data = data;
+        this.timestamp = Instant.now();
+    }
+
+    public static <T> ApiResponse<T> success(T data, String message) {
+        return new ApiResponse<>(true, message, data);
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(true, "Operation completed successfully.", data);
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return new ApiResponse<>(false, message, null);
     }
 }
 
-// =========================================================
-// 3. UPDATE CONTROLLER (CommonRequestService Project)
-// File: com/tcs/fincore/CommonRequestService/controller/RequestController.java
-// =========================================================
 
-// Update method signature to pass 'token' to service
-@PostMapping("/create-request")
-@ResponseStatus(HttpStatus.CREATED)
-public CommonReq createRequest(
-        @Valid @RequestBody CreateRequestDto createRequestDto,
-        @RequestHeader("Authorization") String token // Pass this down
-) throws JsonProcessingException {
-    String userId = JwtUtil.getUserIdFromToken(token);    
-    log.info("Received request creation call from user: {}", userId);
-    // CHANGE: Pass 'token' as 3rd argument
-    return requestService.createRequest(createRequestDto, userId, token);
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ChildMenu {
+    
+	private int id;
+    
+	private String title;
+    
+	private String route;
+    
+	private ScreenDetails screenDetails;
+	
 }
 
-// =========================================================
-// 4. UPDATE SERVICE IMPL (CommonRequestService Project)
-// File: com/tcs/fincore/CommonRequestService/service/RequestServiceImpl.java
-// =========================================================
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class RequestServiceImpl implements RequestService {
 
-    private final BusinessSecurityService businessSecurityService; // Inject new service
-    // ... other dependencies ...
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class MenuResponse {
+    private List<RootMenu> root_menus;
+}
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class NotificationConfigDto {
+
+    private String targetUrl;
+
+    private String targetRoles; // Comma separated string: "51,52,55"
+
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+import lombok.AllArgsConstructor; 
+import lombok.Builder; 
+import lombok.Data; 
+import lombok.NoArgsConstructor;
+
+@Data 
+@NoArgsConstructor 
+@AllArgsConstructor
+@Builder 
+public class PermissionDto { 
+	private Integer id; // MENU_ID 
+	private String title; // MENU_TITLE
+	private String icon; // MENU_ICON
+	private String description; // MENU_ORDER 
+	private int order;
+    private String menuSubmenu; // new addition - v1018405
+
+}
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PermissionEventDto {
+    @JsonProperty("payload")
+    private Payload payload;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Payload {
+        private DataBlock after;
+        private DataBlock before;
+        private String op;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DataBlock {
+        @JsonProperty("MENU_ID")
+        private Long menuId;
+
+    }
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.Data;
+
+@Data
+public class PermissionList {
+
+	public int id;
+
+	public String title;
+
+	public String icon;
+
+	public int order;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.util.List;
+
+import lombok.Data;
+
+@Data
+public class PermissionOrderDto {
+	
+	private int selectedRole;
+	
+	private List<PermissionOrderListDto> permissions;
+
+}
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionOrderListDto {
+
+	private int id;
+
+	private String title;
+
+	private String icon;
+
+	private String description;
+
+	private int order;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionsDto {
+
+    private int menuId;
+
+    private String menuTitle;
+
+    private String menuIcon;
+
+    private String menuSubmenu;
+
+    private String menuAction;
+
+    private String menuUrl;
+
+    private String menuComponentPath;
+
+    private String menuOrder;
+
+    private int menuDependant;
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class RoleDto {
+	private Integer roleId;
+	
+	private String roleName;
+	
+	private String description;
+	
+	private String roleStatus;
+	
+	@Builder.Default
+	private List permissions = new ArrayList<>();
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class RolePermissionEventDto {
+
+    @JsonProperty("payload")
+    private Payload payload;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Payload {
+        private DataBlock after;  // State after change
+        private DataBlock before; // State before change (for deletes)
+        private String op;        // 'c', 'u', 'd'
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class DataBlock {
+        @JsonProperty("ROLE_ID")
+        private Long roleId;
+
+        @JsonProperty("PERMISSION_ID")
+        private Long permissionId;
+    }
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.util.List;
+
+import lombok.Data;
+
+@Data
+public class RoleRequestPayload {
+
+
+    public String roleId;
+
+	public String roleName;
+
+	public String description;
+
+    public String roleStatus;
+
+	public List<PermissionList> permissions;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class RootMenu {
+
+
+        private int id;
+        private String title;
+        private String icon;
+        private String route;
+        private boolean hasChildren;
+        private ScreenDetails screenDetails;
+        private String menuDescription;
+        private List<ChildMenu> children;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class ScreenDetails {
+    private String screenId;
+    private String screenTitle;
+    private String componentPath;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.Data;
+
+@Data
+public class UserCrudRequestDto {
+
+    private Integer targetUserId;
+
+    private String requestType;
+
+    private UserDetailsDto requestPayload;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import jakarta.persistence.Column;
+import lombok.Data;
+
+@Data
+public class UserDetailsDto {
+
+    private String userId;
+
+    private String firstName;
+
+    private String middleName;
+
+    private String lastName;
+
+    private String email;
+
+    private String phoneNumber;
+
+    private String roleName;
+
+}
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class UserDto {
+
+    private int userId;
+
+    private int userRole;
+
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import java.sql.Timestamp;
+
+import lombok.Data;
+@Data
+public class UserLogsDto {
+	
+	private Integer logId;
+
+	private String actionType;
+
+	private String changeType;
+
+	private Timestamp actionTime;
+
+	private Integer userId;
+
+	private String oldValue;
+
+	private String newValue;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class UserRequestDto {
+
+    private long requestId;
+
+    private String approverUserId;
+
+    private String oldValue;
+
+    private String remarks;
+
+    private String actionFlag;
+
+    private String requestType;
+
+    private String requesterUserId;
+}
+
+
+
+package com.tcs.userservice.dto;
+
+import java.sql.Timestamp;
+
+public interface UserRequestProjection {
+	
+	String getRequestorUserId();
+
+	String getRequestStatus();
+	
+	String getRequestId();
+	
+	String getRequestType();
+	
+	Timestamp getRequestDate();
+
+	String getRequestPayload();
+
+}
+
+
+
+
+package com.tcs.userservice.mapper;
+
+import com.tcs.userservice.dto.UserLogsDto;
+import com.tcs.userservice.model.UserLogs;
+
+public class UserLogsMapper {
+
+    /**
+     * This function is for mapping database to network layer
+     *
+     * @param: UserLogs : Entity
+     * @Author: Deepshikha Biswas
+     */
+    public static UserLogsDto toDto(UserLogs userLogs) {
+
+        UserLogsDto userLogsDto = new UserLogsDto();
+        userLogsDto.setLogId(userLogs.getLogId());
+        userLogsDto.setActionType(userLogs.getActionType());
+        userLogsDto.setChangeType(userLogs.getChangeType());
+        userLogsDto.setActionTime(userLogs.getActionTime());
+        userLogsDto.setUserId(userLogs.getUserId());
+        userLogsDto.setOldValue(userLogs.getOldValue());
+        userLogsDto.setNewValue(userLogs.getNewValue());
+
+        return userLogsDto;
+    }
+
+    public static UserLogs toEntity(UserLogsDto userLogsDto) {
+        UserLogs userLogs = new UserLogs();
+        userLogs.setLogId(userLogsDto.getLogId());
+        userLogs.setActionType(userLogsDto.getActionType());
+        userLogs.setChangeType(userLogsDto.getChangeType());
+        userLogs.setActionTime(userLogsDto.getActionTime());
+        userLogs.setUserId(userLogsDto.getUserId());
+        userLogs.setOldValue(userLogsDto.getOldValue());
+        userLogs.setNewValue(userLogsDto.getNewValue());
+
+        return userLogs;
+    }
+}
+
+
+
+
+
+
+
+// model
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+import java.sql.Timestamp;
+
+@Entity
+@Table(name = "AUDIT_LOG")
+@Data
+public class AuditLog {
+
+    @Id
+    @Column(name="LOG_ID")
+    private long logId;
+    @Column(name="REQUEST_ID")
+    private long requestId;
+    @Column(name="USER_ID")
+    private String userId;
+    @Column(name="ACTION_TYPE")
+    private String actionType;
+    @Column(name="CHANGE_TYPE")
+    private String changeType;
+    @Column(name="OLD_VALUE")
+    private String oldValue;
+    @Column(name="NEW_VALUE")
+    private String newValue;
+    @Column(name="IP_ADDRESS")
+    private String ipAddress;
+    @Column(name="ACTION_TIME")
+    private Timestamp actionTime;
+
+
+
+}
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp; // Import this
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.io.Serializable;
+import java.time.Instant; // This is the correct type
+import java.util.Objects;
+import java.util.UUID;
+
+/**
+ * Represents an event in the outbox system, intended for notification purposes.
+ * UPDATED: Added @CreationTimestamp for automatic timestamping.
+ */
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable implements Serializable {
+
+    // Unique primary key for the outbox event.
+    // Using UUID strategy is correct for Oracle's SYS_GUID() or RAW(16
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    // The ID of the user who should receive this notification (for 1-to-1).
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    // The human-readable message to be displayed.
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    // The relative URL the user should be taken to when clicking the notification.
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    // The microservice that generated this event.
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    // The primary key of the business object (e.g., the CommonReq ID).
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    // The timestamp when the event was created.
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    // For 1-to-Many notifications. If USER_ID is null, this role is used.
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+
 
     @Override
-    @Transactional
-    public CommonReq createRequest(
-            CreateRequestDto dto,
-            String creatorId,
-            String token // New Argument
-    ) throws JsonProcessingException {
-        
-        // --- STEP 1: LAYER 2 SECURITY CHECK ---
-        // Validate that the user is allowed to perform this SPECIFIC ChangeType (e.g. BLOCK)
-        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NotificationTable that = (NotificationTable) o;
+        return Objects.equals(eventId, that.eventId);
+    }
 
-        // ... The rest of your existing logic ...
-        KeyablePayload payload = (KeyablePayload) dto.getPayload();
-        // ...
-        
-        // Note: Update the RequestService INTERFACE signature as well!
+    @Override
+    public int hashCode() {
+        return Objects.hash(eventId);
+    }
+
+
+    @Override
+    public String toString() {
+        return "NotificationTable{" +
+                "eventId='" + eventId + '\'' +
+                ", userId='" + userId + '\'' +
+                ", targetRole='" + targetRole + '\'' +
+                ", eventSource='" + eventSource + '\'' +
+                ", aggregateId='" + aggregateId + '\'' +
+                ", eventTimestamp=" + eventTimestamp +
+                '}';
     }
 }
 
@@ -966,3 +1236,889 @@ public class RequestServiceImpl implements RequestService {
 
 
 
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionForRole {
+
+	@Id
+	@Column(name = "MENU_ID")
+	private Integer menuId;
+
+	@Column(name = "MENU_TITLE")
+	private String menuTitle;
+
+	@Column(name = "MENU_ORDER")
+	private String menuOrder;
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Permissions {
+
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    @Column(name = "MENU_TITLE")
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON")
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU")
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION")
+    private String menuAction;
+
+    @Column(name = "MENU_URL")
+    private String menuUrl; // Frontend route (e.g: //glif-reports/**)
+    @Column(name = "MENU_COMPONENT_PATH")
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION")
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private Integer menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE")
+    private String mappedRequestType;
+
+    @Column(name = "API_RESOURCE_PATTERN")
+    private String apiResourcePattern; // Backend route (e.g: //reports/**)
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.math.BigDecimal;
+
+@Entity
+@Table(name = "MENU_ITEMS") // Assuming the table name is MENU_ITEMS
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@ToString
+public class PermissionsForNotification {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "menu_item_seq_gen")
+    @SequenceGenerator(name = "menu_item_seq_gen", sequenceName = "MENU_ITEMS_SEQ", allocationSize = 1)
+    @Column(name = "MENU_ID", nullable = false)
+    private int menuId;
+
+    @Column(name = "MENU_TITLE", nullable = false, length = 100)
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON", length = 100)
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU", length = 100)
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION", nullable = false, length = 200)
+    private String menuAction;
+
+    @Column(name = "MENU_URL", nullable = false, length = 200)
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH", nullable = false, length = 200)
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION", nullable = false, length = 255)
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private int menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE", length = 50)
+    private String mappedRequestType;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Table(name = "ROLES")
+public class Role {
+
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "ROLE_ID")
+	private int roleId;
+
+	@Column(name = "ROLE_NAME")
+	private String roleName;
+
+	@Column(name = "DESCRIPTION")
+	private String description;
+
+	@Column(name = "ROLE_STATUS")
+	private String status;
+}
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.io.Serializable;
+import java.util.Objects;
+
+import jakarta.persistence.Embeddable;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Embeddable
+@NoArgsConstructor
+@AllArgsConstructor
+@Data
+public class RolePermissionId implements Serializable {
+	
+	
+	private int roleId;
+	
+    private int permissionId;
+
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.Value;
+
+@Entity
+@Data
+@Table(name = "ROLE_PERMISSIONS")
+public class RolePermissions {
+
+	@EmbeddedId
+	private RolePermissionId id;
+
+	@Column(name = "PERMISSION_ORDER")
+	int permissionOrder;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.sql.Timestamp;
+
+@Entity
+@Data
+@Table(name = "ROLE_REQUESTS")
+public class RoleRequest {
+
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "REQUEST_ID")
+	private int requestId;
+
+	@Column(name = "REQUEST_TYPE")
+	private String requestType;
+
+	@Column(name = "REQUESTOR_USER_ID")
+	private String requestorUserId;
+
+	@Column(name = "TARGET_ROLE_ID")
+	private int targetRoleId;
+
+	@Column(name = "REQUEST_PAYLOAD")
+	private String requestPayload;
+
+	@Column(name = "REQUEST_STATUS")
+	private String requestStatus;
+
+	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
+	private Timestamp requestDate;
+
+	@Column(name = "APPROVAL_DATE")
+	private Timestamp approvalDate;
+
+	@Column(name = "APPROVER_USER_ID")
+	private String approverUserId;
+
+	@Column(name = "REASON_FOR_REJECTION")
+	private String reasonForRejection;
+
+	@Column(name = "EXECUTION_DATE")
+	private Timestamp executionDate;
+
+	@Column(name = "EXECUTION_DETAILS")
+	private String executionDetails;
+
+}
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.util.List;
+
+import org.springframework.beans.factory.annotation.Qualifier;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.ElementCollection;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Entity
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Table(name="ROLES")
+public class RoleWithPermissions {
+    @Id
+    @Column(name="ROLE_ID")
+    private int roleId;
+
+    @Column(name="ROLE_NAME")
+    private String roleName;
+
+    @Column(name="DESCRIPTION")
+    private String description;
+
+    @Column(name="ROLE_STATUS")
+    private String status;
+
+    @Column(name="PERMISSIONS")
+    @Transient
+    private List<PermissionForRole> permissions;
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.sql.Timestamp;
+
+@Entity
+@Getter
+@Setter
+@Table(name="users")
+public class User {
+
+    @Id
+    @Column(name="USER_ID")
+    private String userId;
+
+    @Column(name="FIRST_NAME")
+    private String firstName;
+    @Column(name="MIDDLE_NAME")
+    private String middleName;
+    @Column(name="LAST_NAME")
+    private String lastName;
+    @Column(name="PHONE_NUMBER")
+    private String phoneNumber;
+    @Column(name="EMAIL")
+    private String email;
+    @Column(name="PASSWORD_HASH")
+    private String passwordHash;
+    @Column(name="ACCOUNT_STATUS")
+    private String accountStatus;
+    @Column(name="CREATED_AT")
+    private Timestamp createdAt;
+    @Column(name="UPDATED_AT")
+    private Timestamp updatedAt;
+    @Column(name="LAST_LOGIN_AT")
+    private Timestamp lastLoginAt;
+
+    @Column(name="IS_DELETED")
+    private char isDeleted;
+    @Column(name="DELETED_AT")
+    private Timestamp deletedAt;
+
+    @Column(name="TEMP_PASSWORD_SET_AT")
+    private Timestamp tempPasswordSetAt;
+
+    @Column(name="USER_WRONG_PASSWORD_COUNT")
+    private int userWrongPasswordCount;
+
+    @Column(name="BRANCH")
+    private int branch;
+}
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import java.sql.Timestamp;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name="User_logs")
+
+// Main model for the entire log entry
+public class UserLogs {
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name="LOG_ID")
+	private Integer logId;
+	
+	@Column(name="ACTION_TYPE")
+	private String actionType;
+	
+	@Column(name="CHANGE_TYPE")
+	private String changeType;
+	
+	@Column(name="ACTION_TIME")
+	private Timestamp actionTime;
+	
+	@Column(name="USER_ID")
+	private Integer userId;
+
+    @Lob
+	@Column(name="OLD_VALUE")
+	private String oldValue;
+
+    @Lob
+	@Column(name="NEW_VALUE")
+	private String newValue;
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
+
+import java.sql.Timestamp;
+
+@Entity
+@Getter
+@Setter
+@ToString
+/*
+ * @Table(name="USER_CHANGES_REQUEST_TRACK") public class UserRequest {
+ * 
+ * @Id
+ * 
+ * @GeneratedValue(strategy = GenerationType.IDENTITY)
+ * 
+ * @Column(name="REQUEST_ID") private int requestId;
+ * 
+ * @Column(name="REQUEST_STATUS") private String requestStatus;
+ * 
+ * @Column(name="REQUEST_RAISED_BY") private String requestRaisedBy;
+ * 
+ * @Column(name="REQUEST_RAISED_AT",nullable=false,updatable=false,insertable=
+ * false) private Timestamp requestRaisedAt;
+ * 
+ * @Column(name="REQUEST_REVIEWED_BY") private String requestReviewedBy;
+ * 
+ * @Column(name="REQUEST_REVIEWED_AT") private Timestamp requestReviewedAt;
+ * 
+ * @Column(name="REQUEST_FLAG") private String requestFlag;
+ * 
+ * @Column(name="REQUEST_CATEGORIES") private String requestCategories;
+ * 
+ * @Column(name="USER_ID") private String userId;
+ * 
+ * @Column(name="UPDATED_FIRST_NAME") private String updatedFirstName;
+ * 
+ * @Column(name="UPDATED_MIDDLE_NAME") private String updatedMiddleName;
+ * 
+ * @Column(name="UPDATED_LAST_NAME") private String updatedLastName;
+ * 
+ * @Column(name="UPDATED_PHONE_NUMBER") private String updatedPhoneNumber;
+ * 
+ * @Column(name="UPDATED_EMAIL") private String updatedEmail;
+ * 
+ * @Column(name="UPDATED_ROLE") private int updatedRole;
+ * 
+ * @Column(name="REQUEST_REMARKS") private String requestRemarks; }
+ */
+@Table(name = "USER_REQUESTS")
+public class UserRequest {
+	@Id
+	@GeneratedValue(strategy = GenerationType.IDENTITY)
+	@Column(name = "REQUEST_ID")
+	private int requestId;
+	
+	@Column(name = "REQUEST_TYPE")
+	private String requestType;
+	
+	@Column(name = "REQUESTOR_USER_ID")
+	private String requestorUserId;
+	
+	@Column(name = "TARGET_USER_ID")
+	private String targetUserId;
+	
+	@Column(name = "REQUEST_PAYLOAD")
+	private String requestPayload;
+	
+	@Column(name = "REQUEST_STATUS")
+	private String requestStatus;
+	
+	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
+	private Timestamp requestDate;
+	
+	@Column(name = "APPROVAL_DATE")
+	private Timestamp approvalDate;
+	
+	@Column(name = "APPROVER_USER_ID")
+	private String approverUserId;
+	
+	@Column(name = "REASON_FOR_REJECTION")
+	private String reasonForRejection;
+	
+	@Column(name = "EXECUTION_DATE")
+	private Timestamp executionDate;
+	
+	@Column(name = "EXECUTION_DETAILS")
+	private String executionDetails;
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name = "USER_ROLES")
+public class UserRole {
+    
+    @Id
+    @Column(name = "USER_ID")
+    private String userId;
+
+    @Column(name = "ROLE_ID")
+    private int roleId;
+
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.UUID;
+
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID> {
+}
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.UUID;
+
+public interface NotificationRepository extends JpaRepository<NotificationTable, UUID> {
+}
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.List;
+import java.util.Set;
+
+public interface PermissionsRepository extends JpaRepository<Permissions, Integer> {
+
+    List<Permissions> findAll();
+
+    /**
+     * Retrieves a list of mapped request type keys for a given set of menu IDs.
+     */
+    @Query("SELECT p.mappedRequestType FROM Permissions p WHERE p.menuId IN :incomingIds")
+    List<String> findMappedRequestTypeByMenuId(@Param("incomingIds") Set<Integer> incomingIds);
+
+    /**
+     * Fetches both the Target URL and the authorized Role IDs in a single database call.
+     *
+     * @param requestType The mapped request type string (e.g., 'SEGMENT_CODE')
+     * @return A list of arrays where index [0] is MENU_URL (String) and index [1] is ROLE_ID (Number)
+     */
+    @Query(value = """
+            SELECT p.MENU_URL, rp.ROLE_ID
+            FROM PERMISSIONS p
+            JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+            JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+            WHERE p.MAPPED_REQUEST_TYPE = :requestType
+            AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+            AND r.ROLE_STATUS = 'ACTIVE'
+            """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+
+    /**
+     * Joins ROLES -> ROLE_PERMISSIONS -> PERMISSIONS
+     *
+     * @return all permissions assigned specific to role id
+     */
+    @Query(value = """
+                SELECT p.* FROM PERMISSIONS p
+                JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+                WHERE rp.ROLE_ID = :roleId
+            """, nativeQuery = true)
+    List<Permissions> findAllByRoleId(@Param("roleId") Long roleId);
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.stereotype.Repository;
+import com.tcs.userservice.model.Role;
+
+import java.util.List;
+
+@Repository
+public interface RolePermissionRepository extends CrudRepository<Role, Integer> {
+	// Native query that returns role columns +
+	// permission columns. Aliases and column order
+	// must match mapping below.
+	@Query(value = """
+            SELECT
+                r.role_id,
+                r.role_name,
+                r.description,
+                r.role_status,
+                p.menu_id,
+                p.menu_title,
+                p.menu_icon,
+                p.MENU_DESCRIPTION,
+                rp.PERMISSION_ORDER,
+                p.MENU_SUBMENU
+            FROM
+                roles r
+                LEFT JOIN role_permissions rp ON r.role_id = rp.role_id
+                LEFT JOIN permissions     p ON rp.permission_id = p.menu_id
+            ORDER BY
+                r.role_id,
+            	rp.PERMISSION_ORDER
+            """, nativeQuery = true)
+	List<Object[]> findAllRolesWithPermissionsRaw();
+}
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import java.util.List;
+
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import com.tcs.userservice.model.RolePermissionId;
+import com.tcs.userservice.model.RolePermissions;
+
+public interface RolePermissionsRepository extends JpaRepository<RolePermissions, RolePermissionId> {
+
+	/**
+	 * Function for getting permission based on role id used for modification of
+	 * permissions
+	 * 
+	 * @param : roleId : must be a valid role id
+	 */
+	@Query(nativeQuery = true, value = """
+			SELECT
+			    p.MENU_ID,
+			    p.MENU_TITLE,
+			    p.MENU_ICON,
+			    p.MENU_SUBMENU,
+			    p.MENU_ACTION,
+			    p.MENU_URL,
+			    p.MENU_COMPONENT_PATH,
+			    p.MENU_ORDER,
+			    p.MENU_DEPENDANT
+			FROM
+			    PERMISSIONS p
+			INNER JOIN
+			    ROLE_PERMISSIONS rp
+			ON
+			    p.MENU_ID = rp.PERMISSION_ID
+			WHERE
+			    rp.ROLE_ID = :roleId
+
+						""")
+	List<Permissions> findAllByRole(@Param("roleId") String roleId);
+
+	List<RolePermissions> findByIdRoleIdAndIdPermissionIdIn(int roleId, List<Integer> permissionIds);
+
+	List<RolePermissions> findByIdRoleId(int roleId);
+
+    @Query(value = "SELECT ROLE_ID FROM ROLE_PERMISSIONS WHERE permission_id = :permissionId", nativeQuery = true)
+    List<Long> findRoleIdsByPermissionId(Long permissionId);
+}
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import com.tcs.userservice.model.Role;
+
+public interface RoleRepository extends JpaRepository<Role, Integer> {
+
+	Role findRoleByRoleId(int roleId);
+
+	Role findRoleByRoleName(String roleName);
+}
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.dto.UserRequestProjection;
+import com.tcs.userservice.model.RoleRequest;
+import com.tcs.userservice.model.UserRequest;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import java.util.List;
+import java.util.Map;
+
+@Repository
+public interface RoleRequestRepository extends JpaRepository<RoleRequest, Integer> {
+
+	@Query(value = "select count(*) from role_requests where TARGET_ROLE_ID=:roleId and request_status='PENDING'", nativeQuery = true)
+	int countPendingRoleRequests(@RequestParam("roleId") int roleId);
+
+	@Query(value = """
+			SELECT
+			    COUNT(*)
+			FROM
+			    role_requests
+			WHERE
+				lower(JSON_VALUE(request_payload, '$.roleName')) =:roleName
+			    AND request_status = 'PENDING'
+					""", nativeQuery = true)
+	int countPendingRoleRequestsByRoleName(@RequestParam("roleName") String roleName);
+
+	@Query(value = """
+						SELECT
+			    request_id,
+			    request_type,
+			    requestor_user_id,
+			    target_role_id,
+			    dbms_lob.substr(REQUEST_PAYLOAD) AS requestPayload,
+			    request_status,
+			    request_date,
+			    approval_date,
+			    approver_user_id,
+			    reason_for_rejection,
+			    execution_date,
+			    execution_details
+			FROM
+			    role_requests
+			WHERE
+			        requestor_user_id !=:requestedByUserId
+			    AND request_status = 'PENDING'
+						""", nativeQuery = true)
+	List<UserRequestProjection> findPendingRoleRequests(@Param("requestedByUserId") String requestedByUserId);
+
+	@Query(value = """
+									SELECT
+			    request_id,
+			    request_type,
+			    requestor_user_id,
+			    target_role_id,
+			    dbms_lob.substr(request_payload) AS requestpayload,
+			    request_status,
+			    request_date,
+			    approval_date,
+			    approver_user_id,
+			    reason_for_rejection,
+			    execution_date,
+			    execution_details
+			FROM
+			    role_requests
+			WHERE
+			    requestor_user_id = :requestedByUserId
+			ORDER BY
+				request_id DESC
+															""", nativeQuery = true)
+	List<UserRequestProjection> findMyPendingRoleRequests(@Param("requestedByUserId") String requestedByUserId);
+
+	RoleRequest findRoleRequestByRequestId(int requestId);
+
+	RoleRequest getRoleRequestByRequestId(long requestId);
+
+	@Query(nativeQuery = true, value = "SELECT ROLE_ID_SEQUENCE.NEXTVAL FROM DUAL")
+	int getNewRoleIdOnCreation();
+}
