@@ -9,22 +9,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
  * Builds navigational menu structures from permission entities or projections.
- *
- * <p>Responsibilities:</p>
- * <ul>
- *   <li>Group permissions by root menu title</li>
- *   <li>Create root and child menu DTOs</li>
- *   <li>Ensure deterministic ordering (by {@code orderId} / {@code permissionOrder})</li>
- *   <li>Be tolerant to missing/nullable sorting fields</li>
- * </ul>
- *
- * <p><strong>Ordering</strong>: Root menus and child menus are sorted in ascending order using their respective
- * order fields. Null order values are placed last to keep ordering stable.</p>
+ * UPDATED: Merges 'menuAction' for Root Menus with the same Title.
  */
 @Slf4j
 @Service
@@ -32,11 +21,6 @@ public class MenuService {
 
     /**
      * Transforms a list of {@link Permissions} entities into a {@link MenuResponse}.
-     * <p>Groups by {@code menuTitle}, creates root items, and (when present) child items from
-     * entries having a non-null {@code subMenu}.</p>
-     *
-     * @param permissionsList permissions entities
-     * @return menu response with ordered root and child menus
      */
     public MenuResponse transform(List<Permissions> permissionsList) {
         MenuResponse response = new MenuResponse();
@@ -55,14 +39,28 @@ public class MenuService {
         for (Map.Entry<String, List<Permissions>> entry : grouped.entrySet()) {
             List<Permissions> group = entry.getValue();
 
-            // Pick a representative for root fields: prefer the one with the smallest non-null orderId
+            // 1. Pick a representative for basic fields (Icon, Route, Desc)
+            // Prefer the one with the smallest non-null orderId
             Permissions rootPerm = group.stream()
                     .min(Comparator.comparing(MenuService::safeOrderId))
                     .orElse(group.get(0));
 
             RootMenu rootMenu = buildRootFromPermissions(rootPerm);
 
-            // Build children from items that actually have a sub-menu
+            // 2. [CRITICAL FIX]: MERGE ROOT ACTIONS
+            // Collect actions from ALL rows in this group (e.g. Maker + Blocker),
+            // split them by pipe, deduplicate, and rejoin.
+            String mergedAction = group.stream()
+                    .map(Permissions::getMenuAction)
+                    .filter(Objects::nonNull)
+                    .flatMap(action -> Arrays.stream(action.split("\\|"))) // Split "create|modify"
+                    .map(String::trim)
+                    .distinct() // Remove duplicates (e.g. if both have "view")
+                    .collect(Collectors.joining("|"));
+
+            rootMenu.setMenuAction(mergedAction); // Ensure RootMenu has this setter
+
+            // 3. Build children from items that actually have a sub-menu
             List<ChildMenu> children = group.stream()
                     .filter(p -> p.getSubMenu() != null)
                     .map(this::buildChildFromPermissions)
@@ -83,10 +81,6 @@ public class MenuService {
 
     /**
      * Transforms a list of {@link PermissionRow} projections into a {@link MenuResponse}.
-     * <p>Groups by {@code menuTitle}, creates root items, and child items from rows having a non-null {@code subMenu}.</p>
-     *
-     * @param rows permission projection rows (typically from a custom query join)
-     * @return menu response with ordered root and child menus
      */
     public MenuResponse transformFromProjection(List<PermissionRow> rows) {
         MenuResponse response = new MenuResponse();
@@ -105,14 +99,25 @@ public class MenuService {
         for (Map.Entry<String, List<PermissionRow>> entry : grouped.entrySet()) {
             List<PermissionRow> group = entry.getValue();
 
-            // Representative root row: choose the smallest non-null permissionOrder
+            // 1. Representative root row
             PermissionRow root = group.stream()
                     .min(Comparator.comparing(MenuService::safePermissionOrder))
                     .orElse(group.get(0));
 
             RootMenu rootMenu = buildRootFromProjection(root);
 
-            // Children (only rows that actually represent a sub-menu), ordered by permissionOrder asc
+            // 2. [CRITICAL FIX]: MERGE ROOT ACTIONS
+            String mergedAction = group.stream()
+                    .map(PermissionRow::getMenuAction)
+                    .filter(Objects::nonNull)
+                    .flatMap(action -> Arrays.stream(action.split("\\|")))
+                    .map(String::trim)
+                    .distinct()
+                    .collect(Collectors.joining("|"));
+
+            rootMenu.setMenuAction(mergedAction);
+
+            // 3. Children (only rows that actually represent a sub-menu)
             List<ChildMenu> children = group.stream()
                     .filter(r -> r.getSubMenu() != null)
                     .map(this::buildChildFromProjection)
@@ -124,7 +129,6 @@ public class MenuService {
             rootMenus.add(rootMenu);
         }
 
-        // Order root menus as well
         rootMenus.sort(Comparator.comparing(MenuService::safeOrderIdRoot));
 
         response.setRoot_menus(rootMenus);
@@ -144,6 +148,7 @@ public class MenuService {
         root.setComponentPath(p.getComponentPath());
         root.setScreenDescription(p.getMenuDescription());
         root.setOrderId(safeOrderId(p));
+        // Note: menuAction is set by the merge logic in the caller method
         return root;
     }
 
@@ -165,6 +170,7 @@ public class MenuService {
         root.setTitle(r.getMenuTitle());
         root.setIcon(r.getMenuIcon());
         root.setRoute(r.getMenuUrl());
+        // setMenuAction is handled by merge logic, but we can set default here
         root.setMenuAction(r.getMenuAction());
         root.setComponentPath(r.getComponentPath());
         root.setScreenDescription(r.getMenuDescription());
@@ -189,336 +195,24 @@ public class MenuService {
     // Null-safe order helpers
     // --------------------------------------------------------------------------------------------
 
-    /**
-     * Returns a non-null order for {@link Permissions} (nulls go to the end).
-     */
     private static int safeOrderId(Permissions p) {
         Integer v = p.getOrderId();
         return v != null ? v : Integer.MAX_VALUE;
     }
 
-    /**
-     * Returns a non-null order for {@link PermissionRow} (nulls go to the end).
-     */
     private static int safePermissionOrder(PermissionRow r) {
         Integer v = r.getPermissionOrder();
         return v != null ? v : Integer.MAX_VALUE;
     }
 
-    /**
-     * Comparator key extractor for root menus.
-     */
     private static int safeOrderIdRoot(RootMenu r) {
         Integer v = r.getOrderId();
         return v != null ? v : Integer.MAX_VALUE;
     }
 
-    /**
-     * Comparator key extractor for child menus.
-     */
     private static int safeOrderIdChild(ChildMenu c) {
         Integer v = c.getOrderId();
         return v != null ? v : Integer.MAX_VALUE;
     }
 }
 
-
-
-
-in fe currently getting resposne like this :-
-
-{
-    "userId": "1015698",
-    "accessToken": "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiIxMDE1Njk4Iiwicm9sZSI6NTEsInJvbGVOYW1lIjoiVUNPIiwiZmlyc3ROYW1lIjoiUmVoYW1hbiIsImxhc3ROYW1lIjoiU2hhaWsiLCJwaG9uZU51bWJlciI6IjAwMDAwMDAwMDAiLCJlbWFpbCI6InR0ckBzYmkuY28uaW4iLCJicmFuY2giOjEyMzQ1LCJzdWIiOiIxMDE1Njk4IiwianRpIjoiOWVjMjUzOTYtM2NjNy00ZjBiLTg4YzctMjVkMGEzNzMwZDg5IiwiaWF0IjoxNzY0NjY2ODQwLCJleHAiOjE3NjQ2Njg2NDB9.SZVtuDiLmVI9hd_NzDcllhdkUd3Hqtf3Q6znrMZUBDY",
-    "tokenType": "Bearer",
-    "expiresIn": 1800,
-    "sub": "1015698",
-    "jti": "9ec25396-3cc7-4f0b-88c7-25d0a3730d89",
-    "roleData": {
-        "root_menus": [
-            {
-                "id": 35,
-                "title": "CloudUploadIcon ",
-                "icon": "GridView",
-                "route": "/dashboard",
-                "hasChildren": false,
-                "componentPath": "user/pages/Dashboard",
-                "screenDescription": "Sample Dashboard screen MUI",
-                "orderId": 1,
-                "menuAction": "view",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 11,
-                "title": "Downloads",
-                "icon": "Download",
-                "route": "/download",
-                "hasChildren": false,
-                "componentPath": "branch/BranchMaster",
-                "screenDescription": "This is demo description",
-                "orderId": 2,
-                "menuAction": "view|download",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 1,
-                "title": "Circle Management",
-                "icon": "AccountTree",
-                "route": "/circle-management",
-                "hasChildren": false,
-                "componentPath": "circle/CircleMaster",
-                "screenDescription": "To manage circles in application",
-                "orderId": 3,
-                "menuAction": "view|create|modify",
-                "requestType": "CIRCLE",
-                "children": []
-            },
-            {
-                "id": 25,
-                "title": "Process Status",
-                "icon": "Memory",
-                "route": "/process-status",
-                "hasChildren": false,
-                "componentPath": "process-status/ProcessStatusPage",
-                "screenDescription": "This is demo description",
-                "orderId": 4,
-                "menuAction": "view",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 5,
-                "title": "CGL Management",
-                "icon": "Casino",
-                "route": "/cgl-management",
-                "hasChildren": false,
-                "componentPath": "cgl/CGLMaster",
-                "screenDescription": "To edit or update active CGLs and to view pending cgl requests",
-                "orderId": 5,
-                "menuAction": "create|modify|delete|cancel|block|unblock",
-                "requestType": "CGL_CODE",
-                "children": []
-            },
-            {
-                "id": 14,
-                "title": "Calendar Configuration",
-                "icon": "EditCalendar",
-                "route": "/calendar-configuration",
-                "hasChildren": false,
-                "componentPath": "calendarConfig/CalendarConfig",
-                "screenDescription": "To manage financial calender configuration in application",
-                "orderId": 6,
-                "menuAction": "view|create|modify",
-                "requestType": "CALENDER",
-                "children": []
-            },
-            {
-                "id": 9,
-                "title": "Branch Management",
-                "icon": "AccountBalance",
-                "route": "/branch-management",
-                "hasChildren": false,
-                "componentPath": "branch/BranchMaster",
-                "screenDescription": "To edit update branches and to check pending branch update requests",
-                "orderId": 7,
-                "menuAction": "view|create|modify|block|unblock",
-                "requestType": "BRANCH",
-                "children": []
-            },
-            {
-                "id": 7,
-                "title": "Segment Management",
-                "icon": "Segment",
-                "route": "/segment-management",
-                "hasChildren": false,
-                "componentPath": "segment/SegmentMaster",
-                "screenDescription": "To manage segments in application",
-                "orderId": 8,
-                "menuAction": "view|create|modify",
-                "requestType": "SEGMENT_CODE",
-                "children": []
-            },
-            {
-                "id": 12,
-                "title": "User Management",
-                "icon": "People",
-                "route": "/user-management/create",
-                "hasChildren": true,
-                "componentPath": "user/pages/UserManagement",
-                "screenDescription": "For creating new user",
-                "orderId": 9,
-                "menuAction": "view|create|modify|delete",
-                "requestType": "USER_MANAGEMENT",
-                "children": [
-                    {
-                        "id": 12,
-                        "title": "User Creation",
-                        "icon": "People",
-                        "route": "/user-management/create",
-                        "componentPath": "user/pages/UserManagement",
-                        "screenDescription": "For creating new user",
-                        "orderId": 9
-                    },
-                    {
-                        "id": 24,
-                        "title": "User Requests Audit",
-                        "icon": "People",
-                        "route": "/user-management/user-audit",
-                        "componentPath": "user/pages/UserLogs",
-                        "screenDescription": "Shows user audit requests",
-                        "orderId": 14
-                    }
-                ]
-            },
-            {
-                "id": 16,
-                "title": "State Management",
-                "icon": "Domain",
-                "route": "/state-management",
-                "hasChildren": false,
-                "componentPath": "state/StateMaster",
-                "screenDescription": "To manage states in application",
-                "orderId": 10,
-                "menuAction": "view|create|modify",
-                "requestType": "STATE",
-                "children": []
-            },
-            {
-                "id": 18,
-                "title": "Currency Management",
-                "icon": "LocalAtm",
-                "route": "/currency-management",
-                "hasChildren": false,
-                "componentPath": "currency/CurrencyMaster",
-                "screenDescription": "To manage currency in application",
-                "orderId": 11,
-                "menuAction": "view|create|modify",
-                "requestType": "CURRENCY",
-                "children": []
-            },
-            {
-                "id": 20,
-                "title": "Currency Rate Change",
-                "icon": "PriceChange",
-                "route": "/currency-rate-change",
-                "hasChildren": false,
-                "componentPath": "currency/CurrencyRateChange",
-                "screenDescription": "To manage currency rate in application",
-                "orderId": 12,
-                "menuAction": "view|create|modify",
-                "requestType": "CURRENCY_RATE_CHANGE",
-                "children": []
-            },
-            {
-                "id": 22,
-                "title": "Role Management",
-                "icon": "Badge",
-                "route": "/role-management",
-                "hasChildren": false,
-                "componentPath": "role/RoleManagement",
-                "screenDescription": "To manage roles in application",
-                "orderId": 13,
-                "menuAction": "view|create|modify|cancel",
-                "requestType": "ROLE_MANAGEMENT",
-                "children": []
-            },
-            {
-                "id": 26,
-                "title": "GLIF Reports",
-                "icon": "Summarize",
-                "route": "/glif-Reports",
-                "hasChildren": false,
-                "componentPath": "glifReports/GlifReports",
-                "screenDescription": "This is demo description",
-                "orderId": 15,
-                "menuAction": "view|download",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 30,
-                "title": "Journal Posting",
-                "icon": "EditCalendar",
-                "route": "/journal-posting",
-                "hasChildren": false,
-                "componentPath": "journal/JournalPosting",
-                "screenDescription": "This is demo description",
-                "orderId": 16,
-                "menuAction": "view|create",
-                "requestType": "JOURNAL_AUTH",
-                "children": []
-            },
-            {
-                "id": 32,
-                "title": "Journal Posting Status",
-                "icon": "Ballot",
-                "route": "/journal-posting-status",
-                "hasChildren": false,
-                "componentPath": "journal/JournalPostingStatus",
-                "screenDescription": "to cansel there own Request",
-                "orderId": 17,
-                "menuAction": "view|cancel",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 34,
-                "title": "Transaction Enquiry",
-                "icon": "ReceiptLong",
-                "route": "/transaction-enquiry",
-                "hasChildren": false,
-                "componentPath": "transaction-enquiry/TransactionEnquiry",
-                "screenDescription": "This is demo description",
-                "orderId": 18,
-                "menuAction": "view",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 33,
-                "title": "Balance Enquiry",
-                "icon": "AccountBalance",
-                "route": "/balance-enquiry",
-                "hasChildren": false,
-                "componentPath": "balanceEnquiry/BalanceEnquiryScreen",
-                "screenDescription": "This provides closing balance for each day according to selected range.",
-                "orderId": 19,
-                "menuAction": "view",
-                "requestType": null,
-                "children": []
-            },
-            {
-                "id": 19,
-                "title": "Currency Requests",
-                "icon": "CreditScore",
-                "route": "/currency-requests",
-                "hasChildren": false,
-                "componentPath": "common/CommonRequestScreen",
-                "screenDescription": "To efficiently review and process the pending requests for currency master.",
-                "orderId": 20,
-                "menuAction": "view|approve|reject",
-                "requestType": "CURRENCY",
-                "children": []
-            },
-            {
-                "id": 36,
-                "title": "Journal Bulk Upload",
-                "icon": "FileUploadIcon ",
-                "route": "/journal-bulk-upload",
-                "hasChildren": false,
-                "componentPath": "journal/JournalBulkUpload",
-                "screenDescription": "To Upload the Bulk Journals",
-                "orderId": 21,
-                "menuAction": "view|upload",
-                "requestType": null,
-                "children": []
-            }
-        ]
-    },
-    "error": null,
-    "validCredentials": true,
-    "userStatus": "ACTIVE",
-    "passwordLoginStatus": "ACTIVE"
-}
