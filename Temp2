@@ -380,3 +380,184 @@ public class DashboardServiceImpl {
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.dashboard.repository;
+
+import com.tcs.dashboard.model.CommonReq;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+/**
+ * OPTIMIZED REPOSITORY
+ * Uses Native Queries and Projections to perform heavy aggregations at the Database level.
+ * This prevents loading thousands of Entity objects into Java Heap memory.
+ */
+@Repository
+public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long> {
+
+    // --- PROJECTION INTERFACE (Lightweight Data Carrier) ---
+    interface TypeCount {
+        String getType();   // e.g., "CGL_CODE"
+        String getStatus(); // e.g., "P"
+        Long getCount();    // e.g., 50
+    }
+
+    // ==================================================================================
+    // 1. STATS AGGREGATION (MAKER & EXECUTOR)
+    // ==================================================================================
+
+    /**
+     * MAKER VIEW: Counts requests created by this user, grouped by Type and Status.
+     * Efficiently replaces fetching findAllByCreatorId().
+     */
+    @Query(value = "SELECT REQ_TYPE as type, REQ_STATUS as status, COUNT(*) as count " +
+                   "FROM COMMON_REQ WHERE CREATOR_ID = :userId " +
+                   "GROUP BY REQ_TYPE, REQ_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsCrs(@Param("userId") String userId);
+
+    /**
+     * EXECUTOR VIEW: Counts pending requests for specific allowed types.
+     * Used to populate 'Pending For Me' details.
+     */
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count " +
+                   "FROM COMMON_REQ " +
+                   "WHERE REQ_STATUS = 'P' AND REQ_TYPE IN :types " +
+                   "GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getPendingCountsByTypes(@Param("types") List<String> types);
+
+    // ==================================================================================
+    // 2. INTELLIGENCE: BOTTLENECK & ANOMALY DETECTION
+    // ==================================================================================
+
+    /**
+     * BOTTLENECK DETECTION:
+     * Counts items pending for more than 48 hours (2 days) for specific types.
+     * Oracle Syntax: REQ_DATE < SYSDATE - 2
+     */
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ " +
+                   "WHERE REQ_STATUS = 'P' " +
+                   "AND REQ_TYPE IN :types " +
+                   "AND REQ_DATE < (SYSDATE - 2)", nativeQuery = true)
+    int countOverdueItems(@Param("types") List<String> types);
+
+    /**
+     * ANOMALY DETECTION:
+     * Counts how many items this user REJECTED in the last 1 HOUR.
+     * High volume indicates potential error or bulk script usage.
+     * Oracle Syntax: SYSDATE - (1/24) means current time minus 1 hour.
+     */
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ " +
+                   "WHERE EXECUTOR_ID = :userId " +
+                   "AND REQ_STATUS = 'R' " +
+                   "AND EXECUTION_DATE > (SYSDATE - (1/24))", nativeQuery = true)
+    int countRecentRejections(@Param("userId") String userId);
+
+    // ==================================================================================
+    // 3. INTELLIGENCE: BEHAVIORAL ANALYSIS (FOR SMART QUICK ACTIONS)
+    // ==================================================================================
+
+    /**
+     * FREQUENCY ANALYSIS (CRS):
+     * Finds which modules this user interacts with most (Creation).
+     */
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count " +
+                   "FROM COMMON_REQ WHERE CREATOR_ID = :userId " +
+                   "GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getUserCrsUsageFrequency(@Param("userId") String userId);
+
+    /**
+     * FREQUENCY ANALYSIS (JOURNAL):
+     * Checks if user frequently uploads journals.
+     */
+    @Query(value = "SELECT COUNT(*) FROM JOURNAL_REQUESTS WHERE CREATOR_ID = :userId", nativeQuery = true)
+    int getUserJournalUsageCount(@Param("userId") String userId);
+
+    /**
+     * FREQUENCY ANALYSIS (USER OPS):
+     * Checks if user frequently performs user management.
+     */
+    @Query(value = "SELECT COUNT(*) FROM USER_LOGS " +
+                   "WHERE USER_ID = :userId AND ACTION_TYPE LIKE 'USER_%'", nativeQuery = true)
+    int getUserMgmtUsageCount(@Param("userId") String userId);
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.dashboard.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.util.Map;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class StatsDto {
+    // --- TOP LEVEL CARDS (Aggregated) ---
+    private int totalPending;
+    private int totalApproved;
+    private int totalRejected;
+
+    // --- EXECUTOR VIEW DATA ---
+    private int pendingForMe;
+    // Map: "CGL_CODE" -> 5, "BRANCH" -> 2
+    private Map<String, Integer> pendingForMeDetails;
+
+    // --- MAKER VIEW DATA ---
+    private int myPending;
+    private Map<String, Integer> myPendingDetails;
+
+    private int myApproved;
+    private Map<String, Integer> myApprovedDetails;
+
+    private int myRejected;
+    private Map<String, Integer> myRejectedDetails;
+
+    // --- INTELLIGENT INSIGHTS (New) ---
+    // Trigger: If overduePendingCount > 5, Frontend turns card Orange/Red
+    private int overduePendingCount; 
+    private boolean isBottleneck;    
+
+    // Trigger: If anomalyDetected = true, Frontend shows Toast/Banner
+    private boolean anomalyDetected; 
+    private String anomalyMessage;
+
+    public void calculateTotals() {
+        this.totalPending = myPending; // Simplification: Total usually refers to "My" total in dashboard context
+        this.totalApproved = myApproved;
+        this.totalRejected = myRejected;
+    }
+}
+
+
+
+
