@@ -1,0 +1,2017 @@
+package com.tcs.userservice.aspect;
+
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.model.UserLogs;
+import com.tcs.userservice.repository.UserLogsRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.lang.annotation.AfterReturning;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.stereotype.Component;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.Map;
+import org.springframework.http.ResponseEntity;
+import com.tcs.userservice.ResponseVO;
+
+
+@Aspect
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class UserActivityLogger {
+
+    private final UserLogsRepository userLogsRepository;
+
+    // 1. Log User Creation/Modification Requests
+    @AfterReturning(
+            pointcut = "execution(* com.tcs.userservice.service.UserRequestService.createNewRequest(..)) && args(request, userId)",
+            returning = "result",
+            argNames = "joinPoint,request,userId,result")
+    public void logUserRequest(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
+        if (isSuccess(result)) {
+            String type = String.valueOf(request.get("requestType"));
+            saveLog(userId, "USER_REQUEST", type + " Request Raised", request.toString());
+        } else {
+            log.debug("Skipping audit log for failed/conflicted user request.");
+        }
+    }
+
+    // 2. Log Role Requests
+    @AfterReturning(
+            pointcut = "execution(* com.tcs.userservice.service.RoleRequestService.createNewRoleRequest(..)) && args(request, userId)",
+            returning = "result",
+            argNames = "joinPoint,request,userId,result")
+    public void logRoleRequest(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
+        if (isSuccess(result)) {
+            saveLog(userId, "ROLE_REQUEST", "Role Request Raised", request.toString());
+        }
+    }
+
+
+    // =================================================================
+    // 3. Log User Approval/Rejection
+    // =================================================================
+        @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.UserRequestService.acceptOrRejectUserRequest(..)) && args(dto, ip, userId)",
+            returning = "result", argNames = "joinPoint,dto,ip,userId,result")
+    public void logUserApproval(JoinPoint joinPoint, UserRequestDto dto, String ip, String userId, Object result) {
+        if (!isSuccess(result)) return;
+
+        String actionFlag = dto == null ? null : dto.getActionFlag();
+        String requestType = dto == null ? null : dto.getRequestType();
+        String targetUser = dto == null ? null : dto.getRequesterUserId();
+        String actionType = "USER_" + (actionFlag == null ? "" : actionFlag);
+
+        String description;
+        if ("REJECT".equalsIgnoreCase(actionFlag)) {
+            description = "Rejected " + (requestType == null ? "" : requestType) + " request for user";
+        } else {
+            String rt = requestType == null ? "" : requestType;
+            if ("LOCK".equalsIgnoreCase(rt)) description = "Locked User Account";
+            else if ("UNLOCK".equalsIgnoreCase(rt)) description = "Unlocked User Account";
+            else if ("DELETE".equalsIgnoreCase(rt)) description = "Deleted User Account";
+            else if ("CREATE".equalsIgnoreCase(rt)) description = "Approved User Creation";
+            else if ("MODIFY".equalsIgnoreCase(rt)) description = "Approved User Modification";
+            else description = "Processed User Request (" + (requestType == null ? "" : requestType) + ")";
+        }
+
+        // minimal single-line payload string (null-safe)
+        String newVal = "Target: " + (targetUser == null ? "unknown" : targetUser)
+                + " | IP: " + (ip == null ? "" : ip)
+                + (requestType == null ? "" : " | RequestType: " + requestType)
+                + ((dto != null && dto.getOldValue() != null && !dto.getOldValue().isEmpty())
+                ? " | OldValue: " + (dto.getOldValue().length() > 3900 ? dto.getOldValue().substring(0,3900) + "..." : dto.getOldValue())
+                : "");
+
+        saveLog(userId, actionType, description, newVal);
+    }
+
+    // =================================================================
+    // 4. Log Role Approval
+    // =================================================================
+    @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.RoleRequestService.acceptOrRejectRoleRequest(..)) && args(request, userId)",
+            returning = "result", argNames = "joinPoint,request,userId,result")
+    public void logRoleApproval(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
+        if (isSuccess(result)) {
+            String actionFlag = String.valueOf(request.get("action"));
+            String requestId = String.valueOf(request.get("requestId"));
+            String description = "APPROVE".equalsIgnoreCase(actionFlag)
+                    ? "Approved Role Request ID: " + requestId
+                    : "Rejected Role Request ID: " + requestId;
+            saveLog(userId, "ROLE_" + actionFlag, description, request.toString());
+        }
+    }
+
+
+    // =================================================================
+    // 5. Log User Request Cancellation
+    // =================================================================
+    @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.UserRequestService.cancelRequest(..)) && args(request)",
+            returning = "result", argNames = "joinPoint,request,result")
+    public void logUserCancel(JoinPoint joinPoint, Map<String, Object> request, Object result) {
+        if (isSuccess(result)) {
+            String userId = String.valueOf(request.get("userId"));
+            String requestId = String.valueOf(request.get("requestId"));
+            saveLog(userId, "USER_CANCEL", "Cancelled User Request", "Request ID: " + requestId);
+        }
+    }
+
+
+    // =================================================================
+    // 6. Log Role Request Cancellation
+    // =================================================================
+    @AfterReturning(pointcut = "execution(* com.tcs.userservice.service.RoleRequestService.cancelRoleRequest(..)) && args(request, userId)",
+            returning = "result", argNames = "joinPoint,request,userId,result")
+    public void logRoleCancel(JoinPoint joinPoint, Map<String, Object> request, String userId, Object result) {
+        if (isSuccess(result)) {
+            String requestId = String.valueOf(request.get("requestId"));
+            saveLog(userId, "ROLE_CANCEL", "Cancelled Role Request", "Request ID: " + requestId);
+        }
+    }
+
+    // Helper to Save to DB
+    private void saveLog(String userId, String actionType, String changeType, String newValue) {
+        try {
+            UserLogs logEntry = new UserLogs();
+            logEntry.setUserId(userId);
+            logEntry.setActionType(actionType); // Short code (e.g. USER_LOCK)
+            logEntry.setChangeType(changeType); // Human readable (e.g. Locked Account)
+            logEntry.setActionTime(Timestamp.from(Instant.now()));
+            if (newValue != null && newValue.length() > 3900) {
+                newValue = newValue.substring(0, 3900) + "...";
+            }
+            logEntry.setNewValue(newValue);
+            userLogsRepository.save(logEntry);
+            log.info("✅ Auto-Logged: {} -> {}", userId, changeType);
+        } catch (Exception e) {
+            log.error("Failed to save audit log: {}", e.getMessage());
+        }
+    }
+
+
+    // Helper Method to Determine Success
+    private boolean isSuccess(Object result) {
+        if (result instanceof ResponseEntity) {
+            ResponseEntity<?> response = (ResponseEntity<?>) result;
+            if (!response.getStatusCode().is2xxSuccessful()) return false;
+            Object body = response.getBody();
+            if (body instanceof ResponseVO) {
+                ResponseVO<?> vo = (ResponseVO<?>) body;
+                Object voResult = vo.getResult();
+                if (voResult instanceof Map) {
+                    Object statusObj = ((Map<?, ?>) voResult).get("status");
+                    if (statusObj instanceof Boolean) return (Boolean) statusObj;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+// updated 
+package com.tcs.userservice.dto;
+
+import lombok.Data;
+
+@Data
+public class PermissionList {
+
+	public int id;
+
+	public String title;
+
+	public String icon;
+
+	public int order;
+    public String description;
+    public  String menuSubmenu;
+}
+
+
+package com.tcs.userservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PermissionOrderListDto {
+
+	private int id;
+
+	private String title;
+
+	private String icon;
+
+	private String description;
+
+	private int order;
+
+    private String menuSubmenu;
+
+
+}
+
+
+
+
+package com.tcs.userservice.dto;
+import lombok.AllArgsConstructor; 
+import lombok.Builder; 
+import lombok.Data; 
+import lombok.NoArgsConstructor;
+
+@Data 
+@NoArgsConstructor 
+@AllArgsConstructor
+@Builder 
+public class PermissionDto { 
+	private Integer id; // MENU_ID 
+	private String title; // MENU_TITLE
+	private String icon; // MENU_ICON
+	private String description; // MENU_ORDER 
+	private int order;
+    private String menuSubmenu; // new addition - v1018405
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.ResponseVO;
+import com.tcs.userservice.dto.*;
+import com.tcs.userservice.model.*;
+import com.tcs.userservice.repository.PermissionsRepository;
+import com.tcs.userservice.repository.RolePermissionsRepository;
+import com.tcs.userservice.repository.RoleRepository;
+import com.tcs.userservice.repository.RoleRequestRepository;
+import com.tcs.userservice.utility.Constant;
+import com.tcs.userservice.utility.RequestUtility;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class RoleRequestServiceImpl implements RoleRequestService {
+
+    private static final String EVENT_SOURCE = "USER_SERVICE";
+    private static final String REQUEST_TYPE_KEY = "ROLE_MANAGEMENT";
+
+    private final String STATUS = Constant.STATUS;
+    private final String MESSAGE = Constant.MESSAGE;
+    @Autowired
+    private RoleRequestRepository roleRequestRepository;
+    @Autowired
+    private RoleRepository roleRepository;
+    @Autowired
+    private ObjectMapper objectMapper;
+    @Autowired
+    private RoleService roleService;
+    @Autowired
+    private PermissionsRepository permissionsRepository;
+    @Autowired
+    private RolePermissionsRepository rolePermissionsRepository;
+    @Autowired
+    private CacheManager cacheManager;
+    @Autowired
+    private PermissionConfigService permissionConfigService;
+    @Autowired
+    private NotificationWriterService notificationWriterService;
+
+    private static String getStatusText(String actionFlag, boolean success) {
+        String statusText;
+        if ("PENDING".equalsIgnoreCase(actionFlag)) {
+            statusText = success ? "PENDING" : "FAILED";
+        } else if (Constant.ACCEPT.equalsIgnoreCase(actionFlag)) {
+            statusText = success ? "APPROVED" : "FAILED";
+        } else if (Constant.REJECT.equalsIgnoreCase(actionFlag)) {
+            statusText = "REJECTED";
+        } else if (Constant.CANCEL.equalsIgnoreCase(actionFlag)) {
+            statusText = "CANCELLED";
+        } else {
+            statusText = "UNKNOWN";
+        }
+        return statusText;
+    }
+
+    /**
+     * Creates a new role request (CREATE / MODIFY / LOCK / UNLOCK / DELETE).
+     * <p>
+     * - Validates mandatory fields.
+     * <p>
+     * - Applies business rules (no duplicate pending requests, etc.).
+     * <p>
+     * - Persists a RoleRequest with PENDING status.
+     * <p>
+     * - Triggers a "PENDING" notification on success.
+     */
+    @SuppressWarnings("unchecked")
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<?>> createNewRoleRequest(final Map<String, Object> request, String userId) {
+        final ResponseVO<Object> responseVo = new ResponseVO<>();
+        final Map<String, Object> result = new HashMap<>();
+
+        // 1) Basic request validation (return early on invalid)
+        final String[] required = {"requestType", "requestPayload", "targetRoleId", "requestorUserId"};
+        if (RequestUtility.verifyRequest(request, required)) { // 'true' means invalid
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid request.");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(responseVo);
+        }
+
+        // 2) Map incoming request -> RoleRequest safely
+        final RoleRequest roleRequest;
+        try {
+            roleRequest = objectMapper.convertValue(request, RoleRequest.class);
+        } catch (IllegalArgumentException ex) {
+            log.error("Malformed role request payload", ex);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVo.setMessage("Malformed request payload.");
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(responseVo);
+        }
+
+        // 3) Canonicalize inputs for RoleRequest
+        roleRequest.setRequestStatus(Constant.PENDING);
+        roleRequest.setRequestDate(new Timestamp(System.currentTimeMillis()));
+        roleRequest.setRequestorUserId(userId);
+
+        final String requestFlag = String.valueOf(request.get("requestType"));
+        final boolean isCreate = Constant.CREATE.equalsIgnoreCase(requestFlag);
+        final int targetRoleId = roleRequest.getTargetRoleId();
+
+        // 4) Parse JSON requestPayload to extract roleName
+        final JsonNode payloadNode;
+        try {
+            payloadNode = objectMapper.readTree(String.valueOf(request.get("requestPayload")));
+        } catch (JsonProcessingException e) {
+            log.error("Error parsing requestPayload JSON", e);
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid requestPayload JSON");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(responseVo);
+        }
+
+        // Extract simple fields from payload
+        String roleName = payloadNode.get("roleName").asText();
+        log.info("Role request roleName: {}", roleName);
+
+        log.info("Role request: flag={}, targetRoleId={}, roleName={}, requestorUserId={}",
+                requestFlag, targetRoleId, roleName, userId);
+
+        // 5) Pre-fetch dependent data (avoid duplicate queries)
+        final Role existingRole = roleRepository.findRoleByRoleId(targetRoleId);
+        final long pendingById = isCreate ? 0L : roleRequestRepository.countPendingRoleRequests(targetRoleId);
+        final long pendingByName = isCreate && roleName != null
+                ? roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.toLowerCase())
+                : 0L;
+
+        // 6) Business rules (early exit on conflicts)
+        if (isCreate && existingRole != null) {
+            log.info("Create denied: role with id {} already exists", targetRoleId);
+            result.put(STATUS, false);
+            result.put(MESSAGE, "A role with this ID already exists.");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.CONFLICT.value()));
+            responseVo.setMessage(HttpStatus.CONFLICT.getReasonPhrase());
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(responseVo);
+        }
+
+        if (!isCreate && pendingById > 0) {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "There is already a pending request for this role.");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.CONFLICT.value()));
+            responseVo.setMessage(HttpStatus.CONFLICT.getReasonPhrase());
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(responseVo);
+        }
+
+        if (isCreate && pendingByName > 0) {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "There is already a role creation request pending for this role.");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.CONFLICT.value()));
+            responseVo.setMessage(HttpStatus.CONFLICT.getReasonPhrase());
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(responseVo);
+        }
+
+        // 7) Finalize and persist RoleRequest
+        if (isCreate) {
+            roleRequest.setTargetRoleId(roleRequestRepository.getNewRoleIdOnCreation());
+        }
+
+        roleRequestRepository.save(roleRequest);
+
+        result.put("roleRequest", roleRequest);
+        result.put(STATUS, true);
+        result.put(MESSAGE, "New request created.");
+        responseVo.setResult(result);
+        responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.CREATED.value()));
+        responseVo.setMessage(HttpStatus.CREATED.getReasonPhrase());
+
+        String cancelMessage = "New role : "+ roleRequest.getTargetRoleId() + " creation request is pending for approval";
+        // 8) Notification: new ROLE request is now PENDING (atomic with DB)
+        createRoleRequestNotification(
+                roleRequest,
+                "PENDING",                      // workflow stage
+                true,                           // success path
+                cancelMessage  // info message
+        );
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(responseVo);
+    }
+
+    /**
+     * Returns all pending role requests assigned to the given userId (approver).
+     * <p>
+     * - No notifications here
+     * <p>
+     * - This is a pure read operation.
+     */
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRoleRequests(String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        try {
+            List<UserRequestProjection> pendingRequests = roleRequestRepository.findPendingRoleRequests(userId);
+
+            if (pendingRequests.isEmpty()) {
+                result.put(MESSAGE, "No pending requests");
+            } else {
+                result.put(MESSAGE, String.format("%d pending requests found ", pendingRequests.size()));
+                result.put("pendingRequests", pendingRequests);
+                result.put("pendingRequestsCount", pendingRequests.size());
+            }
+
+            result.put(STATUS, true);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+            responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+
+        } catch (Exception e) {
+            log.error("Error fetching pending role requests for userId={}", userId, e);
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid User Id and parameters: " + e.getMessage());
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+        }
+        responseVo.setResult(result);
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Approves or rejects a role request.
+     *
+     * <p>- Delegates core business logic to {@link #performUpdateOperation}.</p>
+     * <p>- Sets approver info and timestamps.</p>
+     * <p>- Triggers notification for APPROVE/REJECT outcomes.</p>
+     *
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectRoleRequest(Map<String, Object> request,
+                                                                                     String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        String actionFlag = (String) request.get("actionFlag");
+        int requestId = Integer.parseInt((String) request.get("requestId"));
+        RoleRequest roleRequest = roleRequestRepository.findRoleRequestByRequestId(requestId);
+
+        roleRequest.setApproverUserId(userId);
+        roleRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        String requestFlag = roleRequest.getRequestType();
+
+        // Perform DB operations based on actionFlag + requestFlag
+        responseVo.setResult(performUpdateOperation(result, actionFlag, roleRequest, requestFlag));
+        responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+        responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+
+        // Notification (ACCEPT / REJECT) – based on result
+        boolean success = Boolean.TRUE.equals(result.get(STATUS));
+        String actionText = actionFlag.equalsIgnoreCase("ACCEPT") ? "approved." : "rejected.";
+        String infoMessage = "Your role creation/modification request has been "+ actionText ;
+
+        createRoleRequestNotification(
+                roleRequest,
+                actionFlag,   // ACCEPT / REJECT
+                success,
+                infoMessage
+        );
+
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Core business handler for ACCEPT / REJECT on RoleRequest.
+     * <p>
+     * - For ACCEPT: dispatches based on requestType (CREATE/MODIFY/LOCK/UNLOCK/DELETE).
+     * <p>
+     * - For REJECT: only marks the request as REJECTED.
+     * <p>
+     * - Populates the result map used for API response + notification.
+     */
+    private Map<String, Object> performUpdateOperation(Map<String, Object> result,
+                                                       String actionFlag,
+                                                       RoleRequest roleRequest,
+                                                       String requestFlag) {
+
+        if (actionFlag.equalsIgnoreCase(Constant.ACCEPT)) {
+            Role role = roleRepository.findRoleByRoleId(roleRequest.getTargetRoleId());
+            roleRequest.setRequestStatus(Constant.ACCEPTED);
+
+            // Flags for type of operation
+            boolean isCreate = requestFlag.equalsIgnoreCase(Constant.CREATE);
+            boolean isModify = requestFlag.equalsIgnoreCase(Constant.MODIFY);
+            boolean isLock = requestFlag.equalsIgnoreCase(Constant.LOCK);
+            boolean isUnlock = requestFlag.equalsIgnoreCase(Constant.UNLOCK);
+            boolean isDelete = requestFlag.equalsIgnoreCase(Constant.DELETE);
+
+            // Basic presence checks
+            if (role == null && !isCreate) {
+                result.put(STATUS, false);
+                result.put(MESSAGE, "Role not found");
+                return result;
+            }
+            if (role != null && isCreate) {
+                result.put(STATUS, false);
+                result.put(MESSAGE, "This Role already present");
+                return result;
+            }
+
+            // CREATE / MODIFY: upsert Role + permissions
+            if (isCreate || isModify) {
+                if (isCreate) {
+                    role = new Role();
+                }
+                try {
+                    Map<String, Object> roleMap = objectMapper.readValue(roleRequest.getRequestPayload(),
+                            new TypeReference<Map<String, Object>>() {
+                            });
+                    log.info("Role payload map: {}", roleMap);
+
+                    role.setRoleName(String.valueOf(roleMap.get("roleName")));
+                    role.setDescription(String.valueOf(roleMap.get("description")));
+                    role.setStatus(Constant.ACTIVE);
+                    Role newRole = roleRepository.save(role);
+                    log.info("Saved Role: {} with id={}", newRole, newRole.getRoleId());
+
+                    RoleRequestPayload roleRequestPayload = objectMapper.readValue(
+                            roleRequest.getRequestPayload(),
+                            RoleRequestPayload.class
+                    );
+
+                    if (savePermissions(roleRequestPayload, newRole.getRoleId())) {
+                        // Evict notification configs cache entries for affected menus
+                        List<PermissionList> selectedPermissions = roleRequestPayload.getPermissions();
+                        Set<Integer> incomingIds = selectedPermissions.stream()
+                                .map(PermissionList::getId)
+                                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+                        List<String> requestTypeKey = permissionsRepository.findMappedRequestTypeByMenuId(incomingIds);
+
+                        Cache cache = cacheManager.getCache("notification_configs");
+                        if (cache != null) {
+                            for (String key : requestTypeKey) {
+                                cache.evict(key);
+                                log.info("Cache evicted: cleared configuration for key {}", key);
+                            }
+                        }
+
+                        result.put(STATUS, true);
+                        result.put(MESSAGE, isCreate ? "New Role Created" : "Existing role Updated");
+                    } else {
+                        result.put(STATUS, false);
+                        result.put(MESSAGE, "Error while saving permissions for " + role.getRoleId() + ".");
+                    }
+                    roleRequestRepository.save(roleRequest);
+                } catch (JsonProcessingException e) {
+                    log.error("Error parsing roleRequest payload for create/modify", e);
+                    throw new RuntimeException(e);
+                }
+                return result;
+            }
+
+            // LOCK / UNLOCK: toggle Role status
+            if (isLock || isUnlock) {
+                role.setStatus(isUnlock ? Constant.ACTIVE : Constant.LOCKED);
+                roleRepository.save(role);
+
+                result.put(STATUS, true);
+                result.put(MESSAGE, isUnlock ? "USER UNLOCKED" : "USER LOCKED");
+                roleRequestRepository.save(roleRequest);
+                return result;
+            }
+
+            // DELETE: remove role
+            if (isDelete) {
+                try {
+                    roleRepository.delete(role);
+                    result.put(STATUS, true);
+                    result.put(MESSAGE, "User Deleted");
+                    roleRequestRepository.save(roleRequest);
+                } catch (Exception e) {
+                    log.error("Error deleting role", e);
+                    result.put(STATUS, false);
+                    result.put(MESSAGE, e.getMessage());
+                }
+                return result;
+            }
+
+            // Unknown requestFlag
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid Action Flag");
+            return result;
+
+        } else {
+            // REJECT flow: only update RoleRequest status
+            roleRequest.setRequestStatus(Constant.REJECTED);
+            roleRequestRepository.save(roleRequest);
+            result.put(STATUS, true);
+            result.put(MESSAGE, "User request rejected");
+            return result;
+        }
+    }
+
+    /**
+     * Saves permissions for a specific role, handling:
+     * <p>
+     * - inserts, updates and deletes in one pass
+     * <p>
+     * - prevents duplicates via composite key (roleId, permissionId)
+     */
+    private boolean savePermissions(RoleRequestPayload payload, int roleId) {
+        try {
+            List<PermissionList> selectedPermissions = payload.getPermissions() == null
+                    ? Collections.emptyList()
+                    : payload.getPermissions();
+
+            // Build set of incoming permissionIds (unique, ordered)
+            Set<Integer> incomingIds = selectedPermissions.stream()
+                    .map(PermissionList::getId)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+
+            // Fetch existing role-permission links
+            List<RolePermissions> existingList = rolePermissionsRepository.findByIdRoleId(roleId);
+
+            // Map existing by permissionId for quick lookup
+            Map<Integer, RolePermissions> existingMap = existingList.stream()
+                    .collect(Collectors.toMap(rp -> rp.getId().getPermissionId(), Function.identity()));
+
+            List<RolePermissions> toInsert = new ArrayList<>();
+            List<RolePermissions> toUpdate = new ArrayList<>();
+
+            // Process incoming payload (insert or update)
+            for (PermissionList p : selectedPermissions) {
+                int pid = p.getId();
+                RolePermissions existing = existingMap.get(pid);
+
+                if (existing == null) {
+                    // New mapping
+                    RolePermissionId newId = new RolePermissionId(roleId, pid);
+                    RolePermissions rp = new RolePermissions();
+                    rp.setId(newId);
+                    rp.setPermissionOrder(p.getOrder());
+                    toInsert.add(rp);
+                } else {
+                    // Update order if changed
+                    Integer existingOrder = existing.getPermissionOrder();
+                    Integer incomingOrder = p.getOrder();
+                    if (!Objects.equals(existingOrder, incomingOrder)) {
+                        existing.setPermissionOrder(incomingOrder);
+                        toUpdate.add(existing);
+                    }
+                    // Mark as processed
+                    existingMap.remove(pid);
+                }
+            }
+
+            // Persist inserts and updates
+            if (!toInsert.isEmpty()) {
+                rolePermissionsRepository.saveAll(toInsert);
+            }
+            if (!toUpdate.isEmpty()) {
+                rolePermissionsRepository.saveAll(toUpdate);
+            }
+
+            // Delete mappings that are no longer present in incoming payload
+            if (!existingMap.isEmpty()) {
+                List<RolePermissions> toDelete = new ArrayList<>(existingMap.values());
+                rolePermissionsRepository.deleteAll(toDelete);
+            }
+
+            rolePermissionsRepository.flush();
+
+            log.info("Inserted {}, updated {}, deleted {} for roleId {}",
+                    toInsert.size(), toUpdate.size(), existingMap.size(), roleId);
+
+            return true;
+        } catch (Exception e) {
+            log.error("Exception while saving permissions for roleId {}: {}", roleId, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * Returns all roles (optionally with permissions) based on request flag.
+     * <p>
+     * This is a read-only method, no notifications involved.
+     */
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getAllRoles(Map<String, Object> request) {
+
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        boolean includePermissions = Boolean.parseBoolean((String) request.get("permissions"));
+        List<RoleDto> roles = roleService.getAllRolesWithPermissions(includePermissions);
+
+        if (roles.isEmpty()) {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "No roles found.");
+        } else {
+            result.put(STATUS, true);
+            result.put(MESSAGE, String.format("%d pending roles found ", roles.size()));
+            result.put("roles", roles);
+        }
+
+        responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+        responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        responseVo.setResult(result);
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Cancels a pending role request raised by the same user (requestor).
+     * <p>
+     * - Validates that the caller is the owner of the request.
+     * <p>
+     * - Sets status to CANCEL.
+     * <p>
+     * - Triggers a "CANCELLED" notification on success.
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> cancelRoleRequest(Map<String, Object> request, String userId) {
+        ResponseVO<Map<String, Object>> responseVO = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        try {
+            int requestId = Integer.parseInt(request.get("requestId").toString());
+            RoleRequest roleRequest = roleRequestRepository.getRoleRequestByRequestId(requestId);
+
+            log.info("Requester ID {}", roleRequest.getRequestorUserId());
+            log.info("User ID : {}", userId);
+
+            if (userId == null || userId.isEmpty() || !userId.equals(roleRequest.getRequestorUserId())) {
+                result.put(STATUS, false);
+                result.put(MESSAGE, "You are unauthorized to cancel this request");
+                responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.UNAUTHORIZED.value()));
+                responseVO.setMessage(HttpStatus.UNAUTHORIZED.getReasonPhrase());
+            } else {
+                roleRequest.setRequestStatus(Constant.CANCEL);
+                roleRequestRepository.save(roleRequest);
+
+                result.put(STATUS, true);
+                result.put(MESSAGE, "Request cancelled");
+                responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+                responseVO.setMessage(HttpStatus.OK.getReasonPhrase());
+
+                String cancelMessage = "Your role : "+ roleRequest.getTargetRoleId() +"creation/modification request has been cancelled.";
+
+                // Notification only on successful cancel (atomic with DB)
+                createRoleRequestNotification(
+                        roleRequest,
+                        Constant.CANCEL,          // workflow action
+                        true,
+                        cancelMessage
+                );
+            }
+
+        } catch (Exception e) {
+            log.error("Error while cancelling role request", e);
+            result.put(STATUS, false);
+            result.put(MESSAGE, e.getMessage());
+            responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVO.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+        }
+        responseVO.setResult(result);
+        return new ResponseEntity<>(responseVO, responseVO.getStatusCode());
+    }
+
+    /**
+     * Returns pending role requests raised by the given userId (requestor).
+     * <p>
+     * No notifications, pure query.
+     */
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRoleRequests(String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        if (userId != null && !userId.isEmpty()) {
+            try {
+                List<UserRequestProjection> myRequests = roleRequestRepository.findMyPendingRoleRequests(userId);
+
+                if (myRequests.isEmpty()) {
+                    result.put(STATUS, false);
+                    result.put(MESSAGE, "You have raised 0 requests");
+                } else {
+                    result.put(STATUS, true);
+                    result.put(MESSAGE, String.format("You have raised %d  requests.", myRequests.size()));
+                    result.put("myRequests", myRequests);
+                    result.put("requestCount", myRequests.size());
+                }
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+                responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+                responseVo.setResult(result);
+            } catch (IllegalArgumentException e) {
+                log.error("Error fetching my role requests for userId={}", userId, e);
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+                responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+            }
+        } else {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid user id");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+            responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        }
+
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Returns master list of permissions (menus) as DTOs.
+     * <p>
+     * Pure read-only operation, no notifications.
+     */
+    @Override
+    public ResponseEntity<ResponseVO<List<PermissionDto>>> getAllPermissions() {
+        ResponseVO<List<PermissionDto>> responseVo = new ResponseVO<>();
+
+        List<Permissions> permissions = permissionsRepository.findAll();
+
+        if (permissions.isEmpty()) {
+            responseVo.setMessage(HttpStatus.NOT_FOUND.getReasonPhrase());
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.NOT_FOUND.value()));
+        } else {
+            List<PermissionDto> permissionDto = permissions.stream()
+                    .map(p -> PermissionDto.builder()
+                            .id(p.getMenuId())
+                            .title(p.getMenuTitle())
+                            .icon(p.getMenuIcon())
+                            .description(p.getMenuDescription())
+                            .menuSubmenu(p.getMenuSubmenu())
+                            .build())
+                    .toList();
+            responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+            responseVo.setResult(permissionDto);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+        }
+
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Saves the display order of permissions for a given role.
+     * <p>
+     * Note: this is a direct write, no notifications triggered from here.
+     */
+    @Override
+    public ResponseEntity<?> savePermissionOrder(PermissionOrderDto payload) {
+
+        try {
+            List<RolePermissions> newPermissions = payload.getPermissions().stream()
+                    .map(p -> {
+                        RolePermissions rp = new RolePermissions();
+                        RolePermissionId newId = new RolePermissionId(payload.getSelectedRole(), p.getId());
+                        rp.setId(newId);
+                        rp.setPermissionOrder(p.getOrder());
+                        return rp;
+                    })
+                    .collect(Collectors.toList());
+
+            if (newPermissions.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                        .body(Map.of("message", "No permissions provided"));
+            }
+
+            rolePermissionsRepository.saveAll(newPermissions);
+
+            return ResponseEntity.ok(
+                    Map.of("message", "Permissions saved successfully", "savedCount", newPermissions.size())
+            );
+
+        } catch (Exception e) {
+            log.error("Error saving permissions for roleId {}: {}", payload.getSelectedRole(), e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "Failed to save permissions", "error", e.getMessage()));
+        }
+
+    }
+
+    /**
+     * Creates a notification event for a role request lifecycle change.
+     * <p>
+     * - Uses PermissionConfigService to resolve target roles + URL by request type key.
+     * <p>
+     * - Throws RuntimeException on failure to force transaction rollback in caller.
+     */
+    private void createRoleRequestNotification(RoleRequest roleRequest,
+                                               String actionFlag,   // PENDING / ACCEPT / REJECT / CANCEL
+                                               boolean success,
+                                               String infoMessage) {
+        try {
+            // Build requestTypeKey for notification configuration (e.g. ROLE_CREATE)
+            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+
+            // Derive status label to show in message
+//            String statusText = getStatusText(actionFlag, success);
+
+            String referenceId = String.valueOf(roleRequest.getRequestId());
+
+
+            String userId = Objects.equals(roleRequest.getRequestType(), Constant.ACCEPT)
+                    || Objects.equals(roleRequest.getRequestType(), Constant.REJECT)
+                    || Objects.equals(actionFlag, Constant.CANCEL)
+                    ? roleRequest.getRequestorUserId()
+                    : roleRequest.getApproverUserId();
+
+            String targetRoles = Objects.equals(actionFlag, Constant.CANCEL) ? null : config.getTargetRoles();
+            notificationWriterService.createNotification(
+                    userId,                          // userId == null => group notification
+                    targetRoles,       // e.g. "51,55"
+                    infoMessage,
+                    config.getTargetUrl(),         // e.g. "/role-requests"
+                    referenceId,
+                    EVENT_SOURCE
+            );
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create notification for role request {}. Rolling back transaction.",
+                    roleRequest.getRequestId(), e);
+            throw new RuntimeException("Failed to create role request notification, rolling back.", e);
+        }
+    }
+
+    /**
+     * Maps a RoleRequest into a notification config key.
+     * <p>
+     * For example, a requestType "CREATE" becomes "ROLE_CREATE".
+     */
+    private String buildRoleRequestTypeKey(RoleRequest roleRequest) {
+        return "ROLE_" + roleRequest.getRequestType().toUpperCase();
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.ResponseVO;
+import com.tcs.userservice.dto.NotificationConfigDto;
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.model.AuditLog;
+import com.tcs.userservice.model.User;
+import com.tcs.userservice.model.UserRequest;
+import com.tcs.userservice.model.UserRole;
+import com.tcs.userservice.repository.UserRepository;
+import com.tcs.userservice.repository.UserRequestRepository;
+import com.tcs.userservice.repository.UserRoleRepository;
+import com.tcs.userservice.utility.Constant;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+@Slf4j
+@Service
+public class UserRequestServiceImpl implements UserRequestService {
+    private static final String EVENT_SOURCE = "USER_SERVICE";
+    private static final String REQUEST_TYPE_KEY = "USER_MANAGEMENT";
+    private final String STATUS = Constant.STATUS;
+    private final String MESSAGE = Constant.MESSAGE;
+    @Autowired
+    NotificationWriterService notificationWriterService;
+
+    @Autowired
+    PermissionConfigService permissionConfigService;
+    @Autowired
+    private UserRequestRepository userRequestRepository;
+    @Autowired
+    private ObjectMapper objectMapper;
+    @Autowired
+    private UserRepository userRepository;
+    @Autowired
+    private UserRoleRepository userRoleRepository;
+
+    private static String getStatusText(boolean success, String actionFlag) {
+        String statusText;
+        if (Constant.PENDING.equalsIgnoreCase(actionFlag)) {
+            statusText = success ? Constant.PENDING : Constant.FAILED;
+        } else if (actionFlag.equalsIgnoreCase(Constant.ACCEPT)) {
+            statusText = success ? Constant.APPROVED : Constant.FAILED;
+        } else if (actionFlag.equalsIgnoreCase(Constant.REJECT)) {
+            statusText = Constant.REJECTED;
+        } else {
+            statusText = Constant.UNKNOWN;
+        }
+        return statusText;
+    }
+
+    /**
+     * Updated : Shubhankar
+     * Fixed transaction and error handling logic
+     */
+    @Transactional
+    public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(Map<String, Object> request, String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        try {
+
+            String targetUserId = request.get("targetUserId").toString();
+            String requestType = request.get("requestType").toString();
+
+            // If conflict found, return immediately. Do NOT proceed to save logic.
+            if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
+                log.warn("There is already a pending request for this user : {}", targetUserId);
+                return buildErrorResponse(HttpStatus.CONFLICT, "There is already a pending request for this user");
+            }
+
+            // 2. Fetch current user state
+            User user = userRepository.findUserByUserId(targetUserId);
+            if (requestType.equalsIgnoreCase(Constant.CREATE) && user != null) {
+                log.warn("User : {} already exists", targetUserId);
+                return buildErrorResponse(HttpStatus.CONFLICT, "User already exists");
+            }
+            if (!requestType.equalsIgnoreCase(Constant.CREATE) && user == null) {
+                log.warn("User : {} already exists", targetUserId);
+                return buildErrorResponse(HttpStatus.NOT_FOUND, "User does not exist");
+            }
+
+            // 2. Execution
+            // All logic inside here participates in the Transaction
+            UserRequest userRequest = objectMapper.convertValue(request, UserRequest.class);
+            userRequest.setRequestDate(new Timestamp(System.currentTimeMillis()));
+            userRequest.setRequestorUserId(userId);
+            userRequest.setRequestStatus(Constant.PENDING);
+
+            // A. Save to DB
+            UserRequest savedRequest = userRequestRepository.save(userRequest);
+            log.info("Saved UserRequest with ID: {}", savedRequest.getRequestId());
+
+            // B. Creating Notification (Atomic: If this fails, the DB save rolls back)
+            UserRequestDto requestDto = new UserRequestDto();
+            requestDto.setRequestId(savedRequest.getRequestId());
+            requestDto.setRequesterUserId(savedRequest.getRequestorUserId());
+            requestDto.setRequestType(savedRequest.getRequestType());
+            requestDto.setActionFlag(Constant.PENDING); // Default for creation
+            requestDto.setRemarks("Creation Request");
+
+            createRequestNotification(requestDto, targetUserId, savedRequest, true,
+                    "New request created", Constant.PENDING);
+
+            // C. Construct Success Response
+            result.put("userRequest", savedRequest);
+            result.put(Constant.STATUS, true);
+            result.put(Constant.MESSAGE, "New request created");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.CREATED.value()));
+            responseVo.setMessage(HttpStatus.CREATED.getReasonPhrase());
+
+            return ResponseEntity.status(HttpStatus.CREATED).body(responseVo);
+
+        } catch (Exception e) {
+
+            log.error("Error in createNewRequest", e);
+            throw new RuntimeException("Failed to create request: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Helper to avoid repeating conflict response setup.
+     */
+    private ResponseEntity<ResponseVO<Map<String, Object>>> buildErrorResponse(HttpStatus status, String message) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+
+        Map<String, Object> result = new HashMap<>();
+        result.put(Constant.STATUS, false);
+        result.put(Constant.MESSAGE, message);
+        responseVo.setResult(result);
+        responseVo.setStatusCode(HttpStatusCode.valueOf(status.value()));
+        responseVo.setMessage(status.getReasonPhrase());
+
+        return ResponseEntity.status(status).body(responseVo);
+    }
+
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRequests(Map<String, Object> params, String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+//        String userId2 = (String) params.get("userId");
+        log.info("userId : {}", userId);
+        if (userId != null && !userId.isEmpty()) {
+            try {
+                List<UserRequest> pendingRequests = userRequestRepository.findUserPendingRequests(userId);
+
+                if (pendingRequests.isEmpty()) {
+
+                    result.put(STATUS, false);
+                    result.put(MESSAGE, "No pending requests");
+                } else {
+                    result.put(STATUS, true);
+                    result.put(MESSAGE, String.format("%d pending requests found for user", pendingRequests.size()));
+                    result.put("pendingRequests", pendingRequests);
+                }
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+                responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+                responseVo.setResult(result);
+            } catch (IllegalArgumentException e) {
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+                responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+            }
+        } else {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid user id");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+            responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        }
+
+        return new ResponseEntity(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Super method for handling all requests in SRP-style
+     *
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectUserRequest(UserRequestDto userRequestDto, String ipAddress, String userId) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+
+        String actionFlag = userRequestDto.getActionFlag();
+
+        long requestId = userRequestDto.getRequestId();
+        UserRequest userRequest = userRequestRepository.findUserRequestsByRequestId(requestId);
+
+        userRequest.setApproverUserId(userId);
+        userRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+
+        String requestFlag = userRequest.getRequestType();
+
+        if (actionFlag.equalsIgnoreCase(Constant.APPROVE)) {
+            handleAcceptFlow(userRequestDto, ipAddress, userRequest, requestFlag, result);
+        } else if (actionFlag.equalsIgnoreCase(Constant.REJECT)) {
+            handleRejectFlow(userRequestDto, userRequest, result);
+        } else {
+            result.put("status", false);
+            result.put("message", "Invalid action flag");
+        }
+
+        // Final request status only when ACCEPT and business success
+        if (actionFlag.equalsIgnoreCase(Constant.APPROVE) && Boolean.TRUE.equals(result.get("status"))) {
+            userRequest.setRequestStatus(Constant.ACCEPTED);
+            userRequestRepository.save(userRequest);
+        }
+
+        // ---------- Notification ----------
+        boolean success = Boolean.TRUE.equals(result.get("status"));
+        String infoMessage = (String) result.getOrDefault("message", "No message");
+
+        String message = "[" + getStatusText(success, userRequestDto.getActionFlag()) + "] " + userRequest.getRequestType() + " request for " + userRequest.getTargetUserId() + " - " + infoMessage;
+
+        notificationWriterService.createNotification(
+                userRequest.getRequestorUserId(),
+                null,
+                message, "/dashboard",
+                String.valueOf(userRequest.getRequestId()),
+                EVENT_SOURCE);
+
+        // ------------ notification ends -------------
+
+        responseVo.setResult(result);
+        responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+        responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    /**
+     * Handles the ACCEPT path: create/modify/lock/unlock/delete.
+     */
+    private void handleAcceptFlow(UserRequestDto userRequestDto, String ipAddress, UserRequest userRequest, String requestFlag, Map<String, Object> result) {
+
+        String approverUserId = userRequestDto.getApproverUserId();
+        long requestId = userRequestDto.getRequestId();
+
+        // Init audit log (only meaningful when change actually happens)
+        AuditLog newLog = new AuditLog();
+        newLog.setRequestId(requestId);
+        newLog.setUserId(approverUserId);
+        newLog.setOldValue(userRequestDto.getOldValue());
+        newLog.setChangeType(Constant.USER);
+        newLog.setActionType(Constant.USER + requestFlag + "ED");
+        newLog.setNewValue(userRequest.getRequestPayload());
+        newLog.setIpAddress(ipAddress);
+
+        User user = userRepository.findUserByUserId(userRequest.getTargetUserId());
+
+        if (user == null && !(requestFlag.equalsIgnoreCase(Constant.CREATE))) {
+            result.put("status", false);
+            result.put("message", "User not found");
+            return;
+        }
+
+        if (user != null && (requestFlag.equalsIgnoreCase(Constant.CREATE))) {
+            result.put("status", false);
+            result.put("message", "User already present");
+            return;
+        }
+
+        if (requestFlag.equalsIgnoreCase(Constant.MODIFY) || requestFlag.equals(Constant.CREATE)) {
+            handleCreateOrModifyUser(userRequest, requestFlag, user, result);
+        } else if (requestFlag.equalsIgnoreCase(Constant.LOCK) || requestFlag.equalsIgnoreCase(Constant.UNLOCK)) {
+            handleLockUnlockUser(requestFlag, user, result);
+        } else if (requestFlag.equalsIgnoreCase("D")) {
+            handleDeleteUser(user, result);
+        } else {
+            result.put("status", false);
+            result.put("message", "Invalid request flag");
+        }
+    }
+
+    /**
+     *
+     *
+     */
+    private void handleRejectFlow(UserRequestDto userRequestDto, UserRequest userRequest, Map<String, Object> result) {
+        userRequest.setRequestStatus(Constant.REJECTED);
+        userRequest.setReasonForRejection(userRequestDto.getRemarks());
+        userRequestRepository.save(userRequest);
+
+        result.put("status", true);
+        result.put("message", "User request rejected");
+    }
+
+    /**
+     * CREATE / MODIFY logic for User + UserRole.
+     */
+    private void handleCreateOrModifyUser(UserRequest userRequest, String requestFlag, User user, Map<String, Object> result) {
+        if (requestFlag.equals(Constant.CREATE)) {
+            user = new User();
+            user.setAccountStatus(Constant.ACTIVE);
+            user.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+            user.setIsDeleted('N');
+            user.setUserWrongPasswordCount(0);
+        }
+
+        try {
+            Map<String, Object> userMap = objectMapper.readValue(userRequest.getRequestPayload(), new TypeReference<Map<String, Object>>() {
+            });
+            log.info("test : {}", userMap);
+            log.info("userRequest : ", userRequest);
+
+            applyUserPayloadToEntity(user, userRequest, userMap);
+            userRepository.save(user);
+
+            UserRole userRole = userRoleRepository.getUserRolesByUserId(userRequest.getTargetUserId());
+            if (userRole == null) {
+                userRole = new UserRole();
+            }
+            userRole.setUserId(userMap.get("userId").toString());
+            userRole.setRoleId(Integer.parseInt(userMap.get("roleId").toString()));
+            userRoleRepository.save(userRole);
+
+            result.put("status", true);
+            result.put("message", requestFlag.equalsIgnoreCase(Constant.CREATE) ? "USER CREATED" : "USER UPDATED");
+
+        } catch (JsonProcessingException e) {
+            result.put("status", false);
+            result.put("message", e.getMessage());
+        }
+    }
+
+    /**
+     * LOCK / UNLOCK logic.
+     */
+    private void handleLockUnlockUser(String requestFlag, User user, Map<String, Object> result) {
+        user.setAccountStatus(requestFlag.equalsIgnoreCase(Constant.UNLOCK) ? Constant.ACTIVE : Constant.LOCKED);
+
+        userRepository.save(user);
+        result.put("status", true);
+        result.put("message", requestFlag.equalsIgnoreCase(Constant.UNLOCK) ? "USER UNLOCKED" : "USER LOCKED");
+    }
+
+    /**
+     * DELETE logic.
+     */
+    private void handleDeleteUser(User user, Map<String, Object> result) {
+        try {
+            userRepository.delete(user);
+            result.put("status", true);
+            result.put("message", "User deleted successfully");
+        } catch (Exception e) {
+            result.put("status", false);
+            result.put("message", "Failed to delete user");
+        }
+    }
+
+    /**
+     * Maps JSON payload -> User entity fields.
+     */
+    private void applyUserPayloadToEntity(User user, UserRequest userRequest, Map<String, Object> userMap) {
+        user.setUserId(userRequest.getTargetUserId());
+        user.setFirstName(Objects.toString(userMap.get("firstName"), null));
+        user.setMiddleName(Objects.toString(userMap.get("middleName"), null));
+        user.setLastName(Objects.toString(userMap.get("lastName"), null));
+        user.setEmail(userMap.get("email").toString());
+        user.setPhoneNumber(userMap.get("phoneNumber").toString());
+        // user.setBranch(Integer.parseInt(userMap.get("branch").toString()));
+        user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+    }
+
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getUserDetails(Map<String, String> params) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+
+        String userId = params.get("id");
+        Integer role = params.get("roleId") != null ? Integer.parseInt(params.get("roleId")) : null;
+
+        //Integer branch = params.get("branch")!=null?Integer.parseInt(params.get("branch")):null;
+        Map<String, Object> result = new HashMap<>();
+        log.info("userID:{}", userId);
+        log.info("Role :{}", role);
+
+
+        List<Map<String, Object>> users = userRepository.getUsers(userId, role);
+        if (users.isEmpty()) {
+            result.put("status", false);
+            result.put("message", "Users not found");
+        } else {
+            result.put("status", true);
+            result.put("message", String.format("%d users found ", users.size()));
+            result.put("users", users);
+        }
+        responseVo.setResult(result);
+        responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+        responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+
+
+    }
+
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRequests(Map<String, String> params) {
+        ResponseVO<Map<String, Object>> responseVo = new ResponseVO<>();
+        Map<String, Object> result = new HashMap<>();
+        String userId = params.get("userId");
+        if (userId != null && !userId.isEmpty()) {
+            try {
+                List<UserRequest> myRequests = userRequestRepository.findUserRequestsByRequestorUserId(userId);
+
+                if (myRequests.isEmpty()) {
+
+                    result.put(STATUS, false);
+                    result.put(MESSAGE, "You have raised 0 requests");
+                } else {
+                    result.put(STATUS, true);
+                    result.put(MESSAGE, String.format("You have raised %d  requests.", myRequests.size()));
+                    result.put("myRequests", myRequests);
+                    result.put("requestCount", myRequests.size());
+                }
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+                responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+                responseVo.setResult(result);
+            } catch (IllegalArgumentException e) {
+                responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+                responseVo.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+            }
+        } else {
+            result.put(STATUS, false);
+            result.put(MESSAGE, "Invalid user id");
+            responseVo.setResult(result);
+            responseVo.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+            responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
+        }
+
+        return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
+    }
+
+    @Override
+    public ResponseEntity cancelRequest(Map<String, Object> request) {
+        ResponseVO responseVO = new ResponseVO();
+        Map<String, Object> result = new HashMap<>();
+        try {
+            long requestId = Long.parseLong(request.get("requestId").toString());
+            String userId = (String) request.get("userId");
+            UserRequest userRequest = userRequestRepository.findUserRequestsByRequestId(requestId);
+
+            if (userRequest == null) {
+                result.put(STATUS, false);
+                result.put(MESSAGE, "Request not found");
+                responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+                responseVO.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+                responseVO.setResult(result);
+            } else if (userId == null || userId.isEmpty() || !userId.equals(userRequest.getRequestorUserId())) {
+                result.put(STATUS, false);
+                result.put(MESSAGE, "You are unauthorized to cancel this request");
+                responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.UNAUTHORIZED.value()));
+                responseVO.setMessage(HttpStatus.UNAUTHORIZED.getReasonPhrase());
+
+            } else {
+                userRequestRepository.delete(userRequest);
+                result.put(STATUS, true);
+                result.put(MESSAGE, "Request cancelled");
+                responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.OK.value()));
+                responseVO.setMessage(HttpStatus.OK.getReasonPhrase());
+            }
+
+        } catch (NullPointerException | NumberFormatException e) {
+
+            result.put(STATUS, false);
+            result.put(MESSAGE, e.getMessage());
+            responseVO.setStatusCode(HttpStatusCode.valueOf(HttpStatus.BAD_REQUEST.value()));
+            responseVO.setMessage(HttpStatus.BAD_REQUEST.getReasonPhrase());
+        }
+        responseVO.setResult(result);
+        return new ResponseEntity(responseVO, responseVO.getStatusCode());
+    }
+
+    /**
+     *
+     * Helper method – called from createNewRequest(), acceptOrRejectUserRequest()
+     * If this throws, the @Transactional on createNewRequest and acceptOrRejectUserRequest
+     * will roll back everything.
+     */
+    private void createRequestNotification(UserRequestDto dto, String targetId, UserRequest savedRequest, boolean success, String infoMessage, String actionFlag) {
+        try {
+            // 1. Fetch Config from CACHE/DB
+            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+
+            String statusText = getStatusText(success, actionFlag);
+
+            String message = "[" + statusText + "] " + dto.getRequestType() + " request for " + targetId + " - " + infoMessage;
+
+            String referenceId = String.valueOf(savedRequest.getRequestId());
+
+            notificationWriterService.createNotification(dto.getRequesterUserId(), // id to be excluded
+                    config.getTargetRoles(),    // e.g. "51,55"
+                    message, config.getTargetUrl(),      // e.g. "/user-requests"
+                    referenceId, EVENT_SOURCE);
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to create notification for request: {}. Rolling back transaction.", dto.getRequestId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back.", e);
+        }
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.tcs.userservice.model.Permissions;
+import com.tcs.userservice.repository.PermissionsRepository;
+import com.tcs.userservice.repository.RolePermissionsRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+
+/**
+ * PermissionCacheService :- RBAC CPU ENTRY
+ *
+ * While starting the user service, this Permission Cache Service fetches all available permissions for all the roles
+ * available in DB and map the permissions with roles, urls, contexts [MAPPED_REQUEST_TYPES] and store those in REDIS.
+ * Then every api  pases through common-utilities
+ *
+ * @author Shubhankar [v1018405]
+ * @version 1.0
+ * @since 2025-12-11
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionCacheService {
+
+    private final PermissionsRepository permissionRepository;
+    private final StringRedisTemplate redisTemplate;
+    private final RolePermissionsRepository rolePermissionsRepository;
+
+    /**
+     * Refreshes the Redis cache for a specific Role ID.
+     * Call this on Startup and whenever a Role is updated.
+     */
+    @Transactional(readOnly = true)
+    public void refreshRolePermissions(Long roleId) {
+        List<Permissions> perms = permissionRepository.findAllByRoleId(roleId);
+        String redisKey = "RBAC::PERMISSIONS::" + roleId;
+
+        redisTemplate.delete(redisKey);
+        Set<String> redisValues = new HashSet<>();
+
+        // =================================================================
+        // 1. GLOBAL / DEFAULT PERMISSIONS
+        // These are granted to ALL logged-in users, regardless of DB rows.
+        // =================================================================
+        // Notification Service (Stream + History + Unread Count)
+        redisValues.add("GET:/notifications/**|*");
+        redisValues.add("POST:/notifications/**|*"); // For "Mark as Read"
+
+        // Dashboard Common Widgets (If accessible to all)
+        redisValues.add("GET:/dashboard/**|*");
+
+        for (Permissions p : perms) {
+            String apiPattern = p.getApiResourcePattern(); // e.g. "/user/**" or "/cgl*"
+            String actionRaw = p.getMenuAction();
+            String action = (actionRaw != null) ? actionRaw.toLowerCase() : "";
+            String context = p.getMappedRequestType(); // e.g. "CGL_CODE" or "USER_MANAGEMENT"
+
+            String contextSuffix = (context == null || context.trim().isEmpty()) ? "*" : context;
+
+            // ==========================================================================================
+            // LOGIC BLOCK A: MAKER-CHECKER & GENERIC REQUESTS (CommonRequestService)
+            // ==========================================================================================
+            if (!contextSuffix.equals("*")) {
+
+                // DRY RUN: Role 51 (CGL Maker). Action="create|modify". Context="CGL_CODE".
+                // Controller: RequestController. Endpoint: POST /create-request, POST /update-request.
+                // VERDICT: GRANTED.
+                if (containsAny(action, "create", "modify", "delete", "cancel")) {
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix);
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/cancel-request|" + contextSuffix);
+                    redisValues.add("PATCH:/cancel-request|" + contextSuffix);
+                    // Endpoint: /my-requests (MyRequestFilterDto)
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                }
+
+                // DRY RUN: Role 52 (CGL Blocker). Action="block". Context="CGL_CODE".
+                // Controller: RequestController. Endpoint: POST /create-request (Blocking is a request).
+                // VERDICT: GRANTED.
+                if (containsAny(action, "block", "unblock")) {
+                    redisValues.add("POST:/create-request|" + contextSuffix);
+                    redisValues.add("POST:/update-request|" + contextSuffix);
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/my-requests|" + contextSuffix);
+                }
+
+                // DRY RUN: Role 55 (CGL Checker). Action="approve". Context="CGL_CODE".
+                // Controller: RequestController. Endpoint: PATCH /update-request (ProcessRequestDto).
+                // VERDICT: GRANTED.
+                if (containsAny(action, "approve", "reject")) {
+                    redisValues.add("PATCH:/update-request|" + contextSuffix);
+                    redisValues.add("POST:/pending-requests|" + contextSuffix);
+                }
+
+                // store different actions for specific context to differentiate
+                String opsKey = "RBAC::OPS::" + roleId + "::" + contextSuffix;
+                Set<String> allowedOps = new HashSet<>();
+
+                // Map DB Action Strings -> Enum ChangeTypes
+                if (action.contains("create")) allowedOps.add("ADD");
+                if (action.contains("modify")) allowedOps.add("UPDATE");
+                if (action.contains("delete")) allowedOps.add("DELETE");
+
+                // GRANULAR PERMISSIONS
+                if (action.contains("block")) allowedOps.add("BLOCK");
+                if (action.contains("unblock")) allowedOps.add("UNBLOCK");
+
+                if (!allowedOps.isEmpty()) {
+                    // Store allowed operations in Redis
+                    // Example Key: RBAC::OPS::52::CGL_CODE -> ["BLOCK", "UNBLOCK"]
+                    redisTemplate.opsForSet().add(opsKey, allowedOps.toArray(new String[0]));
+                    log.info("🔒 Cached OPS for Role {} Context {}: {}", roleId, contextSuffix, allowedOps);
+                }
+            }
+
+            // ==========================================================================================
+            // LOGIC BLOCK B: RESOURCE ENDPOINTS (User, Role, Reports, Masters, Notifications)
+            // ==========================================================================================
+            if (apiPattern != null && !apiPattern.isEmpty()) {
+
+                // Handle comma-separated patterns (e.g., Circle needs /circle-codes AND /zone-codes)
+                String[] patterns = apiPattern.split(",");
+
+                for (String effectiveUrl : patterns) {
+                    effectiveUrl = effectiveUrl.trim();
+
+                    // --- READ ACCESS ---
+                    // DRY RUN: Role 51 (Maker). Needs to see CGL list to edit.
+                    // Controller: CommonMasterController. Endpoint: GET /cgls.
+                    // VERDICT: GRANTED (Implicitly via 'create'/'modify' check).
+                    //
+                    // DRY RUN: Dashboard (All Users). Action="view". Pattern="/notifications/**".
+                    // Controller: NotificationController. Endpoint: GET /notifications.
+                    // VERDICT: GRANTED.
+                    if (containsAny(action, "view", "read", "create", "modify", "block", "unblock")) {
+                        // Grant access with Specific Context (if header sent)
+                        redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
+                        // DRY RUN: Transactions/Balance. These use POST to search/view.
+                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
+
+                        // Grant access with Wildcard Context (if header NOT sent - Standard behavior)
+                        redisValues.add("GET:" + effectiveUrl + "|*");
+                        redisValues.add("POST:" + effectiveUrl + "|*");
+                    }
+
+                    // --- WRITE ACCESS (Create) ---
+                    // DRY RUN: User Mgmt (ID 12). Action="create". Pattern="/user/**|USER-MANAGEMENT OR /user/**|* work both cases".
+                    // Controller: UserRequestController. Endpoint: POST /user/create-request.
+                    // VERDICT: GRANTED.
+                    String writeContext = "*"; // Standard APIs rarely send context headers
+
+                    if (action.contains("create")) {
+                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+                    }
+
+                    // --- WRITE ACCESS (Modify/Approve) ---
+                    // DRY RUN: Role Mgmt (ID 22). Action="modify". Pattern="/role/**".
+                    // Controller: RoleRequestController. Endpoint: PATCH /save-permission-order.
+                    // VERDICT: GRANTED.
+                    if (action.contains("modify") || action.contains("approve")) {
+                        redisValues.add("PUT:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("PUT:" + effectiveUrl + "|" + writeContext);
+
+                        redisValues.add("PATCH:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("PATCH:" + effectiveUrl + "|" + writeContext);
+
+                        // Some update APIs use POST (e.g. /user/accept-request)
+                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+                    }
+
+                    // --- WRITE ACCESS (Delete/Cancel) ---
+                    // DRY RUN: User Mgmt. Action="cancel". Pattern="/user/**".
+                    // Controller: UserRequestController. Endpoint: POST /user/cancel-request.
+                    // VERDICT: GRANTED.
+                    if (action.contains("delete") || action.contains("cancel")) {
+                        redisValues.add("DELETE:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("DELETE:" + effectiveUrl + "|" + writeContext);
+                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+                    }
+
+                    // --- WRITE ACCESS (Download/Upload) ---
+                    // DRY RUN: Reports (ID 26). Action="download". Pattern="/reports/**".
+                    // Controller: ReportController. Endpoint: POST /reports/download.
+                    // VERDICT: GRANTED.
+                    // DRY RUN: Journal Upload (ID 36). Action="Bulk Upload". Pattern="/journal-bulk-upload/**".
+                    // VERDICT: GRANTED.
+                    if (action.contains("download") || action.contains("upload")) {
+                        redisValues.add("GET:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("POST:" + effectiveUrl + "|" + contextSuffix);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+
+                        redisValues.add("GET:" + effectiveUrl + "|" + writeContext);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+                        redisValues.add("POST:" + effectiveUrl + "|" + writeContext);
+                    }
+                }
+            }
+        }
+
+        if (!redisValues.isEmpty()) {
+            redisTemplate.opsForSet().add(redisKey, redisValues.toArray(new String[0]));
+        }
+        log.info("✅ Cached {} permissions for Role {}", redisValues.size(), roleId);
+    }
+
+    /**
+     * Called when a PERMISSION definition changes (e.g. URL update).
+     * Finds all roles using this permission and refreshes them.
+     */
+    @Transactional(readOnly = true)
+    public void refreshRolesByPermissionId(Long permissionId) {
+        // Query DB: Find all Role IDs associated with this Permission ID
+        // You'll need to add this query to your Repository
+        List<Long> affectedRoleIds = rolePermissionsRepository.findRoleIdsByPermissionId(permissionId);
+
+        log.info("Permission {} changed. Refreshing {} affected roles.", permissionId, affectedRoleIds.size());
+
+        for (Long roleId : affectedRoleIds) {
+            refreshRolePermissions(roleId);
+        }
+    }
+
+    private boolean containsAny(String input, String... keywords) {
+        if (input == null) return false;
+        for (String keyword : keywords) {
+            if (input.contains(keyword)) return true;
+        }
+        return false;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.utility;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
+import java.util.Map;
+
+public class RequestUtility {
+
+    public static boolean verifyRequest(Map<String,Object>request,String[] keys){
+        for(String key:keys){
+            if(request.get(key)==null) return false;
+        }
+        return request==null;
+    }
+
+    public static String getClientIp(HttpServletRequest request) {
+        String ip = request.getHeader("X-Forwarded-For");
+
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.getHeader("Proxy-Client-IP");
+        }
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.getHeader("WL-Proxy-Client-IP");
+        }
+        if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
+            ip = request.getRemoteAddr(); // Standard Servlet method
+        }
+        // Handle cases where multiple IPs are in X-Forwarded-For (e.g. "client, proxy1, proxy2")
+        if (ip != null) {
+            if (ip.contains(",")) {
+                ip = ip.split(",")[0].trim();
+            }
+            // Handle IPv6 localhost
+            if ("0:0:0:0:0:0:0:1".equals(ip)) {
+                ip = "127.0.0.1";
+            }
+        }
+        return ip;
+    }
+}
+
+
+
+
+
+package com.tcs.userservice.controller;
+ 
+
+import com.fincore.commonutilities.jwt.JwtUtil; 
+import com.tcs.userservice.dto.PermissionOrderDto;
+import com.tcs.userservice.service.RoleRequestService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController()
+@RequestMapping("/role") //context path
+public class RoleRequestController {
+
+	private final RoleRequestService roleRequestService;
+    private final JwtUtil jwtUtil;
+
+	public RoleRequestController(RoleRequestService roleRequestService, JwtUtil jwtUtil) {
+		this.roleRequestService = roleRequestService;
+        this.jwtUtil = jwtUtil;
+	}
+
+	@GetMapping("/get-roles") //end point
+	public ResponseEntity getAllRoles(@RequestParam Map<String, Object> requestParams) {
+		return roleRequestService.getAllRoles(requestParams);
+	}
+
+	@PostMapping("/create-role-request")//end point
+	public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization")String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.createNewRoleRequest(request, userId);
+	}
+
+	@GetMapping("/pending-role-requests")//end point
+	public ResponseEntity getPendingRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getPendingRoleRequests(userId);
+	}
+
+	@PostMapping("/role-request-action")//end point
+	public ResponseEntity acceptRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.acceptOrRejectRoleRequest(request, userId);
+	}
+
+	@GetMapping("/my-role-requests")//end point
+	public ResponseEntity getMyRequests(@RequestHeader("Authorization") String token) {
+		String userId = jwtUtil.getUserIdFromToken(token);
+		return roleRequestService.getMyRoleRequests(userId);
+	}
+
+	@PostMapping("/cancel-role-request")//end point
+	public ResponseEntity cancelRoleRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+		return roleRequestService.cancelRoleRequest(request, jwtUtil.getUserIdFromToken(token));
+	}
+
+	@GetMapping("/get-all-permissions")//end point
+	public ResponseEntity getRoleWisePermissions() {
+		return roleRequestService.getAllPermissions();
+	}
+	
+	@PatchMapping("/save-permission-order")
+	public ResponseEntity savePermissionOrder(@RequestBody PermissionOrderDto payload) {
+		return roleRequestService.savePermissionOrder(payload);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.userservice.dto.UserLogsDto;
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.service.UserLogsService;
+import com.tcs.userservice.service.UserRequestService;
+import com.tcs.userservice.utility.RequestUtility;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.Map;
+import jakarta.servlet.http.HttpServletRequest;
+
+@Slf4j
+@RestController()
+@RequestMapping("/user")
+public class UserRequestController {
+
+    @Autowired
+    private UserRequestService userRequestService;
+
+    @Autowired
+    private UserLogsService userLogsService;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @PostMapping("/create-request")
+    public ResponseEntity createNewRequest(@RequestBody Map<String, Object> request, @RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return userRequestService.createNewRequest(request, userId);
+    }
+
+    @GetMapping("/pending-user-requests")
+    public ResponseEntity getPendingRequests(@RequestParam Map<String, Object> params,  @RequestHeader("Authorization") String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return userRequestService.getPendingRequests(params, userId);
+    }
+
+    @PostMapping("/accept-request")
+    public ResponseEntity acceptRequest(HttpServletRequest request, @RequestBody UserRequestDto userRequest, @RequestHeader("Authorization") String token) {
+        String clientIp = RequestUtility.getClientIp(request);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        userRequest.setApproverUserId(userId);
+        return userRequestService.acceptOrRejectUserRequest(userRequest, clientIp, userId);
+    }
+
+
+    @GetMapping("/user-details")
+    public ResponseEntity getUserDetails(@RequestParam Map<String, String> request) {
+        return userRequestService.getUserDetails(request);
+    }
+
+    @GetMapping("/my-requests")
+    public ResponseEntity getMyRequests(@RequestParam Map<String, String> params) {
+        return userRequestService.getMyRequests(params);
+    }
+
+    @PostMapping("/cancel-request")
+    public ResponseEntity cancelRequest(@RequestBody Map<String, Object> request) {
+        return userRequestService.cancelRequest(request);
+    }
+
+    @PostMapping("/logs-batch")
+    public ResponseEntity<List<UserLogsDto>> createLogsBatch(@RequestBody List<UserLogsDto> payload) {
+        List<UserLogsDto> savedLogs = (List<UserLogsDto>) userLogsService.saveLogs(payload);
+
+        // Returning the saved DTOs with the CREATED status
+        return new ResponseEntity<>(savedLogs, HttpStatus.CREATED);
+    }
+
+    // GET API to fetch all user logs
+    @GetMapping("/all-logs")
+    public ResponseEntity<List<UserLogsDto>> findAllLogs() {
+        List<UserLogsDto> logs = userLogsService.findAllLogs();
+        return ResponseEntity.ok(logs);
+    }
+
+    // GET API to fetch a user log by ID
+    @GetMapping("/{id}")
+    public ResponseEntity<UserLogsDto> findLogById(@PathVariable Integer id) {
+        UserLogsDto log = userLogsService.findLogById(id);
+        return ResponseEntity.ok(log);
+    }
+
+}
+
+
+
+
+
