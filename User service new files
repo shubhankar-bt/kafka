@@ -2015,3 +2015,170 @@ public class UserRequestController {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.dto.UserRequestProjection;
+import com.tcs.userservice.model.RoleRequest;
+import com.tcs.userservice.model.UserRequest;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import java.util.List;
+import java.util.Map;
+
+@Repository
+public interface RoleRequestRepository extends JpaRepository<RoleRequest, Integer> {
+
+	@Query(value = "select count(*) from role_requests where TARGET_ROLE_ID=:roleId and request_status='PENDING'", nativeQuery = true)
+	int countPendingRoleRequests(@RequestParam("roleId") int roleId);
+
+	@Query(value = """
+			SELECT
+			    COUNT(*)
+			FROM
+			    role_requests
+			WHERE
+				lower(JSON_VALUE(request_payload, '$.roleName')) =:roleName
+			    AND request_status = 'PENDING'
+					""", nativeQuery = true)
+	int countPendingRoleRequestsByRoleName(@RequestParam("roleName") String roleName);
+
+	@Query(value = """
+						SELECT
+			    request_id,
+			    request_type,
+			    requestor_user_id,
+			    target_role_id,
+			    dbms_lob.substr(REQUEST_PAYLOAD) AS requestPayload,
+			    request_status,
+			    request_date,
+			    approval_date,
+			    approver_user_id,
+			    reason_for_rejection,
+			    execution_date,
+			    execution_details
+			FROM
+			    role_requests
+			WHERE
+			        requestor_user_id !=:requestedByUserId
+			    AND request_status = 'PENDING'
+						""", nativeQuery = true)
+	List<UserRequestProjection> findPendingRoleRequests(@Param("requestedByUserId") String requestedByUserId);
+
+	@Query(value = """
+									SELECT
+			    request_id,
+			    request_type,
+			    requestor_user_id,
+			    target_role_id,
+			    dbms_lob.substr(request_payload) AS requestpayload,
+			    request_status,
+			    request_date,
+			    approval_date,
+			    approver_user_id,
+			    reason_for_rejection,
+			    execution_date,
+			    execution_details
+			FROM
+			    role_requests
+			WHERE
+			    requestor_user_id = :requestedByUserId
+			ORDER BY
+				request_id DESC
+															""", nativeQuery = true)
+	List<UserRequestProjection> findMyPendingRoleRequests(@Param("requestedByUserId") String requestedByUserId);
+
+	RoleRequest findRoleRequestByRequestId(int requestId);
+
+	RoleRequest getRoleRequestByRequestId(long requestId);
+
+	@Query(nativeQuery = true, value = "SELECT ROLE_ID_SEQUENCE.NEXTVAL FROM DUAL")
+	int getNewRoleIdOnCreation();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.dto.UserRequestDto;
+import com.tcs.userservice.model.UserRequest;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import java.util.List;
+
+@Repository
+public interface UserRequestRepository extends JpaRepository<UserRequest, Integer> {
+
+    @Query(value="select count(*) from user_requests where target_user_id=:targetUserId and request_status='PENDING'", nativeQuery=true)
+    int countUserPendingRequests(@RequestParam("targetUserId") String targetUserId);
+
+    @Query(value="select * from user_requests where REQUESTOR_USER_ID!=:requestedByUserId and request_status='PENDING'",nativeQuery = true)
+    List<UserRequest> findUserPendingRequests(@RequestParam("requestedByUserId") String requestedByUserId);
+
+    UserRequest findUserRequestsByRequestId(long requestId);
+
+    List<UserRequest> findUserRequestsByRequestorUserId(String userId);
+
+    @Query(nativeQuery = true,
+            value = """
+                    SELECT
+                        request_id,
+                        request_type AS action_flag,
+                        requestor_user_id,
+                        request_payload,
+                        request_type,
+                        approver_user_id
+                    FROM
+                        user_requests
+                    WHERE
+                        request_id = :requestId
+                    """
+    )
+    UserRequestDto getUserRequestDto(@Param("requestId") String requestId);
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
