@@ -3217,3 +3217,616 @@ public class VerifyUserDTO {
 
 
 
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.interfaces.RSAPublicKey;
+import java.util.Base64;
+
+/**
+ * Configuration class responsible for dynamically creating a {@link ReactiveJwtDecoder}
+ * based on the configured security mode (HMAC or RSA).
+ * <p>
+ * This configuration allows switching between HMAC-SHA256 (HS256) and
+ * RSA-SHA256 (RS256) token verification mechanisms solely by changing
+ * properties in the application configuration file.
+ * </p>
+ * <p>
+ * Supported modes and required properties:
+ * <ul>
+ *     <li>{@code mode=hmac}: Requires {@code security.jwt.hmac-base64-secret} (Base64 encoded secret bytes >= 256-bit).</li>
+ *     <li>{@code mode=rsa}: Requires {@code security.jwt.rsa-public} (PEM formatted public key).</li>
+ * </ul>
+ * </p>
+ */
+@Configuration
+public class JwtDecoderConfig {
+
+    /**
+     * The configured JWT mode (e.g., "hmac" or "rsa"). Defaults to "hmac".
+     */
+    @Value("${security.jwt.mode:hmac}")
+    private String mode;
+
+    /**
+     * The Base64 encoded secret used for HMAC verification. Required if mode is "hmac".
+     */
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacBase64Secret;
+
+    /**
+     * The PEM-encoded RSA public key used for RSA verification. Required if mode is "rsa".
+     */
+    @Value("${security.jwt.rsa-public:}")
+    private String rsaPublicPem;
+
+    /**
+     * Performs sanity checks on the configuration properties after injection is complete.
+     * Ensures that the necessary properties for the selected {@code mode} are present and valid,
+     * throwing an {@link IllegalStateException} if configuration is invalid.
+     */
+    @PostConstruct
+    void sanity() {
+        if ("hmac".equalsIgnoreCase(mode)) {
+            if (hmacBase64Secret == null || hmacBase64Secret.isBlank()) {
+                throw new IllegalStateException("HMAC mode selected but security.jwt.hmac-base64-secret is empty");
+            }
+        } else if ("rsa".equalsIgnoreCase(mode)) {
+            if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
+                throw new IllegalStateException("RSA mode selected but security.jwt.rsa-public is empty");
+            }
+        } else {
+            // Catches any mode that is neither 'hmac' nor 'rsa'
+            throw new IllegalStateException("Unsupported security.jwt.mode: " + mode + " (use 'hmac' or 'rsa')");
+        }
+    }
+
+    /**
+     * Configures and provides a {@link ReactiveJwtDecoder} bean based on the application's
+     * configured {@code security.jwt.mode}.
+     *
+     * @return A {@link NimbusReactiveJwtDecoder} configured with the appropriate verification key (HMAC secret or RSA public key).
+     */
+    @Bean
+    public ReactiveJwtDecoder jwtDecoder() {
+        if ("hmac".equalsIgnoreCase(mode)) {
+            // Decode base64 secret to raw bytes and create a SecretKey for HS256 verification
+            byte[] secretBytes = Base64.getDecoder().decode(hmacBase64Secret);
+            SecretKey key = new SecretKeySpec(secretBytes, "HmacSHA256");
+            return NimbusReactiveJwtDecoder.withSecretKey(key).build();
+        } else {
+            // Parse RSA public key from PEM format for RS256 verification
+            RSAPublicKey publicKey = KeyUtils.parseRsaPublicKey(rsaPublicPem);
+            return NimbusReactiveJwtDecoder.withPublicKey(publicKey).build();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import java.security.KeyFactory;
+import java.security.NoSuchAlgorithmException;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
+
+/**
+ * Utility class for handling cryptographic keys, specifically for parsing
+ * PEM-formatted RSA public keys into Java's {@link RSAPublicKey} object format.
+ */
+public class KeyUtils {
+
+    /**
+     * Parses a PEM (Privacy Enhanced Mail) formatted String containing an RSA public key
+     * into a standard {@link RSAPublicKey} object.
+     * <p>
+     * This method handles removing standard PEM headers/footers and whitespace before
+     * decoding the Base64 content and generating the key specification.
+     * </p>
+     *
+     * @param pem The PEM formatted public key string (e.g., including "-----BEGIN PUBLIC KEY-----" headers).
+     * @return The resulting {@link RSAPublicKey} object.
+     * @throws IllegalArgumentException if the provided PEM string is invalid, poorly formatted,
+     *                                  or does not represent a valid RSA public key.
+     */
+    public static RSAPublicKey parseRsaPublicKey(String pem) {
+        try {
+            // Remove PEM headers, footers, and all whitespace
+            String clean = pem
+                    .replace("-----BEGIN PUBLIC KEY-----", "")
+                    .replace("-----END PUBLIC KEY-----", "")
+                    .replaceAll("\\s", "");
+
+            // Decode the Base64 content into raw bytes
+            byte[] decoded = Base64.getDecoder().decode(clean);
+
+            // Define the key specification using X509 encoding (standard for public keys)
+            X509EncodedKeySpec spec = new X509EncodedKeySpec(decoded);
+
+            // Get an instance of the RSA KeyFactory and generate the public key
+            KeyFactory kf = KeyFactory.getInstance("RSA");
+            return (RSAPublicKey) kf.generatePublic(spec);
+
+        } catch (NoSuchAlgorithmException e) {
+            // RSA algorithm is expected to be present in standard JVMs
+            throw new IllegalStateException("RSA algorithm not available in the runtime environment", e);
+        } catch (InvalidKeySpecException e) {
+            // Thrown if the decoded bytes do not form a valid RSA public key structure
+            throw new IllegalArgumentException("Invalid RSA public key specification provided in PEM string", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+@Configuration
+public class RedisConfig {
+
+    /**
+     * Provides a StringRedisTemplate if the main application hasn't defined one.
+     * This is crucial for the RbacFilter to work out-of-the-box.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import com.fincore.gateway.Service.TokenSessionValidator;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.config.Customizer;
+// import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity; // Commented out in source
+import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
+import org.springframework.security.config.web.server.ServerHttpSecurity;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.web.server.SecurityWebFilterChain;
+import org.springframework.web.server.WebFilter;
+import org.springframework.web.server.WebFilterChain;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.Set;
+
+/**
+ * Security configuration class for the Spring WebFlux application.
+ * This class defines the security filter chain, handles authentication logic,
+ * and integrates a custom filter for validating tokens against a Redis session store.
+ * It uses Project Reactor for reactive programming.
+ */
+@Slf4j
+@Configuration
+// @EnableWebFluxSecurity // Annotation is commented out in the original file, so omitted here as well.
+public class SecurityConfig {
+
+    private final TokenSessionValidator tokenSessionValidator;
+
+    /**
+     * Set of endpoints that are explicitly excluded from full security checks (permit all access).
+     */
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/check-user",
+            "/auth/login1",
+            "/auth/logout",
+            "/actuator/info",
+            "/actuator/health",
+            "/auth/update-password");
+
+    /**
+     * Constructor for dependency injection of the {@link TokenSessionValidator}.
+     *
+     * @param tokenSessionValidator The service responsible for validating session tokens via Redis.
+     */
+    public SecurityConfig(TokenSessionValidator tokenSessionValidator) {
+        this.tokenSessionValidator = tokenSessionValidator;
+    }
+
+    /**
+     * Configures the main security web filter chain for the gateway application.
+     * Disables CSRF protection, configures authorization rules, enables OAuth2 resource server support
+     * with JWT decoding, and injects a custom Redis validation filter before standard authorization checks.
+     *
+     * @param http The ServerHttpSecurity instance to configure.
+     * @return The built {@link SecurityWebFilterChain}.
+     */
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        log.info("Loading SecurityWebFilterChain");
+        return http.csrf(ServerHttpSecurity.CsrfSpec::disable)
+                .authorizeExchange(exchanges -> exchanges
+                        .pathMatchers("/auth/**", "/actuator/**").permitAll() // Allow public access to auth and actuator endpoints
+                        .anyExchange().authenticated() // Require authentication for all other requests
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults())) // Configure OAuth2 JWT resource server
+                // Run the custom Redis filter before standard Spring Security authorization
+                .addFilterBefore(redisValidationFilter(), SecurityWebFiltersOrder.AUTHORIZATION).build();
+    }
+
+    /**
+     * Creates a custom {@link WebFilter} to validate the current user's session against Redis.
+     * This filter runs *after* the JWT has been decoded and the {@link Authentication} principal
+     * has been established by the standard Spring Security flow, but *before* method/resource
+     * authorization decisions are made.
+     *
+     * @return A {@link WebFilter} implementation for Redis session validation.
+     */
+    private WebFilter redisValidationFilter() {
+        return (ServerWebExchange exchange, WebFilterChain chain) -> {
+            String path = exchange.getRequest().getPath().value();
+            log.info("RedisValidationFilter invoked for path={}", path);
+
+            // Skip validation for paths that do not require an active session check
+            if (isWhitelisted(path)) {
+                return chain.filter(exchange);
+            }
+
+            // Retrieve the authenticated principal (if present) as an Authentication object
+            return exchange.getPrincipal().cast(Authentication.class)
+                    .flatMap(auth -> tokenSessionValidator.validateWithRedis(auth) // Validate the token/session in Redis
+                            .flatMap(validAuth -> {
+                                if (validAuth == null) {
+                                    log.warn("Redis validation failed for principal={}", auth.getName());
+                                    exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                                    return exchange.getResponse().setComplete(); // Stop processing if validation fails
+                                }
+                                log.info("Redis validated for {}", validAuth.getName());
+                                return chain.filter(exchange); // Continue the filter chain
+                            })
+                    )
+                    .switchIfEmpty(chain.filter(exchange)) // If there is no principal found, simply continue the chain (e.g. anonymous access might be handled later, though usually blocked by .anyExchange().authenticated())
+                    .onErrorResume(e -> {
+                        // Catch any exceptions during validation and return 401 Unauthorized
+                        log.error("RedisValidationFilter error: {}", e.getMessage(), e);
+                        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                        return exchange.getResponse().setComplete();
+                    });
+        };
+    }
+
+    /**
+     * Helper method to check if a given request path is in the exclusion list.
+     *
+     * @param path The request URI path.
+     * @return true if the path is whitelisted, false otherwise.
+     */
+    private boolean isWhitelisted(String path) {
+        // Checks explicit matches and path prefixes
+        return WHITELIST.contains(path) || path.startsWith("/auth/") || path.startsWith("/actuator/");
+    }
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.advice;
+
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+
+import com.fincore.gateway.dto.ApiResponse;
+
+/**
+ * This ControllerAdvice intercepts successful responses from
+ * any @RestController
+ * and wraps them in a standard ApiResponse format.
+ */
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // This advice applies to any method in a class annotated with @RestController
+        // that is not already returning a ResponseEntity (which gives manual control).
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+            Class<? extends HttpMessageConverter<?>> selectedConverterType,
+            ServerHttpRequest request, ServerHttpResponse response) {
+
+        // If the controller has already manually wrapped the response, do nothing.
+        if (body instanceof ApiResponse<?>) {
+            return body;
+        }
+
+        // Wrap the successful response body in the standard ApiResponse structure.
+        return ApiResponse.success(body);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.utility;
+
+public class Constants {
+
+    public static final String STATUS = "status";
+    public static final String MESSAGE = "message";
+    public static final String ACCEPTED = "ACCEPTED";
+    public static final String REJECTED = "REJECTED";
+    public static final String SUCCESS = "SUCCESS";
+    public static final String ERROR = "ERROR";
+    public static final String LOCK = "LOCK";
+    public static final String UNLOCK = "UNLOCK";
+    public static final String ACTIVE = "ACTIVE";
+    public static final String INACTIVE = "INACTIVE";
+    public static final String CREATE = "CREATE";
+    public static final String MODIFY = "MODIFY";
+    public static final String DELETE = "DELETE";
+    public static final String BLOCK = "BLOCK";
+    public static final String UNBLOCK = "UNBLOCK";
+    public static final String ACCEPT = "ACCEPT";
+    public static final String REJECT = "REJECT";
+    public static final String PENDING = "PENDING";
+    public static final String LOCKED = "LOCKED";
+    public static final String PASSWORD_BASED_LOGIN = "PASS";
+    public static final String SSO_BASED_LOGIN = "SSO";
+    public static final String INVALID = "INVALID";
+    public static final char PASSWORD = 'P';
+    public static final char SSO = 'S';
+    public static final String ACTIVE_USER = "Active User";
+    public static final String HMAC = "hmac";
+
+}
+
+
+
+
+
+
+package com.fincore.gateway.utility;
+
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+@Slf4j
+public class LoginUtility {
+
+    public static String getClientIp(ServerHttpRequest request)
+    {
+        String ip = request.getHeaders().getFirst("X-Forwarded-For");
+
+        if(ip ==null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip))
+        {
+            ip = String.valueOf(request.getRemoteAddress());
+
+        }
+        if(ip!=null){
+            if(ip.contains(",")){
+                ip = ip.split(",")[0].trim();
+            } else if (ip.startsWith("::ffff:")) {
+                ip = ip.substring(7);
+
+            }
+            else if (ip.startsWith("::1"))
+            {
+                ip = ip.substring(3);
+            }
+
+        }
+
+        return ip;
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+/**
+ * Api Gateway Application (Spring Cloud Gateway - WebFlux).
+ */
+@SpringBootApplication
+public class LoginService {
+    public static void main(String[] args) {
+        SpringApplication.run(LoginService.class, args);
+    }
+}
+
+
+
+
+
+
+
+spring:
+  application:
+    name: LoginService
+
+
+
+  profiles:
+    active: dev
+  main:
+    web-application-type: reactive
+
+#  cloud:
+  gateway:
+    routes:
+      - id: product-service
+        uri: http://product-service:8081
+        predicates:
+          - Path=/Product/**
+      - id: fincore-service
+        uri: http://fincore-service:8089
+        predicates:
+          - Path=/Fincore/**
+  kubernetes:
+    discovery:
+      enabled: false
+
+# ========== DB Details ==========
+  datasource:
+    url: jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+    username: fincore
+    password: Password#1234
+    driver-class-name: oracle.jdbc.OracleDriver
+
+server:
+  port: 8085
+
+# ========== JWT MODE ==========
+security:
+  jwt:
+    mode: hmac
+    hmac-base64-secret: UG5ldW1vbm91bHRyYW1pY3Jvc2NvcGljc2lsaWNvdm9sY2Fub2Nvbmlvc2lz
+    # for prod, if using RSA
+    rsa-public: ""
+#    Timeout in 15 Min (900 Sec)
+#    todo
+    ttl-seconds: 1800
+    #    ByPassing Spring-Security URL/ Allowed Without JWT Security
+    bypass-paths: /auth/login,/auth/logout,/auth/check-user
+
+
+# ========== Redis ==========
+redis:
+  enabled: true
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+      # password: ""  # if needed
+
+# ========== Actuator ==========
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+# ========== Logging ==========
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd :: HH:mm:ss.SSS ||} %highlight(%-5level:: %file: | %line |){ERROR=bold red, WARN=yellow, INFO=white, DEBUG=green, TRACE=green} :: %msg%n"
+
+
+
+
+
+
+
+
+
+
+
+security:
+  jwt:
+    mode: hmac
+    # example 32-byte (256-bit) base64-encoded secret
+    hmac-base64-secret: bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
+    # bypass-paths: /auth/login,/actuator/**
+
+spring:
+  data:
+    redis:
+#      host: redis
+#      use "localhost" when run locally
+      host: localhost
+      port: 6379
+      database: 0
+
+redis:
+  enabled: true
+
+
+
+
+
+
+
+
+
