@@ -41,6 +41,8 @@ import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.function.Function;
 
 @Component
@@ -51,6 +53,12 @@ public class JwtUtil {
     // Default value provided just in case, but we MUST OVERRIDE THIS in application.properties
     @Value("${jwt.secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
     private String secretKey;
+
+    @Value("${jwt.access-token-validity:900000}") // 15 minutes
+    private long accessTokenValidity;
+
+    @Value("${jwt.refresh-token-validity:86400000}") // 24 hours
+    private long refreshTokenValidity;
 
     /**
      * Extracts User ID from "Bearer <token>"
@@ -78,15 +86,39 @@ public class JwtUtil {
     /**
      * Validates the token signature and expiration.
      */
+    /**
+     * Validates signature and expiration.
+     * Throws specific exceptions for handling in Filter.
+     */
     public boolean isTokenValid(String token) {
-        try {
-            String cleanToken = removeBearerPrefix(token);
-            return !isTokenExpired(cleanToken);
-        } catch (JwtException | IllegalArgumentException e) {
-            log.error("Invalid JWT Token: {}", e.getMessage());
-            return false;
-        }
+        String cleanToken = removeBearerPrefix(token);
+        // This will throw ExpiredJwtException if expired
+        return !isTokenExpired(cleanToken);
     }
+
+    // --- Generation Methods (For Auth Service) ---
+
+    public String generateAccessToken(String userId, int roleId) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("role", roleId);
+        return buildToken(claims, userId, accessTokenValidity);
+    }
+
+    public String generateRefreshToken(String userId) {
+        // Refresh tokens typically just identify the user
+        return buildToken(new HashMap<>(), userId, refreshTokenValidity);
+    }
+
+    private String buildToken(Map<String, Object> claims, String subject, long validity) {
+        return Jwts.builder()
+                .claims(claims)
+                .subject(subject)
+                .issuedAt(new Date(System.currentTimeMillis()))
+                .expiration(new Date(System.currentTimeMillis() + validity))
+                .signWith(getSigningKey())
+                .compact();
+    }
+
 
     // --- Internal Helpers ---
 
@@ -133,9 +165,12 @@ public class JwtUtil {
 
 
 
+
 package com.fincore.commonutilities.security;
 
 import com.fincore.commonutilities.jwt.JwtUtil;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -185,35 +220,89 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             }
         }
 
-        // 2. VALIDATE TOKEN
+        // 2. VALIDATE TOKEN & CATCH EXPIRATION
         String token = request.getHeader("Authorization");
-        if (token == null || !jwtUtil.isTokenValid(token)) {
-            // Let Spring Security handle the 401 later if authentication is missing
-            filterChain.doFilter(request, response);
+
+        if (token != null) {
+
+            try {
+                // 2. VALIDATE TOKEN SIGNATURE & EXPIRY
+                String userId = jwtUtil.getUserIdFromToken(token);
+                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+                String roleId = String.valueOf(roleIdInt);
+
+//                // =================================================================
+//                // 3. SECURITY CHECK: SINGLE SESSION ENFORCEMENT (Redis)
+//                // =================================================================
+//                String sessionKey = "USER_SESSION::" + userId;
+//                String activeToken = redisTemplate.opsForValue().get(sessionKey);
+//
+//                if (activeToken == null) {
+//                    // Scenario: Token valid locally, but session expired/deleted in Redis
+//                    throw new JwtException("Session Expired or Terminated");
+//                }
+//
+//                if (!token.equals(activeToken)) {
+//                    // Scenario: Token valid locally, but Redis has a DIFFERENT token
+//                    // This means user logged in on another device.
+//                    log.warn("Concurrent Login Detected for User {}. Terminating old session.", userId);
+//                    response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+//                    response.setContentType("application/json");
+//                    response.getWriter().write("{\"status\": 401, \"error\": \"CONCURRENT_LOGIN\", \"message\": \"You have been logged out because you signed in on another device.\"}");
+//                    return; // STOP execution
+//                }
+                // =================================================================
+
+                // Token is valid, set context
+                if (SecurityContextHolder.getContext().getAuthentication() == null) {
+                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+                    );
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
+
+                // 3. RBAC LOGIC (Only runs if token is valid)
+                if (!checkRbac(request, response, roleId, userId)) {
+                    return; // Response already sent in checkRbac
+                }
+
+            } catch (ExpiredJwtException e) {
+                // --- CATCH EXPIRED TOKEN HERE ---
+                log.warn("JWT Expired for IP: {}", request.getRemoteAddr());
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                response.setContentType("application/json");
+                response.getWriter().write("{\"status\": 401, \"error\": \"TOKEN_EXPIRED\", \"message\": \"JWT has expired. Please refresh.\"}");
+                return;
+            } catch (JwtException | IllegalArgumentException e) {
+                log.error("Invalid Token/Session: {}", e.getMessage());
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid Session");
+                return;
+            }
+        } else {
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing Authorization Header");
             return;
         }
 
-        // 3. SET SECURITY CONTEXT
-        String userId = jwtUtil.getUserIdFromToken(token);
-        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-        String roleId = String.valueOf(roleIdInt);
+        filterChain.doFilter(request, response);
+    }
 
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
 
-        // 4. DETERMINE CONTEXT (Header)
+    /**
+     * Helper method to keep the main filter clean.
+     * Returns true if authorized, false if denied (and response written).
+     */
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
+
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+
+        // DETERMINE CONTEXT (Header)
         String contextHeader = request.getHeader("X-Request-Type");
         // Normalize: If header is missing, treat as "*" (Global Context)
         String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
 
-        // 5. REDIS AUTHORIZATION CHECK
+        // REDIS AUTHORIZATION CHECK
         String redisKey = "RBAC::PERMISSIONS::" + roleId;
-        // Optimization: In high load, use isMember instead of fetching all,
-        // but since we have wildcards, fetching members is necessary.
         Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
 
         boolean isAuthorized = false;
@@ -246,17 +335,23 @@ public class ContextRbacFilter extends OncePerRequestFilter {
                     isAuthorized = true;
                     break;
                 }
+
             }
         }
 
-        if (isAuthorized) {
-            filterChain.doFilter(request, response);
-        } else {
-            log.warn("⛔ RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
+
+        if (!isAuthorized) {
+            log.warn("? RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
             response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied: Insufficient Permissions");
+            return false;
         }
+        return true;
     }
 }
+
+
+
+
 
 
 
