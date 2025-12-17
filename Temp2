@@ -1,15 +1,280 @@
-QL Error: 1400, SQLState: 23000
-2025-12-17 :: 12:51:45.181 || ERROR:: SqlExceptionHelper.java: | 150 | ::  ORA-01400: cannot insert NULL into ("FINCORE"."USERS"."UPDATED_AT")
+package com.tcs.userservice.service;
 
-2025-12-17 :: 12:51:45.197 || ERROR:: UserActivityLogger.java: | 154 | ::  Failed to save audit log: could not execute statement [ORA-01400: cannot insert NULL into ("FINCORE"."USERS"."UPDATED_AT")
-] [insert into users (account_status,branch,created_at,deleted_at,email,first_name,is_deleted,last_login_at,last_name,middle_name,password_hash,phone_number,temp_password_set_at,updated_at,user_wrong_password_count,user_id) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]; SQL [insert into users (account_status,branch,created_at,deleted_at,email,first_name,is_deleted,last_login_at,last_name,middle_name,password_hash,phone_number,temp_password_set_at,updated_at,user_wrong_password_count,user_id) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]; constraint [null]
-2025-12-17 :: 12:51:45.222 || ERROR:: DirectJDKLog.java: | 175 | ::  Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.springframework.transaction.UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only] with root cause
-org.springframework.transaction.UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only
-	at org.springframework.transaction.support.AbstractPlatformTransactionManager.processCommit(AbstractPlatformTransactionManager.java:804)
-	at org.springframework.transaction.support.AbstractPlatformTransactionManager.commit(AbstractPlatformTransactionManager.java:758)
-	at org.springframework.transaction.interceptor.TransactionAspectSupport.commitTransactionAfterReturning(TransactionAspectSupport.java:676)
-	at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:426)
-	at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:119)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.ResponseVO;
+import com.tcs.userservice.dto.*;
+import com.tcs.userservice.model.*;
+import com.tcs.userservice.repository.*;
+import com.tcs.userservice.utility.ClobUtil;
+import com.tcs.userservice.utility.Constant;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class UserRequestServiceImpl implements UserRequestService {
+
+    private static final String EVENT_SOURCE = "USER_SERVICE";
+    private static final String REQUEST_TYPE_KEY = "USER_MANAGEMENT";
+
+    private final UserRequestRepository userRequestRepository;
+    private final UserRepository userRepository;
+    private final UserRoleRepository userRoleRepository;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequestCreateDto dto, String userId) {
+        String targetUserId = dto.getTargetUserId();
+        String requestType = dto.getRequestType();
+
+        // 1. Conflict Checks
+        if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
+             return buildError(HttpStatus.CONFLICT, "Pending request already exists");
+        }
+        User existingUser = userRepository.findUserByUserId(targetUserId);
+        if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
+             return buildError(HttpStatus.CONFLICT, "User already exists");
+        }
+        if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
+             return buildError(HttpStatus.NOT_FOUND, "User does not exist");
+        }
+
+        // 2. Create Entity
+        UserRequest request = new UserRequest();
+        request.setRequestType(requestType);
+        request.setTargetUserId(targetUserId);
+        request.setRequestorUserId(userId);
+        request.setRequestStatus(Constant.PENDING);
+        request.setRequestDate(new Timestamp(System.currentTimeMillis()));
+
+        // 3. Handle Payload (String vs Map support)
+        try {
+            String jsonPayload;
+            if (dto.getRequestPayload() instanceof String) {
+                jsonPayload = (String) dto.getRequestPayload();
+                // Validate JSON format
+                objectMapper.readTree(jsonPayload); 
+            } else {
+                jsonPayload = objectMapper.writeValueAsString(dto.getRequestPayload());
+            }
+            request.setRequestPayload(jsonPayload);
+        } catch (Exception e) {
+            throw new RuntimeException("Invalid Payload", e);
+        }
+
+        // 4. Save & Notify
+        UserRequest saved = userRequestRepository.save(request);
+        createNotification(saved.getRequestorUserId(), null, "User Request Created", String.valueOf(saved.getRequestId()));
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+            .body(ResponseVO.<Map<String, Object>>builder()
+                    .statusCode(HttpStatus.CREATED)
+                    .message("Request Created")
+                    .result(Map.of("userRequest", saved))
+                    .build());
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRequests(Map<String, Object> params, String userId) {
+        List<UserRequestProjection> rawList = userRequestRepository.findUserPendingRequests(userId);
+        return processProjections(rawList, "pendingRequests");
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRequests(Map<String, String> params) {
+        String userId = params.get("userId");
+        List<UserRequestProjection> rawList = userRequestRepository.findUserRequestsByRequestorUserId(userId);
+        return processProjections(rawList, "myRequests");
+    }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> processProjections(List<UserRequestProjection> rawList, String key) {
+        List<Map<String, Object>> processed = rawList.stream().map(req -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("requestId", req.getRequestId());
+            map.put("requestType", req.getRequestType());
+            map.put("targetUserId", req.getTargetUserId());
+            map.put("requestStatus", req.getRequestStatus());
+            map.put("requestDate", req.getRequestDate());
+            map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
+            return map;
+        }).collect(Collectors.toList());
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(Map.of(key, processed))
+                .build());
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectUserRequest(UserRequestDto dto, String ipAddress, String userId) {
+        UserRequest request = userRequestRepository.findUserRequestsByRequestId(dto.getRequestId());
+        request.setApproverUserId(userId);
+        request.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        
+        Map<String, Object> result = new HashMap<>();
+        String action = dto.getActionFlag();
+
+        if (Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action)) { 
+            handleAccept(request, result, dto, ipAddress);
+        } else {
+            request.setRequestStatus(Constant.REJECTED);
+            request.setReasonForRejection(dto.getRemarks());
+            userRequestRepository.save(request);
+            result.put("status", true);
+            result.put("message", "Rejected");
+        }
+
+        boolean success = (boolean) result.get("status");
+        if(success && (Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action))) {
+            request.setRequestStatus(Constant.ACCEPTED);
+            userRequestRepository.save(request);
+        }
+
+        createNotification(request.getRequestorUserId(), null, 
+            "Request " + (success ? "Processed" : "Failed"), String.valueOf(request.getRequestId()));
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(result)
+                .build());
+    }
+
+    private void handleAccept(UserRequest request, Map<String, Object> result, UserRequestDto dto, String ip) {
+        try {
+            String jsonPayload = ClobUtil.clobToString(request.getRequestPayload());
+            Map<String, Object> payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<>() {});
+            
+            User user = userRepository.findUserByUserId(request.getTargetUserId());
+            String type = request.getRequestType();
+
+            // 1. Initialize for CREATE
+            if (Constant.CREATE.equalsIgnoreCase(type)) {
+                if (user != null) throw new RuntimeException("User already exists");
+                user = new User();
+                user.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+                user.setAccountStatus(Constant.ACTIVE);
+                user.setIsDeleted("N");
+                user.setUserWrongPasswordCount(0);
+            } else if (user == null) {
+                throw new RuntimeException("User not found");
+            }
+
+            // 2. Map Fields (Create/Modify)
+            if (Constant.CREATE.equalsIgnoreCase(type) || Constant.MODIFY.equalsIgnoreCase(type)) {
+                user.setUserId(request.getTargetUserId());
+                
+                // Map all common fields safely
+                if (payloadMap.containsKey("firstName")) user.setFirstName((String) payloadMap.get("firstName"));
+                if (payloadMap.containsKey("middleName")) user.setMiddleName((String) payloadMap.get("middleName"));
+                if (payloadMap.containsKey("lastName")) user.setLastName((String) payloadMap.get("lastName"));
+                if (payloadMap.containsKey("email")) user.setEmail((String) payloadMap.get("email"));
+                if (payloadMap.containsKey("mobileNumber")) user.setPhoneNumber((String) payloadMap.get("mobileNumber"));
+                
+                // CRITICAL FIX: Ensure Branch is set (NOT NULL in DB)
+                if (payloadMap.containsKey("branch")) {
+                    Object branchObj = payloadMap.get("branch");
+                    if (branchObj != null) {
+                        user.setBranch(Integer.parseInt(String.valueOf(branchObj)));
+                    }
+                }
+                
+                // CRITICAL FIX: Set UPDATED_AT to prevent ORA-01400
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+                
+                userRepository.save(user);
+                
+                // Update User Role linkage
+                if(payloadMap.containsKey("roleId")) {
+                    UserRole ur = userRoleRepository.getUserRolesByUserId(user.getUserId());
+                    if(ur == null) ur = new UserRole();
+                    ur.setUserId(user.getUserId());
+                    ur.setRoleId(Integer.parseInt(String.valueOf(payloadMap.get("roleId"))));
+                    userRoleRepository.save(ur);
+                }
+
+            } else if (Constant.LOCK.equalsIgnoreCase(type)) {
+                user.setAccountStatus(Constant.LOCKED);
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Lock
+                userRepository.save(user);
+            } else if (Constant.UNLOCK.equalsIgnoreCase(type)) {
+                user.setAccountStatus(Constant.ACTIVE);
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Unlock
+                userRepository.save(user);
+            }
+
+            result.put("status", true);
+            result.put("message", "User Updated Successfully");
+
+        } catch (Exception e) {
+            log.error("Error applying user changes", e);
+            result.put("status", false);
+            result.put("message", "Failed to apply changes: " + e.getMessage());
+            // Rethrow to trigger rollback
+            throw new RuntimeException("Transaction Failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity cancelRequest(Map<String, Object> requestMap) {
+        long id = Long.parseLong(String.valueOf(requestMap.get("requestId")));
+        UserRequest req = userRequestRepository.findUserRequestsByRequestId(id);
+        
+        userRequestRepository.delete(req);
+        
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .message("Cancelled")
+                .result(Map.of("status", true))
+                .build());
+    }
+
+    private void createNotification(String userId, String roles, String msg, String refId) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+            notificationWriterService.createNotification(userId, roles, msg, config.getTargetUrl(), refId, EVENT_SOURCE);
+        } catch (Exception e) {
+            log.error("Notification failed", e);
+            // We swallow notification error to allow transaction to complete, 
+            // unless strict consistency is required
+        }
+    }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> buildError(HttpStatus status, String msg) {
+        return ResponseEntity.status(status).body(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(status)
+                .message(msg)
+                .result(Map.of("status", false, "message", msg))
+                .build());
+    }
+
+    @Override
+    public ResponseEntity getUserDetails(Map<String, String> request) {
+        String userId = request.get("userId");
+        User user = userRepository.findUserByUserId(userId);
+        if(user == null) {
+            return buildError(HttpStatus.NOT_FOUND, "User not found");
+        }
+        return ResponseEntity.ok(ResponseVO.builder()
+                .statusCode(HttpStatus.OK)
+                .result(user)
+                .build());
+    }
+}
+
+
