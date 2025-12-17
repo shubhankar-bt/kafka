@@ -2214,3 +2214,888 @@ data :
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------------------------
+
+
+package com.fincore.DashboardService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDate;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class FinancialYearDto {
+    private LocalDate startDate;
+    private LocalDate endDate;
+    private String description; // e.g. "FY 2024-2025"
+    private String status;      // e.g. "Active"
+}
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.repository;
+
+import com.fincore.DashboardService.model.CalenderConfigModel;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+
+@Repository
+public interface CalenderConfigRepository extends JpaRepository<CalenderConfigModel, Long> {
+    
+    // Fetches the latest entry (effectively the singleton config)
+    Optional<CalenderConfigModel> findFirstByOrderByIdDesc();
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class DashboardResponse {
+
+    // Values: "MAKER", "EXECUTOR", "HYBRID", "VIEWER"
+    private String viewType;
+
+    private StatsDto stats;
+
+    private FrequencyStatsDto frequencyStats;
+
+    private List<QuickActionDto> quickActions;
+
+    private List<AnnouncementDto> announcements;
+    
+    // NEW: Populated from CALENDER_CONFIG table
+    private FinancialYearDto financialYear;
+
+    private List<ActivityLogDto> recentActivity;
+    
+    // Notifications field from previous context
+    private List<NotificationDto> notifications;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.service;
+
+import com.fincore.DashboardService.dto.*;
+import com.fincore.DashboardService.model.*;
+import com.fincore.DashboardService.repository.*;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import com.fincore.DashboardService.repository.DashboardStatsRepository.TypeCount;
+import com.fincore.DashboardService.repository.DashboardStatsRepository.DailyStats;
+
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DashboardServiceImpl implements DashboardService {
+
+    private final PermissionRepository permissionRepo;
+    private final AnnouncementRepository announcementRepo;
+    private final NotificationRepository notificationRepo;
+    private final UserLogsRepository userLogRepo;
+    private final DashboardStatsRepository statsRepo;
+    private final CommonReqRepository commonReqRepo;
+    private final UserRequestRepository userReqRepo;
+    private final RoleRequestRepository roleReqRepo;
+    private final JournalRequestRepository journalReqRepo;
+    private final CalenderConfigRepository calendarRepo; // Added Repository
+    private final JwtUtil jwtUtil;
+
+    @Override
+    @Transactional(readOnly = true)
+    public DashboardResponse getDashboardData(String token) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+        String roleIdStr = String.valueOf(roleIdInt);
+
+        log.info("Generating dashboard for User: {}, Role: {}", userId, roleIdStr);
+        DashboardResponse response = new DashboardResponse();
+
+        // 1. BASICS
+        response.setAnnouncements(fetchAnnouncements(roleIdStr));
+        response.setNotifications(fetchNotifications(userId, roleIdStr));
+
+        // 2. VIEW TYPE DETERMINATION
+        List<String> approvalTypes = permissionRepo.findApprovalTypesForRole(roleIdInt);
+        int creationPermCount = permissionRepo.countCreationPermissions(roleIdInt);
+        
+        boolean canApprove = !approvalTypes.isEmpty();
+        boolean canCreate = creationPermCount > 0;
+        
+        if (canApprove && canCreate) response.setViewType("HYBRID");
+        else if (canApprove) response.setViewType("EXECUTOR");
+        else if (canCreate) response.setViewType("MAKER");
+        else response.setViewType("VIEWER");
+
+        // 3. STATS
+        StatsDto stats = new StatsDto();
+        calculateMakerStats(stats, userId);
+        if (canApprove) {
+            calculateExecutorStats(stats, approvalTypes);
+            applyIntelligenceLayer(stats, userId, approvalTypes);
+        }
+        stats.calculateTotals();
+        response.setStats(stats);
+
+        // 4. FINANCIAL YEAR (New Requirement)
+        enrichWithFinancialYear(response);
+
+        // 5. QUICK ACTIONS
+        response.setQuickActions(generateSmartQuickActions(roleIdInt, userId));
+
+        // 6. FREQUENCY STATS
+        LocalDateTime end = LocalDateTime.now();
+        LocalDateTime start = end.minusDays(30);
+        response.setFrequencyStats(calculateFlexibleFrequencyStats(start, end));
+
+        // 7. ACTIVITY
+        response.setRecentActivity(fetchUnifiedActivity(userId));
+
+        return response;
+    }
+
+    /**
+     * Simple fetch for Financial Year from Master Table.
+     * No complex alerts, just the data.
+     */
+    private void enrichWithFinancialYear(DashboardResponse response) {
+        Optional<CalenderConfigModel> configOpt = calendarRepo.findFirstByOrderByIdDesc();
+        
+        if (configOpt.isPresent()) {
+            CalenderConfigModel cfg = configOpt.get();
+            FinancialYearDto dto = FinancialYearDto.builder()
+                    .startDate(cfg.getYearStartDate())
+                    .endDate(cfg.getYearEndDate())
+                    .description(cfg.getRemarks())
+                    .status("Active")
+                    .build();
+            response.setFinancialYear(dto);
+        } else {
+            // Optional: Handle case where no config exists
+            response.setFinancialYear(null);
+        }
+    }
+
+    // --- FREQUENCY ---
+    public FrequencyStatsDto calculateFlexibleFrequencyStats(LocalDateTime start, LocalDateTime end) {
+        List<DailyStats> rawData = statsRepo.getFrequencyStatsByRange(start, end);
+
+        Map<String, DailyDataPoint> dataMap = rawData.stream()
+                .collect(Collectors.toMap(
+                        DailyStats::getDateStr,
+                        d -> new DailyDataPoint(d.getDateStr(), d.getCreatedCount().intValue(), d.getExecutedCount().intValue())
+                ));
+
+        List<DailyDataPoint> history = new ArrayList<>();
+        int totalCreated = 0;
+        int totalExecuted = 0;
+
+        LocalDate current = start.toLocalDate();
+        LocalDate endDate = end.toLocalDate();
+        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+        while (!current.isAfter(endDate)) {
+            String dateKey = current.format(dtf);
+            DailyDataPoint point = dataMap.getOrDefault(dateKey, new DailyDataPoint(dateKey, 0, 0));
+            history.add(point);
+            totalCreated += point.getCreated();
+            totalExecuted += point.getExecuted();
+            current = current.plusDays(1);
+        }
+
+        return FrequencyStatsDto.builder()
+                .totalCreated(totalCreated)
+                .totalExecuted(totalExecuted)
+                .history(history)
+                .build();
+    }
+
+
+    // --- ALGORITHMS ---
+
+    private void calculateMakerStats(StatsDto stats, String userId) {
+        Map<String, Integer> pMap = new HashMap<>();
+        Map<String, Integer> aMap = new HashMap<>();
+        Map<String, Integer> rMap = new HashMap<>();
+
+        List<TypeCount> crsStats = statsRepo.getMakerStatsCrs(userId);
+        for (TypeCount row : crsStats) bucketStats(pMap, aMap, rMap, row.getType(), row.getStatus(), row.getCount().intValue());
+
+        List<TypeCount> journalStats = statsRepo.getMakerStatsJournal(userId);
+        for (TypeCount row : journalStats) bucketStats(pMap, aMap, rMap, "JOURNAL_AUTH", row.getStatus(), row.getCount().intValue());
+
+        List<TypeCount> userStats = statsRepo.getMakerStatsUser(userId);
+        for (TypeCount row : userStats) bucketStats(pMap, aMap, rMap, "USER_MANAGEMENT", row.getStatus(), row.getCount().intValue());
+
+        List<TypeCount> roleStats = statsRepo.getMakerStatsRole(userId);
+        for (TypeCount row : roleStats) bucketStats(pMap, aMap, rMap, "ROLE_MANAGEMENT", row.getStatus(), row.getCount().intValue());
+
+        stats.setMyPending(sumMap(pMap));
+        stats.setMyApproved(sumMap(aMap));
+        stats.setMyRejected(sumMap(rMap));
+        stats.setMyPendingDetails(pMap);
+        stats.setMyApprovedDetails(aMap);
+        stats.setMyRejectedDetails(rMap);
+    }
+
+    private void calculateExecutorStats(StatsDto stats, List<String> allowedTypes) {
+        Map<String, Integer> details = new HashMap<>();
+
+        if(!allowedTypes.isEmpty()) {
+            List<TypeCount> crsPending = statsRepo.getPendingCountsByTypes(allowedTypes);
+            for(TypeCount row : crsPending) details.put(row.getType(), row.getCount().intValue());
+        }
+
+        if(allowedTypes.contains("USER_MANAGEMENT")) addIfPositive(details, "USER_MANAGEMENT", statsRepo.countPendingUserReqs());
+        if(allowedTypes.contains("ROLE_MANAGEMENT")) addIfPositive(details, "ROLE_MANAGEMENT", statsRepo.countPendingRoleReqs());
+        if(allowedTypes.contains("JOURNAL_AUTH")) addIfPositive(details, "JOURNAL_AUTH", statsRepo.countPendingJournals());
+
+        stats.setPendingForMe(sumMap(details));
+        stats.setPendingForMeDetails(details);
+    }
+
+    private void applyIntelligenceLayer(StatsDto stats, String userId, List<String> approvalTypes) {
+        int overdueCount = statsRepo.countOverdueItems(approvalTypes);
+        stats.setOverduePendingCount(overdueCount);
+        stats.setBottleneck(overdueCount > 4);
+
+        int recentRejections = statsRepo.countRecentRejections(userId);
+        if (recentRejections > 20) {
+            stats.setAnomalyDetected(true);
+            stats.setAnomalyMessage("Warning: High volume of rejections detected (" + recentRejections + " in last hour).");
+        }
+        
+        Double avgHours = statsRepo.getAverageApprovalTimeHours(userId);
+        stats.setAvgApprovalTimeHours(Math.round(avgHours * 10.0) / 10.0);
+        if (avgHours == 0) stats.setEfficiencyRating("N/A");
+        else if (avgHours < 4) stats.setEfficiencyRating("Excellent ⚡");
+        else if (avgHours < 24) stats.setEfficiencyRating("Good ✅");
+        else stats.setEfficiencyRating("Needs Improvement ⚠️");
+    }
+
+    private List<QuickActionDto> generateSmartQuickActions(int roleId, String userId) {
+        List<Permissions> allPerms = permissionRepo.findAllByRoleId(roleId);
+        Map<String, Integer> usageMap = new HashMap<>();
+        
+        List<TypeCount> crsUsage = statsRepo.getUserCrsUsageFrequency(userId);
+        for(TypeCount row : crsUsage) usageMap.put(row.getType(), row.getCount().intValue());
+        
+        int journalUsage = statsRepo.getUserJournalUsageCount(userId);
+        if(journalUsage > 0) usageMap.put("JOURNAL", journalUsage);
+        
+        int userMgmtUsage = statsRepo.getUserMgmtUsageCount(userId);
+        if(userMgmtUsage > 0) usageMap.put("USER_MANAGEMENT", userMgmtUsage);
+
+        List<QuickActionDto> actions = new ArrayList<>();
+        List<QuickActionDto> approvalActions = new ArrayList<>();
+
+        for (Permissions p : allPerms) {
+            String type = getActionType(p.getMenuAction());
+            String reqType = p.getMappedRequestType();
+            
+            if(p.getMenuTitle().matches("Dashboard") || p.getMenuUrl().equals("/dashboard")) continue;
+
+            int score = 0;
+            if (reqType != null && usageMap.containsKey(reqType)) score += (usageMap.get(reqType) * 2);
+            if (p.getMenuUrl().contains("journal") && usageMap.containsKey("JOURNAL")) score += 20;
+            if (p.getMenuUrl().contains("user") && usageMap.containsKey("USER_MANAGEMENT")) score += 20;
+
+            if ("UPLOAD".equals(type)) score += 10;
+            else if ("CREATE".equals(type)) score += 8;
+            else if ("DOWNLOAD".equals(type)) score += 5;
+            else if ("APPROVE".equals(type)) score += 6;
+            else score += 1;
+
+            QuickActionDto action = new QuickActionDto(
+                    p.getMenuId(), deriveLabel(type, p.getMenuTitle()),
+                    p.getMenuUrl(), p.getMenuIcon(), type, p.getMenuDescription(), score
+            );
+
+            if (isApprovalScreen(p)) approvalActions.add(action);
+            else actions.add(action);
+        }
+
+        actions.sort((a, b) -> Integer.compare(b.getScore(), a.getScore()));
+        
+        if (actions.size() < 4) {
+            approvalActions.sort((a, b) -> Integer.compare(b.getScore(), a.getScore()));
+            for (QuickActionDto approval : approvalActions) {
+                if (actions.size() >= 4) break;
+                approval.setLabel("Manage " + approval.getLabel().replace("Requests", "").trim());
+                approval.setIcon("check-square");
+                actions.add(approval);
+            }
+        }
+        if (actions.isEmpty()) {
+            actions.add(new QuickActionDto(0, "View Profile", "/profile", "user", "VIEW", "User Profile", 0));
+        }
+
+        return actions.stream().limit(6).collect(Collectors.toList());
+    }
+
+    private List<ActivityLogDto> fetchUnifiedActivity(String userId) {
+        List<ActivityLogDto> timeline = new ArrayList<>();
+        
+        List<UserLogs> userLogs = userLogRepo.findTop20ByUserIdOrderByActionTimeDesc(userId);
+        for (UserLogs log : userLogs) timeline.add(parseUserLogDetails(log));
+        
+        for (CommonReq r : commonReqRepo.findTop10ByCreatorIdOrderByReqDateDesc(userId)) {
+            String message = String.format("Raised request to %s %s (Target: %s)",
+                    mapChangeType(r.getReqType()), r.getReqType(), r.getTargetId());
+            timeline.add(createLog("Request Raised", toMillis(r.getReqDate()), "COMMON_REQ", message, normalizeStatus(r.getReqStatus()), r.getCreatorId()));
+        }
+        for (CommonReq r : commonReqRepo.findTop10ByExecutorIdOrderByExecutionDateDesc(userId)) {
+            if (r.getExecutionDate() != null) {
+                String status = normalizeStatus(r.getReqStatus());
+                String message = String.format("%s request for %s (Target: %s)", status, r.getReqType(), r.getTargetId());
+                timeline.add(createLog("Request Processed", toMillis(r.getExecutionDate()), "COMMON_REQ", message, status, r.getExecutorId()));
+            }
+        }
+        
+        List<JournalRequest> journals = journalReqRepo.findTop10ByCreatorIdOrderByReqDateDesc(userId);
+        for (JournalRequest j : journals) {
+            timeline.add(createLog("Journal Upload", toMillis(j.getReqDate()), "JOURNAL", "Uploaded Batch " + j.getBatchId(), normalizeStatus(j.getReqStatus()), j.getCreatorId()));
+        }
+
+        Collections.sort(timeline);
+        return timeline.stream().limit(15).collect(Collectors.toList());
+    }
+
+    private List<AnnouncementDto> fetchAnnouncements(String roleId) {
+        return announcementRepo.findActiveAnnouncements(roleId).stream()
+                .map(a -> new AnnouncementDto(a.getId(), a.getTitle(), a.getMessage(), a.getSeverity(), a.getCreatedAt().toString()))
+                .collect(Collectors.toList());
+    }
+
+    private List<NotificationDto> fetchNotifications(String userId, String roleId) {
+        return notificationRepo.findRecentNotifications(userId, roleId).stream()
+                .map(n -> new NotificationDto(
+                        n.getEventId(), n.getMessage(), n.getLinkUrl(),
+                        getTimeAgo(n.getEventTimestamp()), n.getEventSource(),
+                        n.getEventSource().contains("REPORT") ? "INFO" : "ALERT"
+                ))
+                .collect(Collectors.toList());
+    }
+
+    // --- HELPERS ---
+
+    private String getTimeAgo(Timestamp time) {
+        if(time == null) return "Unknown";
+        Duration d = Duration.between(time.toLocalDateTime(), LocalDateTime.now());
+        if(d.toMinutes() < 1) return "Just now";
+        if(d.toHours() < 1) return d.toMinutes() + " mins ago";
+        if(d.toDays() < 1) return d.toHours() + " hours ago";
+        return d.toDays() + " days ago";
+    }
+
+    private ActivityLogDto parseUserLogDetails(UserLogs log) {
+        String raw = log.getNewValue();
+        String actionType = log.getActionType() != null ? log.getActionType() : "ACTIVITY";
+        String reqType = extractRegex(raw, "requestType");
+        String target = extractRegex(raw, "targetUserId");
+        String display = actionType.replace("_", " ");
+        String details = log.getChangeType();
+
+        if ("USER_REQUEST".equals(actionType)) {
+            display = "User Management";
+            details = String.format("Raised %s for User %s", reqType, target);
+        } else if (actionType.contains("APPROVAL")) {
+            display = "Approval";
+            details = String.format("Processed %s for %s", reqType != null ? reqType : "Request", target);
+        }
+        return createLog(display, log.getActionTime().getTime(), "USER_LOG", details, "COMPLETED", log.getUserId());
+    }
+
+    private void bucketStats(Map<String, Integer> p, Map<String, Integer> a, Map<String, Integer> r, String type, String rawStatus, int count) {
+        String status = normalizeStatus(rawStatus);
+        if ("PENDING".equals(status)) p.merge(type, count, Integer::sum);
+        else if ("APPROVED".equals(status)) a.merge(type, count, Integer::sum);
+        else if ("REJECTED".equals(status)) r.merge(type, count, Integer::sum);
+    }
+
+    private void addIfPositive(Map<String, Integer> map, String key, int count) {
+        if(count > 0) map.put(key, count);
+    }
+
+    private int sumMap(Map<String, Integer> map) {
+        return map.values().stream().mapToInt(Integer::intValue).sum();
+    }
+
+    private String normalizeStatus(String rawStatus) {
+        if (rawStatus == null) return "UNKNOWN";
+        String s = rawStatus.trim().toUpperCase();
+        return switch (s) {
+            case "P", "PENDING" -> "PENDING";
+            case "A", "ACCEPTED", "APPROVED", "SUCCESS" -> "APPROVED";
+            case "R", "REJECTED", "CANCELLED" -> "REJECTED";
+            case "D", "DELETED" -> "DELETED";
+            case "C", "CANCELED" -> "CANCELED";
+            default -> s;
+        };
+    }
+
+    private String mapChangeType(String type) {
+        if (type == null) return "Modify";
+        if (type.equalsIgnoreCase("A")) return "Create";
+        if (type.equalsIgnoreCase("U")) return "Update";
+        if (type.equalsIgnoreCase("D")) return "Delete";
+        if (type.equalsIgnoreCase("B")) return "Block";
+        if (type.equalsIgnoreCase("UB")) return "Unblock";
+        return "Modify";
+    }
+
+    private String getActionType(String raw) {
+        if(raw == null) return "VIEW";
+        raw = raw.toLowerCase();
+        if(raw.contains("upload")) return "UPLOAD";
+        if(raw.contains("create")) return "CREATE";
+        if(raw.contains("download")) return "DOWNLOAD";
+        if(raw.contains("approve")) return "APPROVE";
+        return "VIEW";
+    }
+
+    private String deriveLabel(String type, String title) {
+        if("VIEW".equals(type)) return title;
+        if("APPROVE".equals(type)) return title;
+        return type.charAt(0) + type.substring(1).toLowerCase() + " " + title;
+    }
+
+    private boolean isApprovalScreen(Permissions p) {
+        return p.getMenuTitle().contains("Requests") ||
+                (p.getMenuAction() != null && p.getMenuAction().toLowerCase().contains("approve"));
+    }
+
+    private String extractRegex(String source, String key) {
+        if (source == null) return "Unknown";
+        Pattern p = Pattern.compile(key + "=([^,}]+)");
+        Matcher m = p.matcher(source);
+        if (m.find()) return m.group(1).trim();
+        return "Unknown";
+    }
+
+    private ActivityLogDto createLog(String action, long time, String source, String details, String status, String user) {
+        ActivityLogDto log = new ActivityLogDto();
+        log.setAction(action);
+        log.setTimestamp(time);
+        log.setDisplayTime(new Timestamp(time).toString());
+        log.setSource(source);
+        log.setDetails(details);
+        log.setStatus(status);
+        log.setUser(user);
+        return log;
+    }
+
+    private long toMillis(LocalDateTime ldt) {
+        return ldt == null ? 0 : ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----/ notification
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.GenericGenerator;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * Maps to the shared NOTIFICATIONS table.
+ * Acts as the "Outbox" for the Dashboard Service.
+ */
+@Entity
+@Table(name = "NOTIFICATIONS") // Shared table
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class NotificationOutbox {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID")
+    private String eventId;
+
+    @Column(name = "USER_ID")
+    private String userId;
+
+    @Column(name = "MESSAGE")
+    private String message;
+
+    @Column(name = "LINK_URL")
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE")
+    private String eventSource; // Will be "DASHBOARD_INTELLIGENCE"
+
+    @Column(name = "AGGREGATE_ID")
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", updatable = false)
+    private Instant eventTimestamp;
+
+    @Column(name = "TARGET_ROLE")
+    private String targetRole;
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.repository;
+
+import com.fincore.DashboardService.model.NotificationOutbox;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface NotificationOutboxRepository extends JpaRepository<NotificationOutbox, String> {
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.repository;
+
+import com.fincore.DashboardService.model.CommonReq;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Repository
+public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long> {
+
+    // --- PROJECTIONS ---
+    interface TypeCount {
+        String getType();
+        String getStatus();
+        Long getCount();
+    }
+
+    interface DailyStats {
+        String getDateStr();
+        Long getCreatedCount();
+        Long getExecutedCount();
+    }
+    
+    // Interface for Intelligence Findings
+    interface UserBottleneck {
+        String getUserId();
+        Integer getOverdueCount();
+    }
+
+    // ==================================================================================
+    // EXISTING QUERIES (Preserved)
+    // ==================================================================================
+    @Query(value = "SELECT REQ_TYPE as type, REQ_STATUS as status, COUNT(*) as count FROM COMMON_REQ WHERE CREATOR_ID = :userId GROUP BY REQ_TYPE, REQ_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsCrs(@Param("userId") String userId);
+
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count FROM COMMON_REQ WHERE REQ_STATUS = 'P' AND REQ_TYPE IN :types GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getPendingCountsByTypes(@Param("types") List<String> types);
+
+    @Query(value = "SELECT REQ_STATUS as status, COUNT(*) as count FROM JOURNAL_REQUEST WHERE CREATOR_ID = :userId GROUP BY REQ_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsJournal(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE REQ_STATUS = 'P'", nativeQuery = true)
+    int countPendingJournals();
+
+    @Query(value = "SELECT REQUEST_STATUS as status, COUNT(*) as count FROM USER_REQUESTS WHERE REQUESTOR_USER_ID = :userId GROUP BY REQUEST_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsUser(@Param("userId") String userId);
+
+    @Query(value = "SELECT REQUEST_STATUS as status, COUNT(*) as count FROM ROLE_REQUESTS WHERE REQUESTOR_USER_ID = :userId GROUP BY REQUEST_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsRole(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM USER_REQUESTS WHERE REQUEST_STATUS = 'PENDING'", nativeQuery = true)
+    int countPendingUserReqs();
+
+    @Query(value = "SELECT COUNT(*) FROM ROLE_REQUESTS WHERE REQUEST_STATUS = 'PENDING'", nativeQuery = true)
+    int countPendingRoleReqs();
+    
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count FROM COMMON_REQ WHERE CREATOR_ID = :userId GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getUserCrsUsageFrequency(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE CREATOR_ID = :userId", nativeQuery = true)
+    int getUserJournalUsageCount(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM USER_LOGS WHERE USER_ID = :userId AND ACTION_TYPE LIKE 'USER_%'", nativeQuery = true)
+    int getUserMgmtUsageCount(@Param("userId") String userId);
+
+    // ==================================================================================
+    // INTELLIGENCE QUERIES (Used by Scheduler & Dashboard)
+    // ==================================================================================
+
+    /**
+     * Finds ALL users who have > 5 items pending for more than 48 hours.
+     * Used by the Daily Scheduler.
+     */
+    @Query(value = """
+        SELECT EXECUTOR_ID as userId, COUNT(*) as overdueCount
+        FROM COMMON_REQ
+        WHERE REQ_STATUS = 'P' 
+        AND REQ_DATE < (SYSDATE - 2)
+        AND EXECUTOR_ID IS NOT NULL
+        GROUP BY EXECUTOR_ID
+        HAVING COUNT(*) > 5
+    """, nativeQuery = true)
+    List<UserBottleneck> findAllBottleneckUsers();
+
+    /**
+     * For single user view (Dashboard Load)
+     */
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ WHERE REQ_STATUS = 'P' AND REQ_TYPE IN :types AND REQ_DATE < (SYSDATE - 2)", nativeQuery = true)
+    int countOverdueItems(@Param("types") List<String> types);
+
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ WHERE EXECUTOR_ID = :userId AND REQ_STATUS = 'R' AND EXECUTION_DATE > (SYSDATE - (1/24))", nativeQuery = true)
+    int countRecentRejections(@Param("userId") String userId);
+    
+    @Query(value = """
+        SELECT COALESCE(AVG((EXECUTION_DATE - REQ_DATE) * 24), 0)
+        FROM COMMON_REQ
+        WHERE EXECUTOR_ID = :userId 
+        AND REQ_STATUS IN ('A','R')
+        AND EXECUTION_DATE > (SYSDATE - 30)
+    """, nativeQuery = true)
+    Double getAverageApprovalTimeHours(@Param("userId") String userId);
+
+    @Query(value = """
+       SELECT
+           TO_CHAR(TRUNC(req_date), 'YYYY-MM-DD') as dateStr,
+           COUNT(*) as createdCount,
+           SUM(CASE WHEN status IN ('A', 'R', 'ACCEPTED', 'REJECTED', 'APPROVED', 'SUCCESS', 'CANCELED', 'CANCELLED') THEN 1 ELSE 0 END) as executedCount
+       FROM (
+           SELECT REQ_DATE as req_date, REQ_STATUS as status FROM COMMON_REQ WHERE REQ_DATE BETWEEN :startDate AND :endDate
+           UNION ALL
+           SELECT REQ_DATE as req_date, REQ_STATUS as status FROM JOURNAL_REQUEST WHERE REQ_DATE BETWEEN :startDate AND :endDate
+           UNION ALL
+           SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status FROM USER_REQUESTS WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+           UNION ALL
+           SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status FROM ROLE_REQUESTS WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+       ) all_requests
+       GROUP BY TRUNC(req_date)
+       ORDER BY dateStr ASC
+   """, nativeQuery = true)
+    List<DailyStats> getFrequencyStatsByRange(@Param("startDate") LocalDateTime startDate, @Param("endDate") LocalDateTime endDate);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.service;
+
+import com.fincore.DashboardService.model.NotificationOutbox;
+import com.fincore.DashboardService.repository.DashboardStatsRepository;
+import com.fincore.DashboardService.repository.DashboardStatsRepository.UserBottleneck;
+import com.fincore.DashboardService.repository.NotificationOutboxRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class IntelligenceSchedulerService {
+
+    private final DashboardStatsRepository statsRepo;
+    private final NotificationOutboxRepository outboxRepo;
+
+    /**
+     * Daily Job (9:00 AM): BOTTLENECK DETECTION
+     * Scans for any users who have > 5 items pending for more than 48 hours.
+     * Writes a warning to the Outbox table.
+     */
+    @Scheduled(cron = "0 0 9 * * ?") // 9 AM Daily
+    @Transactional
+    public void runBottleneckDetection() {
+        log.info("🕵️ Starting Daily Intelligence Scan: Bottleneck Detection...");
+
+        List<UserBottleneck> bottlenecks = statsRepo.findAllBottleneckUsers();
+
+        if (bottlenecks.isEmpty()) {
+            log.info("✅ No bottlenecks detected today.");
+            return;
+        }
+
+        log.warn("⚠️ Detected {} users with critical bottlenecks.", bottlenecks.size());
+
+        for (UserBottleneck user : bottlenecks) {
+            String message = String.format("Action Required: You have %d request(s) pending for over 48 hours. Please clear your queue.", user.getOverdueCount());
+            
+            // Create Notification Event (Outbox Pattern)
+            // This maps directly to your NOTIFICATIONS table
+            NotificationOutbox event = NotificationOutbox.builder()
+                    .userId(user.getUserId())
+                    .message(message)
+                    .linkUrl("/dashboard?view=pending") // Direct them to their pending queue
+                    .eventSource("DASHBOARD_INTELLIGENCE")
+                    .aggregateId("BOTTLENECK_" + System.currentTimeMillis()) // Unique ID for this run
+                    .build();
+
+            outboxRepo.save(event);
+            log.info(" -> Notification dispatched for User: {}", user.getUserId());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling // Required for the Intelligence Scheduler
+public class DashboardServiceApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(DashboardServiceApplication.class, args);
+	}
+
+}
+
+
