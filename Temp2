@@ -112,6 +112,132 @@ MenuResponse roleData = loginService.fetchRoleWiseData(user.getUserId());
 
 
 
+
+
+
+
+package com.fincore.commonutilities.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.util.Date;
+import java.util.function.Function;
+
+/**
+ * Utility class for manipulating and validating JSON Web Tokens (JWT).
+ * This class is shared across microservices to ensure consistent token parsing logic.
+ */
+@Component
+@Slf4j
+public class JwtUtil {
+
+    // Default value provided for dev, override in application.properties
+    @Value("${jwt.secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
+    private String secretKey;
+
+    @Value("${jwt.access-token-validity:900000}") // 15 minutes
+    private long accessTokenValidity;
+
+    /**
+     * Extracts the User ID (Subject) from the token.
+     * @param token The Bearer token.
+     * @return The userId string.
+     */
+    public String getUserIdFromToken(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        return extractClaim(cleanToken, Claims::getSubject);
+    }
+
+    /**
+     * Extracts the Role ID from the token claims.
+     * @param token The Bearer token.
+     * @return The Role ID as an integer.
+     */
+    public int getUserRoleFromToken(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        return extractClaim(cleanToken, claims -> {
+            Object role = claims.get("role");
+            if (role instanceof Number) {
+                return ((Number) role).intValue();
+            }
+            // Fallback for string roles if necessary
+            if (role instanceof String) {
+                try { return Integer.parseInt((String) role); } catch (NumberFormatException ignored) {}
+            }
+            throw new IllegalArgumentException("Token role claim is not a number");
+        });
+    }
+
+    /**
+     * Validates the cryptographic signature and expiration of the token.
+     * @param token The Bearer token.
+     * @return true if valid, false if expired or tampered.
+     */
+    public boolean isTokenValid(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        return !isTokenExpired(cleanToken);
+    }
+
+    /**
+     * GENERIC CLAIM EXTRACTOR (Made Public for Filter access).
+     * This is required to extract 'jti' (JWT ID) for session validation.
+     */
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+
+    // --- Internal Helpers ---
+
+    private String removeBearerPrefix(String token) {
+        if (token != null && token.startsWith("Bearer ")) {
+            return token.substring(7);
+        }
+        return token;
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractExpiration(token).before(new Date());
+    }
+
+    private Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser()
+                .verifyWith(getSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    private SecretKey getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.commonutilities.security;
 
 import com.fincore.commonutilities.jwt.JwtUtil;
@@ -124,6 +250,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.lang.NonNull;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -136,6 +263,13 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 
+/**
+ * A Blocking (Servlet) Filter that enforces security for microservices.
+ * * Responsibilities:
+ * 1. Validate JWT Signature.
+ * 2. Enforce "One Session Per User" by comparing JWT 'jti' with Redis 'USR:<userId>'.
+ * 3. Enforce RBAC (Role Based Access Control) via Redis permissions.
+ */
 @Slf4j
 @RequiredArgsConstructor
 public class ContextRbacFilter extends OncePerRequestFilter {
@@ -144,9 +278,11 @@ public class ContextRbacFilter extends OncePerRequestFilter {
     private final JwtUtil jwtUtil;
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
-    // MUST match the prefix used in Login Service (TokenSessionValidator.java)
+    // MUST match the prefix used in Login Service (AuthController / TokenSessionValidator)
     private static final String REDIS_USER_PREFIX = "USR:";
+    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
 
+    // Whitelist for endpoints that don't need auth
     private static final Set<String> WHITELIST = Set.of(
             "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
     );
@@ -161,6 +297,7 @@ public class ContextRbacFilter extends OncePerRequestFilter {
         String uri = request.getRequestURI();
 
         // 1. SKIP WHITELIST
+        // Performance Check: Simple loop is faster than Stream for small sets
         for (String pattern : WHITELIST) {
             if (pathMatcher.match(pattern, uri)) {
                 filterChain.doFilter(request, response);
@@ -172,47 +309,51 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
         if (token != null) {
             try {
-                // 2. BASIC VALIDATION (Signature & Expiry)
-                // This throws ExpiredJwtException if token is old
+                // 2. CRYPTOGRAPHIC VALIDATION
                 if (!jwtUtil.isTokenValid(token)) {
                     throw new JwtException("Invalid Token Signature");
                 }
 
                 String userId = jwtUtil.getUserIdFromToken(token);
                 
-                // We need to extract the 'jti' (JWT ID) from the token
-                // Ensure your JwtUtil exposes a way to get Claims or the jti directly
-                String incomingJti = jwtUtil.extractClaim(token, Claims::getId);
+                // Extract JTI (JWT ID) to ensure this is the LATEST session
+                String incomingJti = jwtUtil.extractClaim(removeBearer(token), Claims::getId);
                 
                 if (incomingJti == null) {
-                     sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
+                     sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI claim");
                      return;
                 }
 
                 // =================================================================
-                // 3. DISTRIBUTED SESSION CHECK (The "One Session" Logic)
+                // 3. DISTRIBUTED SESSION CHECK (The "Gateway" Logic)
                 // =================================================================
                 String sessionKey = REDIS_USER_PREFIX + userId;
+                String activeJti = null;
                 
-                // Fetch the "Active" JTI from Redis (Written by Login Service)
-                String activeJti = redisTemplate.opsForValue().get(sessionKey);
+                try {
+                    activeJti = redisTemplate.opsForValue().get(sessionKey);
+                } catch (RedisConnectionFailureException e) {
+                    log.error("Redis unreachable. Failing open or closed based on policy. Current: FAIL CLOSED.");
+                    sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
+                    return;
+                }
 
                 if (activeJti == null) {
-                    // Redis key expired or user logged out manually
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out or logged out.");
+                    // Scenario: Redis TTL expired or user logged out manually via Auth Service
+                    log.warn("Session expired in Redis for user {}", userId);
+                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out. Please login again.");
                     return; 
                 }
 
                 if (!incomingJti.equals(activeJti)) {
-                    // The token is valid crypto-wise, but Redis has a DIFFERENT JTI.
-                    // This means the user logged in again on another device.
+                    // Scenario: User logged in on another device, generating a new JTI and overwriting Redis.
                     log.warn("Concurrent Login Detected for User {}. Incoming JTI: {}, Active JTI: {}", userId, incomingJti, activeJti);
                     sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "You have been logged out because of a login on another device.");
                     return; 
                 }
                 // =================================================================
 
-                // 4. SET SECURITY CONTEXT
+                // 4. SET SECURITY CONTEXT (Spring Security)
                 int roleIdInt = jwtUtil.getUserRoleFromToken(token);
                 if (SecurityContextHolder.getContext().getAuthentication() == null) {
                     UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
@@ -221,9 +362,9 @@ public class ContextRbacFilter extends OncePerRequestFilter {
                     SecurityContextHolder.getContext().setAuthentication(authToken);
                 }
 
-                // 5. RBAC CHECK (Redis Permissions)
+                // 5. RBAC CHECK (Permissions)
                 if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
-                    return; // Response handled in checkRbac
+                    return; // Error response already sent in checkRbac
                 }
 
             } catch (ExpiredJwtException e) {
@@ -231,7 +372,7 @@ public class ContextRbacFilter extends OncePerRequestFilter {
                 sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
                 return;
             } catch (Exception e) {
-                log.error("Auth Error: {}", e.getMessage());
+                log.error("Auth Error for user: {}", e.getMessage());
                 sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
                 return;
             }
@@ -243,35 +384,361 @@ public class ContextRbacFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
+    /**
+     * Checks if the user's role has permission to access the requested Method + URL + Context.
+     */
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
+        
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+        
+        // DETERMINE CONTEXT (Header)
+        // This supports the Maker-Checker flow (e.g., SEGMENT_CODE, USER_MANAGEMENT)
+        String contextHeader = request.getHeader("X-Request-Type");
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
+
+        String redisKey = REDIS_RBAC_PREFIX + roleId;
+        
+        // Fetch permissions set from Redis
+        // Format: "METHOD:URL_PATTERN|CONTEXT" -> e.g., "POST:/user/create|USER_MANAGEMENT"
+        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
+
+        boolean isAuthorized = false;
+
+        if (permissions != null) {
+            for (String perm : permissions) {
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+
+                String methodAndUrl = parts[0];
+                String allowedContext = parts[1];
+
+                // A. Context Match
+                // If permission context is "*", it allows anything.
+                // Otherwise, the header must match the permission context.
+                if (!allowedContext.equals("*") && !allowedContext.equals(requestContext)) {
+                    continue;
+                }
+
+                // B. URL & Method Match
+                String[] muParts = methodAndUrl.split(":", 2);
+                if (muParts.length < 2) continue;
+
+                String allowedMethod = muParts[0];
+                String allowedUrlPattern = muParts[1];
+
+                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isAuthorized) {
+            log.warn("RBAC Deny: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
+            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions for this resource.");
+            return false;
+        }
+        return true;
+    }
+
     private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
         response.setStatus(status);
         response.setContentType("application/json");
         response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
     }
-
-    // ... (Keep existing checkRbac method exactly as it is in your file) ...
-    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
-        // ... paste existing RBAC logic here ...
-        // (This part of your code was fine, just ensure Redis Template is wired correctly)
-        
-        // Shortened for brevity in this response, refer to your original file for the RBAC logic
-        return true; 
+    
+    private String removeBearer(String token) {
+        if (token != null && token.startsWith("Bearer ")) {
+            return token.substring(7);
+        }
+        return token;
     }
 }
 
-Step C: Update JwtUtil in Common Utilities
-Your ContextRbacFilter now relies on extracting the jti (Token ID). You need to ensure JwtUtil exposes a helper for this or extractClaim is public.
-In common-utilities-latest.txt, extractClaim is private. Make it public:
-// In JwtUtil.java
 
-// Change private to public
-public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-    // ... logic ...
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Centralized Security Configuration Bean provider.
+ * * Microservices should Import this class or define the beans similar to this
+ * to ensure consistent CORS policies across the distributed system.
+ */
+@Configuration
+public class CommonSecurityConfig {
+
+    /**
+     * Defines the CORS policy for the entire microservice ecosystem.
+     * Since there is no Gateway, every service must handle CORS individually.
+     * This bean standardizes that logic.
+     */
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        
+        // 1. Allowed Origins
+        // In PROD: Replace "*" with specific frontend domains (e.g., "https://myapp.com")
+        configuration.setAllowedOrigins(List.of("http://localhost:3000", "http://localhost:4200", "*"));
+        
+        // 2. Allowed Methods
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        
+        // 3. Allowed Headers
+        // "X-Request-Type" is critical for your RBAC Logic
+        configuration.setAllowedHeaders(Arrays.asList(
+            "Authorization", 
+            "Content-Type", 
+            "X-Request-Type", 
+            "X-Forwarded-For",
+            "Accept"
+        ));
+        
+        // 4. Expose Headers
+        // Allows frontend to read the Auth header if updated
+        configuration.setExposedHeaders(List.of("Authorization"));
+        
+        // 5. Allow Credentials
+        // Set to true if using Cookies. If false, "*" origins are allowed.
+        // If set to true, you CANNOT use "*" for origins.
+        configuration.setAllowCredentials(false); 
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
 }
 
-Or add a specific method:
-public String getTokenId(String token) {
-    String cleanToken = removeBearerPrefix(token);
-    return extractClaim(cleanToken, Claims::getId);
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.config;
+
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.config.CommonSecurityConfig; // Import Central CORS
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+/**
+ * User Service Security Configuration.
+ * * Aligned with the "Distributed Gateway" architecture.
+ * It uses the ContextRbacFilter from Common Utilities to enforce:
+ * 1. Token Validity
+ * 2. Single Session (Redis check)
+ * 3. RBAC Permissions
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class, CommonSecurityConfig.class}) // Import logic from JAR
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+    
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig; // Wire in the CORS config
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                // 1. Disable CSRF (Stateless API)
+                .csrf(csrf -> csrf.disable())
+                
+                // 2. Apply Centralized CORS Policy
+                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+                
+                // 3. Stateless Session (No JSESSIONID)
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // 4. Authorization Rules
+                .authorizeHttpRequests(authz -> authz
+                        // Public Endpoints
+                        .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                        // All other endpoints require Authentication (and RBAC filter check)
+                        .anyRequest().authenticated()
+                )
+
+                // 5. Add the "Distributed Gateway" Filter
+                .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----////-------
+
+
+
+// In AuthController.java, inside the login() method:
+
+// ... (Token generation code) ...
+String token = HmacJwtUtil.generate(hmacSecret, user.getUserId(), ttlSeconds, claims);
+
+// Parse back the token to extract its JTI
+var parser = io.jsonwebtoken.Jwts.parser()
+        .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
+        .build();
+
+var claimsJws = parser.parseSignedClaims(token);
+String jti = claimsJws.getPayload().getId();
+
+// === CRITICAL FIX START ===
+// We MUST register the session in Redis with the new JTI.
+// This key ("USR:<userId>") is what Common Utilities checks in the User Service.
+// Using .block() here is acceptable in this specific context to ensure consistency before return.
+validator.registerUserSession(user.getUserId(), jti).block();
+log.info("Session registered in Redis for User: {} with JTI: {}", user.getUserId(), jti);
+// === CRITICAL FIX END ===
+
+MenuResponse roleData = loginService.fetchRoleWiseData(user.getUserId());
+// ... (continue to return response)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// In AuthController.java, add this new method:
+
+    /**
+     * Refreshes the Access Token.
+     * 1. Validates the incoming refresh token.
+     * 2. Checks if the User's session is still active in Redis (USR:<userId>).
+     * 3. Generates a NEW JTI and updates Redis (Rotating the session).
+     */
+    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
+    public LoginResponseDTO refreshToken(@RequestBody Map<String, String> body) {
+        String refreshToken = body.get("refreshToken");
+
+        if (refreshToken == null || refreshToken.isBlank()) {
+            return LoginResponseDTO.builder().error("Missing refresh token").build();
+        }
+
+        try {
+            // 1. Verify Crypto Signature (Using same secret for simplicity, or use specific refresh secret)
+            var parser = io.jsonwebtoken.Jwts.parser()
+                    .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
+                    .build();
+            
+            var claims = parser.parseSignedClaims(refreshToken).getPayload();
+            String userId = claims.getSubject();
+
+            // 2. Check Distributed Session in Redis
+            // If the key is gone, the user session has timed out globally.
+            String userKey = USER_PREFIX + userId;
+            String currentJti = redisTemplate.opsForValue().get(userKey).block();
+
+            if (currentJti == null) {
+                return LoginResponseDTO.builder().error("Session expired. Please login again.").build();
+            }
+
+            // 3. Generate NEW Access Token (New JTI)
+            // Ideally fetch role from DB, but for speed, we might reuse claims if acceptable
+            // Here assuming we just refresh the session validity
+            Map<String, Object> newClaims = new java.util.HashMap<>(claims);
+            // Update expiration
+            
+            String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, ttlSeconds, newClaims);
+
+            // 4. Extract NEW JTI
+            var newClaimsJws = parser.parseSignedClaims(newAccessToken);
+            String newJti = newClaimsJws.getPayload().getId();
+
+            // 5. ROTATE SESSION (Update Redis)
+            // This invalidates the PREVIOUS Access Token immediately because JTIs won't match anymore.
+            validator.registerUserSession(userId, newJti).block();
+            log.info("Token Refreshed for User: {}. New JTI: {}", userId, newJti);
+
+            return LoginResponseDTO.builder()
+                    .userId(userId)
+                    .accessToken(newAccessToken)
+                    .refreshToken(refreshToken) // Return same or rotate refresh token
+                    .expiresIn(ttlSeconds)
+                    .jti(newJti)
+                    .tokenType("Bearer")
+                    .validCredentials(true)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("Refresh Token Failed: {}", e.getMessage());
+            return LoginResponseDTO.builder().error("Invalid or Expired Refresh Token").build();
+        }
+    }
+
+
+
+
+
+
+
+
+
 
