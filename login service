@@ -1,0 +1,1609 @@
+package com.fincore.gateway.Controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.Service.TokenSessionValidator;
+import com.fincore.gateway.dto.LoginResponseDTO;
+import com.fincore.gateway.dto.MenuResponse;
+import com.fincore.gateway.dto.UpdatePasswordDTO;
+import com.fincore.gateway.dto.UserDto;
+import com.fincore.gateway.dto.VerifyUserDTO;
+import com.fincore.gateway.utility.Constants;
+import com.fincore.gateway.utility.LoginUtility;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Base64;
+import java.util.Map;
+
+/**
+ * Authentication controller for issuing and revoking demo HS256 JWTs and exercising a Redis-backed
+ * token/session model.
+ *
+ * <p><strong>Endpoints</strong>
+ * <ul>
+ *   <li><b>POST /auth/login</b> — Verifies credentials, issues an HS256 token (with {@code sub}, {@code jti}, {@code exp}),
+ *       and returns role-wise screen data.</li>
+ *   <li><b>POST /auth/logout</b> — Blacklists the current token {@code jti} and, if it matches the active session,
+ *       clears the user's session in Redis.</li>
+ *   <li><b>POST /auth/check-user</b> — Checks if a user exists and returns basic verification details.</li>
+ *   <li><b>POST /auth/update-password</b> — Updates a user's password.</li>
+ * </ul>
+ *
+ * <p><strong>IMPORTANT (Production)</strong>
+ * <ul>
+ *   <li>This controller is intended for local/demo use. In production, issue tokens in a dedicated Auth service.</li>
+ *   <li>For session management, write keys such as {@code USR:<user>=<jti>} and blacklist keys {@code BL:<jti>=1} on logout.</li>
+ *   <li>Consider removing blocking calls in reactive flows (see notes in {@link #logout(JwtAuthenticationToken)}).</li>
+ * </ul>
+ */
+@Slf4j
+@RestController
+@RequestMapping("/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    /**
+     * Redis key prefix for storing the current JTI per user (e.g., USR:alice -> abc-123).
+     */
+    private static final String USER_PREFIX = "USR:";
+
+    private final TokenSessionValidator validator;
+    private final ReactiveStringRedisTemplate redisTemplate;
+    private final LoginService loginService;
+    private final ObjectMapper mapper;
+    
+
+    /**
+     * Mode for JWT issuance; demo supports only {@code hmac} here.
+     */
+    @Value("${security.jwt.mode:hmac}")
+    private String mode;
+
+    /**
+     * Base64-encoded HMAC secret used to sign HS256 tokens.
+     */
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    /**
+     * Token time-to-live in seconds.
+     */
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long ttlSeconds;
+
+    /**
+     * Verifies credentials and issues an HS256 access token with {@code sub}, {@code jti}, and {@code exp}.
+     *
+     * @param request the current HTTP request (used to compute client IP)
+     * @param payload the user credentials payload
+     * @return a {@link LoginResponseDTO} with token info and role-wise menu data or an error message
+     */
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public LoginResponseDTO login(ServerHttpRequest request, @RequestBody @Valid UserDto payload) {
+
+        final String clientIp = LoginUtility.getClientIp(request);
+        log.info("Client IP: {}", clientIp);
+
+        // Validate user credentials via service
+        UserDto user = loginService.verifyUserCredentials(payload, clientIp);
+        log.debug("User verification result: {}", user);
+
+        if (!user.isValidCredentials()) {
+            return LoginResponseDTO.builder()
+                    .userId(user.getUserId())
+                    .validCredentials(false)
+                    .userStatus(user.getUserStatus())
+                    .passwordLoginStatus(user.getPasswordLoginStatus())
+                    .error("Invalid credentials")
+                    .build();
+        }
+
+        if (!Constants.HMAC.equalsIgnoreCase(mode)) {
+            return LoginResponseDTO.builder()
+                    .error("This demo /auth/login issues HS256 tokens only. Set property security.jwt.mode=hmac.")
+                    .build();
+        }
+
+        if (hmacSecret == null || hmacSecret.isBlank()) {
+            return LoginResponseDTO.builder().error("Missing HMAC secret").build();
+        }
+
+        // Build claims from domain user object (ensure it is safe to include in a JWT!)
+        @SuppressWarnings("unchecked")
+        Map<String, Object> claims = mapper.convertValue(user.getUser(), Map.class);
+
+        // Generate HS256 JWT (sub + jti + exp)
+        String token = HmacJwtUtil.generate(hmacSecret, user.getUserId(), ttlSeconds, claims);
+
+        // Parse back the token to extract its JTI (safe since we just created it)
+        var parser = io.jsonwebtoken.Jwts.parser()
+                .verifyWith(io
+                        .jsonwebtoken
+                        .security
+                        .Keys
+                        .hmacShaKeyFor(Base64.getDecoder()
+                                .decode(hmacSecret)))
+                .build();
+
+        var claimsJws = parser.parseSignedClaims(token);
+        String jti = claimsJws.getPayload().getId();
+
+        // Fetch role-based menu data
+        MenuResponse roleData = loginService.fetchRoleWiseData(user.getUserId());
+
+        log.info("Login response generated for user: {}", user.getUserId());
+
+        return LoginResponseDTO.builder()
+                .userId(user.getUserId())
+                .validCredentials(true)
+                .userStatus(user.getUserStatus())
+                .passwordLoginStatus(user.getPasswordLoginStatus())
+                .accessToken(token)
+                .tokenType("Bearer")
+                .expiresIn(ttlSeconds)
+                .sub(user.getUserId())
+                .jti(jti)
+                .roleData(roleData)
+                .build();
+    }
+
+    /**
+     * Blacklists the current token {@code jti}. If the blacklisted {@code jti} matches the active session for the
+     * user, clears the stored session reference.
+     *
+     * <p><strong>Note:</strong> This method uses {@code .block()} on a reactive chain for simplicity.
+     * In a fully reactive stack, prefer returning a reactive type and avoid blocking.</p>
+     *
+     * @param jwtAuth the authenticated JWT (injected by Spring Security)
+     * @return a {@link LoginResponseDTO} describing the result
+     */
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public LoginResponseDTO logout(JwtAuthenticationToken jwtAuth) {
+        if (jwtAuth == null) {
+            return LoginResponseDTO.builder().error("No authenticated token provided").build();
+        }
+
+        var jwt = jwtAuth.getToken();
+        String username = jwt.getSubject();
+        String jti = jwt.getId();
+
+        if (username == null || jti == null) {
+            return LoginResponseDTO.builder().error("Token missing subject or jti").build();
+        }
+
+        log.info("Logout requested for user={} jti={}", username, jti);
+
+        String userKey = USER_PREFIX + username;
+
+        // 1) Blacklist the given JTI, then 2) read the currently stored JTI for the user.
+        String currentJti = validator.blacklistToken(jti)
+                .then(
+                        redisTemplate.opsForValue()
+                                .get(userKey)
+                                .defaultIfEmpty("")
+                )
+                .block(); // Blocking for demo simplicity
+
+        if (jti.equals(currentJti)) {
+            // 3) Only clear session if the stored JTI equals this JTI
+            log.info("Stored JTI matches logout JTI -> clearing session for user={}", username);
+            boolean cleared = Boolean.TRUE.equals(validator.clearUserSession(username).block());
+
+            if (cleared) {
+                return LoginResponseDTO.builder()
+                        .userId(username)
+                        .jti(jti)
+                        .error("User logged out (revoked token and cleared session)")
+                        .build();
+            } else {
+                return LoginResponseDTO.builder().error("Logout failed").build();
+            }
+        } else {
+            // Someone else has already replaced the session; keep that session intact.
+            log.info("Stored JTI does not match logout JTI (currentJti={}) -> not clearing session for user={}",
+                    currentJti, username);
+
+            return LoginResponseDTO.builder()
+                    .userId(username)
+                    .jti(jti)
+                    .error("Token revoked. Active session remains (another token is active)")
+                    .build();
+        }
+    }
+
+    /**
+     * Checks if a given user exists and returns verification details.
+     *
+     * @param body a JSON object containing the {@code userId} key
+     * @return {@link VerifyUserDTO} describing existence/status of the user
+     */
+    @PostMapping(value = "/check-user", produces = MediaType.APPLICATION_JSON_VALUE)
+    public VerifyUserDTO checkUser(@RequestBody Map<String, String> body) {
+        String userId = body.get("userId");
+        log.info("check-user called for userId={}", userId);
+
+        VerifyUserDTO result = loginService.checkUser(userId);
+        log.debug("check-user result: {}", result);
+
+        return result;
+    }
+
+    /**
+     * Updates a user's password.
+     *
+     * @param userCredentials payload containing identifiers and the new password
+     * @return {@link UpdatePasswordDTO} reflecting update status
+     */
+    @PostMapping(value = "/update-password", produces = MediaType.APPLICATION_JSON_VALUE)
+    public UpdatePasswordDTO updatePassword(@RequestBody @Valid UpdatePasswordDTO userCredentials) {
+        return loginService.updatePassword(userCredentials);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Controller;
+
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Mono;
+
+import java.util.Map;
+
+/**
+ * Protected endpoint to verify auth+redis policies easily.
+ */
+@RestController
+@RequestMapping("/secure")
+public class ProtectedEchoController {
+
+    @GetMapping("/hello")
+    public Mono<Map<String, Object>> hello(JwtAuthenticationToken auth) {
+        return Mono.just(Map.of(
+                "message", "Hello " + auth.getName(),
+                "sub", auth.getToken().getSubject(),
+                "jti", auth.getToken().getId()
+        ));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import com.fincore.gateway.dto.MenuResponse;
+import com.fincore.gateway.dto.UpdatePasswordDTO;
+import com.fincore.gateway.dto.UserDto;
+import com.fincore.gateway.dto.VerifyUserDTO;
+import com.fincore.gateway.model.LoginAttempt;
+import com.fincore.gateway.model.LoginParam;
+import com.fincore.gateway.model.User;
+
+/**
+ * Contract for login/authentication workflows, user/session checks, and menu resolution.
+ *
+ * <p>Implementations should:
+ * <ul>
+ *   <li>Validate credentials (password-based or SSO-based)</li>
+ *   <li>Issue JWTs and compose token-visible user data</li>
+ *   <li>Enforce wrong-password attempt limits and track attempts</li>
+ *   <li>Transform role permissions to a menu response</li>
+ * </ul>
+ */
+public interface LoginService {
+
+    /**
+     * Verifies user credentials and, on success, produces a {@link UserDto} containing
+     * validity flags, statuses, and an access token with token-visible user data.
+     *
+     * @param userCredentials input payload with userId (and password for password mode)
+     * @param clientIp        caller's IP address for auditing
+     * @return populated {@link UserDto} describing the outcome
+     */
+    UserDto verifyUserCredentials(UserDto userCredentials, String clientIp);
+
+    /**
+     * Fetches role-wise permissions for the user and transforms them into a menu response.
+     *
+     * @param userId the user identifier
+     * @return {@link MenuResponse} built from ordered permissions (possibly empty)
+     */
+    MenuResponse fetchRoleWiseData(String userId);
+
+    /**
+     * Checks a user's status and requirements prior to login.
+     *
+     * @param userId the user identifier
+     * @return {@link VerifyUserDTO} describing status and next steps (e.g., update password)
+     */
+    VerifyUserDTO checkUser(String userId);
+
+    /**
+     * Updates a user's password hash and related metadata.
+     *
+     * @param userCredentials input DTO containing {@code userId} and new raw {@code password}
+     * @return {@link UpdatePasswordDTO} with status and message
+     */
+    UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials);
+
+    /**
+     * Executes password-based authentication logic, enforcing wrong-password limits and
+     * updating counters/flags in the provided objects.
+     *
+     * @param password     raw password from the request
+     * @param loginAttempt login attempt entity to update with success/failure
+     * @param userInfo     output DTO to set validity flags and attempts left
+     * @param user         the user being authenticated
+     * @param loginParam   login parameters (e.g., permitted attempts)
+     */
+    void passwordBasedLogin(String password,
+                            LoginAttempt loginAttempt,
+                            UserDto userInfo,
+                            User user,
+                            LoginParam loginParam);
+
+    /**
+     * Produces a human-readable message describing a blocked login due to the given status/type.
+     *
+     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
+     * @param type   subject type (e.g., "user", "role")
+     * @return formatted message
+     */
+    String generateStatusMessage(String status, String type);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.dto.MenuResponse;
+import com.fincore.gateway.dto.UpdatePasswordDTO;
+import com.fincore.gateway.dto.UserDto;
+import com.fincore.gateway.dto.UserTokenDataDto;
+import com.fincore.gateway.dto.VerifyUserDTO;
+import com.fincore.gateway.model.LoginAttempt;
+import com.fincore.gateway.model.LoginParam;
+import com.fincore.gateway.dto.PermissionRow;
+import com.fincore.gateway.model.User;
+import com.fincore.gateway.model.UserRoles;
+import com.fincore.gateway.repository.LoginAttemptRepository;
+import com.fincore.gateway.repository.LoginParamRepository;
+import com.fincore.gateway.repository.RolePermissionsRepository;
+import com.fincore.gateway.repository.UserRepository;
+import com.fincore.gateway.utility.Constants;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Service implementation handling user login/verification, menu resolution, and password updates.
+ *
+ * <p><strong>Responsibilities</strong>
+ * <ul>
+ *   <li>Validate credentials (password-based and SSO-based)</li>
+ *   <li>Issue HS256 JWTs and embed limited user/role claims</li>
+ *   <li>Transform role permissions into menu responses</li>
+ *   <li>Track login attempts and enforce wrong password limits</li>
+ * </ul>
+ *
+ * <p><strong>Notes</strong>
+ * <ul>
+ *   <li>JWT generation uses an HMAC Base64 secret; ensure it is configured for the environment.</li>
+ *   <li>{@code BCryptPasswordEncoder} is created locally for convenience; consider injecting a singleton bean instead.</li>
+ *   <li>Write operations are wrapped in {@link Transactional} where appropriate.</li>
+ * </ul>
+ */
+@Slf4j
+@Service("LoginService")
+@RequiredArgsConstructor
+public class LoginServiceImpl implements LoginService {
+
+    /**
+     * Prefer injecting a singleton bean; retained local instance for compatibility.
+     */
+    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+
+    // ======= Config =======
+
+    /**
+     * Base64-encoded HMAC secret used to sign HS256 JWTs.
+     */
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    /**
+     * Token time-to-live in seconds.
+     */
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long ttlSeconds;
+
+    // ======= Dependencies =======
+
+    private final UserRepository userRepository;
+    private final LoginAttemptRepository loginAttemptRepository;
+    private final LoginParamRepository loginParamRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final MenuService menuService;
+    private final ObjectMapper mapper;
+
+    // ======= Public API =======
+
+    /**
+     * Fetches role-wise permissions for the given user and transforms them into a menu response.
+     *
+     * @param userId ID of the user
+     * @return {@link MenuResponse} built from ordered permissions; empty if none or on error
+     */
+    @Transactional(readOnly = true)
+    @Override
+    public MenuResponse fetchRoleWiseData(String userId) {
+        log.info("Fetching role-wise data for userId: {}", userId);
+        try {
+            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
+
+            if (rows == null || rows.isEmpty()) {
+                log.info("No permissions found for userId: {}", userId);
+                return new MenuResponse(Collections.emptyList());
+            }
+            return menuService.transformFromProjection(rows);
+        } catch (Exception e) {
+            log.error("Error fetching permissions for userId: {}", userId, e);
+            return new MenuResponse(Collections.emptyList());
+        }
+    }
+
+    /**
+     * Verifies user credentials and, on success, builds {@link UserDto} populated with an access token and token data.
+     * <p>Also records the login attempt and enforces password attempt limits.</p>
+     *
+     * @param userCredentials payload containing {@code userId} and (for password mode) {@code password}
+     * @param clientIp        caller's IP address for audit
+     * @return {@link UserDto} with validity flags, statuses, and (if valid) a signed access token
+     */
+    @Transactional
+    @Override
+    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
+
+        final String userId = userCredentials.getUserId();
+        final String rawPassword = userCredentials.getPassword();
+
+        UserDto result = new UserDto();
+        User user = userRepository.findByUserId(userId);
+
+        if (user == null) {
+            result.setValidCredentials(false);
+            result.setUserStatus(Constants.INVALID);
+            log.info("Login attempt for invalid userId: {}", userId);
+            return result;
+        }
+
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        LoginAttempt attempt = new LoginAttempt();
+        attempt.setLoginMethod(loginParam.getActiveLoginMode() == 'P'
+                ? Constants.PASSWORD_BASED_LOGIN
+                : Constants.SSO_BASED_LOGIN);
+        attempt.setSuccess("N");
+        attempt.setIpAddress(clientIp);
+        attempt.setUserId(userId);
+
+        result.setLoginMethod(loginParam.getActiveLoginMode());
+        result.setUserId(user.getUserId());
+
+        UserRoles userRole = userRepository.getUserRole(userId);
+
+        // Status checks: role & user
+        result.setRoleStatus(userRole.getRoleStatus());
+        result.setUserStatus(user.getAccountStatus());
+        result.setPasswordLoginStatus(user.getPasswordLogin());
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
+            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        // Proceed by login mode
+        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
+            // Password-based login allowed?
+            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
+            } else {
+                result.setValidCredentials(false);
+                attempt.setFailureReason("Password login is disabled for this user.");
+            }
+        } else {
+            // SSO-based login
+            attempt.setSuccess("Y");
+            attempt.setFailureReason("SUCCESS");
+            result.setValidCredentials(true);
+
+            // If password-login was disabled, re-enable it on successful SSO per your original logic
+            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                user.setPasswordLogin(Constants.ACTIVE);
+                userRepository.save(user);
+            }
+        }
+
+        // On success, mint token and populate token data
+        if (result.isValidCredentials()) {
+            log.info("Credentials validated. Issuing token for userId={}", userId);
+
+            UserDto safeClaims = new UserDto();
+            safeClaims.setUserId(user.getUserId());
+            safeClaims.setUserrole(userRole.getRole());
+
+            @SuppressWarnings("unchecked")
+            String accessToken = HmacJwtUtil.generate(
+                    hmacSecret,
+                    user.getUserId(),
+                    ttlSeconds,
+                    mapper.convertValue(safeClaims, Map.class)
+            );
+
+            UserTokenDataDto tokenData = initializeTokenData(user, userRole);
+            result.setAccessToken(accessToken);
+            result.setUser(tokenData);
+        }
+
+        loginAttemptRepository.save(attempt);
+        log.debug("verifyUserCredentials result={}", result);
+        return result;
+    }
+
+    /**
+     * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
+     *
+     * @param password     raw password from the request
+     * @param loginAttempt login attempt entity to be updated with success/failure
+     * @param userInfo     output DTO updated with validity and attempts left
+     * @param user         the user entity being authenticated
+     * @param loginParam   login parameter configuration (e.g., permitted attempts)
+     */
+    @Transactional
+    @Override
+    public void passwordBasedLogin(String password,
+                                   LoginAttempt loginAttempt,
+                                   UserDto userInfo,
+                                   User user,
+                                   LoginParam loginParam) {
+
+        log.info("Password-based login for userId={}", user.getUserId());
+
+        int failedCount = user.getUserWrongPasswordCount();
+        int permitted = loginParam.getWrongPasswordAttempts();
+
+        if (failedCount >= permitted) {
+            loginAttempt.setFailureReason("Exceeded attempt limit");
+            userInfo.setMessage("Exceeded attempt limit");
+            userInfo.setValidCredentials(false);
+            return;
+        }
+
+        if (encoder.matches(password, user.getPasswordHash())) {
+            // Success
+            loginAttempt.setSuccess("Y");
+            loginAttempt.setFailureReason("Success");
+            userInfo.setValidCredentials(true);
+            // Reset wrong password counter on success (optional, add if desired)
+            if (failedCount != 0) {
+                user.setUserWrongPasswordCount(0);
+                userRepository.save(user);
+            }
+            return;
+        }
+
+        // Failure path
+        if (failedCount == permitted - 1) {
+            // Lock password login on next failure threshold
+            user.setPasswordLogin(Constants.INACTIVE);
+            user.setUserWrongPasswordCount(0);
+        } else {
+            user.setUserWrongPasswordCount(failedCount + 1);
+        }
+
+        userRepository.save(user);
+        loginAttempt.setSuccess("N");
+        loginAttempt.setFailureReason("Wrong password");
+        userInfo.setValidCredentials(false);
+        userInfo.setAttemptsLeft(Math.max(0, permitted - failedCount - 1));
+    }
+
+    /**
+     * Produces a human-readable message describing a blocked login due to {@code status} of a given {@code type}.
+     *
+     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
+     * @param type   subject type (e.g., "user", "role")
+     * @return formatted message
+     */
+    @Override
+    public String generateStatusMessage(String status, String type) {
+        return String.format("Trying to login with a %s %s", status, type);
+    }
+
+    /**
+     * Checks the status and requirements for a user attempting to log in (without performing login).
+     *
+     * @param userId the user identifier
+     * @return {@link VerifyUserDTO} describing status, password update requirements, and messages
+     */
+    @Transactional(readOnly = true)
+    public VerifyUserDTO checkUser(String userId) {
+        VerifyUserDTO out = new VerifyUserDTO();
+        out.setUserId(userId);
+
+        User user = userRepository.findByUserId(userId);
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        out.setLoginMethod(loginParam.getActiveLoginMode());
+
+        if (user == null) {
+            // Invalid user
+            out.setUserCheck(false);
+            out.setUserStatus(Constants.INVALID);
+            out.setMessage("Invalid User");
+            return out;
+        }
+
+        // Existing user
+        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            // Password validity window based on tempPasswordSetAt (guard nulls)
+            Timestamp setAt = user.getTempPasswordSetAt();
+            boolean isPasswordValid = false;
+            if (setAt != null) {
+                LocalDateTime lastUpdate = setAt.toLocalDateTime();
+                isPasswordValid = LocalDateTime.now()
+                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+            }
+
+            UserRoles userRole = userRepository.getUserRole(userId);
+            out.setRoleStatus(userRole.getRoleStatus());
+            out.setUpdatePassword(user.getPasswordHash() == null || !isPasswordValid);
+            out.setUserStatus(Constants.ACTIVE);
+            out.setMessage(Constants.ACTIVE_USER);
+            out.setPasswordLoginStatus(user.getPasswordLogin());
+        } else {
+            // Inactive, Locked, Pending_Verification
+            String accountStatus = user.getAccountStatus();
+            out.setUserCheck(true);
+            out.setUserStatus(accountStatus);
+            out.setMessage(
+                    accountStatus.equalsIgnoreCase("locked") ? "Locked User"
+                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
+            );
+        }
+
+        return out;
+    }
+
+    /**
+     * Updates the user's password hash and resets the temporary password timestamp.
+     * <p><strong>TODO:</strong> Integrate OTP validation before update.</p>
+     *
+     * @param userCredentials input DTO with {@code userId} and new raw {@code password}
+     * @return {@link UpdatePasswordDTO} indicating success and message; sensitive fields are cleared
+     */
+    @Transactional
+    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
+        String userId = userCredentials.getUserId();
+        String password = userCredentials.getPassword();
+
+        // Always sanitize outbound fields
+        userCredentials.setUpdateFlag(false);
+        userCredentials.setPassword("");
+        userCredentials.setOtp("");
+
+        try {
+            User user = userRepository.findByUserId(userId);
+            if (user == null) {
+                userCredentials.setMessage("Invalid user id");
+                return userCredentials;
+            }
+
+            String passwordHash = encoder.encode(password);
+            user.setPasswordHash(passwordHash);
+            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
+            userRepository.save(user);
+
+            userCredentials.setMessage("User password successfully updated");
+            userCredentials.setUpdateFlag(true);
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Data integrity violation while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Failed to change password, please try again");
+        } catch (Exception e) {
+            log.error("Unexpected error while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Unexpected error while changing password");
+        }
+
+        return userCredentials;
+    }
+
+    // ======= Helpers =======
+
+    /**
+     * Initializes the token-visible user data embedded/returned alongside the JWT.
+     *
+     * @param user     the user entity
+     * @param userRole the role mapping for the user
+     * @return user token DTO with non-sensitive fields
+     */
+    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
+        UserTokenDataDto tokenData = new UserTokenDataDto();
+        tokenData.setFirstName(user.getFirstName());
+        tokenData.setLastName(user.getLastName());
+        tokenData.setPhoneNumber(user.getPhoneNumber());
+        tokenData.setUserId(user.getUserId());
+        tokenData.setBranch(user.getBranch());
+        tokenData.setEmail(user.getEmail());
+        tokenData.setRole(userRole.getRole());
+        tokenData.setRoleName(userRole.getRoleName());
+        return tokenData;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import com.fincore.gateway.dto.ChildMenu;
+import com.fincore.gateway.dto.MenuResponse;
+import com.fincore.gateway.dto.PermissionRow;
+import com.fincore.gateway.dto.RootMenu;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Builds navigational menu structures from permission entities or projections.
+ *
+ * <p>Responsibilities:</p>
+ * <ul>
+ *   <li>Group permissions by root menu title</li>
+ *   <li>Create root and child menu DTOs</li>
+ *   <li>Ensure deterministic ordering (by {@code orderId} / {@code permissionOrder})</li>
+ *   <li>Be tolerant to missing/nullable sorting fields</li>
+ * </ul>
+ *
+ * <p><strong>Ordering</strong>: Root menus and child menus are sorted in ascending order using their respective
+ * order fields. Null order values are placed last to keep ordering stable.</p>
+ *
+ * <strong>UPDATED:</strong> Merges 'menuAction' for Root Menus with the same Title.
+ */
+@Slf4j
+@Service
+public class MenuService {
+
+    /**
+     * Returns a non-null order for {@link PermissionRow} (nulls go to the end).
+     */
+    private static int safePermissionOrder(PermissionRow r) {
+        Integer v = r.getPermissionOrder();
+        return v != null ? v : Integer.MAX_VALUE;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Builders
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Comparator key extractor for root menus.
+     */
+    private static int safeOrderIdRoot(RootMenu r) {
+        Integer v = r.getOrderId();
+        return v != null ? v : Integer.MAX_VALUE;
+    }
+
+    /**
+     * Comparator key extractor for child menus.
+     */
+    private static int safeOrderIdChild(ChildMenu c) {
+        Integer v = c.getOrderId();
+        return v != null ? v : Integer.MAX_VALUE;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Null-safe order helpers
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Transforms a list of {@link PermissionRow} projections into a {@link MenuResponse}.
+     * <p>Groups by {@code menuTitle}, creates root items, and child items from rows having a non-null {@code subMenu}.</p>
+     *
+     * @param rows permission projection rows (typically from a custom query join)
+     * @return menu response with ordered root and child menus
+     */
+    public MenuResponse transformFromProjection(List<PermissionRow> rows) {
+        MenuResponse response = new MenuResponse();
+
+        if (rows == null || rows.isEmpty()) {
+            response.setRoot_menus(Collections.emptyList());
+            return response;
+        }
+
+        // Group by root menu title
+        Map<String, List<PermissionRow>> grouped = rows.stream().collect(Collectors.groupingBy(PermissionRow::getMenuTitle));
+
+        List<RootMenu> rootMenus = new ArrayList<>();
+
+        for (Map.Entry<String, List<PermissionRow>> entry : grouped.entrySet()) {
+            List<PermissionRow> group = entry.getValue();
+
+            //1. Representative root row: choose the smallest non-null permissionOrder
+            PermissionRow root = group.stream().min(Comparator.comparing(MenuService::safePermissionOrder)).orElse(group.get(0));
+
+            RootMenu rootMenu = buildRootFromProjection(root);
+
+            // 2. MERGE ROOT ACTIONS
+            String mergedAction = group.stream().map(PermissionRow::getMenuAction)       // Get action from each row
+                    .filter(Objects::nonNull)                // Ignore nulls
+                    .flatMap(action -> Arrays.stream(action.split("\\|"))) // Split "create|modify"
+                    .map(String::trim)                       // Clean spaces
+                    .filter(s -> !s.isEmpty())               // Remove empty strings
+                    .distinct()                              // Remove duplicates
+                    .collect(Collectors.joining("|"));       // Join back to "create|modify|block"
+            // Overwrite the single-row action with the merged action
+            rootMenu.setMenuAction(mergedAction);
+
+            // 3.  Children (only rows that actually represent a sub-menu), ordered by permissionOrder asc
+            List<ChildMenu> children = group.stream().filter(r ->
+                    r.getSubMenu() != null)
+                    .map(this::buildChildFromProjection)
+                    .sorted(Comparator.comparing(MenuService::safeOrderIdChild))
+                    .collect(Collectors.toList());
+
+            boolean multiChildren = children.size() > 1;
+            rootMenu.setHasChildren(multiChildren);
+            if (!multiChildren) {
+                // children size is 0 or 1
+                if (children.size() == 1) {
+                    // promote the only child
+                    rootMenu.setTitle(children.get(0).getTitle());
+                }
+            } else {
+                // children > 1 → set children normally
+                rootMenu.setChildren(children);
+            }
+            // add root menu
+            rootMenus.add(rootMenu);
+        }
+
+        // Order root menus as well
+        rootMenus.sort(Comparator.comparing(MenuService::safeOrderIdRoot));
+
+        response.setRoot_menus(rootMenus);
+        return response;
+    }
+
+    private RootMenu buildRootFromProjection(PermissionRow r) {
+        RootMenu root = new RootMenu();
+        root.setId(r.getMenuId());
+        root.setTitle(r.getMenuTitle());
+        root.setIcon(r.getMenuIcon());
+        root.setRoute(r.getMenuUrl());
+        root.setMenuAction(r.getMenuAction());
+        root.setComponentPath(r.getComponentPath());
+        root.setScreenDescription(r.getMenuDescription());
+        root.setOrderId(safePermissionOrder(r));
+        root.setRequestType(r.getRequestType());
+        return root;
+    }
+
+    private ChildMenu buildChildFromProjection(PermissionRow r) {
+        ChildMenu c = new ChildMenu();
+        c.setId(r.getMenuId());
+        c.setTitle(r.getSubMenu());
+        c.setIcon(r.getMenuIcon());
+        c.setRoute(r.getMenuUrl());
+        c.setComponentPath(r.getComponentPath());
+        c.setScreenDescription(r.getMenuDescription());
+        c.setMenuAction(r.getMenuAction());
+        c.setRequestType(r.getRequestType());
+        c.setOrderId(safePermissionOrder(r));
+        return c;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.util.Objects;
+
+/**
+ * Validates JWT sessions against Redis using two key families:
+ * <ul>
+ *   <li><b>USR:&lt;username&gt;</b> → stores the latest active JTI for the user</li>
+ *   <li><b>BL:&lt;jti&gt;</b> → blacklisted JTIs (revoked/expired/rotated)</li>
+ * </ul>
+ *
+ * <p><strong>Workflow</strong></p>
+ * <ol>
+ *   <li><b>registerUserSession</b>: On login, blacklist any previous JTI and store the new one.</li>
+ *   <li><b>validateWithRedis</b>: On each request, reject if blacklisted or if JTI != stored latest.</li>
+ *   <li><b>clearUserSession</b>: On logout, remove the USR:&lt;user&gt; pointer.</li>
+ *   <li><b>blacklistToken</b>: On logout or rotation, add JTI to blacklist.</li>
+ * </ol>
+ *
+ * <p><strong>TTL</strong>: Keys are set to the same TTL as the JWT (configurable via
+ * {@code security.jwt.ttl-seconds}).</p>
+ */
+@Component
+public class TokenSessionValidator {
+
+    private static final Logger log = LoggerFactory.getLogger(TokenSessionValidator.class);
+
+    /** Redis key prefixes. */
+    private static final String USER_PREFIX = "USR:";
+    private static final String BLACKLIST_PREFIX = "BL:";
+
+    private final ReactiveStringRedisTemplate redis;
+
+    /** Token TTL aligned with JWT expiry. */
+    private final Duration tokenTtl;
+
+    public TokenSessionValidator(
+            ReactiveStringRedisTemplate redis,
+            @Value("${security.jwt.ttl-seconds:900}") long ttlSeconds
+    ) {
+        this.redis = redis;
+        this.tokenTtl = Duration.ofSeconds(ttlSeconds);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Session management
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Register a new session for a user.
+     * <ol>
+     *   <li>If an old JTI exists for the user, blacklist it.</li>
+     *   <li>Store the new JTI under {@code USR:<username>} with {@link #tokenTtl}.</li>
+     * </ol>
+     *
+     * @param username the subject/username
+     * @param newJti   the new token ID
+     * @return completion signal
+     */
+    public Mono<Void> registerUserSession(String username, String newJti) {
+        Objects.requireNonNull(username, "username must not be null");
+        Objects.requireNonNull(newJti, "newJti must not be null");
+
+        final String userKey = userKey(username);
+        log.info("Registering new session user={} jti={}", username, newJti);
+
+        return redis.opsForValue().get(userKey)
+                .flatMap(oldJti -> {
+                    if (oldJti != null) {
+                        log.info("Found old session for user={} -> blacklisting oldJti={}", username, oldJti);
+                        return blacklistToken(oldJti).then();
+                    }
+                    return Mono.empty();
+                })
+                .then(
+                        redis.opsForValue()
+                                .set(userKey, newJti, tokenTtl)
+                                .doOnSuccess(v -> log.info("Registered session in Redis user={} jti={}", username, newJti))
+                                .then()
+                );
+    }
+
+    /**
+     * Blacklist a JTI (used on logout or token rotation).
+     *
+     * @param jti token id
+     * @return {@code true} if set succeeded
+     */
+    public Mono<Boolean> blacklistToken(String jti) {
+        Objects.requireNonNull(jti, "jti must not be null");
+        final String blKey = blacklistKey(jti);
+        return redis.opsForValue().set(blKey, "true", tokenTtl)
+                .doOnSuccess(v -> log.info("Blacklisted jti={}", jti));
+    }
+
+    /**
+     * Clear the current session pointer for a user.
+     *
+     * @param username the subject/username
+     * @return {@code true} if a key was deleted
+     */
+    public Mono<Boolean> clearUserSession(String username) {
+        Objects.requireNonNull(username, "username must not be null");
+        return redis.delete(userKey(username))
+                .map(deleted -> {
+                    if (deleted > 0) {
+                        log.info("Cleared session for user={}", username);
+                        return true;
+                    }
+                    return false;
+                });
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Request-time validation
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Validate an incoming {@link Authentication} against Redis:
+     * <ul>
+     *   <li>Reject if not a {@link JwtAuthenticationToken}</li>
+     *   <li>Reject if JTI is blacklisted</li>
+     *   <li>Reject if JTI != {@code USR:&lt;username&gt;} stored JTI</li>
+     * </ul>
+     *
+     * @param authentication the Spring Security authentication (expected {@link JwtAuthenticationToken})
+     * @return a {@link Mono} with the same {@code authentication} on success, or an error on failure
+     */
+    public Mono<Authentication> validateWithRedis(Authentication authentication) {
+        if (!(authentication instanceof JwtAuthenticationToken jwtAuth)) {
+            log.warn("Validation failed: not a JwtAuthenticationToken -> {}", authentication);
+            return Mono.error(new BadCredentialsException("Invalid authentication type"));
+        }
+
+        Jwt jwt = jwtAuth.getToken();
+        String username = jwt.getSubject();
+        String jti = jwt.getId();
+
+        if (username == null || username.isBlank()) {
+            log.error("Token missing subject -> rejecting");
+            return Mono.error(new BadCredentialsException("Missing subject (sub)"));
+        }
+        if (jti == null || jti.isBlank()) {
+            log.error("Token missing JTI claim -> rejecting user={}", username);
+            return Mono.error(new BadCredentialsException("Missing token ID (jti)"));
+        }
+
+        log.info("Validating token user={} jti={}", username, jti);
+
+        // 1) Check blacklist
+        return redis.hasKey(blacklistKey(jti))
+                .flatMap(isBlacklisted -> {
+                    if (Boolean.TRUE.equals(isBlacklisted)) {
+                        log.warn("Token is blacklisted jti={} user={}", jti, username);
+                        return Mono.error(new BadCredentialsException("Token revoked"));
+                    }
+
+                    // 2) Ensure JTI matches the latest session pointer
+                    return redis.opsForValue().get(userKey(username))
+                            .flatMap(currentJti -> {
+                                log.debug("Redis stored JTI for user={} -> {}", username, currentJti);
+
+                                if (currentJti == null) {
+                                    log.warn("No active session in Redis for user={} -> rejecting", username);
+                                    return Mono.error(new BadCredentialsException("No active session"));
+                                }
+
+                                if (!currentJti.equals(jti)) {
+                                    log.warn("Token mismatch user={} expectedJti={} gotJti={}", username, currentJti, jti);
+                                    return Mono.error(new BadCredentialsException("Another session is active"));
+                                }
+
+                                log.info("Token validation success user={} jti={}", username, jti);
+                                return Mono.just(authentication);
+                            });
+                });
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Key helpers
+    // --------------------------------------------------------------------------------------------
+
+    private static String userKey(String username) {
+        return USER_PREFIX + username;
+    }
+
+    private static String blacklistKey(String jti) {
+        return BLACKLIST_PREFIX + jti;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.gateway.model.LoginAttempt;
+
+/**
+ * Repository interface for managing {@link LoginAttempt} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard CRUD operations
+ * and adds a custom native query method to check for existing login attempts for a specific user.
+ * </p>
+ */
+@Repository
+public interface LoginAttemptRepository extends JpaRepository<LoginAttempt, Long> {
+
+    /**
+     * Checks if a user has any existing login attempts recorded in the database.
+     * <p>
+     * This method executes a native SQL query to count the number of records
+     * in the {@code USER_LOGIN_ATTEMPTS} table for the given user ID.
+     * </p>
+     *
+     * @param userId The unique identifier of the user to check.
+     * @return The number of login attempts found for the specified user. A return value greater than 0 indicates the user is present in the attempts table.
+     */
+    @Query(value = "select count(1) from USER_LOGIN_ATTEMPTS where USER_ID =:userId ", nativeQuery = true)
+    int getIfUserPresent(@Param("userId") String userId);
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.gateway.model.LoginParam;
+
+/**
+ * Repository interface for managing {@link LoginParam} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard data access operations
+ * and defines a custom native query method to retrieve the single configuration
+ * entity that stores global login parameters. The primary key type is {@link Character},
+ * suggesting a specific key (e.g., 'A' for Active parameters).
+ * </p>
+ */
+@Repository
+public interface LoginParamRepository extends JpaRepository<LoginParam, Character> {
+
+    /**
+     * Retrieves the single configuration entity containing system-wide login parameters.
+     * <p>
+     * This method executes a native SQL query to select all records from the
+     * {@code LOGIN_PARAM} table. It is designed to return a single {@link LoginParam}
+     * object, assuming the table only contains one such configuration record
+     * (or that the application expects only one result).
+     * </p>
+     *
+     * @return The single {@link LoginParam} entity containing the system's login parameters.
+     */
+    @Query(value = "Select * from LOGIN_PARAM", nativeQuery = true)
+    LoginParam getLoginParam();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import com.fincore.gateway.model.MenuItems;
+
+import java.util.List;
+
+/**
+ * Repository interface for managing {@link MenuItems} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard data access operations
+ * for menu items, using {@link Integer} as the type for the entity's primary key.
+ * </p>
+ */
+public interface MenuItemRepository extends JpaRepository<MenuItems, Integer> {
+
+    // The following is an example of a custom method that could be added to this repository.
+    // It is commented out in the original request, but included here for documentation purposes.
+
+    /**
+     * Retrieves a list of all menu items associated with a specific role ID, ordered by menu item ID.
+     * <p>
+     * This method uses a JPQL query to join the {@code MenuItems} entity with its associated
+     * roles and filters the results based on the provided {@code roleId}.
+     * </p>
+     *
+     * @param roleId The unique identifier of the user role.
+     * @return A list of {@link MenuItems} accessible by the specified role.
+     */
+    // @Query("SELECT m FROM MenuItems m JOIN m.roles r WHERE r.ROLE_ID = :roleId ORDER BY m.id ASC")
+    // List<MenuItems> findAllByRoleId(@Param("roleId") Integer roleId);
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.CrudRepository;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.gateway.model.RefreshToken;
+
+/**
+ * Repository interface for managing {@link RefreshToken} entities (user sessions).
+ * <p>
+ * This interface extends {@link CrudRepository} to provide standard create, read, update,
+ * and delete operations, and includes a custom native query method to retrieve the
+ * most recent refresh token (session) for a given user.
+ * </p>
+ */
+@Repository
+public interface RefreshTokenRepository extends CrudRepository<RefreshToken, Long> {
+
+    /**
+     * Retrieves the latest active refresh token (user session) for a specified user ID.
+     * <p>
+     * This method executes a native SQL query against the {@code user_session} table.
+     * It orders sessions by the start time in descending order and fetches only the
+     * first row, effectively retrieving the most recent session.
+     * </p>
+     *
+     * @param userId The unique identifier of the user whose latest session is to be retrieved.
+     * @return The most recent {@link RefreshToken} entity for the user, or {@code null} if none is found.
+     */
+    @Query(value = "select * from user_session where user_id=:userId" +
+            " order by session_started_at desc fetch first 1 rows only", nativeQuery = true)
+    RefreshToken getLatestRefreshTokensByUserid(@Param("userId") String userId);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import com.fincore.gateway.dto.PermissionRow;
+import com.fincore.gateway.model.Permissions;
+import com.fincore.gateway.model.RolePermissions;
+
+import java.util.List;
+
+/**
+ * Repository interface for managing {@link RolePermissions} entities and retrieving
+ * related permission data based on user roles.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard data access operations
+ * and includes custom native queries to fetch menu items and permissions associated
+ * with a specific user ID.
+ * </p>
+ */
+public interface RolePermissionsRepository extends JpaRepository<RolePermissions, Integer> {
+
+    /**
+     * Retrieves a list of {@link Permissions} entities (menu items) associated with a specific user ID.
+     * <p>
+     * This native query joins {@code permissions}, {@code role_permissions}, and {@code user_roles}
+     * tables to find all distinct menu items granted to the user through their roles, ordered
+     * by the assigned permission order. This query maps results directly to the {@link Permissions} entity.
+     * </p>
+     *
+     * @param userid The unique identifier of the user.
+     * @return A list of {@link Permissions} objects representing the user's menu access.
+     */
+    @Query(nativeQuery = true, value = """
+                        SELECT DISTINCT
+                p.menu_id,
+                p.menu_title,
+                p.menu_icon,
+                p.menu_submenu,
+                p.menu_action,
+                p.menu_url,
+                p.menu_component_path,
+                p.MENU_DESCRIPTION,
+                p.menu_dependant,
+                rp.permission_order
+            FROM
+                     permissions p
+                JOIN role_permissions rp ON p.menu_id = rp.permission_id
+                JOIN user_roles       ur ON ur.role_id = rp.role_id
+            WHERE
+                ur.user_id = :userid
+            ORDER BY
+            	rp.permission_order
+            """)
+    List<Permissions> findAllByUserId(@Param("userid") String userid);
+
+    /**
+     * Retrieves a list of permission details mapped to the Data Transfer Object {@link PermissionRow}
+     * for a specific user ID.
+     * <p>
+     * Similar to {@link #findAllByUserId(String)}, this native query fetches all relevant permissions
+     * but maps the selected columns to the {@link PermissionRow DTO} interface using SQL aliases
+     * (JPA projection). The results are ordered by {@code rp.permission_order}.
+     * </p>
+     *
+     * @param userId The unique identifier of the user.
+     * @return A list of {@link PermissionRow} objects containing key details of the user's permissions.
+     */
+    @Query(value = """
+                     SELECT DISTINCT
+                         p.menu_id             AS menuid,
+                         p.menu_title          AS menutitle,
+                         p.menu_icon           AS menuicon,
+                         p.menu_submenu        AS submenu,
+                         p.menu_action         AS menuaction,
+                         p.menu_url            AS menuurl,
+                         p.menu_component_path AS componentpath,
+                         p.menu_description    AS menudescription,
+                         p.menu_dependant      AS dependant,
+                         p.MAPPED_REQUEST_TYPE AS requestType,
+                         rp.permission_order   AS permissionorder
+                     FROM
+                              permissions p
+                         JOIN role_permissions rp ON p.menu_id = rp.permission_id
+                         JOIN user_roles       ur ON ur.role_id = rp.role_id
+                     WHERE
+                         ur.user_id = :userid
+                     ORDER BY
+                         rp.permission_order
+            """, nativeQuery = true)
+    List<PermissionRow> findAllPermissionsByUserId(@Param("userid") String userId);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.gateway.model.User;
+import com.fincore.gateway.model.UserRoles;
+
+/**
+ * Repository interface for managing {@link User} entities.
+ * <p>
+ * This interface extends {@link JpaRepository} to provide standard data access operations
+ * and includes custom methods for finding user details, roles, and checking user existence.
+ * The primary key type for the User entity is {@link String}.
+ * </p>
+ */
+@Repository
+public interface UserRepository extends JpaRepository<User, String> {
+
+    /**
+     * Finds a user entity by their unique user ID.
+     * <p>
+     * Spring Data JPA automatically generates the query for this method based on the method name.
+     * </p>
+     *
+     * @param userId The unique identifier of the user.
+     * @return The {@link User} entity associated with the given userId, or {@code null} if not found.
+     */
+    User findByUserId(String userId);
+
+    /**
+     * Retrieves the role information for a specific user ID.
+     * <p>
+     * This native query joins the {@code user_roles} and {@code roles} tables to fetch
+     * the user's role details. It assumes a user has a single primary role and uses
+     * {@code fetch first 1 rows only} to ensure a single result is returned, mapped to
+     * the {@link UserRoles} DTO/interface projection.
+     * </p>
+     *
+     * @param userId The unique identifier of the user.
+     * @return A {@link UserRoles} object containing the user's role ID, name, and status.
+     */
+    @Query(value = """
+            select  u.user_id as USER_ID, u.role_id as ROLE_ID , r.role_name as ROLE_NAME ,r.ROLE_STATUS as ROLE_STATUS
+            from  user_roles u join roles r on u.role_id = r.role_id
+            where u.user_Id = :userId fetch first 1 rows only
+            """, nativeQuery = true)
+    UserRoles getUserRole(@Param("userId") String userId);
+
+    /**
+     * Checks if a user exists in the {@code USERS} table by counting records matching the user ID.
+     *
+     * @param userId The unique identifier of the user to check.
+     * @return The count of users found. A value of 1 indicates the user exists.
+     */
+    @Query(value = "Select count(1) from USERS where USER_ID = :userId", nativeQuery = true)
+    int checkUserExists(@Param("userId") String userId);
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
