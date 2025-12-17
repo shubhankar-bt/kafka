@@ -61,12 +61,11 @@ public class UserRequestServiceImpl implements UserRequestService {
         request.setRequestStatus(Constant.PENDING);
         request.setRequestDate(new Timestamp(System.currentTimeMillis()));
 
-        // 3. Handle Payload (String vs Map support)
+        // 3. Handle Payload
         try {
             String jsonPayload;
             if (dto.getRequestPayload() instanceof String) {
                 jsonPayload = (String) dto.getRequestPayload();
-                // Validate JSON format
                 objectMapper.readTree(jsonPayload); 
             } else {
                 jsonPayload = objectMapper.writeValueAsString(dto.getRequestPayload());
@@ -76,9 +75,16 @@ public class UserRequestServiceImpl implements UserRequestService {
             throw new RuntimeException("Invalid Payload", e);
         }
 
-        // 4. Save & Notify
+        // 4. Save
         UserRequest saved = userRequestRepository.save(request);
-        createNotification(saved.getRequestorUserId(), null, "User Request Created", String.valueOf(saved.getRequestId()));
+
+        // 5. Notification (To Approvers)
+        // Msg: "New User Request (ID: 123) for User 1015698 (CREATE) is pending approval."
+        String notifMsg = String.format("New User Request (ID: %s) for User %s (%s) is pending approval.", 
+                saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
+        
+        // Pass 'null' as targetUser so it fetches 'targetRoles' from Config (Approvers)
+        createNotification(null, notifMsg, String.valueOf(saved.getRequestId()));
 
         return ResponseEntity.status(HttpStatus.CREATED)
             .body(ResponseVO.<Map<String, Object>>builder()
@@ -128,8 +134,9 @@ public class UserRequestServiceImpl implements UserRequestService {
         
         Map<String, Object> result = new HashMap<>();
         String action = dto.getActionFlag();
+        boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action);
 
-        if (Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action)) { 
+        if (isApproved) { 
             handleAccept(request, result, dto, ipAddress);
         } else {
             request.setRequestStatus(Constant.REJECTED);
@@ -140,13 +147,24 @@ public class UserRequestServiceImpl implements UserRequestService {
         }
 
         boolean success = (boolean) result.get("status");
-        if(success && (Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action))) {
+        if(success && isApproved) {
             request.setRequestStatus(Constant.ACCEPTED);
             userRequestRepository.save(request);
         }
 
-        createNotification(request.getRequestorUserId(), null, 
-            "Request " + (success ? "Processed" : "Failed"), String.valueOf(request.getRequestId()));
+        // Notification (To Requestor)
+        // Msg: "Your User Request (ID: 123) for User 1015698 has been ACCEPTED."
+        // Or: "Your User Request (ID: 123) ... has been REJECTED. Reason: ..."
+        String status = isApproved ? "ACCEPTED" : "REJECTED";
+        String notifMsg = String.format("Your User Request (ID: %s) for User %s has been %s.", 
+                request.getRequestId(), request.getTargetUserId(), status);
+        
+        if (!isApproved && dto.getRemarks() != null && !dto.getRemarks().isEmpty()) {
+            notifMsg += " Reason: " + dto.getRemarks();
+        }
+
+        // Pass requestorUserId to target specifically the maker
+        createNotification(request.getRequestorUserId(), notifMsg, String.valueOf(request.getRequestId()));
 
         return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
                 .statusCode(HttpStatus.OK)
@@ -162,7 +180,6 @@ public class UserRequestServiceImpl implements UserRequestService {
             User user = userRepository.findUserByUserId(request.getTargetUserId());
             String type = request.getRequestType();
 
-            // 1. Initialize for CREATE
             if (Constant.CREATE.equalsIgnoreCase(type)) {
                 if (user != null) throw new RuntimeException("User already exists");
                 user = new User();
@@ -174,18 +191,14 @@ public class UserRequestServiceImpl implements UserRequestService {
                 throw new RuntimeException("User not found");
             }
 
-            // 2. Map Fields (Create/Modify)
             if (Constant.CREATE.equalsIgnoreCase(type) || Constant.MODIFY.equalsIgnoreCase(type)) {
                 user.setUserId(request.getTargetUserId());
-                
-                // Map all common fields safely
                 if (payloadMap.containsKey("firstName")) user.setFirstName((String) payloadMap.get("firstName"));
                 if (payloadMap.containsKey("middleName")) user.setMiddleName((String) payloadMap.get("middleName"));
                 if (payloadMap.containsKey("lastName")) user.setLastName((String) payloadMap.get("lastName"));
                 if (payloadMap.containsKey("email")) user.setEmail((String) payloadMap.get("email"));
                 if (payloadMap.containsKey("mobileNumber")) user.setPhoneNumber((String) payloadMap.get("mobileNumber"));
                 
-                // CRITICAL FIX: Ensure Branch is set (NOT NULL in DB)
                 if (payloadMap.containsKey("branch")) {
                     Object branchObj = payloadMap.get("branch");
                     if (branchObj != null) {
@@ -193,12 +206,9 @@ public class UserRequestServiceImpl implements UserRequestService {
                     }
                 }
                 
-                // CRITICAL FIX: Set UPDATED_AT to prevent ORA-01400
                 user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
-                
                 userRepository.save(user);
                 
-                // Update User Role linkage
                 if(payloadMap.containsKey("roleId")) {
                     UserRole ur = userRoleRepository.getUserRolesByUserId(user.getUserId());
                     if(ur == null) ur = new UserRole();
@@ -209,11 +219,11 @@ public class UserRequestServiceImpl implements UserRequestService {
 
             } else if (Constant.LOCK.equalsIgnoreCase(type)) {
                 user.setAccountStatus(Constant.LOCKED);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Lock
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
                 userRepository.save(user);
             } else if (Constant.UNLOCK.equalsIgnoreCase(type)) {
                 user.setAccountStatus(Constant.ACTIVE);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Unlock
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
                 userRepository.save(user);
             }
 
@@ -224,7 +234,6 @@ public class UserRequestServiceImpl implements UserRequestService {
             log.error("Error applying user changes", e);
             result.put("status", false);
             result.put("message", "Failed to apply changes: " + e.getMessage());
-            // Rethrow to trigger rollback
             throw new RuntimeException("Transaction Failed: " + e.getMessage(), e);
         }
     }
@@ -237,6 +246,9 @@ public class UserRequestServiceImpl implements UserRequestService {
         
         userRequestRepository.delete(req);
         
+        // Notify Maker that cancellation is confirmed
+        createNotification(req.getRequestorUserId(), "User Request (ID: " + id + ") has been cancelled.", String.valueOf(id));
+
         return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
                 .statusCode(HttpStatus.OK)
                 .message("Cancelled")
@@ -244,14 +256,16 @@ public class UserRequestServiceImpl implements UserRequestService {
                 .build());
     }
 
-    private void createNotification(String userId, String roles, String msg, String refId) {
+    private void createNotification(String targetUser, String msg, String refId) {
         try {
             NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
-            notificationWriterService.createNotification(userId, roles, msg, config.getTargetUrl(), refId, EVENT_SOURCE);
+            // If targetUser is null, we fetch TargetRoles from Config (Approvers)
+            String targetRoles = (targetUser == null) ? config.getTargetRoles() : null;
+            
+            notificationWriterService.createNotification(targetUser, targetRoles, msg, 
+                config.getTargetUrl(), refId, EVENT_SOURCE);
         } catch (Exception e) {
             log.error("Notification failed", e);
-            // We swallow notification error to allow transaction to complete, 
-            // unless strict consistency is required
         }
     }
 
@@ -274,6 +288,355 @@ public class UserRequestServiceImpl implements UserRequestService {
                 .statusCode(HttpStatus.OK)
                 .result(user)
                 .build());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.ResponseVO;
+import com.tcs.userservice.dto.*;
+import com.tcs.userservice.model.*;
+import com.tcs.userservice.repository.*;
+import com.tcs.userservice.utility.ClobUtil;
+import com.tcs.userservice.utility.Constant;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RoleRequestServiceImpl implements RoleRequestService {
+
+    private static final String EVENT_SOURCE = "USER_SERVICE";
+    private static final String REQUEST_TYPE_KEY = "ROLE_MANAGEMENT";
+
+    private final RoleRequestRepository roleRequestRepository;
+    private final RoleRepository roleRepository;
+    private final ObjectMapper objectMapper;
+    private final RoleService roleService;
+    private final PermissionsRepository permissionsRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final CacheManager cacheManager;
+    private final PermissionConfigService permissionConfigService;
+    private final NotificationWriterService notificationWriterService;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<RoleRequest>> createNewRoleRequest(RoleRequestCreateDto dto, String userId) {
+        
+        RoleRequest roleRequest = new RoleRequest();
+        roleRequest.setRequestType(dto.getRequestType());
+        roleRequest.setTargetRoleId(dto.getTargetRoleId());
+        roleRequest.setRequestorUserId(userId);
+        roleRequest.setRequestStatus(Constant.PENDING);
+        roleRequest.setRequestDate(new Timestamp(System.currentTimeMillis()));
+        
+        String finalJsonPayload;
+        Map<String, Object> payloadMap;
+        try {
+            if (dto.getRequestPayload() instanceof String) {
+                finalJsonPayload = (String) dto.getRequestPayload();
+                payloadMap = objectMapper.readValue(finalJsonPayload, Map.class);
+            } else {
+                payloadMap = (Map<String, Object>) dto.getRequestPayload();
+                finalJsonPayload = objectMapper.writeValueAsString(payloadMap);
+            }
+            roleRequest.setRequestPayload(finalJsonPayload);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Invalid JSON payload structure", e);
+        }
+
+        boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
+        String roleName = (String) payloadMap.get("roleName");
+
+        validateRequest(isCreate, dto.getTargetRoleId(), roleName);
+
+        if (isCreate) {
+            roleRequest.setTargetRoleId(roleRequestRepository.getNewRoleIdOnCreation());
+        }
+
+        RoleRequest saved = roleRequestRepository.save(roleRequest);
+
+        // 1. Notification (To Approvers)
+        // Msg: "New Role Request (ID: 55) for Role 51 (MODIFY) is pending approval."
+        String notifMsg = String.format("New Role Request (ID: %s) for Role %s (%s) is pending approval.",
+                saved.getRequestId(), saved.getTargetRoleId(), saved.getRequestType());
+        
+        createNotification(null, notifMsg, String.valueOf(saved.getRequestId()));
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ResponseVO.<RoleRequest>builder()
+                        .statusCode(HttpStatus.CREATED)
+                        .message("Request Created")
+                        .result(saved)
+                        .build());
+    }
+
+    private void validateRequest(boolean isCreate, int roleId, String roleName) {
+        if (isCreate) {
+             Role existingRole = roleRepository.findRoleByRoleId(roleId);
+             if(existingRole != null) throw new IllegalArgumentException("Role ID already exists");
+             
+             if(roleName != null && roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.toLowerCase()) > 0) {
+                 throw new IllegalArgumentException("Creation request for this Role Name already pending");
+             }
+        } else {
+            if(roleRequestRepository.countPendingRoleRequests(roleId) > 0) {
+                throw new IllegalArgumentException("Pending request already exists for this Role ID");
+            }
+        }
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRoleRequests(String userId) {
+        List<UserRequestProjection> rawList = roleRequestRepository.findPendingRoleRequests(userId);
+        return processProjectionList(rawList, "pendingRequests");
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRoleRequests(String userId) {
+        List<UserRequestProjection> rawList = roleRequestRepository.findMyPendingRoleRequests(userId);
+        return processProjectionList(rawList, "myRequests");
+    }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> processProjectionList(List<UserRequestProjection> rawList, String keyName) {
+        List<Map<String, Object>> processedList = rawList.stream().map(req -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("requestId", req.getRequestId());
+            map.put("requestType", req.getRequestType());
+            map.put("requestorUserId", req.getRequestorUserId());
+            map.put("targetRoleId", req.getTargetRoleId());
+            map.put("requestStatus", req.getRequestStatus());
+            map.put("requestDate", req.getRequestDate());
+            map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
+            map.put("reasonForRejection", req.getReasonForRejection());
+            map.put("executionDetails", ClobUtil.clobToString(req.getExecutionDetails()));
+            return map;
+        }).collect(Collectors.toList());
+
+        Map<String, Object> result = new HashMap<>();
+        result.put(keyName, processedList);
+        result.put("count", processedList.size());
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .message("Fetched " + processedList.size() + " requests")
+                .result(result)
+                .build());
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectRoleRequest(Map<String, Object> request, String userId) {
+        String actionFlag = (String) request.get("actionFlag");
+        int requestId = Integer.parseInt(String.valueOf(request.get("requestId")));
+        
+        RoleRequest roleRequest = roleRequestRepository.findRoleRequestByRequestId(requestId);
+        roleRequest.setApproverUserId(userId);
+        roleRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+
+        Map<String, Object> result = new HashMap<>();
+        boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(actionFlag);
+        
+        performUpdateOperation(result, actionFlag, roleRequest);
+        
+        boolean success = (boolean) result.get(Constant.STATUS);
+        
+        // 2. Notification (To Requestor)
+        // Msg: "Your Role Request (ID: 55) for Role 51 has been ACCEPTED."
+        String status = isApproved ? "ACCEPTED" : "REJECTED";
+        String notifMsg = String.format("Your Role Request (ID: %s) for Role %s has been %s.", 
+                roleRequest.getRequestId(), roleRequest.getTargetRoleId(), status);
+
+        if (!isApproved) {
+            notifMsg += " Reason: " + roleRequest.getReasonForRejection();
+        }
+
+        createNotification(roleRequest.getRequestorUserId(), notifMsg, String.valueOf(roleRequest.getRequestId()));
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .message((String) result.get(Constant.MESSAGE))
+                .result(result)
+                .build());
+    }
+
+    private void performUpdateOperation(Map<String, Object> result, String actionFlag, RoleRequest roleRequest) {
+        if (actionFlag.equalsIgnoreCase(Constant.ACCEPT)) {
+            try {
+                String jsonPayload = ClobUtil.clobToString(roleRequest.getRequestPayload());
+                RoleRequestPayload payload = objectMapper.readValue(jsonPayload, RoleRequestPayload.class);
+                int roleId = roleRequest.getTargetRoleId();
+
+                Role role = roleRepository.findRoleByRoleId(roleId);
+                boolean isCreate = Constant.CREATE.equalsIgnoreCase(roleRequest.getRequestType());
+
+                if (isCreate) role = new Role();
+                if (role == null) {
+                    result.put(Constant.STATUS, false);
+                    result.put(Constant.MESSAGE, "Role not found");
+                    return;
+                }
+
+                role.setRoleId(roleId);
+                role.setRoleName(payload.getRoleName());
+                role.setDescription(payload.getDescription());
+                role.setStatus(Constant.ACTIVE);
+                roleRepository.save(role);
+
+                savePermissions(payload, roleId);
+                
+                evictPermissionCache(payload.getPermissions());
+
+                roleRequest.setRequestStatus(Constant.ACCEPTED);
+                roleRequestRepository.save(roleRequest);
+
+                result.put(Constant.STATUS, true);
+                result.put(Constant.MESSAGE, isCreate ? "Role Created" : "Role Updated");
+
+            } catch (Exception e) {
+                log.error("Error updating role", e);
+                throw new RuntimeException("Update failed", e);
+            }
+        } else {
+            roleRequest.setRequestStatus(Constant.REJECTED);
+            roleRequest.setReasonForRejection("Rejected by approver");
+            roleRequestRepository.save(roleRequest);
+            result.put(Constant.STATUS, true);
+            result.put(Constant.MESSAGE, "Request Rejected");
+        }
+    }
+    
+    private void evictPermissionCache(List<PermissionList> permissions) {
+        if(permissions == null) return;
+        try {
+            Set<Integer> ids = permissions.stream().map(PermissionList::getId).collect(Collectors.toSet());
+            List<String> keys = permissionsRepository.findMappedRequestTypeByMenuId(ids);
+            Cache cache = cacheManager.getCache("notification_configs");
+            if (cache != null && keys != null) {
+                keys.forEach(cache::evict);
+            }
+        } catch (Exception e) {
+            log.warn("Cache eviction failed", e);
+        }
+    }
+
+    private void savePermissions(RoleRequestPayload payload, int roleId) {
+        List<PermissionList> newPerms = payload.getPermissions();
+        if (newPerms == null) return;
+
+        List<RolePermissions> current = rolePermissionsRepository.findByIdRoleId(roleId);
+        rolePermissionsRepository.deleteAll(current);
+        rolePermissionsRepository.flush();
+
+        List<RolePermissions> toSave = newPerms.stream().map(p -> {
+            RolePermissions rp = new RolePermissions();
+            rp.setId(new RolePermissionId(roleId, p.getId()));
+            rp.setPermissionOrder(p.getOrder());
+            return rp;
+        }).collect(Collectors.toList());
+
+        rolePermissionsRepository.saveAll(toSave);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> cancelRoleRequest(Map<String, Object> request, String userId) {
+        int requestId = Integer.parseInt(String.valueOf(request.get("requestId")));
+        RoleRequest roleRequest = roleRequestRepository.getRoleRequestByRequestId(requestId);
+
+        if(!roleRequest.getRequestorUserId().equals(userId)) {
+             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        
+        roleRequest.setRequestStatus(Constant.CANCEL);
+        roleRequestRepository.save(roleRequest);
+        
+        createNotification(roleRequest.getRequestorUserId(), 
+                "Role Request (ID: " + requestId + ") has been cancelled.", 
+                String.valueOf(requestId));
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .message("Cancelled")
+                .result(Map.of("status", true))
+                .build());
+    }
+
+    private void createNotification(String targetUser, String msg, String refId) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+            String targetRoles = (targetUser == null) ? config.getTargetRoles() : null;
+            
+            notificationWriterService.createNotification(targetUser, targetRoles, msg, 
+                                                         config.getTargetUrl(), 
+                                                         refId, EVENT_SOURCE);
+        } catch (Exception e) {
+             throw new RuntimeException("Notification failed", e);
+        }
+    }
+    
+    @Override
+	public ResponseEntity<ResponseVO<Map<String, Object>>> getAllRoles(Map<String, Object> request) {
+        boolean includePermissions = Boolean.parseBoolean(String.valueOf(request.get("permissions")));
+        List<RoleDto> roles = roleService.getAllRolesWithPermissions(includePermissions);
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(Map.of("roles", roles))
+                .build());
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<List<PermissionDto>>> getAllPermissions() {
+        List<Permissions> permissions = permissionsRepository.findAll();
+        List<PermissionDto> dtos = permissions.stream().map(p -> PermissionDto.builder()
+                .id(p.getMenuId())
+                .title(p.getMenuTitle())
+                .icon(p.getMenuIcon())
+                .menuSubmenu(p.getMenuSubmenu())
+                .description(p.getMenuDescription())
+                .build()).collect(Collectors.toList());
+        
+        return ResponseEntity.ok(ResponseVO.<List<PermissionDto>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(dtos)
+                .build());
+    }
+
+    @Override
+    public ResponseEntity<?> savePermissionOrder(PermissionOrderDto payload) {
+        // Implementation as per previous code
+        return null; 
     }
 }
 
