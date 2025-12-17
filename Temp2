@@ -1,296 +1,27 @@
-package com.tcs.userservice.service;
+package com.tcs.userservice.repository;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.userservice.ResponseVO;
-import com.tcs.userservice.dto.*;
-import com.tcs.userservice.model.*;
-import com.tcs.userservice.repository.*;
-import com.tcs.userservice.utility.ClobUtil;
-import com.tcs.userservice.utility.Constant;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
 
-import java.sql.Timestamp;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.List;
+import java.util.Set;
 
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class UserRequestServiceImpl implements UserRequestService {
+@Repository
+public interface PermissionsRepository extends JpaRepository<Permissions, Integer> {
 
-    private static final String EVENT_SOURCE = "USER_SERVICE";
-    private static final String REQUEST_TYPE_KEY = "USER_MANAGEMENT";
+    // Existing method
+    @Query(value = "select REQUEST_TYPE from PERMISSIONS where MENU_ID in :ids", nativeQuery = true)
+    List<String> findMappedRequestTypeByMenuId(@Param("ids") Set<Integer> ids);
 
-    private final UserRequestRepository userRequestRepository;
-    private final UserRepository userRepository;
-    private final UserRoleRepository userRoleRepository;
-    private final ObjectMapper objectMapper;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequestCreateDto dto, String userId) {
-        String targetUserId = dto.getTargetUserId();
-        String requestType = dto.getRequestType();
-
-        // 1. Conflict Checks
-        if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
-             return buildError(HttpStatus.CONFLICT, "Pending request already exists");
-        }
-        User existingUser = userRepository.findUserByUserId(targetUserId);
-        if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
-             return buildError(HttpStatus.CONFLICT, "User already exists");
-        }
-        if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
-             return buildError(HttpStatus.NOT_FOUND, "User does not exist");
-        }
-
-        // 2. Create Entity
-        UserRequest request = new UserRequest();
-        request.setRequestType(requestType);
-        request.setTargetUserId(targetUserId);
-        request.setRequestorUserId(userId);
-        request.setRequestStatus(Constant.PENDING);
-        request.setRequestDate(new Timestamp(System.currentTimeMillis()));
-
-        // 3. Handle Payload
-        try {
-            String jsonPayload;
-            if (dto.getRequestPayload() instanceof String) {
-                jsonPayload = (String) dto.getRequestPayload();
-                objectMapper.readTree(jsonPayload); 
-            } else {
-                jsonPayload = objectMapper.writeValueAsString(dto.getRequestPayload());
-            }
-            request.setRequestPayload(jsonPayload);
-        } catch (Exception e) {
-            throw new RuntimeException("Invalid Payload", e);
-        }
-
-        // 4. Save
-        UserRequest saved = userRequestRepository.save(request);
-
-        // 5. Notification (To Approvers)
-        // Msg: "New User Request (ID: 123) for User 1015698 (CREATE) is pending approval."
-        String notifMsg = String.format("New User Request (ID: %s) for User %s (%s) is pending approval.", 
-                saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
-        
-        // Pass 'null' as targetUser so it fetches 'targetRoles' from Config (Approvers)
-        createNotification(null, notifMsg, String.valueOf(saved.getRequestId()));
-
-        return ResponseEntity.status(HttpStatus.CREATED)
-            .body(ResponseVO.<Map<String, Object>>builder()
-                    .statusCode(HttpStatus.CREATED)
-                    .message("Request Created")
-                    .result(Map.of("userRequest", saved))
-                    .build());
-    }
-
-    @Override
-    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRequests(Map<String, Object> params, String userId) {
-        List<UserRequestProjection> rawList = userRequestRepository.findUserPendingRequests(userId);
-        return processProjections(rawList, "pendingRequests");
-    }
-
-    @Override
-    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRequests(Map<String, String> params) {
-        String userId = params.get("userId");
-        List<UserRequestProjection> rawList = userRequestRepository.findUserRequestsByRequestorUserId(userId);
-        return processProjections(rawList, "myRequests");
-    }
-
-    private ResponseEntity<ResponseVO<Map<String, Object>>> processProjections(List<UserRequestProjection> rawList, String key) {
-        List<Map<String, Object>> processed = rawList.stream().map(req -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("requestId", req.getRequestId());
-            map.put("requestType", req.getRequestType());
-            map.put("targetUserId", req.getTargetUserId());
-            map.put("requestStatus", req.getRequestStatus());
-            map.put("requestDate", req.getRequestDate());
-            map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
-            return map;
-        }).collect(Collectors.toList());
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .result(Map.of(key, processed))
-                .build());
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectUserRequest(UserRequestDto dto, String ipAddress, String userId) {
-        UserRequest request = userRequestRepository.findUserRequestsByRequestId(dto.getRequestId());
-        request.setApproverUserId(userId);
-        request.setApprovalDate(new Timestamp(System.currentTimeMillis()));
-        
-        Map<String, Object> result = new HashMap<>();
-        String action = dto.getActionFlag();
-        boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action);
-
-        if (isApproved) { 
-            handleAccept(request, result, dto, ipAddress);
-        } else {
-            request.setRequestStatus(Constant.REJECTED);
-            request.setReasonForRejection(dto.getRemarks());
-            userRequestRepository.save(request);
-            result.put("status", true);
-            result.put("message", "Rejected");
-        }
-
-        boolean success = (boolean) result.get("status");
-        if(success && isApproved) {
-            request.setRequestStatus(Constant.ACCEPTED);
-            userRequestRepository.save(request);
-        }
-
-        // Notification (To Requestor)
-        // Msg: "Your User Request (ID: 123) for User 1015698 has been ACCEPTED."
-        // Or: "Your User Request (ID: 123) ... has been REJECTED. Reason: ..."
-        String status = isApproved ? "ACCEPTED" : "REJECTED";
-        String notifMsg = String.format("Your User Request (ID: %s) for User %s has been %s.", 
-                request.getRequestId(), request.getTargetUserId(), status);
-        
-        if (!isApproved && dto.getRemarks() != null && !dto.getRemarks().isEmpty()) {
-            notifMsg += " Reason: " + dto.getRemarks();
-        }
-
-        // Pass requestorUserId to target specifically the maker
-        createNotification(request.getRequestorUserId(), notifMsg, String.valueOf(request.getRequestId()));
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .result(result)
-                .build());
-    }
-
-    private void handleAccept(UserRequest request, Map<String, Object> result, UserRequestDto dto, String ip) {
-        try {
-            String jsonPayload = ClobUtil.clobToString(request.getRequestPayload());
-            Map<String, Object> payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<>() {});
-            
-            User user = userRepository.findUserByUserId(request.getTargetUserId());
-            String type = request.getRequestType();
-
-            if (Constant.CREATE.equalsIgnoreCase(type)) {
-                if (user != null) throw new RuntimeException("User already exists");
-                user = new User();
-                user.setCreatedAt(new Timestamp(System.currentTimeMillis()));
-                user.setAccountStatus(Constant.ACTIVE);
-                user.setIsDeleted("N");
-                user.setUserWrongPasswordCount(0);
-            } else if (user == null) {
-                throw new RuntimeException("User not found");
-            }
-
-            if (Constant.CREATE.equalsIgnoreCase(type) || Constant.MODIFY.equalsIgnoreCase(type)) {
-                user.setUserId(request.getTargetUserId());
-                if (payloadMap.containsKey("firstName")) user.setFirstName((String) payloadMap.get("firstName"));
-                if (payloadMap.containsKey("middleName")) user.setMiddleName((String) payloadMap.get("middleName"));
-                if (payloadMap.containsKey("lastName")) user.setLastName((String) payloadMap.get("lastName"));
-                if (payloadMap.containsKey("email")) user.setEmail((String) payloadMap.get("email"));
-                if (payloadMap.containsKey("mobileNumber")) user.setPhoneNumber((String) payloadMap.get("mobileNumber"));
-                
-                if (payloadMap.containsKey("branch")) {
-                    Object branchObj = payloadMap.get("branch");
-                    if (branchObj != null) {
-                        user.setBranch(Integer.parseInt(String.valueOf(branchObj)));
-                    }
-                }
-                
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
-                userRepository.save(user);
-                
-                if(payloadMap.containsKey("roleId")) {
-                    UserRole ur = userRoleRepository.getUserRolesByUserId(user.getUserId());
-                    if(ur == null) ur = new UserRole();
-                    ur.setUserId(user.getUserId());
-                    ur.setRoleId(Integer.parseInt(String.valueOf(payloadMap.get("roleId"))));
-                    userRoleRepository.save(ur);
-                }
-
-            } else if (Constant.LOCK.equalsIgnoreCase(type)) {
-                user.setAccountStatus(Constant.LOCKED);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
-                userRepository.save(user);
-            } else if (Constant.UNLOCK.equalsIgnoreCase(type)) {
-                user.setAccountStatus(Constant.ACTIVE);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
-                userRepository.save(user);
-            }
-
-            result.put("status", true);
-            result.put("message", "User Updated Successfully");
-
-        } catch (Exception e) {
-            log.error("Error applying user changes", e);
-            result.put("status", false);
-            result.put("message", "Failed to apply changes: " + e.getMessage());
-            throw new RuntimeException("Transaction Failed: " + e.getMessage(), e);
-        }
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity cancelRequest(Map<String, Object> requestMap) {
-        long id = Long.parseLong(String.valueOf(requestMap.get("requestId")));
-        UserRequest req = userRequestRepository.findUserRequestsByRequestId(id);
-        
-        userRequestRepository.delete(req);
-        
-        // Notify Maker that cancellation is confirmed
-        createNotification(req.getRequestorUserId(), "User Request (ID: " + id + ") has been cancelled.", String.valueOf(id));
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .message("Cancelled")
-                .result(Map.of("status", true))
-                .build());
-    }
-
-    private void createNotification(String targetUser, String msg, String refId) {
-        try {
-            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
-            // If targetUser is null, we fetch TargetRoles from Config (Approvers)
-            String targetRoles = (targetUser == null) ? config.getTargetRoles() : null;
-            
-            notificationWriterService.createNotification(targetUser, targetRoles, msg, 
-                config.getTargetUrl(), refId, EVENT_SOURCE);
-        } catch (Exception e) {
-            log.error("Notification failed", e);
-        }
-    }
-
-    private ResponseEntity<ResponseVO<Map<String, Object>>> buildError(HttpStatus status, String msg) {
-        return ResponseEntity.status(status).body(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(status)
-                .message(msg)
-                .result(Map.of("status", false, "message", msg))
-                .build());
-    }
-
-    @Override
-    public ResponseEntity getUserDetails(Map<String, String> request) {
-        String userId = request.get("userId");
-        User user = userRepository.findUserByUserId(userId);
-        if(user == null) {
-            return buildError(HttpStatus.NOT_FOUND, "User not found");
-        }
-        return ResponseEntity.ok(ResponseVO.builder()
-                .statusCode(HttpStatus.OK)
-                .result(user)
-                .build());
-    }
+    // --- NEW OPTIMIZED METHOD ---
+    // Efficiently fetches all permissions EXCEPT the specific title passed
+    // Uses Lowercase for case-insensitive safety
+    @Query("SELECT p FROM Permissions p WHERE LOWER(p.menuTitle) <> LOWER(:title)")
+    List<Permissions> findAllExceptTitle(@Param("title") String title);
 }
-
 
 
 
@@ -337,6 +68,12 @@ public class RoleRequestServiceImpl implements RoleRequestService {
 
     private static final String EVENT_SOURCE = "USER_SERVICE";
     private static final String REQUEST_TYPE_KEY = "ROLE_MANAGEMENT";
+    
+    // --- CONFIGURATION CONSTANTS ---
+    // Defined here for easy maintenance. 
+    // If these change in the future, you only edit these lines.
+    private static final String HIDDEN_ROLE_NAME = "F1/Bog";
+    private static final String RESTRICTED_PERMISSION_TITLE = "Role Management";
 
     private final RoleRequestRepository roleRequestRepository;
     private final RoleRepository roleRepository;
@@ -385,8 +122,6 @@ public class RoleRequestServiceImpl implements RoleRequestService {
 
         RoleRequest saved = roleRequestRepository.save(roleRequest);
 
-        // 1. Notification (To Approvers)
-        // Msg: "New Role Request (ID: 55) for Role 51 (MODIFY) is pending approval."
         String notifMsg = String.format("New Role Request (ID: %s) for Role %s (%s) is pending approval.",
                 saved.getRequestId(), saved.getTargetRoleId(), saved.getRequestType());
         
@@ -470,10 +205,6 @@ public class RoleRequestServiceImpl implements RoleRequestService {
         
         performUpdateOperation(result, actionFlag, roleRequest);
         
-        boolean success = (boolean) result.get(Constant.STATUS);
-        
-        // 2. Notification (To Requestor)
-        // Msg: "Your Role Request (ID: 55) for Role 51 has been ACCEPTED."
         String status = isApproved ? "ACCEPTED" : "REJECTED";
         String notifMsg = String.format("Your Role Request (ID: %s) for Role %s has been %s.", 
                 roleRequest.getRequestId(), roleRequest.getTargetRoleId(), status);
@@ -610,6 +341,17 @@ public class RoleRequestServiceImpl implements RoleRequestService {
 	public ResponseEntity<ResponseVO<Map<String, Object>>> getAllRoles(Map<String, Object> request) {
         boolean includePermissions = Boolean.parseBoolean(String.valueOf(request.get("permissions")));
         List<RoleDto> roles = roleService.getAllRolesWithPermissions(includePermissions);
+        
+        // --- JAVA FILTERING (Best Practice for this specific case) ---
+        // Reason: 'getAllRolesWithPermissions' performs complex Join logic.
+        // Duplicating that logic in SQL just to filter one row is risky.
+        // Since roles are < 100, Java filtering is safe and performant here.
+        if(roles != null) {
+            roles = roles.stream()
+                .filter(r -> r.getRoleName() != null && !r.getRoleName().equalsIgnoreCase(HIDDEN_ROLE_NAME))
+                .collect(Collectors.toList());
+        }
+
         return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
                 .statusCode(HttpStatus.OK)
                 .result(Map.of("roles", roles))
@@ -618,14 +360,21 @@ public class RoleRequestServiceImpl implements RoleRequestService {
 
     @Override
     public ResponseEntity<ResponseVO<List<PermissionDto>>> getAllPermissions() {
-        List<Permissions> permissions = permissionsRepository.findAll();
-        List<PermissionDto> dtos = permissions.stream().map(p -> PermissionDto.builder()
-                .id(p.getMenuId())
-                .title(p.getMenuTitle())
-                .icon(p.getMenuIcon())
-                .menuSubmenu(p.getMenuSubmenu())
-                .description(p.getMenuDescription())
-                .build()).collect(Collectors.toList());
+        
+        // --- DB FILTERING (Best Practice) ---
+        // Reason: Permissions can be large (100s or 1000s). 
+        // We use the Repository to fetch ONLY what we need.
+        List<Permissions> permissions = permissionsRepository.findAllExceptTitle(RESTRICTED_PERMISSION_TITLE);
+        
+        List<PermissionDto> dtos = permissions.stream()
+                .map(p -> PermissionDto.builder()
+                    .id(p.getMenuId())
+                    .title(p.getMenuTitle())
+                    .icon(p.getMenuIcon())
+                    .menuSubmenu(p.getMenuSubmenu())
+                    .description(p.getMenuDescription())
+                    .build())
+                .collect(Collectors.toList());
         
         return ResponseEntity.ok(ResponseVO.<List<PermissionDto>>builder()
                 .statusCode(HttpStatus.OK)
@@ -639,5 +388,6 @@ public class RoleRequestServiceImpl implements RoleRequestService {
         return null; 
     }
 }
+
 
 
