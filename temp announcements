@@ -1,0 +1,193 @@
+package com.tcs.fincore.CommonMasterService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EntityListeners(AuditingEntityListener.class)
+public class NotificationTable {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID) // Or manually set if using RAW(16)
+    @Column(name = "EVENT_ID", updatable = false, nullable = false)
+    private UUID eventId;
+
+    @Column(name = "USER_ID", length = 255)
+    private String userId;
+
+    @Column(name = "MESSAGE", length = 1024, nullable = false)
+    private String message;
+
+    @Column(name = "LINK_URL", length = 1024)
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE", length = 100)
+    private String eventSource;
+
+    @Column(name = "AGGREGATE_ID", length = 255)
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", nullable = false, updatable = false)
+    private Instant eventTimestamp;
+
+    @Column(name = "TARGET_ROLE", length = 100)
+    private String targetRole;
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonMasterService.repository;
+
+import com.tcs.fincore.CommonMasterService.model.NotificationTable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.UUID;
+
+@Repository
+public interface NotificationOutboxRepository extends JpaRepository<NotificationTable, UUID> {
+}
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonMasterService.service;
+
+import com.tcs.fincore.CommonMasterService.model.Announcement;
+import com.tcs.fincore.CommonMasterService.model.NotificationTable;
+import com.tcs.fincore.CommonMasterService.repository.NotificationOutboxRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AnnouncementNotificationService {
+
+    private final NotificationOutboxRepository notificationRepository;
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void broadcastAnnouncement(Announcement announcement) {
+        
+        if ("INFO".equalsIgnoreCase(announcement.getSeverity())) {
+            return; 
+        }
+
+        String targetRole = announcement.getTargetRole(); 
+        
+        if ("ALL".equalsIgnoreCase(targetRole) || targetRole == null) {
+            targetRole = "ALL_USERS";
+        }
+
+        String message = buildNotificationMessage(announcement);
+        String link = "/dashboard"; 
+        
+        // Build Entity using Builder Pattern
+        NotificationTable notification = NotificationTable.builder()
+                //.eventId(UUID.randomUUID()) // Optional if using @GeneratedValue
+                .message(message)
+                .linkUrl(link)
+                .targetRole(targetRole)
+                .aggregateId(String.valueOf(announcement.getId()))
+                .eventSource("CommonMasterService")
+                .userId(null) // It's a role broadcast, so user is null
+                .build();
+
+        // Save using JPA
+        notificationRepository.save(notification);
+
+        log.info("📢 Queued Notification for Targets: {}", targetRole);
+    }
+
+    private String buildNotificationMessage(Announcement a) {
+        String prefix = switch (a.getSeverity()) {
+            case "CRITICAL" -> "🚨 URGENT: ";
+            case "WARN" -> "⚠️ Attention: ";
+            default -> "📢 ";
+        };
+        return prefix + a.getTitle();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AnnouncementService {
+
+    private final AnnouncementRepository repository;
+    private final AnnouncementNotificationService notificationService; // Inject
+
+    @Transactional
+    public AnnouncementDto createAnnouncement(AnnouncementDto dto, String userId) {
+        // ... (Mapping logic) ...
+        entity = repository.save(entity);
+
+        // TRIGGER NOTIFICATION
+        // Only if Active ('Y') AND Started (Not Future)
+        if ("Y".equals(entity.getIsActive()) && !isFuture(entity.getStartDate())) {
+            notificationService.broadcastAnnouncement(entity);
+        }
+        return mapEntityToDto(entity);
+    }
+
+    @Transactional
+    public AnnouncementDto toggleStatus(Long id) {
+        // ... (Toggle logic) ...
+        repository.save(entity);
+        
+        // TRIGGER NOTIFICATION
+        // Only if toggled to 'Y'
+        if ("Y".equals(newState)) {
+             notificationService.broadcastAnnouncement(entity);
+        }
+        return mapEntityToDto(entity);
+    }
+    
+    private boolean isFuture(LocalDateTime date) {
+        return date != null && date.isAfter(LocalDateTime.now());
+    }
+    // ...
+}
+
+
+
