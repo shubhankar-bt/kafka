@@ -1,393 +1,736 @@
-package com.tcs.userservice.repository;
+package com.fincore.commonutilities.jwt;
 
-import com.tcs.userservice.model.Permissions;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
 
+import javax.crypto.SecretKey;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+
+@Component
+@Slf4j
+public class JwtUtil {
+
+    @Value("${jwt.secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
+    private String secretKey;
+
+    @Value("${jwt.access-token-validity:900000}") // 15 minutes
+    private long accessTokenValidity;
+
+    @Value("${jwt.refresh-token-validity:86400000}") // 24 hours
+    private long refreshTokenValidity;
+
+    // --- Validation Methods ---
+
+    public String getUserIdFromToken(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        return extractClaim(cleanToken, Claims::getSubject);
+    }
+
+    public int getUserRoleFromToken(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        return extractClaim(cleanToken, claims -> {
+            Object role = claims.get("role");
+            if (role instanceof Number) {
+                return ((Number) role).intValue();
+            }
+            throw new IllegalArgumentException("Token role claim is not a number");
+        });
+    }
+
+    /**
+     * Validates signature and expiration.
+     * Throws specific exceptions for handling in Filter.
+     */
+    public boolean isTokenValid(String token) {
+        String cleanToken = removeBearerPrefix(token);
+        // This will throw ExpiredJwtException if expired
+        return !isTokenExpired(cleanToken);
+    }
+
+    // --- Generation Methods (For Auth Service) ---
+
+    public String generateAccessToken(String userId, int roleId) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("role", roleId);
+        return buildToken(claims, userId, accessTokenValidity);
+    }
+
+    public String generateRefreshToken(String userId) {
+        return buildToken(new HashMap<>(), userId, refreshTokenValidity);
+    }
+
+    private String buildToken(Map<String, Object> claims, String subject, long validity) {
+        return Jwts.builder()
+                .claims(claims)
+                .subject(subject)
+                .issuedAt(new Date(System.currentTimeMillis()))
+                .expiration(new Date(System.currentTimeMillis() + validity))
+                .signWith(getSigningKey())
+                .compact();
+    }
+
+    // --- Internal Helpers ---
+
+    private String removeBearerPrefix(String token) {
+        if (token != null && token.startsWith("Bearer ")) {
+            return token.substring(7);
+        }
+        return token;
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractExpiration(token).before(new Date());
+    }
+
+    private Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+
+    private <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser()
+                .verifyWith(getSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    private SecretKey getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.config;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 
-@Repository
-public interface PermissionsRepository extends JpaRepository<Permissions, Integer> {
-
-    // Existing method
-    @Query(value = "select REQUEST_TYPE from PERMISSIONS where MENU_ID in :ids", nativeQuery = true)
-    List<String> findMappedRequestTypeByMenuId(@Param("ids") Set<Integer> ids);
-
-    // --- NEW OPTIMIZED METHOD ---
-    // Efficiently fetches all permissions EXCEPT the specific title passed
-    // Uses Lowercase for case-insensitive safety
-    @Query("SELECT p FROM Permissions p WHERE LOWER(p.menuTitle) <> LOWER(:title)")
-    List<Permissions> findAllExceptTitle(@Param("title") String title);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.tcs.userservice.service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.userservice.ResponseVO;
-import com.tcs.userservice.dto.*;
-import com.tcs.userservice.model.*;
-import com.tcs.userservice.repository.*;
-import com.tcs.userservice.utility.ClobUtil;
-import com.tcs.userservice.utility.Constant;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.sql.Timestamp;
-import java.util.*;
-import java.util.stream.Collectors;
-
 @Slf4j
-@Service
 @RequiredArgsConstructor
-public class RoleRequestServiceImpl implements RoleRequestService {
+public class ContextRbacFilter extends OncePerRequestFilter {
 
-    private static final String EVENT_SOURCE = "USER_SERVICE";
-    private static final String REQUEST_TYPE_KEY = "ROLE_MANAGEMENT";
-    
-    // --- CONFIGURATION CONSTANTS ---
-    // Defined here for easy maintenance. 
-    // If these change in the future, you only edit these lines.
-    private static final String HIDDEN_ROLE_NAME = "F1/Bog";
-    private static final String RESTRICTED_PERMISSION_TITLE = "Role Management";
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
-    private final RoleRequestRepository roleRequestRepository;
-    private final RoleRepository roleRepository;
-    private final ObjectMapper objectMapper;
-    private final RoleService roleService;
-    private final PermissionsRepository permissionsRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final CacheManager cacheManager;
-    private final PermissionConfigService permissionConfigService;
-    private final NotificationWriterService notificationWriterService;
+    // Endpoints that require X-Request-Type header
+    private static final Set<String> GENERIC_ENDPOINTS = Set.of(
+            "/create-request", "/update-request", "/my-requests", "/pending-requests", "/all-requests"
+    );
+
+    // Endpoints skipped by this filter entirely
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
+    );
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity<ResponseVO<RoleRequest>> createNewRoleRequest(RoleRequestCreateDto dto, String userId) {
-        
-        RoleRequest roleRequest = new RoleRequest();
-        roleRequest.setRequestType(dto.getRequestType());
-        roleRequest.setTargetRoleId(dto.getTargetRoleId());
-        roleRequest.setRequestorUserId(userId);
-        roleRequest.setRequestStatus(Constant.PENDING);
-        roleRequest.setRequestDate(new Timestamp(System.currentTimeMillis()));
-        
-        String finalJsonPayload;
-        Map<String, Object> payloadMap;
-        try {
-            if (dto.getRequestPayload() instanceof String) {
-                finalJsonPayload = (String) dto.getRequestPayload();
-                payloadMap = objectMapper.readValue(finalJsonPayload, Map.class);
-            } else {
-                payloadMap = (Map<String, Object>) dto.getRequestPayload();
-                finalJsonPayload = objectMapper.writeValueAsString(payloadMap);
-            }
-            roleRequest.setRequestPayload(finalJsonPayload);
-        } catch (Exception e) {
-            throw new IllegalArgumentException("Invalid JSON payload structure", e);
-        }
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
 
-        boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
-        String roleName = (String) payloadMap.get("roleName");
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
 
-        validateRequest(isCreate, dto.getTargetRoleId(), roleName);
-
-        if (isCreate) {
-            roleRequest.setTargetRoleId(roleRequestRepository.getNewRoleIdOnCreation());
-        }
-
-        RoleRequest saved = roleRequestRepository.save(roleRequest);
-
-        String notifMsg = String.format("New Role Request (ID: %s) for Role %s (%s) is pending approval.",
-                saved.getRequestId(), saved.getTargetRoleId(), saved.getRequestType());
-        
-        createNotification(null, notifMsg, String.valueOf(saved.getRequestId()));
-
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .body(ResponseVO.<RoleRequest>builder()
-                        .statusCode(HttpStatus.CREATED)
-                        .message("Request Created")
-                        .result(saved)
-                        .build());
-    }
-
-    private void validateRequest(boolean isCreate, int roleId, String roleName) {
-        if (isCreate) {
-             Role existingRole = roleRepository.findRoleByRoleId(roleId);
-             if(existingRole != null) throw new IllegalArgumentException("Role ID already exists");
-             
-             if(roleName != null && roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.toLowerCase()) > 0) {
-                 throw new IllegalArgumentException("Creation request for this Role Name already pending");
-             }
-        } else {
-            if(roleRequestRepository.countPendingRoleRequests(roleId) > 0) {
-                throw new IllegalArgumentException("Pending request already exists for this Role ID");
+        // 1. SKIP WHITELIST
+        for (String pattern : WHITELIST) {
+            if (pathMatcher.match(pattern, uri)) {
+                filterChain.doFilter(request, response);
+                return;
             }
         }
-    }
 
-    @Override
-    @Transactional(readOnly = true)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRoleRequests(String userId) {
-        List<UserRequestProjection> rawList = roleRequestRepository.findPendingRoleRequests(userId);
-        return processProjectionList(rawList, "pendingRequests");
-    }
+        String token = request.getHeader("Authorization");
 
-    @Override
-    @Transactional(readOnly = true)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRoleRequests(String userId) {
-        List<UserRequestProjection> rawList = roleRequestRepository.findMyPendingRoleRequests(userId);
-        return processProjectionList(rawList, "myRequests");
-    }
-
-    private ResponseEntity<ResponseVO<Map<String, Object>>> processProjectionList(List<UserRequestProjection> rawList, String keyName) {
-        List<Map<String, Object>> processedList = rawList.stream().map(req -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("requestId", req.getRequestId());
-            map.put("requestType", req.getRequestType());
-            map.put("requestorUserId", req.getRequestorUserId());
-            map.put("targetRoleId", req.getTargetRoleId());
-            map.put("requestStatus", req.getRequestStatus());
-            map.put("requestDate", req.getRequestDate());
-            map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
-            map.put("reasonForRejection", req.getReasonForRejection());
-            map.put("executionDetails", ClobUtil.clobToString(req.getExecutionDetails()));
-            return map;
-        }).collect(Collectors.toList());
-
-        Map<String, Object> result = new HashMap<>();
-        result.put(keyName, processedList);
-        result.put("count", processedList.size());
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .message("Fetched " + processedList.size() + " requests")
-                .result(result)
-                .build());
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectRoleRequest(Map<String, Object> request, String userId) {
-        String actionFlag = (String) request.get("actionFlag");
-        int requestId = Integer.parseInt(String.valueOf(request.get("requestId")));
-        
-        RoleRequest roleRequest = roleRequestRepository.findRoleRequestByRequestId(requestId);
-        roleRequest.setApproverUserId(userId);
-        roleRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
-
-        Map<String, Object> result = new HashMap<>();
-        boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(actionFlag);
-        
-        performUpdateOperation(result, actionFlag, roleRequest);
-        
-        String status = isApproved ? "ACCEPTED" : "REJECTED";
-        String notifMsg = String.format("Your Role Request (ID: %s) for Role %s has been %s.", 
-                roleRequest.getRequestId(), roleRequest.getTargetRoleId(), status);
-
-        if (!isApproved) {
-            notifMsg += " Reason: " + roleRequest.getReasonForRejection();
-        }
-
-        createNotification(roleRequest.getRequestorUserId(), notifMsg, String.valueOf(roleRequest.getRequestId()));
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .message((String) result.get(Constant.MESSAGE))
-                .result(result)
-                .build());
-    }
-
-    private void performUpdateOperation(Map<String, Object> result, String actionFlag, RoleRequest roleRequest) {
-        if (actionFlag.equalsIgnoreCase(Constant.ACCEPT)) {
+        // 2. VALIDATE TOKEN (Gateway Logic)
+        if (token != null) {
             try {
-                String jsonPayload = ClobUtil.clobToString(roleRequest.getRequestPayload());
-                RoleRequestPayload payload = objectMapper.readValue(jsonPayload, RoleRequestPayload.class);
-                int roleId = roleRequest.getTargetRoleId();
+                // This call validates signature AND expiry. 
+                // If expired, it throws ExpiredJwtException.
+                String userId = jwtUtil.getUserIdFromToken(token);
+                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+                String roleId = String.valueOf(roleIdInt);
 
-                Role role = roleRepository.findRoleByRoleId(roleId);
-                boolean isCreate = Constant.CREATE.equalsIgnoreCase(roleRequest.getRequestType());
-
-                if (isCreate) role = new Role();
-                if (role == null) {
-                    result.put(Constant.STATUS, false);
-                    result.put(Constant.MESSAGE, "Role not found");
-                    return;
+                // Token is valid -> Set Security Context
+                if (SecurityContextHolder.getContext().getAuthentication() == null) {
+                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+                    );
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
                 }
 
-                role.setRoleId(roleId);
-                role.setRoleName(payload.getRoleName());
-                role.setDescription(payload.getDescription());
-                role.setStatus(Constant.ACTIVE);
-                roleRepository.save(role);
+                // 3. RBAC CHECK (Embedded Logic)
+                if (!checkRbac(request, response, roleId)) {
+                    return; // Access Denied, response already sent
+                }
 
-                savePermissions(payload, roleId);
-                
-                evictPermissionCache(payload.getPermissions());
-
-                roleRequest.setRequestStatus(Constant.ACCEPTED);
-                roleRequestRepository.save(roleRequest);
-
-                result.put(Constant.STATUS, true);
-                result.put(Constant.MESSAGE, isCreate ? "Role Created" : "Role Updated");
-
-            } catch (Exception e) {
-                log.error("Error updating role", e);
-                throw new RuntimeException("Update failed", e);
+            } catch (ExpiredJwtException e) {
+                // --- HANDLE EXPIRED TOKEN ---
+                log.warn("Token Expired: {}", e.getMessage());
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                response.setContentType("application/json");
+                response.getWriter().write("{\"status\": 401, \"error\": \"TOKEN_EXPIRED\", \"message\": \"JWT has expired. Please refresh.\"}");
+                return; // Stop execution
+            } catch (JwtException | IllegalArgumentException e) {
+                // --- HANDLE INVALID TOKEN ---
+                log.error("Invalid Token: {}", e.getMessage());
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid Token");
+                return;
             }
         } else {
-            roleRequest.setRequestStatus(Constant.REJECTED);
-            roleRequest.setReasonForRejection("Rejected by approver");
-            roleRequestRepository.save(roleRequest);
-            result.put(Constant.STATUS, true);
-            result.put(Constant.MESSAGE, "Request Rejected");
+            // Missing Token
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing Authorization Header");
+            return;
         }
+
+        // Proceed to Controller
+        filterChain.doFilter(request, response);
     }
-    
-    private void evictPermissionCache(List<PermissionList> permissions) {
-        if(permissions == null) return;
-        try {
-            Set<Integer> ids = permissions.stream().map(PermissionList::getId).collect(Collectors.toSet());
-            List<String> keys = permissionsRepository.findMappedRequestTypeByMenuId(ids);
-            Cache cache = cacheManager.getCache("notification_configs");
-            if (cache != null && keys != null) {
-                keys.forEach(cache::evict);
+
+    /**
+     * Checks permissions against Redis.
+     */
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId) throws IOException {
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+        
+        String contextHeader = request.getHeader("X-Request-Type");
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
+        boolean isGenericEndpoint = GENERIC_ENDPOINTS.stream().anyMatch(uri::endsWith);
+
+        if (isGenericEndpoint && requestContext.equals("*")) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing Header: X-Request-Type is required");
+            return false;
+        }
+
+        String redisKey = "RBAC::PERMISSIONS::" + roleId;
+        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
+        boolean isAuthorized = false;
+
+        if (permissions != null) {
+            for (String perm : permissions) {
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+
+                String methodAndUrl = parts[0];
+                String allowedContext = parts[1];
+
+                boolean contextMatches = false;
+                if (allowedContext.equals(requestContext)) contextMatches = true;
+                else if (allowedContext.equals("*")) contextMatches = true;
+                else if (requestContext.equals("*") && !isGenericEndpoint) contextMatches = true;
+
+                if (!contextMatches) continue;
+
+                String[] muParts = methodAndUrl.split(":", 2);
+                if (muParts.length < 2) continue;
+
+                String allowedMethod = muParts[0];
+                String allowedUrlPattern = muParts[1];
+
+                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
+                    isAuthorized = true;
+                    break;
+                }
             }
-        } catch (Exception e) {
-            log.warn("Cache eviction failed", e);
-        }
-    }
-
-    private void savePermissions(RoleRequestPayload payload, int roleId) {
-        List<PermissionList> newPerms = payload.getPermissions();
-        if (newPerms == null) return;
-
-        List<RolePermissions> current = rolePermissionsRepository.findByIdRoleId(roleId);
-        rolePermissionsRepository.deleteAll(current);
-        rolePermissionsRepository.flush();
-
-        List<RolePermissions> toSave = newPerms.stream().map(p -> {
-            RolePermissions rp = new RolePermissions();
-            rp.setId(new RolePermissionId(roleId, p.getId()));
-            rp.setPermissionOrder(p.getOrder());
-            return rp;
-        }).collect(Collectors.toList());
-
-        rolePermissionsRepository.saveAll(toSave);
-    }
-
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity<ResponseVO<Map<String, Object>>> cancelRoleRequest(Map<String, Object> request, String userId) {
-        int requestId = Integer.parseInt(String.valueOf(request.get("requestId")));
-        RoleRequest roleRequest = roleRequestRepository.getRoleRequestByRequestId(requestId);
-
-        if(!roleRequest.getRequestorUserId().equals(userId)) {
-             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
-        }
-        
-        roleRequest.setRequestStatus(Constant.CANCEL);
-        roleRequestRepository.save(roleRequest);
-        
-        createNotification(roleRequest.getRequestorUserId(), 
-                "Role Request (ID: " + requestId + ") has been cancelled.", 
-                String.valueOf(requestId));
-
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .message("Cancelled")
-                .result(Map.of("status", true))
-                .build());
-    }
-
-    private void createNotification(String targetUser, String msg, String refId) {
-        try {
-            NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
-            String targetRoles = (targetUser == null) ? config.getTargetRoles() : null;
-            
-            notificationWriterService.createNotification(targetUser, targetRoles, msg, 
-                                                         config.getTargetUrl(), 
-                                                         refId, EVENT_SOURCE);
-        } catch (Exception e) {
-             throw new RuntimeException("Notification failed", e);
-        }
-    }
-    
-    @Override
-	public ResponseEntity<ResponseVO<Map<String, Object>>> getAllRoles(Map<String, Object> request) {
-        boolean includePermissions = Boolean.parseBoolean(String.valueOf(request.get("permissions")));
-        List<RoleDto> roles = roleService.getAllRolesWithPermissions(includePermissions);
-        
-        // --- JAVA FILTERING (Best Practice for this specific case) ---
-        // Reason: 'getAllRolesWithPermissions' performs complex Join logic.
-        // Duplicating that logic in SQL just to filter one row is risky.
-        // Since roles are < 100, Java filtering is safe and performant here.
-        if(roles != null) {
-            roles = roles.stream()
-                .filter(r -> r.getRoleName() != null && !r.getRoleName().equalsIgnoreCase(HIDDEN_ROLE_NAME))
-                .collect(Collectors.toList());
         }
 
-        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
-                .statusCode(HttpStatus.OK)
-                .result(Map.of("roles", roles))
-                .build());
-    }
-
-    @Override
-    public ResponseEntity<ResponseVO<List<PermissionDto>>> getAllPermissions() {
-        
-        // --- DB FILTERING (Best Practice) ---
-        // Reason: Permissions can be large (100s or 1000s). 
-        // We use the Repository to fetch ONLY what we need.
-        List<Permissions> permissions = permissionsRepository.findAllExceptTitle(RESTRICTED_PERMISSION_TITLE);
-        
-        List<PermissionDto> dtos = permissions.stream()
-                .map(p -> PermissionDto.builder()
-                    .id(p.getMenuId())
-                    .title(p.getMenuTitle())
-                    .icon(p.getMenuIcon())
-                    .menuSubmenu(p.getMenuSubmenu())
-                    .description(p.getMenuDescription())
-                    .build())
-                .collect(Collectors.toList());
-        
-        return ResponseEntity.ok(ResponseVO.<List<PermissionDto>>builder()
-                .statusCode(HttpStatus.OK)
-                .result(dtos)
-                .build());
-    }
-
-    @Override
-    public ResponseEntity<?> savePermissionOrder(PermissionOrderDto payload) {
-        // Implementation as per previous code
-        return null; 
+        if (!isAuthorized) {
+            log.warn("⛔ RBAC Deny: User Role {} -> {} {} (Context: {})", roleId, method, uri, requestContext);
+            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Access Denied: Insufficient Permissions");
+            return false;
+        }
+        return true;
     }
 }
+
+How to Use This
+ * Build: Run mvn clean install on this common-utilities project.
+ * Import: In every microservice (UserService, CRS, etc.), ensure pom.xml depends on this version.
+ * Configure: In every microservice's SecurityConfig, import these beans:
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class}) // Load beans from library
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/auth/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            // Add the Gateway Filter
+            .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
+        
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// =========================================================
+// 1. UPDATE JwtUtil (Common Utilities)
+// File: com/fincore/commonutilities/jwt/JwtUtil.java
+// =========================================================
+
+// ... existing imports ...
+
+@Component
+@Slf4j
+public class JwtUtil {
+
+    // ... existing fields ...
+
+    @Value("${jwt.access-token-validity:900000}") // 15 mins
+    private long accessTokenValidity;
+
+    @Value("${jwt.refresh-token-validity:86400000}") // 24 hours
+    private long refreshTokenValidity;
+
+    // ... existing validation methods ...
+
+    // --- NEW: Token Generation ---
+
+    public String generateAccessToken(String userId, int roleId) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("role", roleId);
+        return buildToken(claims, userId, accessTokenValidity);
+    }
+
+    public String generateRefreshToken(String userId) {
+        // Refresh tokens typically just identify the user
+        return buildToken(new HashMap<>(), userId, refreshTokenValidity);
+    }
+
+    private String buildToken(Map<String, Object> claims, String subject, long validity) {
+        return Jwts.builder()
+                .claims(claims)
+                .subject(subject)
+                .issuedAt(new Date(System.currentTimeMillis()))
+                .expiration(new Date(System.currentTimeMillis() + validity))
+                .signWith(getSigningKey())
+                .compact();
+    }
+}
+
+// =========================================================
+// 2. CREATE AuthController (User Service)
+// File: com/tcs/userservice/controller/AuthController.java
+// =========================================================
+
+package com.tcs.userservice.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.userservice.service.UserService;
+import com.tcs.userservice.model.User;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/auth")
+@RequiredArgsConstructor
+@Slf4j
+public class AuthController {
+
+    private final JwtUtil jwtUtil;
+    private final UserService userService; // To verify user status
+
+    @PostMapping("/refresh")
+    public ResponseEntity<?> refreshToken(@RequestBody Map<String, String> request) {
+        String refreshToken = request.get("refreshToken");
+
+        if (refreshToken == null || refreshToken.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Refresh Token is required");
+        }
+
+        try {
+            // 1. Validate Refresh Token Signature & Expiry
+            if (jwtUtil.isTokenValid(refreshToken)) {
+                
+                // 2. Extract User ID
+                String userId = jwtUtil.getUserIdFromToken(refreshToken);
+
+                // 3. Verify User State in DB (Security Check)
+                // We must ensure user hasn't been locked/deleted since login
+                User user = userService.findUserByUserId(userId);
+                
+                if (user == null || !"ACTIVE".equals(user.getAccountStatus())) {
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body("User account is locked or inactive");
+                }
+
+                // 4. Generate New Access Token
+                // Note: You might need to fetch Role ID from DB if it can change
+                int roleId = Integer.parseInt(user.getRoleId()); 
+                String newAccessToken = jwtUtil.generateAccessToken(userId, roleId);
+
+                // 5. Optional: Rotate Refresh Token (Strict Security)
+                // String newRefreshToken = jwtUtil.generateRefreshToken(userId);
+
+                return ResponseEntity.ok(Map.of(
+                    "accessToken", newAccessToken,
+                    "tokenType", "Bearer",
+                    "expiresIn", 900 // 15 mins in seconds
+                ));
+            } else {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid Refresh Token");
+            }
+        } catch (Exception e) {
+            log.error("Token Refresh Failed: {}", e.getMessage());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Refresh Token Expired or Invalid");
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------
+
+
+
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Set;
+
+@Slf4j
+@RequiredArgsConstructor
+public class ContextRbacFilter extends OncePerRequestFilter {
+
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    // Whitelist paths skipped by filter
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
+    );
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+
+        String uri = request.getRequestURI();
+        
+        // 1. SKIP WHITELIST
+        for (String pattern : WHITELIST) {
+            if (pathMatcher.match(pattern, uri)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+        }
+
+        String authHeader = request.getHeader("Authorization");
+        String token = null;
+
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            token = authHeader.substring(7);
+        }
+
+        if (token != null) {
+            try {
+                // 2. VALIDATE TOKEN SIGNATURE & EXPIRY
+                String userId = jwtUtil.getUserIdFromToken(token);
+                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+                String roleId = String.valueOf(roleIdInt);
+
+                // =================================================================
+                // 3. SECURITY CHECK: SINGLE SESSION ENFORCEMENT (Redis)
+                // =================================================================
+                String sessionKey = "USER_SESSION::" + userId;
+                String activeToken = redisTemplate.opsForValue().get(sessionKey);
+
+                if (activeToken == null) {
+                    // Scenario: Token valid locally, but session expired/deleted in Redis
+                    throw new JwtException("Session Expired or Terminated");
+                }
+
+                if (!token.equals(activeToken)) {
+                    // Scenario: Token valid locally, but Redis has a DIFFERENT token
+                    // This means user logged in on another device.
+                    log.warn("Concurrent Login Detected for User {}. Terminating old session.", userId);
+                    response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                    response.setContentType("application/json");
+                    response.getWriter().write("{\"status\": 401, \"error\": \"CONCURRENT_LOGIN\", \"message\": \"You have been logged out because you signed in on another device.\"}");
+                    return; // STOP execution
+                }
+                // =================================================================
+
+                // 4. SET CONTEXT
+                if (SecurityContextHolder.getContext().getAuthentication() == null) {
+                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+                    );
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
+
+                // 5. RBAC CHECK
+                if (!checkRbac(request, response, roleId)) {
+                    return; 
+                }
+
+            } catch (ExpiredJwtException e) {
+                log.warn("Token Expired: {}", e.getMessage());
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                response.setContentType("application/json");
+                response.getWriter().write("{\"status\": 401, \"error\": \"TOKEN_EXPIRED\", \"message\": \"JWT has expired. Please refresh.\"}");
+                return;
+            } catch (JwtException | IllegalArgumentException e) {
+                log.error("Invalid Token/Session: {}", e.getMessage());
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid Session");
+                return;
+            }
+        } else {
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing Authorization Header");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    // ... (Keep existing checkRbac helper method) ...
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId) throws IOException {
+       // ... (Same implementation as previously provided) ...
+       // (If you need me to paste it again fully, let me know, but it's unchanged)
+        return true; // Placeholder for brevity
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Inject StringRedisTemplate
+@Autowired
+private StringRedisTemplate redisTemplate;
+
+// In your login/authenticate method:
+public LoginResponse login(LoginRequest request) {
+    // 1. Authenticate (DB check, Password check) ...
+    
+    // 2. Generate Token
+    String accessToken = jwtUtil.generateAccessToken(userId, roleId);
+    
+    // 3. [NEW] STORE SESSION IN REDIS
+    String sessionKey = "USER_SESSION::" + userId;
+    // Store token with same TTL as the JWT (e.g., 15 minutes)
+    redisTemplate.opsForValue().set(sessionKey, accessToken, 15, TimeUnit.MINUTES);
+    
+    // 4. Return response ...
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// In AuthController.java (User Service)
+
+@PostMapping("/refresh")
+public ResponseEntity<?> refreshToken(...) {
+    // ... validate refresh token ...
+    
+    String newAccessToken = jwtUtil.generateAccessToken(userId, roleId);
+    
+    // [NEW] UPDATE SESSION IN REDIS
+    // This invalidates the old access token immediately
+    String sessionKey = "USER_SESSION::" + userId;
+    redisTemplate.opsForValue().set(sessionKey, newAccessToken, 15, TimeUnit.MINUTES);
+    
+    // ... return response
+}
+
+
+
+
+
+
+
 
 
 
