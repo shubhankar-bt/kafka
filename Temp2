@@ -36,6 +36,9 @@ public class AuthController {
     private final LoginService loginService;
     private final ObjectMapper mapper;
 
+    @Value("${security.jwt.mode:hmac}")
+    private String mode;
+
     @Value("${security.jwt.hmac-base64-secret:}")
     private String hmacSecret;
 
@@ -43,19 +46,20 @@ public class AuthController {
     private long ttlSeconds;
 
     /**
-     * REACTIVE LOGIN ENDPOINT
-     * Wraps blocking DB calls in boundedElastic scheduler and chains Redis calls.
+     * REACTIVE LOGIN
+     * 1. Runs DB check on Elastic Thread.
+     * 2. Generates Token.
+     * 3. Writes Session to Redis (Reactive).
+     * 4. Fetches Menus on Elastic Thread.
      */
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<LoginResponseDTO> login(ServerHttpRequest request, @RequestBody @Valid UserDto payload) {
-        
         final String clientIp = LoginUtility.getClientIp(request);
 
-        // 1. Wrap Blocking DB Call (verifyUserCredentials) in Elastic Scheduler
+        // 1. DB Operation (Blocking -> Elastic Scheduler)
         return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic()) 
+                .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(user -> {
-                    // 2. Process Logic
                     if (!user.isValidCredentials()) {
                         return Mono.just(LoginResponseDTO.builder()
                                 .userId(user.getUserId())
@@ -70,45 +74,41 @@ public class AuthController {
                         return Mono.just(LoginResponseDTO.builder().error("Missing HMAC secret").build());
                     }
 
-                    // 3. Generate Token (CPU bound, fast enough to run on current thread)
+                    // 2. Token Generation
                     @SuppressWarnings("unchecked")
                     Map<String, Object> claims = mapper.convertValue(user.getUser(), Map.class);
                     String token = HmacJwtUtil.generate(hmacSecret, user.getUserId(), ttlSeconds, claims);
 
-                    // Extract JTI
                     var parser = io.jsonwebtoken.Jwts.parser()
                             .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
                             .build();
                     String jti = parser.parseSignedClaims(token).getPayload().getId();
 
-                    // 4. Chain Reactive Redis Call (Non-Blocking)
+                    // 3. Redis Write (Non-blocking)
                     return validator.registerUserSession(user.getUserId(), jti)
                             .then(Mono.defer(() -> {
-                                // 5. Fetch Menu Data (Blocking DB call) -> Wrap in Elastic
+                                // 4. Menu Fetch (Blocking DB -> Elastic Scheduler)
                                 return Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
                                         .subscribeOn(Schedulers.boundedElastic());
                             }))
-                            .map(roleData -> {
-                                // 6. Build Final Response
-                                return LoginResponseDTO.builder()
-                                        .userId(user.getUserId())
-                                        .validCredentials(true)
-                                        .userStatus(user.getUserStatus())
-                                        .passwordLoginStatus(user.getPasswordLoginStatus())
-                                        .accessToken(token)
-                                        .tokenType("Bearer")
-                                        .expiresIn(ttlSeconds)
-                                        .sub(user.getUserId())
-                                        .jti(jti)
-                                        .roleData(roleData)
-                                        .build();
-                            });
+                            .map(roleData -> LoginResponseDTO.builder()
+                                    .userId(user.getUserId())
+                                    .validCredentials(true)
+                                    .userStatus(user.getUserStatus())
+                                    .passwordLoginStatus(user.getPasswordLoginStatus())
+                                    .accessToken(token)
+                                    .tokenType("Bearer")
+                                    .expiresIn(ttlSeconds)
+                                    .sub(user.getUserId())
+                                    .jti(jti)
+                                    .roleData(roleData)
+                                    .build());
                 })
                 .doOnError(e -> log.error("Login Error: ", e));
     }
 
     /**
-     * REACTIVE REFRESH TOKEN ENDPOINT
+     * REACTIVE REFRESH TOKEN
      */
     @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<LoginResponseDTO> refreshToken(@RequestBody Map<String, String> body) {
@@ -119,25 +119,23 @@ public class AuthController {
         }
 
         return Mono.fromCallable(() -> {
-            // 1. Parse Token (CPU Bound)
             var parser = io.jsonwebtoken.Jwts.parser()
                     .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
                     .build();
             return parser.parseSignedClaims(refreshToken).getPayload();
         })
-        .subscribeOn(Schedulers.boundedElastic())
+        .subscribeOn(Schedulers.boundedElastic()) // CPU bound but safer on elastic if signature verification is heavy
         .flatMap(claims -> {
             String userId = claims.getSubject();
             String userKey = USER_PREFIX + userId;
 
-            // 2. Check Redis (Reactive)
+            // Check Redis for active session
             return redisTemplate.opsForValue().get(userKey)
                     .flatMap(currentJti -> {
-                        // 3. Wrap Blocking DB Call (getUserRole)
+                        // DB Call (Get Role) -> Elastic
                         return Mono.fromCallable(() -> loginService.getUserRole(userId))
                                 .subscribeOn(Schedulers.boundedElastic())
                                 .flatMap(userRole -> {
-                                    // 4. Generate New Token
                                     Map<String, Object> newClaims = Map.of(
                                             "role", userRole != null ? userRole.getRole() : 0,
                                             "userId", userId
@@ -145,13 +143,12 @@ public class AuthController {
                                     
                                     String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, ttlSeconds, newClaims);
                                     
-                                    // Extract New JTI
                                     var parser = io.jsonwebtoken.Jwts.parser()
                                             .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
                                             .build();
                                     String newJti = parser.parseSignedClaims(newAccessToken).getPayload().getId();
 
-                                    // 5. Update Redis
+                                    // Rotate Session in Redis
                                     return validator.registerUserSession(userId, newJti)
                                             .thenReturn(LoginResponseDTO.builder()
                                                     .accessToken(newAccessToken)
@@ -172,7 +169,10 @@ public class AuthController {
     }
 
     /**
-     * REACTIVE LOGOUT
+     * REACTIVE LOGOUT (CORRECTED)
+     * 1. Blacklists the current Token.
+     * 2. Checks if Redis Active JTI == Current Token JTI.
+     * 3. Only if they match, deletes the Redis Key.
      */
     @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth) {
@@ -181,13 +181,44 @@ public class AuthController {
         }
         String username = jwtAuth.getToken().getSubject();
         String jti = jwtAuth.getToken().getId();
+        String userKey = USER_PREFIX + username;
 
+        log.info("Logout requested for user={} jti={}", username, jti);
+
+        // 1. Blacklist the specific token (Always happen)
         return validator.blacklistToken(jti)
-                .then(validator.clearUserSession(username))
-                .thenReturn(LoginResponseDTO.builder()
-                        .userId(username)
-                        .error("Logged out")
-                        .build());
+                .flatMap(blacklisted -> {
+                    // 2. Fetch the CURRENT active session from Redis
+                    return redisTemplate.opsForValue().get(userKey);
+                })
+                .flatMap(activeJti -> {
+                    // 3. Compare: Is the session in Redis the same one we are logging out?
+                    if (activeJti != null && activeJti.equals(jti)) {
+                        log.info("Stored JTI matches logout JTI -> clearing session for user={}", username);
+                        return validator.clearUserSession(username)
+                                .map(cleared -> LoginResponseDTO.builder()
+                                        .userId(username)
+                                        .jti(jti)
+                                        .error("User logged out (revoked token and cleared session)")
+                                        .build());
+                    } else {
+                        // 4. Mismatch: User might be logged in on another device. Don't kill the other session.
+                        log.info("Stored JTI ({}) does not match logout JTI ({}) -> keeping session", activeJti, jti);
+                        return Mono.just(LoginResponseDTO.builder()
+                                .userId(username)
+                                .jti(jti)
+                                .error("Token revoked. Active session remains (another token is active)")
+                                .build());
+                    }
+                })
+                .switchIfEmpty(Mono.just(
+                        // Case: Redis key was already empty/expired
+                        LoginResponseDTO.builder()
+                                .userId(username)
+                                .jti(jti)
+                                .error("User logged out (session was already expired)")
+                                .build()
+                ));
     }
 
     /**
@@ -196,7 +227,7 @@ public class AuthController {
     @PostMapping(value = "/check-user", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
         String userId = body.get("userId");
-        // Wrap blocking DB call
+        // DB Call -> Elastic
         return Mono.fromCallable(() -> loginService.checkUser(userId))
                 .subscribeOn(Schedulers.boundedElastic());
     }
@@ -206,7 +237,7 @@ public class AuthController {
      */
     @PostMapping(value = "/update-password", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO userCredentials) {
-        // Wrap blocking DB call
+        // DB Call -> Elastic
         return Mono.fromCallable(() -> loginService.updatePassword(userCredentials))
                 .subscribeOn(Schedulers.boundedElastic());
     }
