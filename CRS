@@ -3131,7 +3131,6 @@ public class BusinessSecurityService {
 
 
 
-
 package com.tcs.fincore.CommonRequestService.service;
 
 
@@ -3340,6 +3339,7 @@ public class PermissionConfigService {
 package com.tcs.fincore.CommonRequestService.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.dto.CancelRequestDto;
 import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
 import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
@@ -3390,6 +3390,9 @@ public interface RequestService {
      * @return The updated request entity.
      */
     Optional<CommonReq> updateRequestStatus(ProcessRequestDto processRequestDto, String executorId) throws JsonProcessingException;
+
+
+    CommonReq cancelRequest(CancelRequestDto cancelRequestDto, String userId);
 }
 
 
@@ -3410,10 +3413,7 @@ package com.tcs.fincore.CommonRequestService.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.dto.CglPayloadDto;
-import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
-import com.tcs.fincore.CommonRequestService.dto.NotificationConfigDto;
-import com.tcs.fincore.CommonRequestService.dto.ProcessRequestDto;
+import com.tcs.fincore.CommonRequestService.dto.*;
 import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
 import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
 import com.tcs.fincore.CommonRequestService.model.CGLMaster;
@@ -3427,6 +3427,7 @@ import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -3434,7 +3435,15 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * - Injected NotificationWriterService.
+ * - Handle all requests for different business objects [CGL, SEGMENT, CURRENCY]
+ * - Handle creator/executor scenarios
+ * - Used strategy design patter to differentiate different business objects
+ * - Injected NotificationWriterService and PermissionConfigService for notification
+ * - Injected BusinessSecurityService for second level RBAC authentication to check BLOCK/UNBLOCK/CREATE permissions
+ *
+ *   @author Shubhankar Das [v1018405]
+ *   @version 1.0
+ *   @since 2025-12-11
  */
 @Service
 @RequiredArgsConstructor
@@ -3620,6 +3629,45 @@ public class RequestServiceImpl implements RequestService {
     }
 
     @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq cancelRequest(CancelRequestDto dto, String userId) {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to cancel request ID: {} by user: {}", requestId, userId);
+
+        // 1. Fetch Request
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // 2. Security Check: Only the CREATOR can cancel
+        if (!request.getCreatorId().equals(userId)) {
+            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}",
+                    userId, requestId, request.getCreatorId());
+            throw new AccessDeniedException("You are not authorized to cancel this request.");
+        }
+
+        // 3. State Check: Must be PENDING
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to cancel a processed request. ID: {}, Status: {}", requestId, request.getReqStatus());
+            throw new IllegalStateException("Only pending requests can be cancelled. Current status: " + request.getReqStatus());
+        }
+
+        // 4. Update State
+        request.setReqStatus(RequestStatus.CANCELLED);
+
+        // We use Executor fields to track who cancelled it (the creator themselves)
+        request.setExecutorId(userId);
+        request.setExecutionDate(LocalDateTime.now());
+        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
+
+        // 5. Save & Return
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+        log.info("Request {} successfully cancelled by user.", requestId);
+
+        return updatedRequest;
+    }
+
+    @Override
     public List<CommonReq> getMyRequests(
             String userId,
             RequestType requestType
@@ -3665,8 +3713,16 @@ public class RequestServiceImpl implements RequestService {
 
 
 
-------------------
 
+
+
+
+
+
+
+
+
+------------------
 
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
@@ -3794,6 +3850,9 @@ public class CglCodeStrategy implements RequestTypeStrategy {
         log.info("Successfully updated CGL Status to {} for ID: {}", newStatus, targetId);
     }
 }
+
+
+
 
 
 
@@ -4221,7 +4280,6 @@ public class SegmentCodeStrategy implements RequestTypeStrategy {
 
 
 
-
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.tcs.fincore.CommonRequestService.model.CGLMaster;
@@ -4389,6 +4447,10 @@ public class BranchMasterStrategy implements RequestTypeStrategy {
 
 
 
+
+
+
+
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -4476,6 +4538,116 @@ public class CalenderConfigStrategy implements RequestTypeStrategy {
 
 
 }
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.fincore.CommonRequestService.service.strategy;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Component;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.StateMaster;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.StateMasterRepository;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class StateReqStrategy implements RequestTypeStrategy{
+
+    private final StateMasterRepository stateMasterRepository;
+    private final ObjectMapper objectMapper;
+
+
+    @Override
+    public void processApproval(CommonReq request) throws JsonProcessingException {
+       switch (request.getChangeType()) {
+            case ADD:
+                handleAdd(request);
+                break;
+            case UPDATE:
+                handleUpdate(request);
+                break;
+            case DELETE:
+                handleDelete(request);
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Change type " + request.getChangeType() + " is not supported for State Codes.");
+        }
+    }
+
+    @Override
+    public RequestType getRequestType() {
+       return RequestType.STATE;
+    }
+
+    private void handleAdd(CommonReq request) throws JsonProcessingException{
+     log.info("inside ADD");
+      StateMaster stateData = objectMapper.readValue(request.getPayload(),StateMaster.class);
+      String stateCode =stateData.getStateCode();
+      log.info("{}",stateCode);
+       if (stateMasterRepository.existsById(stateCode)) {
+            log.error("Attempting to add a State Code that already exists: {}", stateCode);
+            throw new DataIntegrityViolationException("'State code '" + stateCode + "' already exists");
+        }
+
+        StateMaster savedData = stateMasterRepository.save(stateData);
+        log.info("Succesfully added State: {} , Code: {} ", savedData.getStateName(), savedData.getStateCode());
+    }
+
+    private void handleUpdate(CommonReq request) throws JsonProcessingException{
+       String targetId = request.getTargetId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Target ID is required for an UPDATE operation.");
+        }
+
+        log.info("Fetching existing State Code with ID: {} for update.", targetId);
+        StateMaster existingState = stateMasterRepository.findById(targetId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "State with code: '" + targetId + "' not found for update."));
+
+        StateMaster updates = objectMapper.readValue(request.getPayload(), StateMaster.class);
+
+        // For Segment Code, only the description can be updated.
+        existingState.setStateName(updates.getStateName());
+        stateMasterRepository.save(existingState);
+        // log.info("Successfully updated State Code with ID: {}", targetId);
+
+
+    }
+
+    private void handleDelete(CommonReq request) throws JsonProcessingException{
+          String targetId = request.getTargetId();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Target ID is required for an DELETE operation.");
+        }
+        StateMaster existingState = stateMasterRepository.findById(targetId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "State with code: '" + targetId + "' not found for delete."));
+        
+        stateMasterRepository.deleteById(targetId);
+        log.info("Successfully Deleted State with Code ", targetId);
+    }
+
+    
+}
+
+
+
 
 
 
