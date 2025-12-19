@@ -102,37 +102,74 @@ public class HadoopConfig {
 
 
 
+
+
+
+
+
+
+
 package com.fincore.ReportService.config;
 
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
+/**
+ * Common Security Configuration.
+ * * Aligned with the "Distributed Gateway" architecture.
+ * It uses the ContextRbacFilter from Common Utilities to enforce:
+ * 1. Token Validity
+ * 2. Single Session (Redis check)
+ * 3. RBAC Permissions
+ */
 @Configuration
 @EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class, CommonSecurityConfig.class}) // Import logic from JAR
 public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig; // Wire in the CORS config
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
-                // 1. Disable CSRF, not needed for stateless REST APIs
+                // 1. Disable CSRF (Stateless API)
                 .csrf(csrf -> csrf.disable())
 
-                // 2. Define authorization rules
+                // 2. Apply Centralized CORS Policy
+                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+
+                // 3. Stateless Session (No JSESSIONID)
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+                // 4. Authorization Rules
                 .authorizeHttpRequests(authz -> authz
-                        .requestMatchers("/reports/**").permitAll() // Allows access to only /reports API endpoints
-                        .requestMatchers("/actuator/**").permitAll() // Allows access to Spring Actuator
-                        .anyRequest().denyAll() // Secure any other endpoints not listed
+                        // Public Endpoints
+                        .requestMatchers("/actuator/**", "/auth/**", "/error").permitAll()
+                        // All other endpoints require Authentication (and RBAC filter check)
+                        .anyRequest().authenticated()
                 )
 
-                // 3. Set session management to stateless, essential for REST APIs
-                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
-
-        // In a real application with JWTs, you would add your JWT filter here
-        // .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+                // 5. Add the "Distributed Gateway" Filter
+                .addFilterBefore(new ContextRbacFilter(redisTemplate, jwtUtil), UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
     }
