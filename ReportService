@@ -1073,14 +1073,12 @@ public class NotificationWriterService {
 
 
 
-
 package com.fincore.ReportService.service;
 
-import org.springframework.core.io.Resource;
 import java.time.LocalDate;
 import java.util.List;
 
-import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportStreamResponse;
 import com.fincore.ReportService.dto.ReportTypeDto;
 
 public interface ReportService {
@@ -1092,17 +1090,14 @@ public interface ReportService {
      * @return A list of {@link ReportTypeDto}.
      */
     List<ReportTypeDto> getReportTypes(int roleId);
-
+    
     /**
-     * Loads a specific report file as a resource after verifying the user's authorization.
-     *
-     * @param fileName The unique name of the report.
-     * @param date The date for which to fetch the report.
-     * @param userRoleId  user's role ID for an authorization check.
-     * @return The report file as a {@link ReportFileDto}.
-     */
-    List<ReportFileDto> getReport(String fileName, LocalDate date, int userRoleId , String userId);
-}
+    * returns a wrapper containing the filename and the stream logic
+    */
+   ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId);
+ }
+
+
 
 
 
@@ -1115,30 +1110,31 @@ public interface ReportService {
 
 package com.fincore.ReportService.service;
 
-import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportStreamResponse;
 import com.fincore.ReportService.dto.ReportTypeDto;
 import com.fincore.ReportService.exception.ResourceNotFoundException;
 import com.fincore.ReportService.model.AppConfig;
 import com.fincore.ReportService.repository.AppConfigRepository;
 import com.fincore.ReportService.repository.ReportTypeRepository;
-import jakarta.transaction.Transactional;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StreamUtils;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Service implementation for handling business logic related to GLIF reports.
@@ -1148,21 +1144,23 @@ import java.util.stream.Stream;
 public class ReportServiceImpl implements ReportService {
 
     private final ReportTypeRepository reportTypeRepository;
-    private final Path reportsBasePath;
+    private final String reportsBasePath;
     private final AppConfigRepository appConfigRepository;
-    private final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
     private final NotificationWriterService notificationWriterService;
+    private final FileSystem hdfsFileSystem;
+    private final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
 
-    public ReportServiceImpl(ReportTypeRepository reportTypeRepository, @Value("${glif.reports.base-path}") String basePath, AppConfigRepository appConfigRepository, NotificationWriterService notificationWriterService) {
+    public ReportServiceImpl(ReportTypeRepository reportTypeRepository, @Value("${glif.reports.base-path}") String basePath, AppConfigRepository appConfigRepository, NotificationWriterService notificationWriterService, FileSystem hdfsFileSystem) {
         this.reportTypeRepository = reportTypeRepository;
-        this.reportsBasePath = Paths.get(basePath);
+        this.reportsBasePath = basePath;
         this.appConfigRepository = appConfigRepository;
         this.notificationWriterService = notificationWriterService;
+        this.hdfsFileSystem = hdfsFileSystem;
     }
 
     /**
      * Retrieves a list of report types that are explicitly mapped to the given
-     * roleId AND start date from app_config table
+     * roleId AND start date from app_config table.
      *
      * @param roleId The ID of the user's role.
      * @return A list of DTOs representing the available reports and start date.
@@ -1177,124 +1175,102 @@ public class ReportServiceImpl implements ReportService {
         // Fetch the date from appConfig to validate the start date of date-picker
         LocalDate startDate = getStartDateFromAppConfig();
 
-        return reportTypeRepository.findByRoleId(roleId).stream().map(reportType -> new ReportTypeDto(reportType.getReportName(), reportType.getFileName(), startDate)).collect(Collectors.toList());
+        return reportTypeRepository.findByRoleId(roleId).stream()
+                .map(reportType -> new ReportTypeDto(reportType.getReportName(), reportType.getFileName(), startDate))
+                .collect(Collectors.toList());
     }
 
     @Transactional
     @Override
-    public List<ReportFileDto> getReport(String fileName, LocalDate date, int userRoleId, String userId) {
-        // Step 1: Perform a authorization check
+    public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
+        // 1. Authorization Check (Remains the same)
         boolean isAuthorized = reportTypeRepository.existsByFileNameAndRoles_roleId(fileName, userRoleId);
-
         if (!isAuthorized) {
-            log.info("Report '" + fileName + "' not found or user : " + userRoleId + " is not authorized to access this report.");
-            throw new AccessDeniedException("You do not have permission to access this report '" + fileName + "'.");
+            log.warn("Access Denied: User {} is not authorized for report {}.", userId, fileName);
+            sendNotification(userId, "Access Denied for report: " + fileName, "/glif-reports", fileName + "_" + date);
+            throw new AccessDeniedException("Access Denied for report: " + fileName);
         }
-        log.info("Report '" + fileName + "' found and user : " + userRoleId + " is authorized to access this report.");
 
-        // Step 2: Construct the search directory and the  prefix.filename
-        // Create a custom DateTimeFormatter for the "yyyy-MM-dd" format to handle the date received from client.
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-        String formattedDate = date.format(formatter);
-
-        // Resolve the formatted date string to the reportsBasePath.
-        Path searchDirectory = reportsBasePath.resolve(formattedDate);
-        log.info("searchDirectory  : {}", searchDirectory);
-
+        // 2. Prepare Paths with the CORRECT format "dd-MM-yyyy"
+        String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE); 
+        Path searchDirectory = new Path(reportsBasePath, formattedDate);
         String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-        log.info("fileNamePrefix  : {}", fileNamePrefix);
+        log.info("Searching HDFS directory {} for files with prefix '{}'...", searchDirectory, fileNamePrefix);
 
-        // Step 3: Search the directory for a file matching the prefix.
-        List<ReportFileDto> reportFiles = new ArrayList<>();
+        // 3. Define the Streaming Logic
+        StreamingResponseBody streamingBody = outputStream -> {
+            try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
+                if (!hdfsFileSystem.exists(searchDirectory)) {
+                    log.info("Directory not found in HDFS: {}", searchDirectory);
+                    // Throw immediately so a proper HTTP 404 is sent to the client
+                    throw new ResourceNotFoundException("Reports directory not found: " + searchDirectory);
+                }
 
-        try (Stream<Path> files = Files.list(searchDirectory)) {
-            List<Path> matchedFiles = files.filter(path -> path.getFileName().toString().startsWith(fileNamePrefix)).collect(Collectors.toList());
+                FileStatus[] fileStatuses = hdfsFileSystem.listStatus(searchDirectory);
+                boolean fileFound = false;
 
-            if (matchedFiles.isEmpty()) {
-                throw new ResourceNotFoundException("No report file found for the selected type and date.");
+                for (FileStatus status : fileStatuses) {
+                    if (!status.isFile()) continue;
+                    String actualFileName = status.getPath().getName();
+
+                    if (actualFileName.startsWith(fileNamePrefix)) {
+                        fileFound = true;
+                        ZipEntry zipEntry = new ZipEntry(actualFileName);
+                        zipOut.putNextEntry(zipEntry);
+
+                        try (FSDataInputStream hdfsStream = hdfsFileSystem.open(status.getPath())) {
+                            StreamUtils.copy(hdfsStream, zipOut);
+                        } finally {
+                            zipOut.closeEntry();
+                        }
+                        log.info("Streamed file {} into zip response.", actualFileName);
+                    }
+                }
+
+                if (!fileFound) {
+                    log.info("No report files found matching prefix: " + fileNamePrefix);
+                    // Throw immediately so a proper HTTP 404 is sent to the client
+                    throw new ResourceNotFoundException("No report files found matching prefix: " + fileNamePrefix);
+                }
+                
+                // Notification is only sent AFTER all files are confirmed found and streamed
+                sendNotification(userId, "Report(s) downloaded successfully.", "/glif-reports", fileName + "_" + date);
+
+            } catch (ResourceNotFoundException e) {
+                // If a resource error happens before streaming starts, it's caught here
+                log.error("Resource not found error: {}", e.getMessage());
+                sendNotification(userId, "Requested report is not available.", "/glif-reports", fileName + "_" + date);
+                // Note: The controller must catch this exception to return a proper 404
+            } catch (IOException e) {
+                // If an I/O error happens DURING streaming, the client will see a failed download
+                // Includes the internet/network-down , HDFS down and NameNode not reachable cases
+                log.error("Streaming I/O error for user {}: {}", userId, e.getMessage(), e);
+                sendNotification(userId, "Download failed due to a streaming or internet issue. Please check your connection and try again.", "/glif-reports", fileName + "_" + date);
             }
-
-            //Loop through all matched files
-            for (Path filePath : matchedFiles) {
-                // Path filePath = foundFile.get();
-                String fullFilename = filePath.getFileName().toString();
-                String extension = getFileExtension(fullFilename);
-                String mimeType = getMimeType(extension);
-                byte[] fileBytes = Files.readAllBytes(filePath);
-                String encodedContent = Base64.getEncoder().encodeToString(fileBytes);
-
-                ReportFileDto dto = new ReportFileDto(fullFilename, mimeType, encodedContent);
-                reportFiles.add(dto);
-
-            }
-
-            //Creates and logs a notification for a user after a report has been fetched successfully.
-            try {
-                String message = "Report fetched successfully for the selected date : " + date;
-                String linkUrl = "/glif-reports"; // link to glif reports page access their reports
-                String aggregateId = fileName + "_" + date; // Business Object ID for this specific notification event
-                String eventSource = "ReportService"; // Source of the notification
-
-                notificationWriterService.createNotification(userId, null, message, linkUrl, aggregateId, eventSource);
-                log.info("Notification created for user {} for report {}", userId, aggregateId);
-            } catch (Exception e) {
-                log.error("Failed to create notification for user {} for report {} : {}", userId, fileName, e.getMessage());
-            }
-            return reportFiles;
-        } catch (IOException e) {
-            try {
-                //Creates and logs a notification for a user when a report is not fetched.
-                String message = "Report not available for the selected date : " + date;
-                String linkUrl = "/glif-reports";  // link to glif reports page access their reports
-                String aggregateId = fileName + "_" + date; // Business Object ID for this specific notification event
-                String eventSource = "ReportService";// Source of the notification
-
-                notificationWriterService.createNotification(userId, null, message, linkUrl, aggregateId, eventSource);
-                log.info("Notification created for missing - directory for user {} for report {}", userId, aggregateId);
-            } catch (Exception ex) {
-                log.error("Failed to create notification for missing - directory for user {} for report {} : {}", userId, fileName, e.getMessage());
-            }
-            throw new ResourceNotFoundException("No report file directory exists for the selected date: " + date.format(DateTimeFormatter.ofPattern("dd/MM/yyyy")));
-        }
-    }
-
-    /*
-     * Helper Fuctions
-     */
-    private String getFileExtension(String filename) {
-        return Optional.ofNullable(filename).filter(f -> f.contains(".")).map(f -> f.substring(f.lastIndexOf(".") + 1)).orElse("");
-    }
-
-    private String getMimeType(String extension) {
-        return switch (extension.toLowerCase()) {
-            case "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-            case "xls" -> "application/vnd.ms-excel";
-            case "csv" -> "text/csv";
-            case "pdf" -> "application/pdf";
-            case "txt" -> "text/plain";
-            case "png" -> "image/png";
-            case "jpg", "jpeg" -> "image/jpeg";
-            default -> "application/octet-stream";
         };
+
+        String downloadName = fileName + "_" + formattedDate + ".zip";
+        return new ReportStreamResponse(downloadName, streamingBody);
     }
 
-    /**
-     * @return LocalDate
-     * @author: v1022518 [Niharika]
-     * @description Function to retun the date received from app config
-     */
-    private LocalDate getStartDateFromAppConfig() {
-        Optional<AppConfig> appConfig = appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY);
+    // =============================== Helper Functions ==================================
 
-        if (appConfig.isEmpty()) {
-            log.info("Required App Configurations is missing : {}", appConfig.get());
-            throw new ResourceNotFoundException("Required App Configurations is missing in DB to get the start date {}");
+    private void sendNotification(String userId, String message, String url, String aggregateId) {
+        try {
+            notificationWriterService.createNotification(userId, null, message, url, aggregateId, "ReportService");
+        } catch (Exception e) {
+            log.warn("Failed to send notification to user {}: {}", userId, e.getMessage());
         }
-        LocalDate date = LocalDate.parse(appConfig.get().getConfigValue());
-        return date;
     }
 
+    private LocalDate getStartDateFromAppConfig() {
+        return appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY)
+                .map(AppConfig::getConfigValue)
+                .map(LocalDate::parse)
+                .orElseThrow(() -> new ResourceNotFoundException("Required App Configurations are missing for key: " + REPORTS_START_DATE_KEY));
+    }
 }
+
 
 
 
