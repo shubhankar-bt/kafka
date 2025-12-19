@@ -1327,25 +1327,11 @@ public class ServletInitializer extends SpringBootServletInitializer {
 
 
 
-
-
-
-{"properties": [{
-  "name": "glif.reports.base-path",
-  "type": "java.lang.String",
-  "description": "A description for 'glif.reports.base-path'"
-}]}
-
-
-
-
-
-
-
 spring.application.name=ReportService
 
+# LOGIN SERVICE KEY USED BY common-entities
+jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
 
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
 spring.profiles.active=dev
 
 # ===================================================================
@@ -1353,9 +1339,42 @@ spring.profiles.active=dev
 # ===================================================================
 server.port=9005
 
-#todo Expose all actuator endpoints over HTTP.
-management.endpoints.web.exposure.include=*
 
+
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+# ===================================================================
+# CUSTOM APPLICATION PROPERTIES
+# ===================================================================
+# IMPORTANT: This is the base directory path where reports are stored. [absolute path]
+# The application will look for date-named folders (e.g., "2025-10-15") inside this path.
+#glif.reports.base-path=E:/media/Fincore/glif-reports
+
+
+spring.mvc.async.request-timeout=3600000
+
+
+
+
+
+
+
+
+
+
+
+
+appication.dev.properties:
+
+# ===================================================================
+# SPRING DATASOURCE (ORACLE)
+# ===================================================================
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+
+
+# ========================== actuator =============================
+management.endpoints.web.exposure.include=*
 # Always show full details on the health endpoint (e.g., database connection status)
 management.endpoint.health.show-details=always
 
@@ -1363,9 +1382,6 @@ management.endpoint.health.show-details=always
 info.app.name=ReportService
 info.app.description=Service to manage and retrieve different reports
 info.app.version=1.0.0
-
-
-
 
 # ===================================================================
 # JPA / HIBERNATE CONFIGURATION
@@ -1377,27 +1393,14 @@ spring.jpa.properties.hibernate.format_sql=false
 logging.level.org.hibernate.SQL=OFF
 logging.level.org.hibernate.orm.jdbc.bind=OFF
 
-# ===================================================================
-# CUSTOM APPLICATION PROPERTIES
-# ===================================================================
-# IMPORTANT: This is the base directory path where reports are stored. [absolute path]
-# The application will look for date-named folders (e.g., "2025-10-15") inside this path.
-glif.reports.base-path=E:/media/Fincore/glif-reports
-
-
-
-
-
-
-
 
 
 # ===================================================================
-# SPRING DATASOURCE (ORACLE)
+# HADOOP / HDFS CONFIGURATION
 # ===================================================================
-spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
-spring.datasource.username=fincore
-spring.datasource.password=Password#1234
+hadoop.fs.uri=hdfs://10.177.103.199:8022
+hadoop.fs.user=root
+glif.reports.base-path=/reports
 
 
 
@@ -1410,313 +1413,25 @@ spring.datasource.password=Password#1234
 
 
 
-// TESTS 
+docker file :
+# Use Red Hat UBI with OpenJDK 17 (if accessible internally)
+FROM alpine/java:22-jdk
 
-package com.fincore.ReportService.repository;
+# Set working directory inside container
+#WORKDIR /app
 
-import com.fincore.ReportService.model.AppConfig;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
-import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
-import java.util.Optional;
+ARG JAR_FILE=target/*.jar
+# Set environment variable (optional)
+ENV SPRING_PROFILES_ACTIVE=dev
+ENV SERVER_PORT=9005
 
-@DataJpaTest
-@AutoConfigureTestDatabase(replace=AutoConfigureTestDatabase.Replace.NONE)//use your real db
-class AppConfigRepositoryTest{
+# Copy JAR file into the container
+COPY ${JAR_FILE} app.jar
 
-    @Autowired
-    private AppConfigRepository appConfigRepository;
+EXPOSE 9005
 
-    @Test  
-    void checkFetch(){
-        Optional<AppConfig> config = appConfigRepository.findByConfigKey("REPORTS_START_DATE");
-        if(config.isPresent()){
-            System.out.println("Data fetched successfully");
-            System.out.println("Key:"+config.get().getConfigKey());
-            System.out.println("Value:"+config.get().getConfigValue());
-            System.out.println("Description:"+config.get().getDescription());
-        }
-        else{
-            System.out.println("No Data Found for REPORTS_START_DATE");
-        }
-    }
-
-
-}
-
-
-
-
-package com.fincore.ReportService.service;
-
-import com.fincore.ReportService.dto.ReportFileDto;
-import com.fincore.ReportService.dto.ReportTypeDto;
-import com.fincore.ReportService.exception.ResourceNotFoundException;
-import com.fincore.ReportService.model.AppConfig;
-import com.fincore.ReportService.model.Notifications;
-import com.fincore.ReportService.model.ReportType;
-import com.fincore.ReportService.model.Role;
-import com.fincore.ReportService.repository.AppConfigRepository;
-import com.fincore.ReportService.repository.NotificationRepository;
-import com.fincore.ReportService.repository.ReportTypeRepository;
-import org.springframework.transaction.annotation.Transactional;
-
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
-import org.springframework.boot.test.context.SpringBootTest;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-import java.time.LocalDate;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
-import java.util.stream.Collectors;
-
-@SpringBootTest
-@Transactional
-@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-public class ReportServiceImplTest {
-
-    @Autowired
-    private ReportServiceImpl reportService;
-
-    @Autowired
-    private ReportTypeRepository reportTypeRepository;
-
-    @Autowired
-    private NotificationRepository notificationRepository;
-
-    @Autowired
-    private AppConfigRepository appConfigRepository;
-
-    // this must be in sync with ReportsServiceImpl.REPORTS_START_DATE_KEY
-    private static final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
-
-   // random test --delete later
-    @Test
-    public void sanityTest() {
-        System.out.println("JUnit + SpringBootTest are working");
-    }
-
-    /**
-     * For every roleId present in DB, verifies that getReportTypes(roleId)
-     * returns exactly the report types mapped to that role via the join table.
-     */
-    @Test
-    public void testGetReportTypes_ForEachRoleIdMatchesDbMapping() {
-        List<ReportType> allReportTypes = reportTypeRepository.findAll();
-        System.out.println("Total report types in DB: " + allReportTypes.size());
-
-        // Collecting all distinct roleIds from the mapping table (via entity relationship)
-        Set<Integer> allRoleIds = allReportTypes.stream()
-                .flatMap(rt -> rt.getRoles().stream())
-                .map(r -> r.getRoleId())
-                .collect(Collectors.toSet());
-
-        assertFalse(allRoleIds.isEmpty(), "No role mappings found in report types table.");
-
-        for (Integer roleId : allRoleIds) {
-            System.out.println("\n=== Testing getReportTypes for roleId: " + roleId + " ===");
-
-            //all report types that have this role mapped
-            Set<String> expectedFileNames = allReportTypes.stream()
-                    .filter(rt -> rt.getRoles().stream().anyMatch(r -> r.getRoleId() == roleId))
-                    .map(ReportType::getFileName)
-                    .collect(Collectors.toSet());
-
-            System.out.println("Expected report types from DB for roleId " + roleId + ": " + expectedFileNames);
-
-            List<ReportTypeDto> actualDtos = reportService.getReportTypes(roleId);
-            Set<String> actualFileNames = actualDtos.stream()
-                    .map(ReportTypeDto::getFileName)
-                    .collect(Collectors.toSet());
-
-            System.out.println("Actual report types from service for roleId " + roleId + ": " + actualFileNames);
-
-            // The service should return exactly what DB mapping says
-            assertEquals(expectedFileNames, actualFileNames,
-                    "Mismatch between DB mapping and service result for roleId " + roleId);
-        }
-    }
-
-    /**
-     * For every (reportType, roleId) mapping in DB:
-     *  - if the role is mapped to the report, getReport(...) must not fail unexpectedly
-     *  - if files exist for given date, they must be returned consistently
-     *  - if files do not exist, service can throw ResourceNotFound or return empty list
-     */
-    @Test
-    public void testGetReport_ForAllMappedReportTypeAndRoleCombinations() {
-        List<ReportType> allReportTypes = reportTypeRepository.findAll();
-        assertFalse(allReportTypes.isEmpty(), "No report types found in DB.");
-
-        String userId = notificationRepository.findAll().stream()
-                .findFirst()
-                .map(Notifications::getUserId)
-                .orElse("test-user");
-
-        LocalDate testDate = getReportsStartDateFromConfig();
-
-        int testCaseCount = 0;
-
-        for (ReportType reportType : allReportTypes) {
-            String fileName = reportType.getFileName();
-
-            for (Role role : reportType.getRoles()) {
-                int roleId = role.getRoleId();
-                testCaseCount++;
-
-                System.out.println("\n--- Executing getReport test case #" + testCaseCount +
-                        " for fileName: " + fileName +
-                        ", roleId: " + roleId +
-                        ", date: " + testDate +
-                        ", userId: " + userId + " ---");
-
-                try {
-                    List<ReportFileDto> files =
-                            reportService.getReport(fileName, testDate, roleId, userId);
-
-                    if (files == null || files.isEmpty()) {
-                        System.out.println("Result: No report files found for this combination (this may be valid if no physical files exist).");
-                    } else {
-                        System.out.println("Result: " + files.size() + " report file(s) fetched successfully.");
-
-                        // Basic sanity checks on returned DTOs
-                        files.forEach(dto -> {
-                            assertNotNull(dto.getFileName(), "File name should not be null.");
-                            assertTrue(dto.getFileName().startsWith(fileName),
-                                    "Returned file should belong to requested report type.");
-                            assertNotNull(dto.getFileContent(), "File content should not be null.");
-                            assertTrue(dto.getFileContent().length() > 0,
-                                    "File content should not be empty.");
-                        });
-                    }
-                } catch (ResourceNotFoundException ex) {
-                    // no physical file present.
-                    System.out.println("Result: No physical file found for this combination: " + ex.getMessage());
-                } catch (Exception ex) {
-                    fail("Unexpected exception for fileName " + fileName +
-                            ", roleId " + roleId + ": " + ex.getMessage());
-                }
-            }
-        }
-
-        System.out.println("\nComprehensive getReport test finished. Total cases run: " + testCaseCount);
-    }
-
-    /**
-     * Helper to get the report start date from app_config, same as service.
-     */
-    private LocalDate getReportsStartDateFromConfig() {
-        Optional<AppConfig> cfgOpt = appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY);
-        assertTrue(cfgOpt.isPresent(), "App configuration for report start date is missing in DB.");
-        return LocalDate.parse(cfgOpt.get().getConfigValue());
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-OLD SERVICEHELP.MD FILE NEED TO BE UPDATED :-
-
-# ReportService: Backend Dev Documentation
-
-## 1. Overview
-
-The ReportService is a Spring Boot microservice responsible for providing role-based access to downloadable report files. It acts as a secure gateway between users and a file system where reports are stored, ensuring that users can only access reports permitted by their assigned roles.
-
-## 2. Architecture
-
-The service follows a standard layered architecture model to separate concerns and improve maintainability.
-
-- **Controller Layer (ReportController):** Exposes the REST API endpoints. It is responsible for handling HTTP requests, validating incoming data (DTOs), and delegating business logic to the service layer.
-- **Service Layer (ReportServiceImpl):** Contains the core business logic. This includes user authorization, constructing file paths, interacting with the file system, and preparing data for the response.
-- **Repository Layer (ReportTypeRepository):** Manages data persistence using Spring Data JPA. It defines the methods for interacting with the database, including the custom query for the authorization check.
-- **Model/Entities (ReportType, Role):** JPA entities that map to the database tables and define their relationships.
-- **DTOs (dto package):** Data Transfer Objects used to define the "shape" of data for API requests and responses. They include validation annotations (`@NotNull`, etc.).
-- **Configuration (config package):** Contains configuration classes, such as `SecurityConfig`, for setting up application behavior.
-- **Exception Handling (advice, exception packages):** Centralized handling of exceptions to ensure consistent and informative API error responses.
-
-## 3. Database Schema
-
-The database consists of three main tables to manage reports and role-based permissions.
-
-- **ROLES:** Stores information about user roles.
-  ○ ROLE_ID (PK): Unique identifier for the role.
-  ○ ROLE_NAME: The name of the role (e.g., "GLIF", "Auditor").
-- **REPORT_TYPES:** Stores metadata for each type of report.
-  ○ ID (PK): Unique identifier for the report type.
-  ○ REPORT_NAME: The user-friendly display name (e.g., "Daily Balance Sheet").
-  ○ FILE_NAME: The system-level file name pattern used for searching (e.g., "daily_balance_sheet").
-- **REPORT_ROLE_MAPPING:** A join table that manages the many-to-many relationship between REPORT_TYPES and ROLES.
-  ○ REPORT_TYPE_ID (FK): Foreign key to REPORT_TYPES.ID.
-  ○ ROLE_ID (FK): Foreign key to ROLES.ROLE_ID.
-
-This structure allows a single report to be assigned to multiple roles, and a single role to have access to multiple reports.
-
-## 4. Logic
-
-### 4.1 Authorization and File Retrieval (`getReport` method)
-
-The process for downloading a report is optimized for both security and performance.
-
-1.  **Authorization Check**:
-
-    - **Repository Method**: `boolean existsByFileNameAndRoles_role_id(String fileName, int roleId);`
-    - **Conceptual SQL**: `SELECT 1 FROM report_types rt JOIN report_role_mapping rrm ON rt.id = rrm.report_type_id WHERE rt.file_name = ? AND rrm.role_id = ?`
-    - **Result**: This query returns a simple `true` or `false` to confirm authorization.
-
-2.  **Security Obfuscation**: If the authorization query returns `false`, the service immediately throws an `AccessDeniedException`.
-
-3.  **Dynamic File Path Construction**:
-
-    - The base path for all reports is configured via the `glif.reports.base-path` property in `application.properties`.
-    - The service dynamically constructs the full path by appending the request date (e.g., `.../glif-reports/2025-10-15`).
-    - A file name prefix is then created using the report's `fileName` and the formatted date (e.g., `daily_balance_sheet_15102025`).
-
-4.  **File Search and Encoding**: The service streams the contents of the target directory, finds the first file matching the generated prefix, reads its bytes, and encodes them into a Base64 string for inclusion in the JSON response.
-
-### 4.2 API Responses
-
-- **`ApiResponseWrapper`**: This `ResponseBodyAdvice` intercepts all successful responses from any `@RestController`. It wraps the original return value inside the standard `ApiResponse` object, ensuring a consistent success format across the API without requiring repetitive code in controllers.
-- **`GlobalExceptionHandler`**: This `@ControllerAdvice` catches predefined exceptions (e.g., `ResourceNotFoundException`, `MethodArgumentNotValidException`) and formats them into the standard `ApiResponse` structure with `success: false`. This centralizes error handling and guarantees a consistent error format.
-
-## 5. Configuration
-
-Key configuration properties are located in `src/main/resources/application.properties`.
-
-- **`glif.reports.base-path`**: (Crucial) The absolute path to the root directory where reports are stored. This path must be configured correctly for each environment (dev, staging, prod).
-- **`server.port`**: The port on which the application runs.
-- **`spring.datasource.*`**: Standard Spring Data source configuration for connecting to the database.
-
-## 6. Security
-
-### Current Implementation
-
-- The `SecurityConfig` class is configured to be stateless (`SessionCreationPolicy.STATELESS`), which is appropriate for a REST API.
-- Currently, all endpoints under `/reports/**` are publicly accessible (`.permitAll()`). **This is suitable for development but must be changed for production.**
-
-### Future Work
-
-The current mechanism of passing `roleId` in the request body is insecure. It should be replaced with a token-based authentication system (e.g., JWT).
-
-1.  **Implement JWT Validation**: Add a filter to `SecurityConfig` that intercepts incoming requests, validates the JWT from the `Authorization` header, and populates the `SecurityContext`.
-
-
-
-
-
-
+# Run your Spring Boot app
+CMD ["java", "-jar", "app.jar"]
 
 
 
