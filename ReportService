@@ -194,54 +194,63 @@ package com.fincore.ReportService.controller;
 
 import java.util.List;
 
+import com.fincore.commonutilities.jwt.JwtUtil;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import com.fincore.ReportService.decrypt.JwtDecoder;
 import com.fincore.ReportService.dto.ReportDownloadRequest;
-import com.fincore.ReportService.dto.ReportFileDto;
+import com.fincore.ReportService.dto.ReportStreamResponse;
 import com.fincore.ReportService.dto.ReportTypeDto;
 import com.fincore.ReportService.service.ReportService;
 
 
-/**
- * @author Shubhankar(V101805)
- * @description REST controller for handling all report-related requests 
- * within the ReportService. It provides role-based
- * access to downloadable report files from the file system.
- * todo replace JWTDecoder with api-gateway once it is ready...  
- */
+@Slf4j
 @RestController
 @RequestMapping("/reports") 
 public class ReportController {
 
     private final ReportService reportService;
+    private final JwtUtil jwtUtil; // Declare an instance field
     
-    public ReportController(ReportService reportService) {
+    public ReportController(ReportService reportService, JwtUtil jwtUtil) {
         this.reportService = reportService;
+        this.jwtUtil = jwtUtil;
     }
-
 
     @PostMapping("/types")
     public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
-        return reportService.getReportTypes(JwtDecoder.getUserRole(token));
-    }
-   
-    /**
-    *
-    */
-    @PostMapping("/download")
-    public List<ReportFileDto> downloadReport(@RequestHeader("Authorization") String token, @RequestBody ReportDownloadRequest request) {
-        return reportService.getReport(request.getFileName(), request.getDate(), JwtDecoder.getUserRole(token),JwtDecoder.getUserId(token));
+        log.info("role and user id from token  : {},  {}", jwtUtil.getUserRoleFromToken(token), jwtUtil.getUserIdFromToken(token));
+        return reportService.getReportTypes(jwtUtil.getUserRoleFromToken(token));
     }
 
+    @PostMapping("/download")
+   public ResponseEntity<StreamingResponseBody> downloadReport(
+           @RequestHeader("Authorization") String token,
+           @RequestBody ReportDownloadRequest request) {
+            log.info("REQUEST : {}",request);
+       ReportStreamResponse response = reportService.downloadReportStream(
+               request.getFileName(),
+               request.getDate(),
+               jwtUtil.getUserRoleFromToken(token),
+               jwtUtil.getUserIdFromToken(token)
+       );
+       return ResponseEntity.ok()
+               // This header tells the browser "This is a file download"
+               .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + response.getDownloadFileName() + "\"")
+               .contentType(MediaType.APPLICATION_OCTET_STREAM)
+               .body(response.getStreamBody());
+   }
 
 }
-
-
 
 
 
