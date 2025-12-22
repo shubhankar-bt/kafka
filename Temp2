@@ -1,13 +1,11 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, useContext } from "react";
 import axios from "axios";
 import { useLocation, useNavigate } from "react-router-dom";
 import useCustomSnackbar from "../utils/useCustomSnackbar";
-import { useSelector, useDispatch } from "react-redux";
+import { useSelector } from "react-redux";
 import { resolveConfig } from "../config/EnvironmentConfig";
 import { convertToKebabCase } from "../utils/CommonUtilities";
-// import { setToken, logout as reduxLogout } from "../store/authSlice"; // Assuming these exist
-import { useContext } from "react";
-import { AuthContext } from "../context/AuthContext"; // Import your AuthContext
+import { AuthContext } from "../context/AuthContext";
 
 const useApi = () => {
   const [data, setData] = useState(null);
@@ -17,36 +15,36 @@ const useApi = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const snackbar = useCustomSnackbar();
-  const dispatch = useDispatch();
 
-  // Use AuthContext for logout and dialog trigger
-  const { logout, triggerSessionDialog } = useContext(AuthContext); 
+  // Access AuthContext for global session management
+  const { logout, triggerSessionDialog } = useContext(AuthContext);
 
-  // Assuming token is stored in Redux, but for refresh logic, we might need to update it.
-  // Ideally, the token should come from a source that updates immediately after refresh (like Context or Redux).
-  const token = useSelector((state) => state.auth.token); 
+  // Redux selectors for token (initial state) and menus
+  const token = useSelector((state) => state.auth.token);
   const menus = useSelector((s) => s.menus.menus);
   const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
 
-  /** -------------------- Refs -------------------- */
+  // Refs for tracking active requests and refresh state
   const activeRequestsRef = useRef(new Set());
   const isRefreshingRef = useRef(false);
   const refreshQueueRef = useRef([]);
 
-  /** -------------------- Cancel Requests -------------------- */
-  const cancelAllRequests = () => {
+  /** -------------------- Cancel Requests on Unmount -------------------- */
+  const cancelAllRequests = useCallback(() => {
     activeRequestsRef.current.forEach((controller) => {
       if (!controller.signal.aborted) controller.abort();
     });
     activeRequestsRef.current.clear();
     setLoading(false);
-  };
+  }, []);
 
-  useEffect(() => () => cancelAllRequests(), []);
+  useEffect(() => {
+    return () => cancelAllRequests();
+  }, [cancelAllRequests]);
 
   /** -------------------- Refresh Token Logic -------------------- */
   const refreshToken = async () => {
-    // If a refresh is already in progress, return a promise that resolves when it's done
+    // Queue concurrent refresh requests
     if (isRefreshingRef.current) {
       return new Promise((resolve, reject) => {
         refreshQueueRef.current.push({ resolve, reject });
@@ -56,47 +54,43 @@ const useApi = () => {
     isRefreshingRef.current = true;
 
     try {
-      // Get the refresh token from storage (Local Storage is standard for persistence)
       const storedRefreshToken = localStorage.getItem("refreshToken");
-      
+
       if (!storedRefreshToken) {
-          throw new Error("No refresh token available");
+        throw new Error("No refresh token available");
       }
 
-      // Call the backend refresh endpoint
-      // Note: Adjust the URL path if your gateway/service structure is different
+      // Call Backend Refresh Endpoint
       const res = await axios.post(
-        `${resolveConfig("/LS") ?? ""}/auth/refresh-token`, 
+        `${resolveConfig("/LS") ?? ""}/auth/refresh-token`,
         { refreshToken: storedRefreshToken },
-        { 
-            headers: { 'Content-Type': 'application/json' },
-            withCredentials: true 
+        {
+          headers: { "Content-Type": "application/json" },
+          withCredentials: true,
         }
       );
 
       const newAccessToken = res.data?.accessToken;
       const newRefreshToken = res.data?.refreshToken; // If backend rotates refresh tokens
 
-      if (!newAccessToken) throw new Error("No access token received");
-
-      // Update Storage
-      localStorage.setItem("accessToken", newAccessToken);
-      if (newRefreshToken) {
-          localStorage.setItem("refreshToken", newRefreshToken);
+      if (!newAccessToken) {
+        throw new Error("No access token received");
       }
 
-      // Update Redux/Context state so the UI reflects the change if needed
-      // dispatch(setToken(newAccessToken)); 
+      // Update Local Storage
+      localStorage.setItem("accessToken", newAccessToken);
+      if (newRefreshToken) {
+        localStorage.setItem("refreshToken", newRefreshToken);
+      }
 
-      // Process the queue: Resolve all waiting promises with the new token
-      refreshQueueRef.current.forEach(p => p.resolve(newAccessToken));
+      // Resolve all queued promises with the new token
+      refreshQueueRef.current.forEach((p) => p.resolve(newAccessToken));
       refreshQueueRef.current = [];
 
       return newAccessToken;
-
     } catch (err) {
-      // Process the queue: Reject all waiting promises
-      refreshQueueRef.current.forEach(p => p.reject(err));
+      // Reject all queued promises
+      refreshQueueRef.current.forEach((p) => p.reject(err));
       refreshQueueRef.current = [];
       throw err;
     } finally {
@@ -147,6 +141,7 @@ const useApi = () => {
       extraConfig = {},
       returnDataOnly = true
     ) => {
+      // URL Resolution Logic
       const parts = url.split("/");
       const service = parts[1];
       parts[1] = resolveConfig(`/${service}`);
@@ -158,9 +153,13 @@ const useApi = () => {
       setLoading(true);
       setError(null);
 
-      // Helper to get current token - prefers argument if provided (for retries)
+      // Helper to prioritize the freshest token (e.g. from retry config or storage)
       const getCurrentToken = () => {
-          return extraConfig?.headers?.Authorization?.replace('Bearer ', '') || token || localStorage.getItem("accessToken");
+        return (
+          extraConfig?.headers?.Authorization?.replace("Bearer ", "") ||
+          localStorage.getItem("accessToken") ||
+          token
+        );
       };
 
       try {
@@ -189,49 +188,37 @@ const useApi = () => {
         setData(response.data);
 
         return returnDataOnly ? response.data : response;
-
       } catch (err) {
         if (axios.isCancel(err)) {
-            // Request was cancelled, do nothing
-            return;
+          return; // Request cancelled, do nothing
         }
 
         const status = err.response?.status;
         const responseData = err.response?.data;
-        // Parse error code safely. Backend might send { error: "CODE" } or { code: "CODE" }
-        // Adjust based on your actual backend error structure (e.g. LoginResponseDTO error field)
-        // Based on AuthController, it sends { error: "Message/Code" }
-        // BUT ContextRbacFilter sends { error: "CODE", message: "..." }
-        let errorCode = responseData?.error || responseData?.code; 
-        
-        // Sometimes error is a string message in AuthController, need to check if it's a code
-        // Ideally, backend should be consistent. Assuming "TOKEN_EXPIRED" etc are codes.
+        // Backend can send { error: "CODE" } or { code: "CODE" }
+        const errorCode = responseData?.error || responseData?.code;
 
-        /** ----------------------------------------------------
-         * CASE 1: Concurrent Login OR Session Expired (Hard Fail)
-         * ----------------------------------------------------
-         */
-        if (status === 401 && (errorCode === "CONCURRENT_LOGIN" || errorCode === "SESSION_EXPIRED")) {
-            // Trigger the UI Dialog through AuthContext
-            triggerSessionDialog(errorCode);
-            setLoading(false);
-            return; // Stop execution
+        // 1. HARD FAIL: Concurrent Login or Session Expired
+        if (
+          status === 401 &&
+          (errorCode === "CONCURRENT_LOGIN" || errorCode === "SESSION_EXPIRED")
+        ) {
+          triggerSessionDialog(errorCode);
+          setLoading(false);
+          return; // Stop execution, user must log in again
         }
 
-        /** ----------------------------------------------------
-         * CASE 2: Token Expired (Soft Fail - Silent Refresh)
-         * ----------------------------------------------------
-         */
+        // 2. SOFT FAIL: Token Expired (Silent Refresh)
         if (
           status === 401 &&
           errorCode === "TOKEN_EXPIRED" &&
-          !extraConfig.__isRetry // Prevent infinite loops
+          !extraConfig.__isRetry
         ) {
           try {
-            // 1. Attempt Refresh
+            // Attempt Refresh
             const newToken = await refreshToken();
 
-            // 2. Retry Original Request with New Token
+            // Retry Original Request with New Token
             return await callApi(
               url,
               payload,
@@ -240,52 +227,144 @@ const useApi = () => {
               contentType,
               {
                 ...extraConfig,
-                __isRetry: true, // Mark as retry
+                __isRetry: true, // Mark as retry to prevent loops
                 headers: {
                   ...(extraConfig.headers || {}),
-                  Authorization: `Bearer ${newToken}`, // Use new token specifically
+                  Authorization: `Bearer ${newToken}`,
                 },
               },
               returnDataOnly
             );
-
           } catch (refreshErr) {
-            // Refresh failed (e.g., Refresh token expired) -> Hard Logout
-            logout(); 
-            // Or trigger dialog: triggerSessionDialog('SESSION_EXPIRED');
+            // Refresh Failed (e.g., refresh token expired) -> Force Logout
+            logout();
             setLoading(false);
             return;
           }
         }
 
-        /** ----------------------------------------------------
-         * CASE 3: Other Errors (Business Logic, 500, etc.)
-         * ----------------------------------------------------
-         */
+        // 3. OTHER ERRORS (Business Logic, 500s, etc.)
         const msg =
-            err.response?.data?.message ||
-            err.response?.data?.error || // Fallback to error field
-            err.message ||
-            "Something went wrong";
-            
+          err.response?.data?.message ||
+          err.response?.data?.error ||
+          err.message ||
+          "Something went wrong";
+
         snackbar(msg, "error");
         setError(err);
-        
-        throw err; // Re-throw for component to handle if needed
-
+        throw err;
       } finally {
         activeRequestsRef.current.delete(controller);
-        // Only set loading false if not retrying (retry will set it true again)
-        // But since retry is a recursive call, this finally block runs for the *failed* call.
-        // The recursive call has its own loading state management.
-        setLoading(false); 
+        // Ensure loading is set to false only if we aren't in a retry loop
+        // (Though the retry call handles its own loading state)
+        setLoading(false);
       }
     },
-    [token, xRequestType, navigate, snackbar, logout, triggerSessionDialog, refreshToken] // Dependencies
+    [
+      token,
+      xRequestType,
+      navigate,
+      snackbar,
+      logout,
+      triggerSessionDialog,
+      // refreshToken - stable function inside component scope or useRef approach
+      // findMenuItem - stable via useCallback
+    ]
   );
 
   return { data, error, loading, callApi, cancelAllRequests };
 };
 
 export default useApi;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React from 'react';
+import { Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button } from '@mui/material';
+
+const SessionDialog = ({ open, reason, onConfirm }) => {
+  let title = "Session Expired";
+  let message = "Your session has timed out. Please log in again.";
+
+  if (reason === "CONCURRENT_LOGIN") {
+    title = "Security Alert";
+    message = "You have been logged out because this account signed in on another device.";
+  }
+
+  return (
+    <Dialog open={open} disableEscapeKeyDown onClose={(e, r) => { if (r !== 'backdropClick') onConfirm(); }}>
+      <DialogTitle color="error">{title}</DialogTitle>
+      <DialogContent><DialogContentText>{message}</DialogContentText></DialogContent>
+      <DialogActions><Button onClick={onConfirm} variant="contained" color="primary">Return to Login</Button></DialogActions>
+    </Dialog>
+  );
+};
+
+export default SessionDialog;
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { createContext, useState, useEffect } from 'react';
+import SessionDialog from '../components/SessionDialog';
+
+export const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [sessionError, setSessionError] = useState('');
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem('user');
+    if(savedUser) setUser(JSON.parse(savedUser));
+  }, []);
+
+  const login = (userData, tokens) => {
+    localStorage.setItem('accessToken', tokens.accessToken);
+    localStorage.setItem('refreshToken', tokens.refreshToken);
+    localStorage.setItem('user', JSON.stringify(userData));
+    setUser(userData);
+  };
+
+  const logout = () => {
+    localStorage.clear();
+    setUser(null);
+    setDialogOpen(false);
+    window.location.href = '/login'; 
+  };
+
+  const triggerSessionDialog = (reason) => {
+    setSessionError(reason);
+    setDialogOpen(true);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, login, logout, triggerSessionDialog }}>
+      {children}
+      <SessionDialog open={dialogOpen} reason={sessionError} onConfirm={logout} />
+    </AuthContext.Provider>
+  );
+};
+
 
