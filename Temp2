@@ -1,246 +1,291 @@
-package com.fincore.gateway.Controller;
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import axios from "axios";
+import { useLocation, useNavigate } from "react-router-dom";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { useSelector, useDispatch } from "react-redux";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
+// import { setToken, logout as reduxLogout } from "../store/authSlice"; // Assuming these exist
+import { useContext } from "react";
+import { AuthContext } from "../context/AuthContext"; // Import your AuthContext
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.UserRoles;
-import com.fincore.gateway.utility.Constants;
-import com.fincore.gateway.utility.LoginUtility;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.MediaType;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.web.bind.annotation.*;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+const useApi = () => {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
 
-import java.util.Base64;
-import java.util.Map;
+  const navigate = useNavigate();
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+  const dispatch = useDispatch();
 
-@Slf4j
-@RestController
-@RequestMapping("/auth")
-@RequiredArgsConstructor
-public class AuthController {
+  // Use AuthContext for logout and dialog trigger
+  const { logout, triggerSessionDialog } = useContext(AuthContext); 
 
-    private static final String USER_PREFIX = "USR:";
+  // Assuming token is stored in Redux, but for refresh logic, we might need to update it.
+  // Ideally, the token should come from a source that updates immediately after refresh (like Context or Redux).
+  const token = useSelector((state) => state.auth.token); 
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
 
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
+  /** -------------------- Refs -------------------- */
+  const activeRequestsRef = useRef(new Set());
+  const isRefreshingRef = useRef(false);
+  const refreshQueueRef = useRef([]);
 
-    @Value("${security.jwt.mode:hmac}")
-    private String mode;
+  /** -------------------- Cancel Requests -------------------- */
+  const cancelAllRequests = () => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (!controller.signal.aborted) controller.abort();
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  };
 
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
+  useEffect(() => () => cancelAllRequests(), []);
 
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long ttlSeconds;
-
-    /**
-     * REACTIVE LOGIN
-     * 1. Runs DB check on Elastic Thread.
-     * 2. Generates Token.
-     * 3. Writes Session to Redis (Reactive).
-     * 4. Fetches Menus on Elastic Thread.
-     */
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> login(ServerHttpRequest request, @RequestBody @Valid UserDto payload) {
-        final String clientIp = LoginUtility.getClientIp(request);
-
-        // 1. DB Operation (Blocking -> Elastic Scheduler)
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(user -> {
-                    if (!user.isValidCredentials()) {
-                        return Mono.just(LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .userStatus(user.getUserStatus())
-                                .passwordLoginStatus(user.getPasswordLoginStatus())
-                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
-                                .build());
-                    }
-
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        return Mono.just(LoginResponseDTO.builder().error("Missing HMAC secret").build());
-                    }
-
-                    // 2. Token Generation
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> claims = mapper.convertValue(user.getUser(), Map.class);
-                    String token = HmacJwtUtil.generate(hmacSecret, user.getUserId(), ttlSeconds, claims);
-
-                    var parser = io.jsonwebtoken.Jwts.parser()
-                            .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
-                            .build();
-                    String jti = parser.parseSignedClaims(token).getPayload().getId();
-
-                    // 3. Redis Write (Non-blocking)
-                    return validator.registerUserSession(user.getUserId(), jti)
-                            .then(Mono.defer(() -> {
-                                // 4. Menu Fetch (Blocking DB -> Elastic Scheduler)
-                                return Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                        .subscribeOn(Schedulers.boundedElastic());
-                            }))
-                            .map(roleData -> LoginResponseDTO.builder()
-                                    .userId(user.getUserId())
-                                    .validCredentials(true)
-                                    .userStatus(user.getUserStatus())
-                                    .passwordLoginStatus(user.getPasswordLoginStatus())
-                                    .accessToken(token)
-                                    .tokenType("Bearer")
-                                    .expiresIn(ttlSeconds)
-                                    .sub(user.getUserId())
-                                    .jti(jti)
-                                    .roleData(roleData)
-                                    .build());
-                })
-                .doOnError(e -> log.error("Login Error: ", e));
+  /** -------------------- Refresh Token Logic -------------------- */
+  const refreshToken = async () => {
+    // If a refresh is already in progress, return a promise that resolves when it's done
+    if (isRefreshingRef.current) {
+      return new Promise((resolve, reject) => {
+        refreshQueueRef.current.push({ resolve, reject });
+      });
     }
 
-    /**
-     * REACTIVE REFRESH TOKEN
-     */
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> refreshToken(@RequestBody Map<String, String> body) {
-        String refreshToken = body.get("refreshToken");
+    isRefreshingRef.current = true;
 
-        if (refreshToken == null || refreshToken.isBlank()) {
-            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token").build());
+    try {
+      // Get the refresh token from storage (Local Storage is standard for persistence)
+      const storedRefreshToken = localStorage.getItem("refreshToken");
+      
+      if (!storedRefreshToken) {
+          throw new Error("No refresh token available");
+      }
+
+      // Call the backend refresh endpoint
+      // Note: Adjust the URL path if your gateway/service structure is different
+      const res = await axios.post(
+        `${resolveConfig("/LS") ?? ""}/auth/refresh-token`, 
+        { refreshToken: storedRefreshToken },
+        { 
+            headers: { 'Content-Type': 'application/json' },
+            withCredentials: true 
+        }
+      );
+
+      const newAccessToken = res.data?.accessToken;
+      const newRefreshToken = res.data?.refreshToken; // If backend rotates refresh tokens
+
+      if (!newAccessToken) throw new Error("No access token received");
+
+      // Update Storage
+      localStorage.setItem("accessToken", newAccessToken);
+      if (newRefreshToken) {
+          localStorage.setItem("refreshToken", newRefreshToken);
+      }
+
+      // Update Redux/Context state so the UI reflects the change if needed
+      // dispatch(setToken(newAccessToken)); 
+
+      // Process the queue: Resolve all waiting promises with the new token
+      refreshQueueRef.current.forEach(p => p.resolve(newAccessToken));
+      refreshQueueRef.current = [];
+
+      return newAccessToken;
+
+    } catch (err) {
+      // Process the queue: Reject all waiting promises
+      refreshQueueRef.current.forEach(p => p.reject(err));
+      refreshQueueRef.current = [];
+      throw err;
+    } finally {
+      isRefreshingRef.current = false;
+    }
+  };
+
+  /** -------------------- Menu Resolver -------------------- */
+  const findMenuItem = useCallback((items, route) => {
+    if (!items?.length) return null;
+
+    for (const item of items) {
+      if (item.route === route) return item;
+
+      if (item.children?.length) {
+        if (route.includes("/choose-option/")) {
+          const param = route.split("/choose-option/")[1];
+          if (param === convertToKebabCase(item.title)) return item;
         }
 
-        return Mono.fromCallable(() -> {
-            var parser = io.jsonwebtoken.Jwts.parser()
-                    .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
-                    .build();
-            return parser.parseSignedClaims(refreshToken).getPayload();
-        })
-        .subscribeOn(Schedulers.boundedElastic()) // CPU bound but safer on elastic if signature verification is heavy
-        .flatMap(claims -> {
-            String userId = claims.getSubject();
-            String userKey = USER_PREFIX + userId;
-
-            // Check Redis for active session
-            return redisTemplate.opsForValue().get(userKey)
-                    .flatMap(currentJti -> {
-                        // DB Call (Get Role) -> Elastic
-                        return Mono.fromCallable(() -> loginService.getUserRole(userId))
-                                .subscribeOn(Schedulers.boundedElastic())
-                                .flatMap(userRole -> {
-                                    Map<String, Object> newClaims = Map.of(
-                                            "role", userRole != null ? userRole.getRole() : 0,
-                                            "userId", userId
-                                    );
-                                    
-                                    String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, ttlSeconds, newClaims);
-                                    
-                                    var parser = io.jsonwebtoken.Jwts.parser()
-                                            .verifyWith(io.jsonwebtoken.security.Keys.hmacShaKeyFor(Base64.getDecoder().decode(hmacSecret)))
-                                            .build();
-                                    String newJti = parser.parseSignedClaims(newAccessToken).getPayload().getId();
-
-                                    // Rotate Session in Redis
-                                    return validator.registerUserSession(userId, newJti)
-                                            .thenReturn(LoginResponseDTO.builder()
-                                                    .accessToken(newAccessToken)
-                                                    .refreshToken(refreshToken)
-                                                    .userId(userId)
-                                                    .jti(newJti)
-                                                    .expiresIn(ttlSeconds)
-                                                    .validCredentials(true)
-                                                    .build());
-                                });
-                    })
-                    .switchIfEmpty(Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build()));
-        })
-        .onErrorResume(e -> {
-            log.error("Refresh Token Failed", e);
-            return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
-        });
+        const found = findMenuItem(item.children, route);
+        if (found) return found;
+      }
     }
+    return null;
+  }, []);
 
-    /**
-     * REACTIVE LOGOUT (CORRECTED)
-     * 1. Blacklists the current Token.
-     * 2. Checks if Redis Active JTI == Current Token JTI.
-     * 3. Only if they match, deletes the Redis Key.
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth) {
-        if (jwtAuth == null) {
-            return Mono.just(LoginResponseDTO.builder().error("No token").build());
+  const currentMenuFromRoute = useMemo(() => {
+    return findMenuItem(menus, location.pathname);
+  }, [menus, location.pathname, findMenuItem]);
+
+  const xRequestType = useMemo(
+    () =>
+      currentMenuFromRoute?.requestType ||
+      selectedMenuItem?.requestType ||
+      "*",
+    [currentMenuFromRoute, selectedMenuItem]
+  );
+
+  /** -------------------- Main API Caller -------------------- */
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      const parts = url.split("/");
+      const service = parts[1];
+      parts[1] = resolveConfig(`/${service}`);
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      // Helper to get current token - prefers argument if provided (for retries)
+      const getCurrentToken = () => {
+          return extraConfig?.headers?.Authorization?.replace('Bearer ', '') || token || localStorage.getItem("accessToken");
+      };
+
+      try {
+        const config = {
+          method,
+          url: Final_Url,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${getCurrentToken()}`,
+            "Content-Type": contentType,
+            "X-Request-Type": xRequestType,
+            ...(extraConfig.headers || {}),
+          },
+          ...extraConfig,
+        };
+
+        if (payload) {
+          method === "GET"
+            ? (config.params = payload)
+            : (config.data = payload);
         }
-        String username = jwtAuth.getToken().getSubject();
-        String jti = jwtAuth.getToken().getId();
-        String userKey = USER_PREFIX + username;
 
-        log.info("Logout requested for user={} jti={}", username, jti);
+        const response = await axios(config);
+        setData(response.data);
 
-        // 1. Blacklist the specific token (Always happen)
-        return validator.blacklistToken(jti)
-                .flatMap(blacklisted -> {
-                    // 2. Fetch the CURRENT active session from Redis
-                    return redisTemplate.opsForValue().get(userKey);
-                })
-                .flatMap(activeJti -> {
-                    // 3. Compare: Is the session in Redis the same one we are logging out?
-                    if (activeJti != null && activeJti.equals(jti)) {
-                        log.info("Stored JTI matches logout JTI -> clearing session for user={}", username);
-                        return validator.clearUserSession(username)
-                                .map(cleared -> LoginResponseDTO.builder()
-                                        .userId(username)
-                                        .jti(jti)
-                                        .error("User logged out (revoked token and cleared session)")
-                                        .build());
-                    } else {
-                        // 4. Mismatch: User might be logged in on another device. Don't kill the other session.
-                        log.info("Stored JTI ({}) does not match logout JTI ({}) -> keeping session", activeJti, jti);
-                        return Mono.just(LoginResponseDTO.builder()
-                                .userId(username)
-                                .jti(jti)
-                                .error("Token revoked. Active session remains (another token is active)")
-                                .build());
-                    }
-                })
-                .switchIfEmpty(Mono.just(
-                        // Case: Redis key was already empty/expired
-                        LoginResponseDTO.builder()
-                                .userId(username)
-                                .jti(jti)
-                                .error("User logged out (session was already expired)")
-                                .build()
-                ));
-    }
+        return returnDataOnly ? response.data : response;
 
-    /**
-     * REACTIVE CHECK USER
-     */
-    @PostMapping(value = "/check-user", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
-        String userId = body.get("userId");
-        // DB Call -> Elastic
-        return Mono.fromCallable(() -> loginService.checkUser(userId))
-                .subscribeOn(Schedulers.boundedElastic());
-    }
+      } catch (err) {
+        if (axios.isCancel(err)) {
+            // Request was cancelled, do nothing
+            return;
+        }
 
-    /**
-     * REACTIVE UPDATE PASSWORD
-     */
-    @PostMapping(value = "/update-password", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO userCredentials) {
-        // DB Call -> Elastic
-        return Mono.fromCallable(() -> loginService.updatePassword(userCredentials))
-                .subscribeOn(Schedulers.boundedElastic());
-    }
-}
+        const status = err.response?.status;
+        const responseData = err.response?.data;
+        // Parse error code safely. Backend might send { error: "CODE" } or { code: "CODE" }
+        // Adjust based on your actual backend error structure (e.g. LoginResponseDTO error field)
+        // Based on AuthController, it sends { error: "Message/Code" }
+        // BUT ContextRbacFilter sends { error: "CODE", message: "..." }
+        let errorCode = responseData?.error || responseData?.code; 
+        
+        // Sometimes error is a string message in AuthController, need to check if it's a code
+        // Ideally, backend should be consistent. Assuming "TOKEN_EXPIRED" etc are codes.
 
+        /** ----------------------------------------------------
+         * CASE 1: Concurrent Login OR Session Expired (Hard Fail)
+         * ----------------------------------------------------
+         */
+        if (status === 401 && (errorCode === "CONCURRENT_LOGIN" || errorCode === "SESSION_EXPIRED")) {
+            // Trigger the UI Dialog through AuthContext
+            triggerSessionDialog(errorCode);
+            setLoading(false);
+            return; // Stop execution
+        }
+
+        /** ----------------------------------------------------
+         * CASE 2: Token Expired (Soft Fail - Silent Refresh)
+         * ----------------------------------------------------
+         */
+        if (
+          status === 401 &&
+          errorCode === "TOKEN_EXPIRED" &&
+          !extraConfig.__isRetry // Prevent infinite loops
+        ) {
+          try {
+            // 1. Attempt Refresh
+            const newToken = await refreshToken();
+
+            // 2. Retry Original Request with New Token
+            return await callApi(
+              url,
+              payload,
+              method,
+              responseType,
+              contentType,
+              {
+                ...extraConfig,
+                __isRetry: true, // Mark as retry
+                headers: {
+                  ...(extraConfig.headers || {}),
+                  Authorization: `Bearer ${newToken}`, // Use new token specifically
+                },
+              },
+              returnDataOnly
+            );
+
+          } catch (refreshErr) {
+            // Refresh failed (e.g., Refresh token expired) -> Hard Logout
+            logout(); 
+            // Or trigger dialog: triggerSessionDialog('SESSION_EXPIRED');
+            setLoading(false);
+            return;
+          }
+        }
+
+        /** ----------------------------------------------------
+         * CASE 3: Other Errors (Business Logic, 500, etc.)
+         * ----------------------------------------------------
+         */
+        const msg =
+            err.response?.data?.message ||
+            err.response?.data?.error || // Fallback to error field
+            err.message ||
+            "Something went wrong";
+            
+        snackbar(msg, "error");
+        setError(err);
+        
+        throw err; // Re-throw for component to handle if needed
+
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        // Only set loading false if not retrying (retry will set it true again)
+        // But since retry is a recursive call, this finally block runs for the *failed* call.
+        // The recursive call has its own loading state management.
+        setLoading(false); 
+      }
+    },
+    [token, xRequestType, navigate, snackbar, logout, triggerSessionDialog, refreshToken] // Dependencies
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests };
+};
+
+export default useApi;
 
