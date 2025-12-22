@@ -1,38 +1,216 @@
-2025-12-22 :: 14:19:38.118 || INFO :: SecurityConfig.java: | 86 | :: RedisValidationFilter invoked for path=/auth/refresh-token
-2025-12-22 :: 14:19:38.120 || ERROR:: AuthController.java: | 166 | :: Refresh Token Failed
-io.jsonwebtoken.ExpiredJwtException: JWT expired 2120 milliseconds ago at 2025-12-22T08:49:36.000Z. Current time: 2025-12-22T08:49:38.120Z. Allowed clock skew: 0 milliseconds.
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:691)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:364)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:94)
-	at io.jsonwebtoken.impl.io.AbstractParser.parse(AbstractParser.java:36)
-	at io.jsonwebtoken.impl.io.AbstractParser.parse(AbstractParser.java:29)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parseSignedClaims(DefaultJwtParser.java:830)
-	at com.fincore.gateway.Controller.AuthController.lambda$refreshToken$6(AuthController.java:125)
-	at reactor.core.publisher.MonoCallable.call(MonoCallable.java:72)
-	at reactor.core.publisher.FluxSubscribeOnCallable$CallableSubscribeOnSubscription.run(FluxSubscribeOnCallable.java:228)
-	at reactor.core.scheduler.SchedulerTask.call(SchedulerTask.java:68)
-	at reactor.core.scheduler.SchedulerTask.call(SchedulerTask.java:28)
-	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
-	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)
-	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
-	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
-	at java.base/java.lang.Thread.run(Thread.java:1570)
-2025-12-22 :: 14:19:38.221 || INFO :: SecurityConfig.java: | 86 | :: RedisValidationFilter invoked for path=/auth/refresh-token
-2025-12-22 :: 14:19:38.223 || ERROR:: AuthController.java: | 166 | :: Refresh Token Failed
-io.jsonwebtoken.ExpiredJwtException: JWT expired 2223 milliseconds ago at 2025-12-22T08:49:36.000Z. Current time: 2025-12-22T08:49:38.223Z. Allowed clock skew: 0 milliseconds.
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:691)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:364)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parse(DefaultJwtParser.java:94)
-	at io.jsonwebtoken.impl.io.AbstractParser.parse(AbstractParser.java:36)
-	at io.jsonwebtoken.impl.io.AbstractParser.parse(AbstractParser.java:29)
-	at io.jsonwebtoken.impl.DefaultJwtParser.parseSignedClaims(DefaultJwtParser.java:830)
-	at com.fincore.gateway.Controller.AuthController.lambda$refreshToken$6(AuthController.java:125)
-	at reactor.core.publisher.MonoCallable.call(MonoCallable.java:72)
-	at reactor.core.publisher.FluxSubscribeOnCallable$CallableSubscribeOnSubscription.run(FluxSubscribeOnCallable.java:228)
-	at reactor.core.scheduler.SchedulerTask.call(SchedulerTask.java:68)
-	at reactor.core.scheduler.SchedulerTask.call(SchedulerTask.java:28)
-	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
-	at java.base/java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)
-	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
-	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
-	at java.base/java.lang.Thread.run(Thread.java:1570)
+package com.fincore.gateway.Controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.Service.TokenSessionValidator;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.utility.LoginUtility;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import javax.crypto.SecretKey;
+import java.util.Base64;
+import java.util.Map;
+
+@Slf4j
+@RestController
+@RequestMapping("/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private static final String USER_PREFIX = "USR:";
+
+    private final TokenSessionValidator validator;
+    private final ReactiveStringRedisTemplate redisTemplate;
+    private final LoginService loginService;
+    private final ObjectMapper mapper;
+
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    // Access Token TTL (Short, e.g., 900s / 15m)
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long accessTokenTtl;
+
+    // Refresh Token TTL (Long, e.g., 86400s / 24h)
+    // You can add this property to application.yml: security.jwt.refresh-ttl-seconds=86400
+    // Defaulting to 24h if missing
+    @Value("${security.jwt.refresh-ttl-seconds:86400}")
+    private long refreshTokenTtl;
+
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> login(ServerHttpRequest request, @RequestBody @Valid UserDto payload) {
+        final String clientIp = LoginUtility.getClientIp(request);
+
+        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(user -> {
+                    if (!user.isValidCredentials()) {
+                        return Mono.just(LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
+                                .build());
+                    }
+
+                    if (hmacSecret == null || hmacSecret.isBlank()) {
+                        return Mono.error(new IllegalStateException("Missing HMAC secret"));
+                    }
+
+                    // 1. Generate ACCESS TOKEN (Short-lived, contains Claims)
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
+                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+
+                    // 2. Generate REFRESH TOKEN (Long-lived, Minimal Claims)
+                    // We add a "type" claim to distinguish it, though not strictly required if endpoints are separate.
+                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+                    // Extract JTI from Access Token for Session Tracking
+                    String jti = extractClaims(accessToken).getId();
+
+                    // Register Session (JTI) in Redis
+                    return validator.registerUserSession(user.getUserId(), jti)
+                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                    .subscribeOn(Schedulers.boundedElastic())))
+                            .map(roleData -> LoginResponseDTO.builder()
+                                    .userId(user.getUserId())
+                                    .validCredentials(true)
+                                    .accessToken(accessToken)
+                                    .refreshToken(refreshToken) // <--- CRITICAL: Sending Refresh Token
+                                    .tokenType("Bearer")
+                                    .expiresIn(accessTokenTtl)
+                                    .sub(user.getUserId())
+                                    .jti(jti)
+                                    .roleData(roleData)
+                                    .build());
+                })
+                .onErrorResume(e -> {
+                    log.error("Login Error", e);
+                    return Mono.just(LoginResponseDTO.builder().error("Login failed: " + e.getMessage()).build());
+                });
+    }
+
+    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> refreshToken(@RequestBody Map<String, String> body) {
+        String refreshToken = body.get("refreshToken");
+
+        if (refreshToken == null || refreshToken.isBlank()) {
+            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token").build());
+        }
+
+        return Mono.fromCallable(() -> {
+            try {
+                // Verify Refresh Token Signature & Expiry
+                return extractClaims(refreshToken);
+            } catch (ExpiredJwtException e) {
+                log.warn("Refresh token expired");
+                throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token expired");
+            } catch (Exception e) {
+                log.error("Invalid refresh token", e);
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid refresh token");
+            }
+        })
+        .subscribeOn(Schedulers.boundedElastic())
+        .flatMap(claims -> {
+            String userId = claims.getSubject();
+            
+            // Check if Session is still active in Redis
+            // Note: We check if the user *has* a session, but we don't strictly validate JTI match against 
+            // the *Access Token* JTI because the client didn't send the Access Token here.
+            // This checks "Is the user logged out?".
+            return redisTemplate.opsForValue().get(USER_PREFIX + userId)
+                    .flatMap(currentJti -> Mono.fromCallable(() -> loginService.getUserRole(userId))
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .flatMap(userRole -> {
+                                // Generate NEW Access Token
+                                Map<String, Object> newClaims = Map.of(
+                                        "role", userRole != null ? userRole.getRole() : 0,
+                                        "userId", userId
+                                );
+                                String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, newClaims);
+                                
+                                // Generate NEW Refresh Token (Rotation) - Optional but recommended
+                                Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                                String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
+
+                                String newJti = extractClaims(newAccessToken).getId();
+
+                                // Update Redis with NEW Access Token JTI
+                                return validator.registerUserSession(userId, newJti)
+                                        .thenReturn(LoginResponseDTO.builder()
+                                                .accessToken(newAccessToken)
+                                                .refreshToken(newRefreshToken) // Rotate refresh token
+                                                .userId(userId)
+                                                .jti(newJti)
+                                                .expiresIn(accessTokenTtl)
+                                                .validCredentials(true)
+                                                .build());
+                            }))
+                    .switchIfEmpty(Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build()));
+        })
+        .onErrorResume(e -> {
+            if (e instanceof ResponseStatusException) {
+                 return Mono.just(LoginResponseDTO.builder().error(e.getMessage()).build());
+            }
+            log.error("Refresh failed", e);
+            return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
+        });
+    }
+
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth) {
+        if (jwtAuth == null) return Mono.just(LoginResponseDTO.builder().error("No token").build());
+        
+        String username = jwtAuth.getToken().getSubject();
+        String jti = jwtAuth.getToken().getId(); // JTI of the Access Token being logged out
+
+        return validator.blacklistToken(jti)
+                .flatMap(x -> redisTemplate.opsForValue().get(USER_PREFIX + username))
+                .flatMap(activeJti -> {
+                    // Only clear session if the token being logged out matches the active session
+                    if (activeJti != null && activeJti.equals(jti)) {
+                        return validator.clearUserSession(username)
+                                .map(c -> LoginResponseDTO.builder().userId(username).error("Logged out").build());
+                    } else {
+                        return Mono.just(LoginResponseDTO.builder().userId(username).error("Token revoked").build());
+                    }
+                })
+                .switchIfEmpty(Mono.just(LoginResponseDTO.builder().userId(username).error("Logged out").build()));
+    }
+
+    @PostMapping(value = "/check-user")
+    public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
+        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId"))).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    @PostMapping(value = "/update-password")
+    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
+        return Mono.fromCallable(() -> loginService.updatePassword(dto)).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Claims extractClaims(String token) {
+        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
+        return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
+    }
+}
+
+
+
