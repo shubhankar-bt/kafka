@@ -1,301 +1,750 @@
-package com.fincore.gateway.Controller;
+import axios from "axios";
+import { resolveConfig } from "../config/EnvironmentConfig"; // Ensure this path is correct
+import { tokenRefreshed, logoutSuccess } from "../store/slices/authSlice";
+import { parseJwt } from "../utils/EncryptionUtilities";
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.utility.LoginUtility;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseCookie;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+let store; // Will hold the Redux store reference
 
-import javax.crypto.SecretKey;
-import java.time.Duration;
-import java.util.Base64;
-import java.util.Map;
+// Inject store from App.js or index.js to avoid circular dependency
+export const injectStore = (_store) => {
+  store = _store;
+};
 
-/**
- * Authentication Controller (Reactive).
- * Handles Login, Logout, and Token Refresh using a distributed Redis session model.
- *
- * Security Features:
- * 1. Dual Token System: Short-lived Access Token (JSON) + Long-lived Refresh Token (HttpOnly Cookie).
- * 2. Token Rotation: A new Refresh Token is issued on every use to detect theft.
- * 3. Session Binding: Access Token JTI is bound to Redis `USR:<userId>`.
- * 4. Concurrency Control: "One Session Per User" enforced via Redis JTI checks.
- * 5. Reactive Non-Blocking: Uses WebFlux Mono/Flux patterns with Elastic Scheduler for DB.
- */
-@Slf4j
-@RestController
-@RequestMapping("/auth")
-@RequiredArgsConstructor
-public class AuthController {
+// Create a Singleton Axios Instance
+const api = axios.create({
+  baseURL: resolveConfig("/LS") ?? "", // Base URL
+  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
 
-    private static final String USER_PREFIX = "USR:";
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
+// --- Request Interceptor ---
+api.interceptors.request.use(
+  (config) => {
+    // 1. Get Token from Redux Store
+    const state = store?.getState();
+    const token = state?.auth?.token;
 
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    // Access Token: Short Lived (e.g., 15 mins)
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long accessTokenTtl;
-
-    // Refresh Token: Long Lived (e.g., 24 hours)
-    @Value("${security.jwt.refresh-ttl-seconds:86400}")
-    private long refreshTokenTtl;
-
-    /**
-     * Creates a secure HttpOnly cookie for the refresh token.
-     * Prevents XSS attacks as JavaScript cannot read this cookie.
-     *
-     * CONFIG NOTE:
-     * - secure(false): Allows HTTP (Localhost). Set to true in PROD with HTTPS.
-     * - sameSite("Lax"): Allows cross-origin navigation in Localhost dev.
-     * - path("/"): Ensures cookie is sent to all auth endpoints.
-     */
-    private ResponseCookie createRefreshTokenCookie(String token) {
-        return ResponseCookie.from("refresh_token", token)
-                .httpOnly(true)
-                .secure(false) // TODO: Set to true in Production (requires HTTPS)
-                .path("/")     // Root path ensures availability to all auth endpoints
-                .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Lax") // 'Lax' is safer for localhost dev than 'Strict'
-                .build();
+    // 2. Attach Authorization Header
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
     }
     
-    /**
-     * Creates an empty cookie to clear the refresh token on logout.
-     */
-    private ResponseCookie createEmptyCookie() {
-        return ResponseCookie.from("refresh_token", "")
-                .httpOnly(true)
-                .path("/")
-                .maxAge(0)
-                .build();
+    // 3. Attach Context Header (X-Request-Type) if passed in config
+    // The hook will pass this in, or defaults to '*'
+    if (!config.headers["X-Request-Type"]) {
+        config.headers["X-Request-Type"] = "*";
     }
 
-    /**
-     * LOGIN ENDPOINT
-     * 1. Validates credentials (Blocking DB call on Elastic Scheduler).
-     * 2. Generates Access Token & Refresh Token.
-     * 3. Stores Access Token JTI in Redis (Session Start).
-     * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
-     */
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
-        final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
 
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic()) // Move blocking JDBC call off the event loop
-                .flatMap(user -> {
-                    if (!user.isValidCredentials()) {
-                        log.warn("Invalid credentials for user: {}", payload.getUserId());
-                        return Mono.just(LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
-                                .build());
-                    }
+// --- Response Interceptor ---
+let isRefreshing = false;
+let failedQueue = [];
 
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        log.error("Server Config Error: HMAC secret is missing.");
-                        return Mono.error(new IllegalStateException("Missing HMAC secret"));
-                    }
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
 
-                    // 1. Generate Tokens
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
-                    // Access Token (Short TTL)
-                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-                    
-                    // Refresh Token (Long TTL)
-                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
-
-                    // Extract JTI from Access Token (This is what we track in Redis)
-                    String jti = extractClaims(accessToken).getId();
-
-                    // 2. Set Refresh Token in HttpOnly Cookie
-                    ResponseCookie cookie = createRefreshTokenCookie(refreshToken);
-                    response.addCookie(cookie);
-                    log.info("Login Success. Access Token TTL: {}s. Refresh Cookie Set.", accessTokenTtl);
-
-                    // 3. Register Session (JTI) in Redis & Fetch Menus
-                    return validator.registerUserSession(user.getUserId(), jti)
-                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                    .subscribeOn(Schedulers.boundedElastic())))
-                            .map(roleData -> LoginResponseDTO.builder()
-                                    .userId(user.getUserId())
-                                    .validCredentials(true)
-                                    .accessToken(accessToken) // Only Access Token goes to Frontend JS
-                                    .tokenType("Bearer")
-                                    .expiresIn(accessTokenTtl)
-                                    .sub(user.getUserId())
-                                    .jti(jti)
-                                    .roleData(roleData)
-                                    .build());
-                })
-                .onErrorResume(e -> {
-                    log.error("Login System Error for user {}", payload.getUserId(), e);
-                    return Mono.just(LoginResponseDTO.builder().error("Login failed: " + e.getMessage()).build());
-                });
+api.interceptors.response.use(
+  (response) => {
+    return response;
+  },
+  async (error) => {
+    const originalRequest = error.config;
+    
+    // Safety check to prevent infinite loops
+    if (!originalRequest || originalRequest._retryCount > 2) {
+        return Promise.reject(error);
     }
 
-    /**
-     * REFRESH TOKEN ENDPOINT
-     * 1. Reads Refresh Token from Cookie.
-     * 2. Validates Signature & Expiry.
-     * 3. Checks Redis to ensure User Session is still valid/active.
-     * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
-     */
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
-        
-        // 1. Extract Refresh Token from Cookie
-        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
-        String refreshToken = (cookie != null) ? cookie.getValue() : null;
+    // Extract Error Details
+    const status = error.response?.status;
+    const errorCode = error.response?.data?.error || error.response?.data?.code;
 
-        if (refreshToken == null || refreshToken.isBlank()) {
-            log.warn("Refresh failed: No refresh token cookie found. Cookies present: {}", request.getCookies().keySet());
-            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token cookie").build());
-        }
+    // ---------------------------------------------------------
+    // SCENARIO 1: Concurrent Login / Session Invalidated
+    // ---------------------------------------------------------
+    if (status === 401 && (errorCode === "CONCURRENT_LOGIN" || errorCode === "SESSION_EXPIRED" || errorCode === "INVALID_TOKEN")) {
+       // Do NOT attempt refresh. The session is dead.
+       // We dispatch a custom event that AuthContext listens to for the Dialog
+       window.dispatchEvent(new CustomEvent("auth:session-expired", { detail: { reason: errorCode } }));
+       
+       // Clear local state immediately
+       store.dispatch(logoutSuccess());
+       return Promise.reject(error);
+    }
 
-        return Mono.fromCallable(() -> {
-            try {
-                // Verify Refresh Token Signature & Expiry
-                return extractClaims(refreshToken);
-            } catch (ExpiredJwtException e) {
-                log.warn("Refresh token expired.");
-                throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token expired");
-            } catch (Exception e) {
-                log.error("Invalid refresh token signature/format.", e);
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid refresh token");
-            }
-        })
-        .subscribeOn(Schedulers.boundedElastic())
-        .flatMap(claims -> {
-            String userId = claims.getSubject();
-            String userKey = USER_PREFIX + userId;
-            
-            log.info("Processing refresh for User: {}", userId);
-            
-            // Check if Session is still active in Redis (Global Logout Check)
-            return redisTemplate.opsForValue().get(userKey)
-                    .flatMap(currentJti -> {
-                         log.info("Session Active. Redis Key Found for User: {}", userId);
-                         // Session Found! Proceed to refresh logic.
-                         return Mono.fromCallable(() -> loginService.getUserRole(userId))
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .flatMap(userRole -> {
-                                // Generate NEW Access Token
-                                Map<String, Object> newClaims = Map.of("role", userRole != null ? userRole.getRole() : 0, "userId", userId);
-                                String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, newClaims);
-                                
-                                // Generate NEW Refresh Token (Rotation)
-                                Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                                String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
-                                String newJti = extractClaims(newAccessToken).getId();
-
-                                // Rotate Cookie (Set new refresh token)
-                                response.addCookie(createRefreshTokenCookie(newRefreshToken));
-
-                                // Update Redis Session with NEW Access Token JTI
-                                return validator.registerUserSession(userId, newJti)
-                                        .thenReturn(LoginResponseDTO.builder()
-                                                .accessToken(newAccessToken)
-                                                .userId(userId)
-                                                .jti(newJti)
-                                                .expiresIn(accessTokenTtl)
-                                                .validCredentials(true)
-                                                .build());
-                            });
-                    })
-                    // If Redis returns Empty, the session has expired (TTL) or was evicted
-                    .switchIfEmpty(Mono.defer(() -> {
-                        log.warn("Refresh Denied: Session key {} not found in Redis (Expired/Evicted).", userKey);
-                        return Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build());
-                    }));
-        })
-        .onErrorResume(e -> {
-            if (e instanceof ResponseStatusException) {
-                 return Mono.just(LoginResponseDTO.builder().error(e.getMessage()).build());
-            }
-            log.error("Refresh Token Unexpected Error", e);
-            return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
+    // ---------------------------------------------------------
+    // SCENARIO 2: Access Token Expired (Try Refresh)
+    // ---------------------------------------------------------
+    if (status === 401 && errorCode === "TOKEN_EXPIRED" && !originalRequest._retry) {
+      if (isRefreshing) {
+        // If already refreshing, queue this request
+        return new Promise(function (resolve, reject) {
+          failedQueue.push({
+            resolve: (token) => {
+              originalRequest.headers["Authorization"] = "Bearer " + token;
+              resolve(api(originalRequest));
+            },
+            reject: (err) => {
+              reject(err);
+            },
+          });
         });
-    }
+      }
 
-    /**
-     * LOGOUT ENDPOINT
-     * 1. Clears Refresh Cookie.
-     * 2. Blacklists current Access Token.
-     * 3. Clears Redis Session ONLY if JTI matches (Safe against concurrent login).
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth, ServerHttpResponse response) {
-        // Clear cookie immediately
-        response.addCookie(createEmptyCookie());
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        // Call Backend Refresh Endpoint
+        // Note: We don't send the refresh token in body; backend reads the Cookie
+        const response = await api.post("/auth/refresh-token");
         
-        if (jwtAuth == null) return Mono.just(LoginResponseDTO.builder().error("No token").build());
-        String username = jwtAuth.getToken().getSubject();
-        String jti = jwtAuth.getToken().getId();
-
-        log.info("Logout requested for user: {}", username);
-
-        return validator.blacklistToken(jti)
-                .flatMap(x -> redisTemplate.opsForValue().get(USER_PREFIX + username))
-                .flatMap(activeJti -> {
-                    // Only clear session if the token being logged out matches the active session
-                    if (activeJti != null && activeJti.equals(jti)) {
-                        log.info("Session match. Clearing Redis session for user: {}", username);
-                        return validator.clearUserSession(username)
-                                .map(c -> LoginResponseDTO.builder().userId(username).error("Logged out").build());
-                    } else {
-                        log.info("Session mismatch (User logged in elsewhere). Only revoking token for user: {}", username);
-                        return Mono.just(LoginResponseDTO.builder().userId(username).error("Token revoked").build());
-                    }
-                })
-                .switchIfEmpty(Mono.just(LoginResponseDTO.builder().userId(username).error("Logged out").build()));
+        const { accessToken } = response.data;
+        
+        if(accessToken) {
+             // 1. Update Redux
+             const user = parseJwt(accessToken);
+             store.dispatch(tokenRefreshed({ token: accessToken, user }));
+             
+             // 2. Process Queue
+             processQueue(null, accessToken);
+             
+             // 3. Retry Original Request
+             originalRequest.headers["Authorization"] = "Bearer " + accessToken;
+             return api(originalRequest);
+        } else {
+            throw new Error("No access token returned");
+        }
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        store.dispatch(logoutSuccess());
+        window.dispatchEvent(new CustomEvent("auth:session-expired", { detail: { reason: "SESSION_EXPIRED" } }));
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
     }
+
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+
+import { useState, useCallback, useRef, useEffect } from "react";
+import { useSelector } from "react-redux";
+import { useLocation } from "react-router-dom";
+import api from "../utils/axiosConfig"; // Import the Singleton
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { convertToKebabCase } from "../utils/CommonUtilities";
+
+const useApi = () => {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  
+  const activeRequests = useRef(new Set());
+  const snackbar = useCustomSnackbar();
+  const location = useLocation();
+
+  // Get Menus from Redux to calculate X-Request-Type
+  const menus = useSelector((state) => state.menus.menus);
+  const selectedMenuItem = useSelector((state) => state.menus.selectedMenuItem);
+
+  // --- Helper to find Menu Item based on Route ---
+  const findMenuItem = useCallback((items, route) => {
+    if (!items?.length) return null;
+    for (const item of items) {
+      if (item.route === route) return item;
+      if (item.children?.length) {
+         // Handle dynamic routes if needed
+         if (route.includes("/choose-option/")) {
+            const param = route.split("/choose-option/")[1];
+            if (param === convertToKebabCase(item.title)) return item;
+         }
+         const found = findMenuItem(item.children, route);
+         if (found) return found;
+      }
+    }
+    return null;
+  }, []);
+
+  // Calculate X-Request-Type only when location changes
+  const xRequestType = (() => {
+      const currentMenu = findMenuItem(menus, location.pathname);
+      return currentMenu?.requestType || selectedMenuItem?.requestType || "*";
+  })();
+
+  const cancelAllRequests = useCallback(() => {
+    activeRequests.current.forEach((controller) => {
+        controller.abort();
+    });
+    activeRequests.current.clear();
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+      return () => cancelAllRequests();
+  }, [cancelAllRequests]);
+
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      setLoading(true);
+      setError(null);
+      const controller = new AbortController();
+      activeRequests.current.add(controller);
+
+      // Determine the Service URL (e.g. /LS/auth/...)
+      // Assuming url comes in as "/LS/auth/login" or similar
+      // The logic below adapts your existing split logic
+      let finalUrl = url;
+      if(url.startsWith("/")) {
+          const parts = url.split("/");
+          // parts[0] is empty, parts[1] is service name (e.g. LS)
+          // Ensure your resolveConfig logic is handled either here or in axiosConfig baseURL
+          // If axiosConfig has baseURL, you might just need the relative path
+      }
+
+      try {
+        const config = {
+          method,
+          url: finalUrl,
+          data: method !== "GET" ? payload : undefined,
+          params: method === "GET" ? payload : undefined,
+          responseType,
+          signal: controller.signal,
+          headers: {
+            "Content-Type": contentType,
+            "X-Request-Type": xRequestType, // Context Header
+            ...(extraConfig.headers || {}),
+          },
+          ...extraConfig,
+        };
+
+        // Use the Singleton API instance
+        const response = await api(config);
+
+        setData(response.data);
+        return returnDataOnly ? response.data : response;
+      } catch (err) {
+        if (api.isCancel(err)) {
+           // Request cancelled, do nothing
+           return; 
+        }
+        setError(err);
+        
+        // Show Snackbar for generic errors (skip 401s as they are handled by interceptor)
+        if(err.response?.status !== 401) {
+             const msg = err.response?.data?.message || err.response?.data?.error || "An error occurred";
+             snackbar(msg, "error");
+        }
+        throw err;
+      } finally {
+        activeRequests.current.delete(controller);
+        setLoading(false);
+      }
+    },
+    [xRequestType, snackbar]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests };
+};
+
+export default useApi;
+
+import React, {
+  createContext,
+  useEffect,
+  useRef,
+  useCallback,
+  useState,
+} from "react";
+import { useDispatch, useSelector } from "react-redux";
+import { throttle } from "lodash";
+import SessionDialog from "../components/SessionDialog";
+import SessionWarningDialog from "../components/SessionWarningDialog";
+import { logoutSuccess } from "../store/slices/authSlice";
+import api from "../utils/axiosConfig"; // Use the singleton
+
+export const AuthContext = createContext();
+
+const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 min
+const WARNING_SECONDS = 30;
+
+export const AuthProvider = ({ children }) => {
+  const dispatch = useDispatch();
+  const isAuthenticated = useSelector((state) => state.auth.isAuthenticated);
+  
+  const [warningOpen, setWarningOpen] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(WARNING_SECONDS);
+  
+  const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
+  const [sessionReason, setSessionReason] = useState("");
+
+  const inactivityTimerRef = useRef(null);
+  const warningTimerRef = useRef(null);
+  const countdownRef = useRef(null);
+
+  // --- 1. Helper to Clear Timers ---
+  const clearAllTimers = useCallback(() => {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
+    if (countdownRef.current) clearInterval(countdownRef.current);
+  }, []);
+
+  // --- 2. Perform Logout ---
+  const performLogout = useCallback(async (reason = "USER_INITIATED") => {
+      clearAllTimers();
+      
+      // If triggered by inactivity, show dialog first
+      if (reason === "SESSION_EXPIRED" || reason === "CONCURRENT_LOGIN") {
+          setSessionReason(reason);
+          setSessionDialogOpen(true);
+      }
+      
+      try {
+        // Attempt server logout (clears cookie)
+        // We use 'api' so headers are attached automatically
+        await api.post("/auth/logout");
+      } catch (err) {
+        console.warn("Server logout failed (likely already expired)", err);
+      } finally {
+         // Always clear client state
+         dispatch(logoutSuccess());
+         setWarningOpen(false);
+      }
+  }, [dispatch, clearAllTimers]);
+
+  // --- 3. Start Timers ---
+  const startInactivityTimer = useCallback(() => {
+    clearAllTimers();
+    if(!isAuthenticated) return;
+
+    // Warning Timer
+    warningTimerRef.current = setTimeout(() => {
+      setWarningOpen(true);
+      setSecondsLeft(WARNING_SECONDS);
+      
+      let counter = WARNING_SECONDS;
+      countdownRef.current = setInterval(() => {
+        counter -= 1;
+        setSecondsLeft(counter);
+        if (counter <= 0) clearInterval(countdownRef.current);
+      }, 1000);
+      
+    }, INACTIVITY_TIMEOUT - (WARNING_SECONDS * 1000));
+
+    // Hard Logout Timer
+    inactivityTimerRef.current = setTimeout(() => {
+       performLogout("SESSION_EXPIRED");
+    }, INACTIVITY_TIMEOUT);
     
-    @PostMapping(value = "/check-user")
-    public Mono<VerifyUserDTO> checkUser(@RequestBody Map<String, String> body) {
-        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId"))).subscribeOn(Schedulers.boundedElastic());
-    }
+  }, [isAuthenticated, clearAllTimers, performLogout]);
 
-    @PostMapping(value = "/update-password")
-    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
-        return Mono.fromCallable(() -> loginService.updatePassword(dto)).subscribeOn(Schedulers.boundedElastic());
-    }
+  // --- 4. Event Listeners for Activity ---
+  const onActivity = useCallback(
+    throttle(() => {
+      if (!isAuthenticated || sessionDialogOpen) return;
+      // If warning is open, close it and reset
+      if (warningOpen) setWarningOpen(false);
+      startInactivityTimer();
+    }, 2000),
+    [isAuthenticated, sessionDialogOpen, warningOpen, startInactivityTimer]
+  );
 
-    // Helper to parse token
-    private Claims extractClaims(String token) {
-        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
-        return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
-    }
-}
+  // --- 5. Effect: Monitor Auth State & Global Events ---
+  useEffect(() => {
+      if (isAuthenticated) {
+          startInactivityTimer();
+          const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+          events.forEach((e) => window.addEventListener(e, onActivity));
+          
+          return () => {
+              events.forEach((e) => window.removeEventListener(e, onActivity));
+              onActivity.cancel();
+              clearAllTimers();
+          };
+      } else {
+          clearAllTimers();
+          setWarningOpen(false);
+      }
+  }, [isAuthenticated, onActivity, startInactivityTimer, clearAllTimers]);
 
+  // --- 6. Effect: Listen for Axios Interceptor Events ---
+  useEffect(() => {
+      const handleSessionEvent = (e) => {
+          const reason = e.detail?.reason || "SESSION_EXPIRED";
+          performLogout(reason);
+      };
+      
+      window.addEventListener("auth:session-expired", handleSessionEvent);
+      return () => window.removeEventListener("auth:session-expired", handleSessionEvent);
+  }, [performLogout]);
+
+  return (
+    <AuthContext.Provider
+      value={{
+        logout: () => performLogout("USER_INITIATED"),
+      }}
+    >
+      {children}
+
+      <SessionWarningDialog
+        open={warningOpen}
+        secondsLeft={secondsLeft}
+        onContinue={() => {
+            setWarningOpen(false);
+            startInactivityTimer();
+        }}
+      />
+
+      <SessionDialog
+        open={sessionDialogOpen}
+        reason={sessionReason}
+        onConfirm={() => {
+          setSessionDialogOpen(false);
+          // Redirect to home/login
+          window.location.href = "/"; 
+        }}
+      />
+    </AuthContext.Provider>
+  );
+};
+
+import React, { useEffect, useState } from "react";
+import { useDispatch, useSelector } from "react-redux";
+import { useNavigate } from "react-router-dom";
+import { Box, InputAdornment, IconButton } from "@mui/material";
+import LockIcon from "@mui/icons-material/Lock";
+import Visibility from "@mui/icons-material/Visibility";
+import VisibilityOff from "@mui/icons-material/VisibilityOff";
+
+import api from "../utils/axiosConfig"; // Use Singleton
+import { parseJwt } from "../utils/EncryptionUtilities";
+import { loginSuccess } from "../store/slices/authSlice";
+import { setMenus, setSelectedMenuItem } from "../store/slices/menuSlice";
+import { setTabId } from "../store/slices/tabSlice";
+import { resolveConfig } from "../config/EnvironmentConfig";
+
+import { loginDialogMessages, loginDialogHeaders } from "./constants";
+import { StyledTextField, PrimaryButton, FormTitle, PasswordErrorText } from "./LoginStyles";
+
+const LoginWithPassword = ({ userId, openLoginErrorDialog }) => {
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [passwordInvalidMessage, setPasswordInvalidMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  
+  const navigate = useNavigate();
+  const dispatch = useDispatch();
+  const menus = useSelector((state) => state.menus.menus);
+
+  // Navigate after successful login and menu loading
+  useEffect(() => {
+    if (menus && menus.length > 0 && menus[0]?.route) {
+      navigate(menus[0]?.route);
+    }
+  }, [menus, navigate]);
+
+  const validateUserCredentials = async () => {
+    setIsLoading(true);
+    setPasswordInvalidMessage("");
+    
+    try {
+      // 1. Call Login API
+      // Using 'api' instance ensures standard headers and settings
+      const response = await api.post("/auth/login", {
+          userId: userId,
+          password: password,
+      });
+
+      const result = response.data;
+
+      if (result.validCredentials === true) {
+          // 2. Decode Token
+          const user = parseJwt(result.accessToken);
+          const tabId = crypto.randomUUID();
+
+          // 3. Update Redux (Auth & Menus)
+          dispatch(loginSuccess({
+              token: result.accessToken,
+              user: user
+          }));
+          
+          dispatch(setTabId(tabId));
+          dispatch(setMenus(result.roleData.root_menus));
+          dispatch(setSelectedMenuItem(result.roleData.root_menus[0]));
+
+          // 4. Broadcast to other tabs (Optional)
+          const bc = new BroadcastChannel("auth");
+          setTimeout(() => {
+            bc.postMessage({
+              type: "USER_LOGGED_IN",
+              tabId,
+              userId: user.userId,
+            });
+          }, 1000);
+
+      } else {
+          // Handle Logic Failure (Account Locked, Bad Pass, etc)
+          handleLoginFailure(result);
+      }
+    } catch (e) {
+      console.error("Login Error:", e);
+      // Handle Network/Server Error
+      // Note: 401s are intercepted, but for Login endpoint specifically, 
+      // we usually get 200 OK with validCredentials=false OR 401 Bad Creds.
+      // If interceptor catches 401, it might dispatch logout, which is fine.
+      
+      const msg = e.response?.data?.message || "Failed to log into FinCore, please try again later";
+      openLoginErrorDialog("Login Failed", msg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleLoginFailure = (result) => {
+      if (result.userStatus === "ACTIVE" && result.loginMethod === "P") {
+        if (result.attemptsLeft > 0) {
+          setPasswordInvalidMessage(`Invalid password. ${result.attemptsLeft} attempts left.`);
+          openLoginErrorDialog("Invalid password", "Password incorrect.");
+        } else {
+          openLoginErrorDialog("Account locked", "You are out of attempts and your account has been locked");
+        }
+      } else {
+        openLoginErrorDialog(
+          loginDialogHeaders[result.userStatus] || "Login Failed",
+          loginDialogMessages[result.userStatus] || "Account status issue."
+        );
+      }
+  };
+
+  return (
+    <>
+      <FormTitle>Sign In</FormTitle>
+      <StyledTextField
+        fullWidth
+        label="Password"
+        type={showPassword ? "text" : "password"}
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        variant="outlined"
+        error={!!passwordInvalidMessage}
+        margin="normal"
+        InputProps={{
+          startAdornment: (
+            <InputAdornment position="start"><LockIcon /></InputAdornment>
+          ),
+          endAdornment: (
+            <InputAdornment position="end">
+              <IconButton onClick={() => setShowPassword(!showPassword)} edge="end">
+                {showPassword ? <Visibility /> : <VisibilityOff />}
+              </IconButton>
+            </InputAdornment>
+          ),
+        }}
+      />
+      {passwordInvalidMessage && (
+        <PasswordErrorText>{passwordInvalidMessage}</PasswordErrorText>
+      )}
+
+      <PrimaryButton
+        fullWidth
+        variant="contained"
+        onClick={validateUserCredentials}
+        disabled={!userId || isLoading}
+      >
+        {isLoading ? "Signing in..." : "Sign In"}
+      </PrimaryButton>
+    </>
+  );
+};
+
+export default LoginWithPassword;
+
+import React, { useEffect, useState } from "react";
+import { useDispatch, useSelector } from "react-redux";
+import { useNavigate } from "react-router-dom";
+import { Box, InputAdornment, IconButton } from "@mui/material";
+import LockIcon from "@mui/icons-material/Lock";
+import Visibility from "@mui/icons-material/Visibility";
+import VisibilityOff from "@mui/icons-material/VisibilityOff";
+
+import api from "../utils/axiosConfig"; // Use Singleton
+import { parseJwt } from "../utils/EncryptionUtilities";
+import { loginSuccess } from "../store/slices/authSlice";
+import { setMenus, setSelectedMenuItem } from "../store/slices/menuSlice";
+import { setTabId } from "../store/slices/tabSlice";
+import { resolveConfig } from "../config/EnvironmentConfig";
+
+import { loginDialogMessages, loginDialogHeaders } from "./constants";
+import { StyledTextField, PrimaryButton, FormTitle, PasswordErrorText } from "./LoginStyles";
+
+const LoginWithPassword = ({ userId, openLoginErrorDialog }) => {
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [passwordInvalidMessage, setPasswordInvalidMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  
+  const navigate = useNavigate();
+  const dispatch = useDispatch();
+  const menus = useSelector((state) => state.menus.menus);
+
+  // Navigate after successful login and menu loading
+  useEffect(() => {
+    if (menus && menus.length > 0 && menus[0]?.route) {
+      navigate(menus[0]?.route);
+    }
+  }, [menus, navigate]);
+
+  const validateUserCredentials = async () => {
+    setIsLoading(true);
+    setPasswordInvalidMessage("");
+    
+    try {
+      // 1. Call Login API
+      // Using 'api' instance ensures standard headers and settings
+      const response = await api.post("/auth/login", {
+          userId: userId,
+          password: password,
+      });
+
+      const result = response.data;
+
+      if (result.validCredentials === true) {
+          // 2. Decode Token
+          const user = parseJwt(result.accessToken);
+          const tabId = crypto.randomUUID();
+
+          // 3. Update Redux (Auth & Menus)
+          dispatch(loginSuccess({
+              token: result.accessToken,
+              user: user
+          }));
+          
+          dispatch(setTabId(tabId));
+          dispatch(setMenus(result.roleData.root_menus));
+          dispatch(setSelectedMenuItem(result.roleData.root_menus[0]));
+
+          // 4. Broadcast to other tabs (Optional)
+          const bc = new BroadcastChannel("auth");
+          setTimeout(() => {
+            bc.postMessage({
+              type: "USER_LOGGED_IN",
+              tabId,
+              userId: user.userId,
+            });
+          }, 1000);
+
+      } else {
+          // Handle Logic Failure (Account Locked, Bad Pass, etc)
+          handleLoginFailure(result);
+      }
+    } catch (e) {
+      console.error("Login Error:", e);
+      // Handle Network/Server Error
+      // Note: 401s are intercepted, but for Login endpoint specifically, 
+      // we usually get 200 OK with validCredentials=false OR 401 Bad Creds.
+      // If interceptor catches 401, it might dispatch logout, which is fine.
+      
+      const msg = e.response?.data?.message || "Failed to log into FinCore, please try again later";
+      openLoginErrorDialog("Login Failed", msg);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleLoginFailure = (result) => {
+      if (result.userStatus === "ACTIVE" && result.loginMethod === "P") {
+        if (result.attemptsLeft > 0) {
+          setPasswordInvalidMessage(`Invalid password. ${result.attemptsLeft} attempts left.`);
+          openLoginErrorDialog("Invalid password", "Password incorrect.");
+        } else {
+          openLoginErrorDialog("Account locked", "You are out of attempts and your account has been locked");
+        }
+      } else {
+        openLoginErrorDialog(
+          loginDialogHeaders[result.userStatus] || "Login Failed",
+          loginDialogMessages[result.userStatus] || "Account status issue."
+        );
+      }
+  };
+
+  return (
+    <>
+      <FormTitle>Sign In</FormTitle>
+      <StyledTextField
+        fullWidth
+        label="Password"
+        type={showPassword ? "text" : "password"}
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        variant="outlined"
+        error={!!passwordInvalidMessage}
+        margin="normal"
+        InputProps={{
+          startAdornment: (
+            <InputAdornment position="start"><LockIcon /></InputAdornment>
+          ),
+          endAdornment: (
+            <InputAdornment position="end">
+              <IconButton onClick={() => setShowPassword(!showPassword)} edge="end">
+                {showPassword ? <Visibility /> : <VisibilityOff />}
+              </IconButton>
+            </InputAdornment>
+          ),
+        }}
+      />
+      {passwordInvalidMessage && (
+        <PasswordErrorText>{passwordInvalidMessage}</PasswordErrorText>
+      )}
+
+      <PrimaryButton
+        fullWidth
+        variant="contained"
+        onClick={validateUserCredentials}
+        disabled={!userId || isLoading}
+      >
+        {isLoading ? "Signing in..." : "Sign In"}
+      </PrimaryButton>
+    </>
+  );
+};
+
+export default LoginWithPassword;
+
+// In your main index.js or App.js where you create the store
+import store from './store'; // Your redux store import
+import { injectStore } from './utils/axiosConfig';
+import { initializeAuth } from './store/slices/authSlice';
+
+// 1. Inject store into Axios interceptors
+injectStore(store);
+
+// 2. Initialize Auth from LocalStorage (if you aren't using redux-persist)
+store.dispatch(initializeAuth());
+
+// ... render App
 
