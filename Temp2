@@ -1,750 +1,551 @@
-import axios from "axios";
-import { resolveConfig } from "../config/EnvironmentConfig"; // Ensure this path is correct
-import { tokenRefreshed, logoutSuccess } from "../store/slices/authSlice";
-import { parseJwt } from "../utils/EncryptionUtilities";
+package com.fincore.commonutilities.security;
 
-let store; // Will hold the Redux store reference
+import com.fincore.commonutilities.jwt.JwtUtil;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
 
-// Inject store from App.js or index.js to avoid circular dependency
-export const injectStore = (_store) => {
-  store = _store;
-};
+import java.io.IOException;
+import java.util.List;
+import java.util.Set;
 
-// Create a Singleton Axios Instance
-const api = axios.create({
-  baseURL: resolveConfig("/LS") ?? "", // Base URL
-  withCredentials: true, // IMPORTANT: Allows sending/receiving HttpOnly Cookies
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
+@Slf4j
+@RequiredArgsConstructor
+public class ContextRbacFilter extends OncePerRequestFilter {
 
-// --- Request Interceptor ---
-api.interceptors.request.use(
-  (config) => {
-    // 1. Get Token from Redux Store
-    const state = store?.getState();
-    const token = state?.auth?.token;
-
-    // 2. Attach Authorization Header
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
+    private static final String REDIS_USER_PREFIX = "USR:";
+    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
     
-    // 3. Attach Context Header (X-Request-Type) if passed in config
-    // The hook will pass this in, or defaults to '*'
-    if (!config.headers["X-Request-Type"]) {
-        config.headers["X-Request-Type"] = "*";
-    }
-
-    return config;
-  },
-  (error) => Promise.reject(error)
-);
-
-// --- Response Interceptor ---
-let isRefreshing = false;
-let failedQueue = [];
-
-const processQueue = (error, token = null) => {
-  failedQueue.forEach((prom) => {
-    if (error) {
-      prom.reject(error);
-    } else {
-      prom.resolve(token);
-    }
-  });
-  failedQueue = [];
-};
-
-api.interceptors.response.use(
-  (response) => {
-    return response;
-  },
-  async (error) => {
-    const originalRequest = error.config;
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login",
+            "/auth/login", "/auth/logout", "/auth/check-user"
+    );
     
-    // Safety check to prevent infinite loops
-    if (!originalRequest || originalRequest._retryCount > 2) {
-        return Promise.reject(error);
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+
+        String uri = request.getRequestURI();
+        
+        // 1. SKIP WHITELIST
+        for (String pattern : WHITELIST) {
+            if (pathMatcher.match(pattern, uri)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+        }
+
+        // 2. VALIDATE TOKEN
+        String token = request.getHeader("Authorization");
+
+        if (token != null) {
+            try {
+                // A. STANDARD VALIDATION (Signature + Expiry)
+                if (!jwtUtil.isTokenValid(token)) {
+                    throw new JwtException("Invalid Token Signature");
+                }
+
+                // If valid, extract info
+                String userId = jwtUtil.getUserIdFromToken(token);
+                String incomingJti = jwtUtil.extractClaim(removeBearer(token), Claims::getId);
+                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
+
+                // B. ACTIVE SESSION CHECK
+                if (!checkRedisSession(response, userId, incomingJti)) {
+                    return; // Error sent
+                }
+
+                // C. RBAC / CONTEXT SETUP
+                setSecurityContext(userId, roleIdInt);
+
+                if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
+                    return;
+                }
+
+            } catch (ExpiredJwtException e) {
+                // -----------------------------------------------------------------
+                // HANDLE EXPIRED TOKEN: Distinguish between "Time out" vs "Concurrent Login"
+                // -----------------------------------------------------------------
+                try {
+                    Claims claims = e.getClaims();
+                    String userId = claims.getSubject();
+                    String incomingJti = claims.getId();
+
+                    String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
+
+                    // CASE 1: Session totally gone from Redis (User idle > 24h)
+                    if (activeJti == null) {
+                        log.warn("Session expired in Redis (found during token expiry check) for user {}", userId);
+                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
+                        return;
+                    }
+
+                    // CASE 2: Concurrent Login (Redis has newer JTI)
+                    if (!activeJti.equals(incomingJti)) {
+                        log.warn("Concurrent Login Detected on Expired Token. User: {}", userId);
+                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
+                        return;
+                    }
+
+                    // CASE 3: Normal Expiry (Redis matches) -> Allow Frontend to Refresh
+                } catch (Exception ex) {
+                    log.error("Error checking concurrency on expired token", ex);
+                }
+
+                // Default behavior: Tell frontend token is expired so it can call /refresh-token
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
+                return;
+
+            } catch (Exception e) {
+                log.error("Auth Error: {}", e.getMessage());
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
+                return;
+            }
+        } else {
+            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "MISSING_TOKEN", "Authorization header missing.");
+            return;
+        }
+
+        filterChain.doFilter(request, response);
     }
 
-    // Extract Error Details
-    const status = error.response?.status;
-    const errorCode = error.response?.data?.error || error.response?.data?.code;
+    // --- Helpers ---
 
-    // ---------------------------------------------------------
-    // SCENARIO 1: Concurrent Login / Session Invalidated
-    // ---------------------------------------------------------
-    if (status === 401 && (errorCode === "CONCURRENT_LOGIN" || errorCode === "SESSION_EXPIRED" || errorCode === "INVALID_TOKEN")) {
-       // Do NOT attempt refresh. The session is dead.
-       // We dispatch a custom event that AuthContext listens to for the Dialog
-       window.dispatchEvent(new CustomEvent("auth:session-expired", { detail: { reason: errorCode } }));
-       
-       // Clear local state immediately
-       store.dispatch(logoutSuccess());
-       return Promise.reject(error);
+    private boolean checkRedisSession(HttpServletResponse response, String userId, String incomingJti) throws IOException {
+        if (incomingJti == null) {
+            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
+            return false;
+        }
+        try {
+            String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
+            if (activeJti == null) {
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
+                return false;
+            }
+            if (!incomingJti.equals(activeJti)) {
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
+                return false;
+            }
+        } catch (RedisConnectionFailureException e) {
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
+            return false;
+        }
+        return true;
     }
 
-    // ---------------------------------------------------------
-    // SCENARIO 2: Access Token Expired (Try Refresh)
-    // ---------------------------------------------------------
-    if (status === 401 && errorCode === "TOKEN_EXPIRED" && !originalRequest._retry) {
-      if (isRefreshing) {
-        // If already refreshing, queue this request
-        return new Promise(function (resolve, reject) {
-          failedQueue.push({
-            resolve: (token) => {
-              originalRequest.headers["Authorization"] = "Bearer " + token;
-              resolve(api(originalRequest));
-            },
-            reject: (err) => {
-              reject(err);
-            },
-          });
+    private void setSecurityContext(String userId, int roleId) {
+        if (SecurityContextHolder.getContext().getAuthentication() == null) {
+            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+            );
+            SecurityContextHolder.getContext().setAuthentication(authToken);
+        }
+    }
+
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+        String contextHeader = request.getHeader("X-Request-Type");
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
+        
+        Set<String> permissions = redisTemplate.opsForSet().members(REDIS_RBAC_PREFIX + roleId);
+        boolean isAuthorized = false;
+
+        if (permissions != null) {
+            for (String perm : permissions) {
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+                if (!parts[1].equals(requestContext) && !parts[1].equals("*")) continue;
+
+                String[] muParts = parts[0].split(":", 2);
+                if (muParts.length < 2) continue;
+                if (muParts[0].equals(method) && pathMatcher.match(muParts[1], uri)) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isAuthorized) {
+            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions.");
+            return false;
+        }
+        return true;
+    }
+
+    private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
+        response.setStatus(status);
+        response.setContentType("application/json");
+        response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
+    }
+
+    private String removeBearer(String token) {
+        return (token != null && token.startsWith("Bearer ")) ? token.substring(7) : token;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------
+
+
+
+
+
+
+package com.fincore.commonutilities.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.util.Date;
+import java.util.function.Function;
+
+@Component
+@Slf4j
+public class JwtUtil {
+
+    @Value("${security.jwt.hmac-base64-secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
+    private String secretKey;
+
+    @Value("${security.jwt.ttl-seconds:900}") 
+    private long accessTokenValidity;
+
+    // --- Standard Validation ---
+    public boolean isTokenValid(String token) {
+        try {
+            return !isTokenExpired(removeBearerPrefix(token));
+        } catch (ExpiredJwtException e) {
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String getUserIdFromToken(String token) {
+        return extractClaim(removeBearerPrefix(token), Claims::getSubject);
+    }
+
+    public int getUserRoleFromToken(String token) {
+        return extractClaim(removeBearerPrefix(token), claims -> {
+            Object role = claims.get("role");
+            if (role instanceof Number) return ((Number) role).intValue();
+            return 0; 
         });
-      }
+    }
 
-      originalRequest._retry = true;
-      isRefreshing = true;
+    /**
+     * Extracts a claim. 
+     * NOTE: If token is expired, this will throw ExpiredJwtException.
+     * Use extractClaimSafe if you need data from an expired token.
+     */
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
 
-      try {
-        // Call Backend Refresh Endpoint
-        // Note: We don't send the refresh token in body; backend reads the Cookie
-        const response = await api.post("/auth/refresh-token");
-        
-        const { accessToken } = response.data;
-        
-        if(accessToken) {
-             // 1. Update Redux
-             const user = parseJwt(accessToken);
-             store.dispatch(tokenRefreshed({ token: accessToken, user }));
-             
-             // 2. Process Queue
-             processQueue(null, accessToken);
-             
-             // 3. Retry Original Request
-             originalRequest.headers["Authorization"] = "Bearer " + accessToken;
-             return api(originalRequest);
+    /**
+     * NEW METHOD: Extracts claims even if the token is expired.
+     * This is required for checking Concurrent Login (JTI mismatch) on expired tokens.
+     */
+    public <T> T extractClaimSafe(String token, Function<Claims, T> claimsResolver) {
+        try {
+            final Claims claims = extractAllClaims(token);
+            return claimsResolver.apply(claims);
+        } catch (ExpiredJwtException e) {
+            // The exception contains the claims that were successfully parsed
+            return claimsResolver.apply(e.getClaims());
+        }
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser()
+                .verifyWith(getSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractClaim(token, Claims::getExpiration).before(new Date());
+    }
+
+    private String removeBearerPrefix(String token) {
+        if (token != null && token.startsWith("Bearer ")) return token.substring(7);
+        return token;
+    }
+
+    private SecretKey getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Date;
+import java.util.List;
+import java.util.Set;
+
+@Slf4j
+@RequiredArgsConstructor
+public class ContextRbacFilter extends OncePerRequestFilter {
+
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    private static final String REDIS_USER_PREFIX = "USR:";
+    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
+
+    private static final Set<String> WHITELIST = Set.of(
+            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
+    );
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+
+        String uri = request.getRequestURI();
+
+        for (String pattern : WHITELIST) {
+            if (pathMatcher.match(pattern, uri)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+        }
+
+        String token = request.getHeader("Authorization");
+
+        if (token != null) {
+            try {
+                // 1. EXTRACT CLAIMS SAFELY (Ignore Expiry for now)
+                // We assume signature is valid if parsing succeeds (even if expired)
+                String cleanToken = removeBearer(token);
+                String userId = jwtUtil.extractClaimSafe(cleanToken, Claims::getSubject);
+                String incomingJti = jwtUtil.extractClaimSafe(cleanToken, Claims::getId);
+                Date expiration = jwtUtil.extractClaimSafe(cleanToken, Claims::getExpiration);
+                
+                if (incomingJti == null || userId == null) {
+                     sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token malformed");
+                     return;
+                }
+
+                // 2. CHECK REDIS SESSION (CONCURRENT LOGIN CHECK)
+                // This MUST happen before Expiry check.
+                // If JTI doesn't match, it means user logged in elsewhere -> HARD LOGOUT.
+                String sessionKey = REDIS_USER_PREFIX + userId;
+                String activeJti = null;
+                
+                try {
+                    activeJti = redisTemplate.opsForValue().get(sessionKey);
+                } catch (RedisConnectionFailureException e) {
+                    log.error("Redis Unreachable");
+                    sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
+                    return;
+                }
+
+                if (activeJti == null) {
+                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
+                    return; 
+                }
+
+                if (!incomingJti.equals(activeJti)) {
+                    log.warn("Concurrent Login: User {} token JTI {} != Redis JTI {}", userId, incomingJti, activeJti);
+                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
+                    return; 
+                }
+
+                // 3. CHECK EXPIRY (TOKEN EXPIRED CHECK)
+                // Only if session is valid (JTI matches), we check if token is expired.
+                if (expiration.before(new Date())) {
+                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
+                    return;
+                }
+
+                // 4. SET CONTEXT (Spring Security)
+                // We use Safe extraction again just in case, though we know it's valid now
+                int roleIdInt = jwtUtil.extractClaimSafe(cleanToken, claims -> {
+                    Object role = claims.get("role");
+                    if (role instanceof Number) return ((Number) role).intValue();
+                    return 0;
+                });
+
+                if (SecurityContextHolder.getContext().getAuthentication() == null) {
+                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleIdInt))
+                    );
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
+
+                // 5. RBAC CHECK
+                if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
+                    return; 
+                }
+
+            } catch (JwtException e) {
+                // Catches signature failures or malformed tokens
+                log.error("Auth Error: {}", e.getMessage());
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
+                return;
+            } catch (Exception e) {
+                log.error("Unexpected Auth Error", e);
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
+                return;
+            }
         } else {
-            throw new Error("No access token returned");
+            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "MISSING_TOKEN", "Authorization header missing.");
+            return;
         }
-      } catch (refreshError) {
-        processQueue(refreshError, null);
-        store.dispatch(logoutSuccess());
-        window.dispatchEvent(new CustomEvent("auth:session-expired", { detail: { reason: "SESSION_EXPIRED" } }));
-        return Promise.reject(refreshError);
-      } finally {
-        isRefreshing = false;
-      }
+
+        filterChain.doFilter(request, response);
     }
 
-    return Promise.reject(error);
-  }
-);
+    // ... (Keep existing checkRbac, sendError, removeBearer methods exactly as they were) ...
+    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
+        // ... (Keep existing logic)
+        String uri = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+        String contextHeader = request.getHeader("X-Request-Type");
+        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
 
-export default api;
+        String redisKey = REDIS_RBAC_PREFIX + roleId;
+        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
 
-import { useState, useCallback, useRef, useEffect } from "react";
-import { useSelector } from "react-redux";
-import { useLocation } from "react-router-dom";
-import api from "../utils/axiosConfig"; // Import the Singleton
-import useCustomSnackbar from "../utils/useCustomSnackbar";
-import { convertToKebabCase } from "../utils/CommonUtilities";
+        boolean isAuthorized = false;
 
-const useApi = () => {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(false);
-  
-  const activeRequests = useRef(new Set());
-  const snackbar = useCustomSnackbar();
-  const location = useLocation();
+        if (permissions != null) {
+            for (String perm : permissions) {
+                String[] parts = perm.split("\\|");
+                if (parts.length < 2) continue;
+                String methodAndUrl = parts[0];
+                String allowedContext = parts[1];
 
-  // Get Menus from Redux to calculate X-Request-Type
-  const menus = useSelector((state) => state.menus.menus);
-  const selectedMenuItem = useSelector((state) => state.menus.selectedMenuItem);
+                if (!allowedContext.equals("*") && !allowedContext.equals(requestContext)) continue;
 
-  // --- Helper to find Menu Item based on Route ---
-  const findMenuItem = useCallback((items, route) => {
-    if (!items?.length) return null;
-    for (const item of items) {
-      if (item.route === route) return item;
-      if (item.children?.length) {
-         // Handle dynamic routes if needed
-         if (route.includes("/choose-option/")) {
-            const param = route.split("/choose-option/")[1];
-            if (param === convertToKebabCase(item.title)) return item;
-         }
-         const found = findMenuItem(item.children, route);
-         if (found) return found;
-      }
+                String[] muParts = methodAndUrl.split(":", 2);
+                if (muParts.length < 2) continue;
+                String allowedMethod = muParts[0];
+                String allowedUrlPattern = muParts[1];
+
+                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
+                    isAuthorized = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isAuthorized) {
+            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions.");
+            return false;
+        }
+        return true;
     }
-    return null;
-  }, []);
 
-  // Calculate X-Request-Type only when location changes
-  const xRequestType = (() => {
-      const currentMenu = findMenuItem(menus, location.pathname);
-      return currentMenu?.requestType || selectedMenuItem?.requestType || "*";
-  })();
-
-  const cancelAllRequests = useCallback(() => {
-    activeRequests.current.forEach((controller) => {
-        controller.abort();
-    });
-    activeRequests.current.clear();
-  }, []);
-
-  // Cleanup on unmount
-  useEffect(() => {
-      return () => cancelAllRequests();
-  }, [cancelAllRequests]);
-
-  const callApi = useCallback(
-    async (
-      url,
-      payload = null,
-      method = "GET",
-      responseType = "json",
-      contentType = "application/json",
-      extraConfig = {},
-      returnDataOnly = true
-    ) => {
-      setLoading(true);
-      setError(null);
-      const controller = new AbortController();
-      activeRequests.current.add(controller);
-
-      // Determine the Service URL (e.g. /LS/auth/...)
-      // Assuming url comes in as "/LS/auth/login" or similar
-      // The logic below adapts your existing split logic
-      let finalUrl = url;
-      if(url.startsWith("/")) {
-          const parts = url.split("/");
-          // parts[0] is empty, parts[1] is service name (e.g. LS)
-          // Ensure your resolveConfig logic is handled either here or in axiosConfig baseURL
-          // If axiosConfig has baseURL, you might just need the relative path
-      }
-
-      try {
-        const config = {
-          method,
-          url: finalUrl,
-          data: method !== "GET" ? payload : undefined,
-          params: method === "GET" ? payload : undefined,
-          responseType,
-          signal: controller.signal,
-          headers: {
-            "Content-Type": contentType,
-            "X-Request-Type": xRequestType, // Context Header
-            ...(extraConfig.headers || {}),
-          },
-          ...extraConfig,
-        };
-
-        // Use the Singleton API instance
-        const response = await api(config);
-
-        setData(response.data);
-        return returnDataOnly ? response.data : response;
-      } catch (err) {
-        if (api.isCancel(err)) {
-           // Request cancelled, do nothing
-           return; 
-        }
-        setError(err);
-        
-        // Show Snackbar for generic errors (skip 401s as they are handled by interceptor)
-        if(err.response?.status !== 401) {
-             const msg = err.response?.data?.message || err.response?.data?.error || "An error occurred";
-             snackbar(msg, "error");
-        }
-        throw err;
-      } finally {
-        activeRequests.current.delete(controller);
-        setLoading(false);
-      }
-    },
-    [xRequestType, snackbar]
-  );
-
-  return { data, error, loading, callApi, cancelAllRequests };
-};
-
-export default useApi;
-
-import React, {
-  createContext,
-  useEffect,
-  useRef,
-  useCallback,
-  useState,
-} from "react";
-import { useDispatch, useSelector } from "react-redux";
-import { throttle } from "lodash";
-import SessionDialog from "../components/SessionDialog";
-import SessionWarningDialog from "../components/SessionWarningDialog";
-import { logoutSuccess } from "../store/slices/authSlice";
-import api from "../utils/axiosConfig"; // Use the singleton
-
-export const AuthContext = createContext();
-
-const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 min
-const WARNING_SECONDS = 30;
-
-export const AuthProvider = ({ children }) => {
-  const dispatch = useDispatch();
-  const isAuthenticated = useSelector((state) => state.auth.isAuthenticated);
-  
-  const [warningOpen, setWarningOpen] = useState(false);
-  const [secondsLeft, setSecondsLeft] = useState(WARNING_SECONDS);
-  
-  const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
-  const [sessionReason, setSessionReason] = useState("");
-
-  const inactivityTimerRef = useRef(null);
-  const warningTimerRef = useRef(null);
-  const countdownRef = useRef(null);
-
-  // --- 1. Helper to Clear Timers ---
-  const clearAllTimers = useCallback(() => {
-    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
-    if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
-  }, []);
-
-  // --- 2. Perform Logout ---
-  const performLogout = useCallback(async (reason = "USER_INITIATED") => {
-      clearAllTimers();
-      
-      // If triggered by inactivity, show dialog first
-      if (reason === "SESSION_EXPIRED" || reason === "CONCURRENT_LOGIN") {
-          setSessionReason(reason);
-          setSessionDialogOpen(true);
-      }
-      
-      try {
-        // Attempt server logout (clears cookie)
-        // We use 'api' so headers are attached automatically
-        await api.post("/auth/logout");
-      } catch (err) {
-        console.warn("Server logout failed (likely already expired)", err);
-      } finally {
-         // Always clear client state
-         dispatch(logoutSuccess());
-         setWarningOpen(false);
-      }
-  }, [dispatch, clearAllTimers]);
-
-  // --- 3. Start Timers ---
-  const startInactivityTimer = useCallback(() => {
-    clearAllTimers();
-    if(!isAuthenticated) return;
-
-    // Warning Timer
-    warningTimerRef.current = setTimeout(() => {
-      setWarningOpen(true);
-      setSecondsLeft(WARNING_SECONDS);
-      
-      let counter = WARNING_SECONDS;
-      countdownRef.current = setInterval(() => {
-        counter -= 1;
-        setSecondsLeft(counter);
-        if (counter <= 0) clearInterval(countdownRef.current);
-      }, 1000);
-      
-    }, INACTIVITY_TIMEOUT - (WARNING_SECONDS * 1000));
-
-    // Hard Logout Timer
-    inactivityTimerRef.current = setTimeout(() => {
-       performLogout("SESSION_EXPIRED");
-    }, INACTIVITY_TIMEOUT);
+    private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
+        response.setStatus(status);
+        response.setContentType("application/json");
+        response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
+    }
     
-  }, [isAuthenticated, clearAllTimers, performLogout]);
-
-  // --- 4. Event Listeners for Activity ---
-  const onActivity = useCallback(
-    throttle(() => {
-      if (!isAuthenticated || sessionDialogOpen) return;
-      // If warning is open, close it and reset
-      if (warningOpen) setWarningOpen(false);
-      startInactivityTimer();
-    }, 2000),
-    [isAuthenticated, sessionDialogOpen, warningOpen, startInactivityTimer]
-  );
-
-  // --- 5. Effect: Monitor Auth State & Global Events ---
-  useEffect(() => {
-      if (isAuthenticated) {
-          startInactivityTimer();
-          const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
-          events.forEach((e) => window.addEventListener(e, onActivity));
-          
-          return () => {
-              events.forEach((e) => window.removeEventListener(e, onActivity));
-              onActivity.cancel();
-              clearAllTimers();
-          };
-      } else {
-          clearAllTimers();
-          setWarningOpen(false);
-      }
-  }, [isAuthenticated, onActivity, startInactivityTimer, clearAllTimers]);
-
-  // --- 6. Effect: Listen for Axios Interceptor Events ---
-  useEffect(() => {
-      const handleSessionEvent = (e) => {
-          const reason = e.detail?.reason || "SESSION_EXPIRED";
-          performLogout(reason);
-      };
-      
-      window.addEventListener("auth:session-expired", handleSessionEvent);
-      return () => window.removeEventListener("auth:session-expired", handleSessionEvent);
-  }, [performLogout]);
-
-  return (
-    <AuthContext.Provider
-      value={{
-        logout: () => performLogout("USER_INITIATED"),
-      }}
-    >
-      {children}
-
-      <SessionWarningDialog
-        open={warningOpen}
-        secondsLeft={secondsLeft}
-        onContinue={() => {
-            setWarningOpen(false);
-            startInactivityTimer();
-        }}
-      />
-
-      <SessionDialog
-        open={sessionDialogOpen}
-        reason={sessionReason}
-        onConfirm={() => {
-          setSessionDialogOpen(false);
-          // Redirect to home/login
-          window.location.href = "/"; 
-        }}
-      />
-    </AuthContext.Provider>
-  );
-};
-
-import React, { useEffect, useState } from "react";
-import { useDispatch, useSelector } from "react-redux";
-import { useNavigate } from "react-router-dom";
-import { Box, InputAdornment, IconButton } from "@mui/material";
-import LockIcon from "@mui/icons-material/Lock";
-import Visibility from "@mui/icons-material/Visibility";
-import VisibilityOff from "@mui/icons-material/VisibilityOff";
-
-import api from "../utils/axiosConfig"; // Use Singleton
-import { parseJwt } from "../utils/EncryptionUtilities";
-import { loginSuccess } from "../store/slices/authSlice";
-import { setMenus, setSelectedMenuItem } from "../store/slices/menuSlice";
-import { setTabId } from "../store/slices/tabSlice";
-import { resolveConfig } from "../config/EnvironmentConfig";
-
-import { loginDialogMessages, loginDialogHeaders } from "./constants";
-import { StyledTextField, PrimaryButton, FormTitle, PasswordErrorText } from "./LoginStyles";
-
-const LoginWithPassword = ({ userId, openLoginErrorDialog }) => {
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [passwordInvalidMessage, setPasswordInvalidMessage] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  
-  const navigate = useNavigate();
-  const dispatch = useDispatch();
-  const menus = useSelector((state) => state.menus.menus);
-
-  // Navigate after successful login and menu loading
-  useEffect(() => {
-    if (menus && menus.length > 0 && menus[0]?.route) {
-      navigate(menus[0]?.route);
+    private String removeBearer(String token) {
+        if (token != null && token.startsWith("Bearer ")) return token.substring(7);
+        return token;
     }
-  }, [menus, navigate]);
+}
 
-  const validateUserCredentials = async () => {
-    setIsLoading(true);
-    setPasswordInvalidMessage("");
-    
-    try {
-      // 1. Call Login API
-      // Using 'api' instance ensures standard headers and settings
-      const response = await api.post("/auth/login", {
-          userId: userId,
-          password: password,
-      });
 
-      const result = response.data;
 
-      if (result.validCredentials === true) {
-          // 2. Decode Token
-          const user = parseJwt(result.accessToken);
-          const tabId = crypto.randomUUID();
 
-          // 3. Update Redux (Auth & Menus)
-          dispatch(loginSuccess({
-              token: result.accessToken,
-              user: user
-          }));
-          
-          dispatch(setTabId(tabId));
-          dispatch(setMenus(result.roleData.root_menus));
-          dispatch(setSelectedMenuItem(result.roleData.root_menus[0]));
 
-          // 4. Broadcast to other tabs (Optional)
-          const bc = new BroadcastChannel("auth");
-          setTimeout(() => {
-            bc.postMessage({
-              type: "USER_LOGGED_IN",
-              tabId,
-              userId: user.userId,
-            });
-          }, 1000);
 
-      } else {
-          // Handle Logic Failure (Account Locked, Bad Pass, etc)
-          handleLoginFailure(result);
-      }
-    } catch (e) {
-      console.error("Login Error:", e);
-      // Handle Network/Server Error
-      // Note: 401s are intercepted, but for Login endpoint specifically, 
-      // we usually get 200 OK with validCredentials=false OR 401 Bad Creds.
-      // If interceptor catches 401, it might dispatch logout, which is fine.
-      
-      const msg = e.response?.data?.message || "Failed to log into FinCore, please try again later";
-      openLoginErrorDialog("Login Failed", msg);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
-  const handleLoginFailure = (result) => {
-      if (result.userStatus === "ACTIVE" && result.loginMethod === "P") {
-        if (result.attemptsLeft > 0) {
-          setPasswordInvalidMessage(`Invalid password. ${result.attemptsLeft} attempts left.`);
-          openLoginErrorDialog("Invalid password", "Password incorrect.");
-        } else {
-          openLoginErrorDialog("Account locked", "You are out of attempts and your account has been locked");
-        }
-      } else {
-        openLoginErrorDialog(
-          loginDialogHeaders[result.userStatus] || "Login Failed",
-          loginDialogMessages[result.userStatus] || "Account status issue."
-        );
-      }
-  };
 
-  return (
-    <>
-      <FormTitle>Sign In</FormTitle>
-      <StyledTextField
-        fullWidth
-        label="Password"
-        type={showPassword ? "text" : "password"}
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        variant="outlined"
-        error={!!passwordInvalidMessage}
-        margin="normal"
-        InputProps={{
-          startAdornment: (
-            <InputAdornment position="start"><LockIcon /></InputAdornment>
-          ),
-          endAdornment: (
-            <InputAdornment position="end">
-              <IconButton onClick={() => setShowPassword(!showPassword)} edge="end">
-                {showPassword ? <Visibility /> : <VisibilityOff />}
-              </IconButton>
-            </InputAdornment>
-          ),
-        }}
-      />
-      {passwordInvalidMessage && (
-        <PasswordErrorText>{passwordInvalidMessage}</PasswordErrorText>
-      )}
 
-      <PrimaryButton
-        fullWidth
-        variant="contained"
-        onClick={validateUserCredentials}
-        disabled={!userId || isLoading}
-      >
-        {isLoading ? "Signing in..." : "Sign In"}
-      </PrimaryButton>
-    </>
-  );
-};
 
-export default LoginWithPassword;
 
-import React, { useEffect, useState } from "react";
-import { useDispatch, useSelector } from "react-redux";
-import { useNavigate } from "react-router-dom";
-import { Box, InputAdornment, IconButton } from "@mui/material";
-import LockIcon from "@mui/icons-material/Lock";
-import Visibility from "@mui/icons-material/Visibility";
-import VisibilityOff from "@mui/icons-material/VisibilityOff";
 
-import api from "../utils/axiosConfig"; // Use Singleton
-import { parseJwt } from "../utils/EncryptionUtilities";
-import { loginSuccess } from "../store/slices/authSlice";
-import { setMenus, setSelectedMenuItem } from "../store/slices/menuSlice";
-import { setTabId } from "../store/slices/tabSlice";
-import { resolveConfig } from "../config/EnvironmentConfig";
 
-import { loginDialogMessages, loginDialogHeaders } from "./constants";
-import { StyledTextField, PrimaryButton, FormTitle, PasswordErrorText } from "./LoginStyles";
 
-const LoginWithPassword = ({ userId, openLoginErrorDialog }) => {
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [passwordInvalidMessage, setPasswordInvalidMessage] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  
-  const navigate = useNavigate();
-  const dispatch = useDispatch();
-  const menus = useSelector((state) => state.menus.menus);
 
-  // Navigate after successful login and menu loading
-  useEffect(() => {
-    if (menus && menus.length > 0 && menus[0]?.route) {
-      navigate(menus[0]?.route);
-    }
-  }, [menus, navigate]);
 
-  const validateUserCredentials = async () => {
-    setIsLoading(true);
-    setPasswordInvalidMessage("");
-    
-    try {
-      // 1. Call Login API
-      // Using 'api' instance ensures standard headers and settings
-      const response = await api.post("/auth/login", {
-          userId: userId,
-          password: password,
-      });
 
-      const result = response.data;
-
-      if (result.validCredentials === true) {
-          // 2. Decode Token
-          const user = parseJwt(result.accessToken);
-          const tabId = crypto.randomUUID();
-
-          // 3. Update Redux (Auth & Menus)
-          dispatch(loginSuccess({
-              token: result.accessToken,
-              user: user
-          }));
-          
-          dispatch(setTabId(tabId));
-          dispatch(setMenus(result.roleData.root_menus));
-          dispatch(setSelectedMenuItem(result.roleData.root_menus[0]));
-
-          // 4. Broadcast to other tabs (Optional)
-          const bc = new BroadcastChannel("auth");
-          setTimeout(() => {
-            bc.postMessage({
-              type: "USER_LOGGED_IN",
-              tabId,
-              userId: user.userId,
-            });
-          }, 1000);
-
-      } else {
-          // Handle Logic Failure (Account Locked, Bad Pass, etc)
-          handleLoginFailure(result);
-      }
-    } catch (e) {
-      console.error("Login Error:", e);
-      // Handle Network/Server Error
-      // Note: 401s are intercepted, but for Login endpoint specifically, 
-      // we usually get 200 OK with validCredentials=false OR 401 Bad Creds.
-      // If interceptor catches 401, it might dispatch logout, which is fine.
-      
-      const msg = e.response?.data?.message || "Failed to log into FinCore, please try again later";
-      openLoginErrorDialog("Login Failed", msg);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleLoginFailure = (result) => {
-      if (result.userStatus === "ACTIVE" && result.loginMethod === "P") {
-        if (result.attemptsLeft > 0) {
-          setPasswordInvalidMessage(`Invalid password. ${result.attemptsLeft} attempts left.`);
-          openLoginErrorDialog("Invalid password", "Password incorrect.");
-        } else {
-          openLoginErrorDialog("Account locked", "You are out of attempts and your account has been locked");
-        }
-      } else {
-        openLoginErrorDialog(
-          loginDialogHeaders[result.userStatus] || "Login Failed",
-          loginDialogMessages[result.userStatus] || "Account status issue."
-        );
-      }
-  };
-
-  return (
-    <>
-      <FormTitle>Sign In</FormTitle>
-      <StyledTextField
-        fullWidth
-        label="Password"
-        type={showPassword ? "text" : "password"}
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        variant="outlined"
-        error={!!passwordInvalidMessage}
-        margin="normal"
-        InputProps={{
-          startAdornment: (
-            <InputAdornment position="start"><LockIcon /></InputAdornment>
-          ),
-          endAdornment: (
-            <InputAdornment position="end">
-              <IconButton onClick={() => setShowPassword(!showPassword)} edge="end">
-                {showPassword ? <Visibility /> : <VisibilityOff />}
-              </IconButton>
-            </InputAdornment>
-          ),
-        }}
-      />
-      {passwordInvalidMessage && (
-        <PasswordErrorText>{passwordInvalidMessage}</PasswordErrorText>
-      )}
-
-      <PrimaryButton
-        fullWidth
-        variant="contained"
-        onClick={validateUserCredentials}
-        disabled={!userId || isLoading}
-      >
-        {isLoading ? "Signing in..." : "Sign In"}
-      </PrimaryButton>
-    </>
-  );
-};
-
-export default LoginWithPassword;
-
-// In your main index.js or App.js where you create the store
-import store from './store'; // Your redux store import
-import { injectStore } from './utils/axiosConfig';
-import { initializeAuth } from './store/slices/authSlice';
-
-// 1. Inject store into Axios interceptors
-injectStore(store);
-
-// 2. Initialize Auth from LocalStorage (if you aren't using redux-persist)
-store.dispatch(initializeAuth());
-
-// ... render App
 
