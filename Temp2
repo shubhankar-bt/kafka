@@ -1,3 +1,64 @@
+import React from "react";
+import {
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
+} from "@mui/material";
+
+const SessionDialog = ({ open, reason, onConfirm }) => {
+  let title = "Session Expired";
+  let message = "Your session has ended due to inactivity. Please log in again.";
+
+  if (reason === "CONCURRENT_LOGIN") {
+    title = "Security Alert";
+    message = "You have been logged out because this account signed in on another device or tab.";
+  }
+
+  return (
+    <Dialog 
+      open={open} 
+      disableEscapeKeyDown={true}
+      // Prevent closing by clicking outside
+      onClose={() => {}} 
+      aria-labelledby="session-dialog-title"
+      sx={{ zIndex: 9999 }} // Ensure it sits on top of everything
+    >
+      <DialogTitle id="session-dialog-title" color="error">
+        {title}
+      </DialogTitle>
+      <DialogContent>
+        <DialogContentText>
+          {message}
+        </DialogContentText>
+      </DialogContent>
+      <DialogActions>
+        <Button 
+          onClick={onConfirm} 
+          variant="contained" 
+          color="primary"
+          autoFocus
+        >
+          Return to Login
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+};
+
+export default SessionDialog;
+
+
+
+
+
+
+
+
+
+
 import React, {
   createContext,
   useEffect,
@@ -6,11 +67,12 @@ import React, {
   useState,
 } from "react";
 import { useDispatch, useSelector } from "react-redux";
+import axios from "axios";
 import { throttle } from "lodash";
 import SessionDialog from "../components/SessionDialog";
 import SessionWarningDialog from "../components/SessionWarningDialog";
-import { logoutSuccess } from "../store/slices/authSlice";
-import api from "../utils/axiosConfig";
+import { logout as reduxLogout } from "../store/slices/authSlice";
+import { resolveConfig } from "../config/EnvironmentConfig";
 
 export const AuthContext = createContext();
 
@@ -19,11 +81,11 @@ const WARNING_SECONDS = 30;
 
 export const AuthProvider = ({ children }) => {
   const dispatch = useDispatch();
-  const isAuthenticated = useSelector((state) => state.auth.isAuthenticated);
-  
+  const token = useSelector((state) => state.auth.token);
+  const user = useSelector((state) => state.auth.user);
+
   const [warningOpen, setWarningOpen] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(WARNING_SECONDS);
-  
   const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
   const [sessionReason, setSessionReason] = useState("");
 
@@ -31,103 +93,119 @@ export const AuthProvider = ({ children }) => {
   const warningTimerRef = useRef(null);
   const countdownRef = useRef(null);
 
-  // --- 1. Helper to Clear Timers ---
+  /* ---------- 1. Clear Timers Helper ---------- */
   const clearAllTimers = useCallback(() => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
   }, []);
 
-  // --- 2. Perform Logout ---
-  // reason can be: "USER_INITIATED", "SESSION_EXPIRED", "CONCURRENT_LOGIN"
-  const performLogout = useCallback(async (reason = "USER_INITIATED") => {
+  /* ---------- 2. The Final Cleanup (Destructive) ---------- */
+  // This is only called when the user CLICKS the button in the dialog
+  // OR manually clicks a "Logout" button in the UI.
+  const completeLogout = useCallback(async () => {
       clearAllTimers();
-      
-      // If triggered by system (not manual button click), show the dialog
-      if (reason !== "USER_INITIATED") {
-          setSessionReason(reason);
-          setSessionDialogOpen(true);
-      }
+      setWarningOpen(false);
       
       try {
-        // Attempt server logout (best effort)
-        await api.post("/auth/logout");
+        await axios.post(
+          `${resolveConfig("/LS") ?? ""}/auth/logout`,
+          {},
+          {
+            headers: { Authorization: `Bearer ${token}` },
+            withCredentials: true,
+          }
+        );
       } catch (err) {
-        // Ignore errors if token is already dead
-      } finally {
-         // Always clear client state
-         dispatch(logoutSuccess());
-         setWarningOpen(false);
+        console.error("Logout API failed (ignoring)", err);
       }
-  }, [dispatch, clearAllTimers]);
 
-  // --- 3. Start Timers ---
-  const startInactivityTimer = useCallback(() => {
+      // CRITICAL: This line triggers the Redirect. We only run it NOW.
+      dispatch(reduxLogout());
+      setSessionDialogOpen(false);
+      window.location.replace("/");
+  }, [token, dispatch, clearAllTimers]);
+
+
+  /* ---------- 3. System Triggered Logout (Non-Destructive UI) ---------- */
+  // This is called by Concurrent Login checks or Timeouts.
+  // It ONLY shows the dialog. It does NOT clear Redux state yet.
+  const triggerSessionDialog = useCallback((reason = "SESSION_EXPIRED") => {
+      // If already open, don't spam
+      setSessionDialogOpen((prev) => {
+        if (prev) return true;
+        
+        clearAllTimers();
+        setWarningOpen(false);
+        setSessionReason(reason);
+        return true;
+      });
+  }, [clearAllTimers]);
+
+
+  /* ---------- 4. Start Inactivity Timers ---------- */
+  const startInactivity = useCallback(() => {
     clearAllTimers();
-    if(!isAuthenticated) return;
+    if (!user) return;
 
+    // Timer 1: Show Warning Dialog
     warningTimerRef.current = setTimeout(() => {
       setWarningOpen(true);
       setSecondsLeft(WARNING_SECONDS);
-      
+
       let counter = WARNING_SECONDS;
       countdownRef.current = setInterval(() => {
         counter -= 1;
         setSecondsLeft(counter);
         if (counter <= 0) clearInterval(countdownRef.current);
       }, 1000);
-      
-    }, INACTIVITY_TIMEOUT - (WARNING_SECONDS * 1000));
+    }, INACTIVITY_TIMEOUT - WARNING_SECONDS * 1000);
 
+    // Timer 2: Trigger the Session Ended Dialog (Do NOT auto-redirect yet)
     inactivityTimerRef.current = setTimeout(() => {
-       performLogout("SESSION_EXPIRED");
+      triggerSessionDialog("SESSION_EXPIRED");
     }, INACTIVITY_TIMEOUT);
-    
-  }, [isAuthenticated, clearAllTimers, performLogout]);
+  }, [user, clearAllTimers, triggerSessionDialog]);
 
-  // --- 4. Event Listeners ---
+  /* ---------- 5. Activity Handler ---------- */
   const onActivity = useCallback(
     throttle(() => {
-      if (!isAuthenticated || sessionDialogOpen) return;
+      // If dialog is open, stop tracking activity
+      if (!user || sessionDialogOpen) return;
+      
+      // If warning was open, close it and reset
       if (warningOpen) setWarningOpen(false);
-      startInactivityTimer();
+      
+      startInactivity();
     }, 2000),
-    [isAuthenticated, sessionDialogOpen, warningOpen, startInactivityTimer]
+    [user, startInactivity, sessionDialogOpen, warningOpen]
   );
 
+  /* ---------- 6. Watch User State ---------- */
   useEffect(() => {
-      if (isAuthenticated) {
-          startInactivityTimer();
-          const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
-          events.forEach((e) => window.addEventListener(e, onActivity));
-          
-          return () => {
-              events.forEach((e) => window.removeEventListener(e, onActivity));
-              onActivity.cancel();
-              clearAllTimers();
-          };
-      } else {
-          clearAllTimers();
-          setWarningOpen(false);
-      }
-  }, [isAuthenticated, onActivity, startInactivityTimer, clearAllTimers]);
+    if (!user) {
+      clearAllTimers();
+      setWarningOpen(false);
+      return;
+    }
 
-  useEffect(() => {
-      const handleSessionEvent = (e) => {
-          const reason = e.detail?.reason || "SESSION_EXPIRED";
-          performLogout(reason);
-      };
-      
-      window.addEventListener("auth:session-expired", handleSessionEvent);
-      return () => window.removeEventListener("auth:session-expired", handleSessionEvent);
-  }, [performLogout]);
+    startInactivity();
+
+    const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+    events.forEach((e) => window.addEventListener(e, onActivity));
+
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, onActivity));
+      onActivity.cancel();
+      clearAllTimers();
+    };
+  }, [user, onActivity, startInactivity, clearAllTimers]);
 
   return (
     <AuthContext.Provider
       value={{
-        logout: () => performLogout("USER_INITIATED"),
-        // Expose this so PrivateRouter can trigger it
-        triggerSessionDialog: (reason) => performLogout(reason)
+        logout: completeLogout,          // Manual User Logout (Immediate)
+        triggerSessionDialog,            // System Event (Shows Dialog, waits for click)
       }}
     >
       {children}
@@ -137,22 +215,20 @@ export const AuthProvider = ({ children }) => {
         secondsLeft={secondsLeft}
         onContinue={() => {
             setWarningOpen(false);
-            startInactivityTimer();
+            startInactivity();
         }}
       />
 
-      {/* The ONE Global Dialog for all session issues */}
+      {/* The Dialog runs completeLogout when confirmed */}
       <SessionDialog
         open={sessionDialogOpen}
         reason={sessionReason}
-        onConfirm={() => {
-          setSessionDialogOpen(false);
-          window.location.href = "/"; 
-        }}
+        onConfirm={completeLogout} 
       />
     </AuthContext.Provider>
   );
 };
+
 
 
 
@@ -172,11 +248,10 @@ const PrivateRouter = () => {
   const { token, user } = useSelector((state) => state.auth);
   const tabId = useSelector((state) => state.tab.tabId);
   
-  // Use the global context trigger
+  // Use the context trigger
   const { triggerSessionDialog } = useContext(AuthContext);
 
   useEffect(() => {
-    // Only listen if logged in
     if (!user?.userId || !tabId) return;
 
     const bc = new BroadcastChannel("auth");
@@ -184,13 +259,14 @@ const PrivateRouter = () => {
     const handleMessage = (event) => {
       const { type, userId: eventUserId, tabId: eventTabId } = event.data || {};
 
-      // If same user logs in on a different tab
+      // Concurrent Login Detection (Same User, Different Tab)
       if (
         type === "USER_LOGGED_IN" &&
         eventUserId === user.userId &&
         eventTabId !== tabId
       ) {
-        // Trigger the global dialog with the correct reason
+        // Trigger the Dialog. 
+        // NOTE: This does NOT clear Redux, so <Outlet /> stays rendered below the dialog.
         triggerSessionDialog("CONCURRENT_LOGIN");
       }
     };
@@ -202,213 +278,15 @@ const PrivateRouter = () => {
     };
   }, [user, tabId, triggerSessionDialog]);
 
+  // If token is explicitly null (user manually logged out), redirect.
+  // But if concurrent login happened, token is STILL here until they click OK in dialog.
   if (!token) {
     return <Navigate to="/" replace />;
   }
 
-  // No local dialogs here! Just the content.
   return <Outlet />;
 };
 
 export default PrivateRouter;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React from "react";
-import {
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
-  Button,
-} from "@mui/material";
-
-const SessionDialog = ({ open, reason, onConfirm }) => {
-  let title = "Session Expired";
-  let message = "Your session has ended. Please log in again.";
-
-  // Covers both Backend 401s and Frontend BroadcastChannel detections
-  if (reason === "CONCURRENT_LOGIN") {
-    title = "Security Alert";
-    message = "You have been logged out because this account signed in on another device or tab.";
-  }
-
-  return (
-    <Dialog 
-        open={open} 
-        disableEscapeKeyDown 
-        // Prevent closing by clicking outside
-        onClose={() => {}}
-    >
-      <DialogTitle color="error">{title}</DialogTitle>
-      <DialogContent>
-        <DialogContentText>{message}</DialogContentText>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onConfirm} variant="contained" color="primary">
-          Return to Login
-        </Button>
-      </DialogActions>
-    </Dialog>
-  );
-};
-
-export default SessionDialog;
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React from "react";
-import {
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
-  Button,
-} from "@mui/material";
-
-const SessionDialog = ({ open, reason, onConfirm }) => {
-  let title = "Session Expired";
-  let message = "Your session has ended. Please log in again.";
-
-  // Covers both Backend 401s and Frontend BroadcastChannel detections
-  if (reason === "CONCURRENT_LOGIN") {
-    title = "Security Alert";
-    message = "You have been logged out because this account signed in on another device or tab.";
-  }
-
-  return (
-    <Dialog 
-        open={open} 
-        disableEscapeKeyDown 
-        // Prevent closing by clicking outside
-        onClose={() => {}}
-    >
-      <DialogTitle color="error">{title}</DialogTitle>
-      <DialogContent>
-        <DialogContentText>{message}</DialogContentText>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onConfirm} variant="contained" color="primary">
-          Return to Login
-        </Button>
-      </DialogActions>
-    </Dialog>
-  );
-};
-
-export default SessionDialog;
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React, { useMemo, Suspense } from "react";
-import { createBrowserRouter, RouterProvider } from "react-router-dom";
-import { useSelector } from "react-redux";
-import PrivateRouter from "./PrivateRouter";
-
-// Page Components
-import Login from "../features/auth/pages/Login";
-import Home from "../pages/Home";
-import NotFound from "../pages/NotFound";
-import ServerError from "../pages/ServerError";
-import CommonLayout from "../layout/CommonLayout";
-import FullscreenLayout from "../layout/FullscreenLayout";
-import SubmenuSelectionPage from "../pages/SubmenuSelectionPage";
-
-import { generateRouteObjects } from "./RouteGenerator";
-
-const PageLoader = () => (
-    <div style={{ display: 'flex', height: '100vh', justifyContent: 'center', alignItems: 'center' }}>
-        Loading...
-    </div>
-);
-
-const DynamicLayout = () => {
-  const isComponentFullscreen = useSelector((state) => state.ui.isComponentFullscreen);
-  return !isComponentFullscreen ? <CommonLayout /> : <FullscreenLayout />;
-};
-
-const AppRouter = () => {
-  const menus = useSelector((state) => state.menus.menus);
-
-  const router = useMemo(() => {
-    const dynamicRoutes = generateRouteObjects(menus || []);
-
-    const routeConfig = [
-      {
-        path: "/",
-        element: <Login />,
-        errorElement: <ServerError />,
-      },
-      {
-        path: "/server-error",
-        element: <ServerError />,
-      },
-      // Protected Routes
-      {
-        element: <PrivateRouter />,
-        children: [
-          {
-            element: <DynamicLayout />,
-            children: [
-              { path: "/home", element: <Home /> },
-              {
-                path: "/choose-option/:mainMenuTitle",
-                element: <SubmenuSelectionPage />,
-              },
-              ...dynamicRoutes,
-            ],
-          },
-        ].filter(Boolean),
-      },
-      {
-        path: "*",
-        element: <NotFound />,
-      },
-    ];
-
-    return createBrowserRouter(routeConfig);
-  }, [menus]);
-
-  return (
-    <Suspense fallback={<PageLoader />}>
-      <RouterProvider router={router} />
-    </Suspense>
-  );
-};
-
-export default AppRouter;
 
 
