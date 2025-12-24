@@ -259,11 +259,12 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
     private static final String REDIS_USER_PREFIX = "USR:";
     private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
-    // Whitelist
+
     private static final Set<String> WHITELIST = Set.of(
             "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login",
             "/auth/login", "/auth/logout", "/auth/check-user"
     );
+
     private final StringRedisTemplate redisTemplate;
     private final JwtUtil jwtUtil;
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
@@ -276,7 +277,6 @@ public class ContextRbacFilter extends OncePerRequestFilter {
     ) throws ServletException, IOException {
 
         String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
 
         // 1. SKIP WHITELIST
         for (String pattern : WHITELIST) {
@@ -286,76 +286,76 @@ public class ContextRbacFilter extends OncePerRequestFilter {
             }
         }
 
-        // 2. VALIDATE TOKEN & CATCH EXPIRATION
+        // 2. VALIDATE TOKEN
         String token = request.getHeader("Authorization");
 
         if (token != null) {
-
             try {
-                // 2. CRYPTOGRAPHIC VALIDATION
+                // A. STANDARD VALIDATION (Signature + Expiry)
                 if (!jwtUtil.isTokenValid(token)) {
                     throw new JwtException("Invalid Token Signature");
                 }
 
+                // If valid, extract info
                 String userId = jwtUtil.getUserIdFromToken(token);
-
-                // Extract JTI (JWT ID) to ensure this is the LATEST session
                 String incomingJti = jwtUtil.extractClaim(removeBearer(token), Claims::getId);
-
-                if (incomingJti == null) {
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI claim");
-                    return;
-                }
-
-                // =================================================================
-                // 3. DISTRIBUTED SESSION CHECK (The "Gateway" Logic)
-                // =================================================================
-                String sessionKey = REDIS_USER_PREFIX + userId;
-                String activeJti = null;
-
-                try {
-                    activeJti = redisTemplate.opsForValue().get(sessionKey);
-                } catch (RedisConnectionFailureException e) {
-                    log.error("Redis unreachable. Failing open or closed based on policy. Current: FAIL CLOSED.");
-                    sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
-                    return;
-                }
-
-                if (activeJti == null) {
-                    // Scenario: Redis TTL expired or user logged out manually via Auth Service
-                    log.warn("Session expired in Redis for user {}", userId);
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out. Please login again.");
-                    return;
-                }
-
-                if (!incomingJti.equals(activeJti)) {
-                    // Scenario: User logged in on another device, generating a new JTI and overwriting Redis.
-                    log.warn("Concurrent Login Detected for User {}. Incoming JTI: {}, Active JTI: {}", userId, incomingJti, activeJti);
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "You have been logged out because of a login on another device.");
-                    return;
-                }
-                // =================================================================
-
-                // 4. SET SECURITY CONTEXT (Spring Security)
                 int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-                if (SecurityContextHolder.getContext().getAuthentication() == null) {
-                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleIdInt))
-                    );
-                    SecurityContextHolder.getContext().setAuthentication(authToken);
+
+                // B. ACTIVE SESSION CHECK
+                if (!checkRedisSession(response, userId, incomingJti)) {
+                    return; // Error sent
                 }
 
-                // 5. RBAC CHECK (Permissions)
+                // C. RBAC / CONTEXT SETUP
+                setSecurityContext(userId, roleIdInt);
+
                 if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
-                    return; // Error response already sent in checkRbac
+                    return;
                 }
 
             } catch (ExpiredJwtException e) {
-                log.warn("JWT Expired for IP: {}", request.getRemoteAddr());
+                // -----------------------------------------------------------------
+                // HANDLE EXPIRED TOKEN: Distinguish between "Time out" vs "Concurrent Login"
+                // -----------------------------------------------------------------
+                try {
+                    Claims claims = e.getClaims();
+                    String userId = claims.getSubject();
+                    String incomingJti = claims.getId();
+
+                    // CHECK 1: Missing JTI ---
+                    if (incomingJti == null) {
+                        log.error("Expired Token missing JTI for user {}", userId);
+                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
+                        return;
+                    }
+
+                    String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
+
+                    // CASE 1: Session totally gone from Redis (User idle > 24h)
+                    if (activeJti == null) {
+                        log.warn("Session expired in Redis (found during token expiry check) for user {}", userId);
+                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
+                        return;
+                    }
+
+                    // CASE 2: Concurrent Login (Redis has newer JTI)
+                    if (!activeJti.equals(incomingJti)) {
+                        log.warn("Concurrent Login Detected on Expired Token. User: {}", userId);
+                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
+                        return;
+                    }
+
+                    // CASE 3: Normal Expiry (Redis matches) -> Allow Frontend to Refresh
+                } catch (Exception ex) {
+                    log.error("Error checking concurrency on expired token", ex);
+                }
+
+                // Default behavior: Tell frontend token is expired so it can call /refresh-token
                 sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
                 return;
+
             } catch (Exception e) {
-                log.error("Auth Error for user: {}", e.getMessage());
+                log.error("Auth Error: {}", e.getMessage());
                 sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
                 return;
             }
@@ -367,6 +367,36 @@ public class ContextRbacFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
+    private boolean checkRedisSession(HttpServletResponse response, String userId, String incomingJti) throws IOException {
+        if (incomingJti == null) {
+            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
+            return false;
+        }
+        try {
+            String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
+            if (activeJti == null) {
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
+                return false;
+            }
+            if (!incomingJti.equals(activeJti)) {
+                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
+                return false;
+            }
+        } catch (RedisConnectionFailureException e) {
+            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
+            return false;
+        }
+        return true;
+    }
+
+    private void setSecurityContext(String userId, int roleId) {
+        if (SecurityContextHolder.getContext().getAuthentication() == null) {
+            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
+            );
+            SecurityContextHolder.getContext().setAuthentication(authToken);
+        }
+    }
 
     /**
      * Checks if the user's role has permission to access the requested Method + URL + Context.
@@ -444,7 +474,6 @@ public class ContextRbacFilter extends OncePerRequestFilter {
         return token;
     }
 }
-
 
 
 
