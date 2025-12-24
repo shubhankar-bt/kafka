@@ -1,1 +1,297 @@
-Login request for user: 3333333 from IP: /10.0.19.203:52373
+package com.fincore.gateway.Controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.Service.TokenSessionValidator;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.utility.LoginUtility;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseCookie;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import javax.crypto.SecretKey;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Authentication Controller (Reactive).
+ * Handles Login, Logout, and Token Refresh using a distributed Redis session model.
+ * Includes IP Blocking functionality.
+ */
+@Slf4j
+@RestController
+@RequestMapping("/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private static final String USER_PREFIX = "USR:";
+    private final TokenSessionValidator validator;
+    private final ReactiveStringRedisTemplate redisTemplate;
+    private final LoginService loginService;
+    private final ObjectMapper mapper;
+
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long accessTokenTtl;
+
+    @Value("${security.jwt.refresh-ttl-seconds:86400}")
+    private long refreshTokenTtl;
+
+    @Value("${security.login.blocked-ips:}") 
+    private String blockedIpsConfig;
+
+    private ResponseCookie createRefreshTokenCookie(String token) {
+        return ResponseCookie.from("refresh_token", token)
+                .httpOnly(true)
+                .secure(false) 
+                .path("/")     
+                .maxAge(Duration.ofSeconds(refreshTokenTtl))
+                .sameSite("Lax") 
+                .build();
+    }
+    
+    private ResponseCookie createEmptyCookie() {
+        return ResponseCookie.from("refresh_token", "")
+                .httpOnly(true)
+                .path("/")
+                .maxAge(0)
+                .build();
+    }
+
+    /**
+     * Helper to clean the IP address string.
+     * Converts "/10.0.19.203:52373" -> "10.0.19.203"
+     */
+    private String sanitizeIp(String rawIp) {
+        if (rawIp == null) return "";
+        String ip = rawIp;
+        if (ip.startsWith("/")) ip = ip.substring(1);
+        int colonIndex = ip.indexOf(':');
+        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
+        return ip;
+    }
+
+    private boolean isIpBlocked(String rawClientIp) {
+        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
+        String cleanIp = sanitizeIp(rawClientIp);
+        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
+        boolean blocked = blockedIps.contains(cleanIp);
+        if (blocked) log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", rawClientIp, cleanIp);
+        return blocked;
+    }
+
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
+        final String rawClientIp = LoginUtility.getClientIp(request);
+        log.info("Login request for user: {} from IP: {}", payload.getUserId(), rawClientIp);
+
+        // 1. IP BLOCK CHECK
+        if (isIpBlocked(rawClientIp)) {
+            log.warn("Login BLOCKED for user: {} from IP: {}", payload.getUserId(), rawClientIp);
+            return Mono.just(LoginResponseDTO.builder()
+                    .userId(payload.getUserId())
+                    .validCredentials(false)
+                    .error("Access denied: Your IP address is blocked.")
+                    .build());
+        }
+
+        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, rawClientIp))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(user -> {
+                    if (!user.isValidCredentials()) {
+                        log.warn("Invalid credentials for user: {}", payload.getUserId());
+                        return Mono.just(LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .error(user.getMessage() != null ? user.getMessage() : "Invalid credentials")
+                                .build());
+                    }
+
+                    if (hmacSecret == null || hmacSecret.isBlank()) {
+                        return Mono.error(new IllegalStateException("Missing HMAC secret"));
+                    }
+
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
+                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+                    
+                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+                    String jti = extractClaims(accessToken).getId();
+
+                    response.addCookie(createRefreshTokenCookie(refreshToken));
+                    log.info("Login Success. Registering Redis Session for User: {} with JTI: {}. TTL: {}s", user.getUserId(), jti, accessTokenTtl);
+
+                    return validator.registerUserSession(user.getUserId(), jti)
+                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                    .subscribeOn(Schedulers.boundedElastic())))
+                            .map(roleData -> LoginResponseDTO.builder()
+                                    .userId(user.getUserId())
+                                    .validCredentials(true)
+                                    .accessToken(accessToken) 
+                                    .tokenType("Bearer")
+                                    .expiresIn(accessTokenTtl)
+                                    .sub(user.getUserId())
+                                    .jti(jti)
+                                    .roleData(roleData)
+                                    .build());
+                })
+                .onErrorResume(e -> {
+                    log.error("Login System Error for user {}", payload.getUserId(), e);
+                    return Mono.just(LoginResponseDTO.builder().error("Login failed: " + e.getMessage()).build());
+                });
+    }
+
+    // ... (refreshToken, logout unchanged) ...
+    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
+        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
+        String refreshToken = (cookie != null) ? cookie.getValue() : null;
+
+        if (refreshToken == null || refreshToken.isBlank()) {
+            log.warn("Refresh failed: No refresh token cookie.");
+            return Mono.just(LoginResponseDTO.builder().error("Missing refresh token cookie").build());
+        }
+
+        return Mono.fromCallable(() -> {
+            try {
+                return extractClaims(refreshToken);
+            } catch (ExpiredJwtException e) {
+                log.warn("Refresh token expired.");
+                throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Refresh token expired");
+            } catch (Exception e) {
+                log.error("Invalid refresh token.", e);
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid refresh token");
+            }
+        })
+        .subscribeOn(Schedulers.boundedElastic())
+        .flatMap(claims -> {
+            String userId = claims.getSubject();
+            String userKey = USER_PREFIX + userId;
+            
+            log.info("Refreshing Token for User: {}. Looking up Redis Key: {}", userId, userKey);
+
+            return redisTemplate.opsForValue().get(userKey)
+                    .flatMap(currentJti -> {
+                         log.info("Found Session JTI in Redis for {}: {}", userId, currentJti);
+                         return Mono.fromCallable(() -> loginService.getUserProfile(userId))
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .flatMap(userDto -> {
+                                if (userDto == null) return Mono.error(new RuntimeException("User not found"));
+
+                                return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
+                                    .subscribeOn(Schedulers.boundedElastic())
+                                    .flatMap(roleData -> {
+                                        @SuppressWarnings("unchecked")
+                                        Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
+                                        String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
+                                        
+                                        Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                                        String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
+
+                                        String newJti = extractClaims(newAccessToken).getId();
+
+                                        response.addCookie(createRefreshTokenCookie(newRefreshToken));
+
+                                        return validator.registerUserSession(userId, newJti)
+                                                .thenReturn(LoginResponseDTO.builder()
+                                                        .accessToken(newAccessToken)
+                                                        .userId(userId)
+                                                        .jti(newJti)
+                                                        .expiresIn(accessTokenTtl)
+                                                        .validCredentials(true)
+                                                        .roleData(roleData)
+                                                        .userStatus(userDto.getUserStatus())
+                                                        .passwordLoginStatus(userDto.getPasswordLoginStatus())
+                                                        .sub(userId)
+                                                        .build());
+                                    });
+                            });
+                    })
+                    .switchIfEmpty(Mono.defer(() -> {
+                        log.warn("Redis returned EMPTY for key: {}. Session expired.", userKey);
+                        return Mono.just(LoginResponseDTO.builder().error("Session expired. Please login again.").build());
+                    }));
+        })
+        .onErrorResume(e -> {
+            if (e instanceof ResponseStatusException) {
+                 return Mono.just(LoginResponseDTO.builder().error(e.getMessage()).build());
+            }
+            log.error("Refresh Token Unexpected Error", e);
+            return Mono.just(LoginResponseDTO.builder().error("Invalid refresh token").build());
+        });
+    }
+
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<LoginResponseDTO> logout(JwtAuthenticationToken jwtAuth, ServerHttpResponse response) {
+        response.addCookie(createEmptyCookie());
+        if (jwtAuth == null) return Mono.just(LoginResponseDTO.builder().error("No token").build());
+        String username = jwtAuth.getToken().getSubject();
+        String jti = jwtAuth.getToken().getId();
+
+        return validator.blacklistToken(jti)
+                .flatMap(x -> redisTemplate.opsForValue().get(USER_PREFIX + username))
+                .flatMap(activeJti -> {
+                    if (activeJti != null && activeJti.equals(jti)) {
+                        return validator.clearUserSession(username)
+                                .map(c -> LoginResponseDTO.builder().userId(username).error("Logged out").build());
+                    } else {
+                        return Mono.just(LoginResponseDTO.builder().userId(username).error("Token revoked").build());
+                    }
+                })
+                .switchIfEmpty(Mono.just(LoginResponseDTO.builder().userId(username).error("Logged out").build()));
+    }
+    
+    @PostMapping(value = "/check-user")
+    public Mono<VerifyUserDTO> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body) {
+        final String rawClientIp = LoginUtility.getClientIp(request);
+        
+        // --- NEW: IP BLOCK CHECK for check-user ---
+        if (isIpBlocked(rawClientIp)) {
+            log.warn("Check User BLOCKED from IP: {}", rawClientIp);
+            VerifyUserDTO blockedDto = new VerifyUserDTO();
+            blockedDto.setExists(false); 
+            // You might want a specific error message field in VerifyUserDTO if available, 
+            // otherwise false/empty is a safe "silent" block.
+            return Mono.just(blockedDto);
+        }
+        // ------------------------------------------
+
+        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId"))).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    @PostMapping(value = "/update-password")
+    public Mono<UpdatePasswordDTO> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
+        return Mono.fromCallable(() -> loginService.updatePassword(dto)).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Claims extractClaims(String token) {
+        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
+        return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
+    }
+}
+
+
