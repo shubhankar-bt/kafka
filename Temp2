@@ -1,539 +1,271 @@
-package com.fincore.commonutilities.security;
+import React, {
+  createContext,
+  useEffect,
+  useRef,
+  useCallback,
+  useState,
+} from "react";
+import { useDispatch, useSelector } from "react-redux";
+import { throttle } from "lodash";
+import SessionDialog from "../components/SessionDialog";
+import SessionWarningDialog from "../components/SessionWarningDialog";
+import { logoutSuccess } from "../store/slices/authSlice";
+import api from "../utils/axiosConfig";
 
-import com.fincore.commonutilities.jwt.JwtUtil;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.JwtException;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.RedisConnectionFailureException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
+export const AuthContext = createContext();
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Set;
+const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 min
+const WARNING_SECONDS = 30;
 
-@Slf4j
-@RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
+export const AuthProvider = ({ children }) => {
+  const dispatch = useDispatch();
+  const isAuthenticated = useSelector((state) => state.auth.isAuthenticated);
+  
+  const [warningOpen, setWarningOpen] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(WARNING_SECONDS);
+  
+  const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
+  const [sessionReason, setSessionReason] = useState("");
 
-    private static final String REDIS_USER_PREFIX = "USR:";
-    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
+  const inactivityTimerRef = useRef(null);
+  const warningTimerRef = useRef(null);
+  const countdownRef = useRef(null);
+
+  // --- 1. Helper to Clear Timers ---
+  const clearAllTimers = useCallback(() => {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
+    if (countdownRef.current) clearInterval(countdownRef.current);
+  }, []);
+
+  // --- 2. Perform Logout ---
+  // reason can be: "USER_INITIATED", "SESSION_EXPIRED", "CONCURRENT_LOGIN"
+  const performLogout = useCallback(async (reason = "USER_INITIATED") => {
+      clearAllTimers();
+      
+      // If triggered by system (not manual button click), show the dialog
+      if (reason !== "USER_INITIATED") {
+          setSessionReason(reason);
+          setSessionDialogOpen(true);
+      }
+      
+      try {
+        // Attempt server logout (best effort)
+        await api.post("/auth/logout");
+      } catch (err) {
+        // Ignore errors if token is already dead
+      } finally {
+         // Always clear client state
+         dispatch(logoutSuccess());
+         setWarningOpen(false);
+      }
+  }, [dispatch, clearAllTimers]);
+
+  // --- 3. Start Timers ---
+  const startInactivityTimer = useCallback(() => {
+    clearAllTimers();
+    if(!isAuthenticated) return;
+
+    warningTimerRef.current = setTimeout(() => {
+      setWarningOpen(true);
+      setSecondsLeft(WARNING_SECONDS);
+      
+      let counter = WARNING_SECONDS;
+      countdownRef.current = setInterval(() => {
+        counter -= 1;
+        setSecondsLeft(counter);
+        if (counter <= 0) clearInterval(countdownRef.current);
+      }, 1000);
+      
+    }, INACTIVITY_TIMEOUT - (WARNING_SECONDS * 1000));
+
+    inactivityTimerRef.current = setTimeout(() => {
+       performLogout("SESSION_EXPIRED");
+    }, INACTIVITY_TIMEOUT);
     
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login",
-            "/auth/login", "/auth/logout", "/auth/check-user"
-    );
-    
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-        
-        // 1. SKIP WHITELIST
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        // 2. VALIDATE TOKEN
-        String token = request.getHeader("Authorization");
-
-        if (token != null) {
-            try {
-                // A. STANDARD VALIDATION (Signature + Expiry)
-                if (!jwtUtil.isTokenValid(token)) {
-                    throw new JwtException("Invalid Token Signature");
-                }
-
-                // If valid, extract info
-                String userId = jwtUtil.getUserIdFromToken(token);
-                String incomingJti = jwtUtil.extractClaim(removeBearer(token), Claims::getId);
-                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-
-                // B. ACTIVE SESSION CHECK
-                if (!checkRedisSession(response, userId, incomingJti)) {
-                    return; // Error sent
-                }
-
-                // C. RBAC / CONTEXT SETUP
-                setSecurityContext(userId, roleIdInt);
-
-                if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
-                    return;
-                }
-
-            } catch (ExpiredJwtException e) {
-                // -----------------------------------------------------------------
-                // HANDLE EXPIRED TOKEN: Distinguish between "Time out" vs "Concurrent Login"
-                // -----------------------------------------------------------------
-                try {
-                    Claims claims = e.getClaims();
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
-
-                    String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
-
-                    // CASE 1: Session totally gone from Redis (User idle > 24h)
-                    if (activeJti == null) {
-                        log.warn("Session expired in Redis (found during token expiry check) for user {}", userId);
-                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
-                        return;
-                    }
-
-                    // CASE 2: Concurrent Login (Redis has newer JTI)
-                    if (!activeJti.equals(incomingJti)) {
-                        log.warn("Concurrent Login Detected on Expired Token. User: {}", userId);
-                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
-                        return;
-                    }
-
-                    // CASE 3: Normal Expiry (Redis matches) -> Allow Frontend to Refresh
-                } catch (Exception ex) {
-                    log.error("Error checking concurrency on expired token", ex);
-                }
-
-                // Default behavior: Tell frontend token is expired so it can call /refresh-token
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
-                return;
-
-            } catch (Exception e) {
-                log.error("Auth Error: {}", e.getMessage());
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
-                return;
-            }
-        } else {
-            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "MISSING_TOKEN", "Authorization header missing.");
-            return;
-        }
-
-        filterChain.doFilter(request, response);
-    }
-
-    // --- Helpers ---
+  }, [isAuthenticated, clearAllTimers, performLogout]);
+
+  // --- 4. Event Listeners ---
+  const onActivity = useCallback(
+    throttle(() => {
+      if (!isAuthenticated || sessionDialogOpen) return;
+      if (warningOpen) setWarningOpen(false);
+      startInactivityTimer();
+    }, 2000),
+    [isAuthenticated, sessionDialogOpen, warningOpen, startInactivityTimer]
+  );
+
+  useEffect(() => {
+      if (isAuthenticated) {
+          startInactivityTimer();
+          const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+          events.forEach((e) => window.addEventListener(e, onActivity));
+          
+          return () => {
+              events.forEach((e) => window.removeEventListener(e, onActivity));
+              onActivity.cancel();
+              clearAllTimers();
+          };
+      } else {
+          clearAllTimers();
+          setWarningOpen(false);
+      }
+  }, [isAuthenticated, onActivity, startInactivityTimer, clearAllTimers]);
+
+  useEffect(() => {
+      const handleSessionEvent = (e) => {
+          const reason = e.detail?.reason || "SESSION_EXPIRED";
+          performLogout(reason);
+      };
+      
+      window.addEventListener("auth:session-expired", handleSessionEvent);
+      return () => window.removeEventListener("auth:session-expired", handleSessionEvent);
+  }, [performLogout]);
 
-    private boolean checkRedisSession(HttpServletResponse response, String userId, String incomingJti) throws IOException {
-        if (incomingJti == null) {
-            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
-            return false;
-        }
-        try {
-            String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
-            if (activeJti == null) {
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
-                return false;
-            }
-            if (!incomingJti.equals(activeJti)) {
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
-                return false;
-            }
-        } catch (RedisConnectionFailureException e) {
-            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
-            return false;
-        }
-        return true;
-    }
+  return (
+    <AuthContext.Provider
+      value={{
+        logout: () => performLogout("USER_INITIATED"),
+        // Expose this so PrivateRouter can trigger it
+        triggerSessionDialog: (reason) => performLogout(reason)
+      }}
+    >
+      {children}
 
-    private void setSecurityContext(String userId, int roleId) {
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
-    }
+      <SessionWarningDialog
+        open={warningOpen}
+        secondsLeft={secondsLeft}
+        onContinue={() => {
+            setWarningOpen(false);
+            startInactivityTimer();
+        }}
+      />
 
-    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-        String contextHeader = request.getHeader("X-Request-Type");
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
-        
-        Set<String> permissions = redisTemplate.opsForSet().members(REDIS_RBAC_PREFIX + roleId);
-        boolean isAuthorized = false;
+      {/* The ONE Global Dialog for all session issues */}
+      <SessionDialog
+        open={sessionDialogOpen}
+        reason={sessionReason}
+        onConfirm={() => {
+          setSessionDialogOpen(false);
+          window.location.href = "/"; 
+        }}
+      />
+    </AuthContext.Provider>
+  );
+};
 
-        if (permissions != null) {
-            for (String perm : permissions) {
-                String[] parts = perm.split("\\|");
-                if (parts.length < 2) continue;
-                if (!parts[1].equals(requestContext) && !parts[1].equals("*")) continue;
 
-                String[] muParts = parts[0].split(":", 2);
-                if (muParts.length < 2) continue;
-                if (muParts[0].equals(method) && pathMatcher.match(muParts[1], uri)) {
-                    isAuthorized = true;
-                    break;
-                }
-            }
-        }
 
-        if (!isAuthorized) {
-            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions.");
-            return false;
-        }
-        return true;
-    }
+
+
+
+
+
+
+
+import React, { useEffect, useContext } from "react";
+import { Navigate, Outlet } from "react-router-dom";
+import { useSelector } from "react-redux";
+import { AuthContext } from "../context/AuthContext";
+
+const PrivateRouter = () => {
+  const { token, user } = useSelector((state) => state.auth);
+  const tabId = useSelector((state) => state.tab.tabId);
+  
+  // Use the global context trigger
+  const { triggerSessionDialog } = useContext(AuthContext);
 
-    private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
-        response.setStatus(status);
-        response.setContentType("application/json");
-        response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
-    }
+  useEffect(() => {
+    // Only listen if logged in
+    if (!user?.userId || !tabId) return;
 
-    private String removeBearer(String token) {
-        return (token != null && token.startsWith("Bearer ")) ? token.substring(7) : token;
-    }
-}
+    const bc = new BroadcastChannel("auth");
 
+    const handleMessage = (event) => {
+      const { type, userId: eventUserId, tabId: eventTabId } = event.data || {};
 
+      // If same user logs in on a different tab
+      if (
+        type === "USER_LOGGED_IN" &&
+        eventUserId === user.userId &&
+        eventTabId !== tabId
+      ) {
+        // Trigger the global dialog with the correct reason
+        triggerSessionDialog("CONCURRENT_LOGIN");
+      }
+    };
 
-
-
-
+    bc.onmessage = handleMessage;
 
-
-
-
+    return () => {
+      bc.close();
+    };
+  }, [user, tabId, triggerSessionDialog]);
 
-
-
-
-
-
-
-
-
----------
-
-
+  if (!token) {
+    return <Navigate to="/" replace />;
+  }
 
+  // No local dialogs here! Just the content.
+  return <Outlet />;
+};
 
+export default PrivateRouter;
 
 
-package com.fincore.commonutilities.jwt;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
 
-import javax.crypto.SecretKey;
-import java.util.Date;
-import java.util.function.Function;
 
-@Component
-@Slf4j
-public class JwtUtil {
 
-    @Value("${security.jwt.hmac-base64-secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
-    private String secretKey;
 
-    @Value("${security.jwt.ttl-seconds:900}") 
-    private long accessTokenValidity;
 
-    // --- Standard Validation ---
-    public boolean isTokenValid(String token) {
-        try {
-            return !isTokenExpired(removeBearerPrefix(token));
-        } catch (ExpiredJwtException e) {
-            return false;
-        } catch (Exception e) {
-            return false;
-        }
-    }
 
-    public String getUserIdFromToken(String token) {
-        return extractClaim(removeBearerPrefix(token), Claims::getSubject);
-    }
 
-    public int getUserRoleFromToken(String token) {
-        return extractClaim(removeBearerPrefix(token), claims -> {
-            Object role = claims.get("role");
-            if (role instanceof Number) return ((Number) role).intValue();
-            return 0; 
-        });
-    }
 
-    /**
-     * Extracts a claim. 
-     * NOTE: If token is expired, this will throw ExpiredJwtException.
-     * Use extractClaimSafe if you need data from an expired token.
-     */
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        final Claims claims = extractAllClaims(token);
-        return claimsResolver.apply(claims);
-    }
 
-    /**
-     * NEW METHOD: Extracts claims even if the token is expired.
-     * This is required for checking Concurrent Login (JTI mismatch) on expired tokens.
-     */
-    public <T> T extractClaimSafe(String token, Function<Claims, T> claimsResolver) {
-        try {
-            final Claims claims = extractAllClaims(token);
-            return claimsResolver.apply(claims);
-        } catch (ExpiredJwtException e) {
-            // The exception contains the claims that were successfully parsed
-            return claimsResolver.apply(e.getClaims());
-        }
-    }
 
-    private Claims extractAllClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
 
-    private boolean isTokenExpired(String token) {
-        return extractClaim(token, Claims::getExpiration).before(new Date());
-    }
+import React from "react";
+import {
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
+} from "@mui/material";
 
-    private String removeBearerPrefix(String token) {
-        if (token != null && token.startsWith("Bearer ")) return token.substring(7);
-        return token;
-    }
-
-    private SecretKey getSigningKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(keyBytes);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.commonutilities.security;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.JwtException;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.RedisConnectionFailureException;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
-
-import java.io.IOException;
-import java.util.Date;
-import java.util.List;
-import java.util.Set;
-
-@Slf4j
-@RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
-
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
-
-    private static final String REDIS_USER_PREFIX = "USR:";
-    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
-
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login"
-    );
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        String token = request.getHeader("Authorization");
-
-        if (token != null) {
-            try {
-                // 1. EXTRACT CLAIMS SAFELY (Ignore Expiry for now)
-                // We assume signature is valid if parsing succeeds (even if expired)
-                String cleanToken = removeBearer(token);
-                String userId = jwtUtil.extractClaimSafe(cleanToken, Claims::getSubject);
-                String incomingJti = jwtUtil.extractClaimSafe(cleanToken, Claims::getId);
-                Date expiration = jwtUtil.extractClaimSafe(cleanToken, Claims::getExpiration);
-                
-                if (incomingJti == null || userId == null) {
-                     sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token malformed");
-                     return;
-                }
-
-                // 2. CHECK REDIS SESSION (CONCURRENT LOGIN CHECK)
-                // This MUST happen before Expiry check.
-                // If JTI doesn't match, it means user logged in elsewhere -> HARD LOGOUT.
-                String sessionKey = REDIS_USER_PREFIX + userId;
-                String activeJti = null;
-                
-                try {
-                    activeJti = redisTemplate.opsForValue().get(sessionKey);
-                } catch (RedisConnectionFailureException e) {
-                    log.error("Redis Unreachable");
-                    sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
-                    return;
-                }
-
-                if (activeJti == null) {
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
-                    return; 
-                }
-
-                if (!incomingJti.equals(activeJti)) {
-                    log.warn("Concurrent Login: User {} token JTI {} != Redis JTI {}", userId, incomingJti, activeJti);
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
-                    return; 
-                }
-
-                // 3. CHECK EXPIRY (TOKEN EXPIRED CHECK)
-                // Only if session is valid (JTI matches), we check if token is expired.
-                if (expiration.before(new Date())) {
-                    sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
-                    return;
-                }
-
-                // 4. SET CONTEXT (Spring Security)
-                // We use Safe extraction again just in case, though we know it's valid now
-                int roleIdInt = jwtUtil.extractClaimSafe(cleanToken, claims -> {
-                    Object role = claims.get("role");
-                    if (role instanceof Number) return ((Number) role).intValue();
-                    return 0;
-                });
-
-                if (SecurityContextHolder.getContext().getAuthentication() == null) {
-                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                            userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleIdInt))
-                    );
-                    SecurityContextHolder.getContext().setAuthentication(authToken);
-                }
-
-                // 5. RBAC CHECK
-                if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
-                    return; 
-                }
-
-            } catch (JwtException e) {
-                // Catches signature failures or malformed tokens
-                log.error("Auth Error: {}", e.getMessage());
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
-                return;
-            } catch (Exception e) {
-                log.error("Unexpected Auth Error", e);
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
-                return;
-            }
-        } else {
-            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "MISSING_TOKEN", "Authorization header missing.");
-            return;
-        }
-
-        filterChain.doFilter(request, response);
-    }
-
-    // ... (Keep existing checkRbac, sendError, removeBearer methods exactly as they were) ...
-    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
-        // ... (Keep existing logic)
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-        String contextHeader = request.getHeader("X-Request-Type");
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
-
-        String redisKey = REDIS_RBAC_PREFIX + roleId;
-        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
-
-        boolean isAuthorized = false;
-
-        if (permissions != null) {
-            for (String perm : permissions) {
-                String[] parts = perm.split("\\|");
-                if (parts.length < 2) continue;
-                String methodAndUrl = parts[0];
-                String allowedContext = parts[1];
-
-                if (!allowedContext.equals("*") && !allowedContext.equals(requestContext)) continue;
-
-                String[] muParts = methodAndUrl.split(":", 2);
-                if (muParts.length < 2) continue;
-                String allowedMethod = muParts[0];
-                String allowedUrlPattern = muParts[1];
-
-                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
-                    isAuthorized = true;
-                    break;
-                }
-            }
-        }
-
-        if (!isAuthorized) {
-            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions.");
-            return false;
-        }
-        return true;
-    }
-
-    private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
-        response.setStatus(status);
-        response.setContentType("application/json");
-        response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
-    }
-    
-    private String removeBearer(String token) {
-        if (token != null && token.startsWith("Bearer ")) return token.substring(7);
-        return token;
-    }
-}
+const SessionDialog = ({ open, reason, onConfirm }) => {
+  let title = "Session Expired";
+  let message = "Your session has ended. Please log in again.";
 
+  // Covers both Backend 401s and Frontend BroadcastChannel detections
+  if (reason === "CONCURRENT_LOGIN") {
+    title = "Security Alert";
+    message = "You have been logged out because this account signed in on another device or tab.";
+  }
 
+  return (
+    <Dialog 
+        open={open} 
+        disableEscapeKeyDown 
+        // Prevent closing by clicking outside
+        onClose={() => {}}
+    >
+      <DialogTitle color="error">{title}</DialogTitle>
+      <DialogContent>
+        <DialogContentText>{message}</DialogContentText>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onConfirm} variant="contained" color="primary">
+          Return to Login
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+};
 
+export default SessionDialog;
 
 
 
@@ -547,5 +279,136 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
 
 
+import React from "react";
+import {
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
+} from "@mui/material";
+
+const SessionDialog = ({ open, reason, onConfirm }) => {
+  let title = "Session Expired";
+  let message = "Your session has ended. Please log in again.";
+
+  // Covers both Backend 401s and Frontend BroadcastChannel detections
+  if (reason === "CONCURRENT_LOGIN") {
+    title = "Security Alert";
+    message = "You have been logged out because this account signed in on another device or tab.";
+  }
+
+  return (
+    <Dialog 
+        open={open} 
+        disableEscapeKeyDown 
+        // Prevent closing by clicking outside
+        onClose={() => {}}
+    >
+      <DialogTitle color="error">{title}</DialogTitle>
+      <DialogContent>
+        <DialogContentText>{message}</DialogContentText>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onConfirm} variant="contained" color="primary">
+          Return to Login
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+};
+
+export default SessionDialog;
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useMemo, Suspense } from "react";
+import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { useSelector } from "react-redux";
+import PrivateRouter from "./PrivateRouter";
+
+// Page Components
+import Login from "../features/auth/pages/Login";
+import Home from "../pages/Home";
+import NotFound from "../pages/NotFound";
+import ServerError from "../pages/ServerError";
+import CommonLayout from "../layout/CommonLayout";
+import FullscreenLayout from "../layout/FullscreenLayout";
+import SubmenuSelectionPage from "../pages/SubmenuSelectionPage";
+
+import { generateRouteObjects } from "./RouteGenerator";
+
+const PageLoader = () => (
+    <div style={{ display: 'flex', height: '100vh', justifyContent: 'center', alignItems: 'center' }}>
+        Loading...
+    </div>
+);
+
+const DynamicLayout = () => {
+  const isComponentFullscreen = useSelector((state) => state.ui.isComponentFullscreen);
+  return !isComponentFullscreen ? <CommonLayout /> : <FullscreenLayout />;
+};
+
+const AppRouter = () => {
+  const menus = useSelector((state) => state.menus.menus);
+
+  const router = useMemo(() => {
+    const dynamicRoutes = generateRouteObjects(menus || []);
+
+    const routeConfig = [
+      {
+        path: "/",
+        element: <Login />,
+        errorElement: <ServerError />,
+      },
+      {
+        path: "/server-error",
+        element: <ServerError />,
+      },
+      // Protected Routes
+      {
+        element: <PrivateRouter />,
+        children: [
+          {
+            element: <DynamicLayout />,
+            children: [
+              { path: "/home", element: <Home /> },
+              {
+                path: "/choose-option/:mainMenuTitle",
+                element: <SubmenuSelectionPage />,
+              },
+              ...dynamicRoutes,
+            ],
+          },
+        ].filter(Boolean),
+      },
+      {
+        path: "*",
+        element: <NotFound />,
+      },
+    ];
+
+    return createBrowserRouter(routeConfig);
+  }, [menus]);
+
+  return (
+    <Suspense fallback={<PageLoader />}>
+      <RouterProvider router={router} />
+    </Suspense>
+  );
+};
+
+export default AppRouter;
 
 
