@@ -1,54 +1,253 @@
-import React from "react";
 import {
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
-  Button,
-} from "@mui/material";
+  useState,
+  useRef,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+} from "react";
+import axios from "axios";
+import { useLocation } from "react-router-dom";
+import { useDispatch, useSelector } from "react-redux";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
+import { AuthContext } from "../context/AuthContext";
+import { parseJwt } from "../utils/EncryptionUtilities";
+import { setToken, setUser } from "../store/slices/authSlice";
 
-const SessionDialog = ({ open, reason, onConfirm }) => {
-  let title = "Session Expired";
-  let message = "Your session has ended due to inactivity. Please log in again.";
+const useApi = () => {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
 
-  if (reason === "CONCURRENT_LOGIN") {
-    title = "Security Alert";
-    message = "You have been logged out because this account signed in on another device or tab.";
-  }
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+  const dispatch = useDispatch();
 
-  return (
-    <Dialog 
-      open={open} 
-      disableEscapeKeyDown={true}
-      // Prevent closing by clicking outside
-      onClose={() => {}} 
-      aria-labelledby="session-dialog-title"
-      sx={{ zIndex: 9999 }} // Ensure it sits on top of everything
-    >
-      <DialogTitle id="session-dialog-title" color="error">
-        {title}
-      </DialogTitle>
-      <DialogContent>
-        <DialogContentText>
-          {message}
-        </DialogContentText>
-      </DialogContent>
-      <DialogActions>
-        <Button 
-          onClick={onConfirm} 
-          variant="contained" 
-          color="primary"
-          autoFocus
-        >
-          Return to Login
-        </Button>
-      </DialogActions>
-    </Dialog>
+  // Get the safe trigger from Context
+  const { triggerSessionDialog, logout } = useContext(AuthContext);
+  
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  const activeRequestsRef = useRef(new Set());
+  const isRefreshingRef = useRef(false);
+  const refreshQueueRef = useRef([]);
+  const sessionInvalidatedRef = useRef(false);
+
+  const cancelAllRequests = useCallback(() => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (!controller.signal.aborted) controller.abort();
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  }, []);
+
+  useEffect(() => cancelAllRequests, [cancelAllRequests]);
+
+  const handleSessionInvalid = useCallback(
+    (reason) => {
+      if (sessionInvalidatedRef.current) return;
+      sessionInvalidatedRef.current = true;
+      
+      cancelAllRequests();
+      
+      // CALL THE SAFE TRIGGER (Doesn't redirect yet)
+      triggerSessionDialog(reason);
+    },
+    [cancelAllRequests, triggerSessionDialog]
   );
+
+  const refreshToken = useCallback(async () => {
+    if (isRefreshingRef.current) {
+      return new Promise((resolve, reject) => {
+        refreshQueueRef.current.push({ resolve, reject });
+      });
+    }
+
+    isRefreshingRef.current = true;
+
+    try {
+      const res = await axios.post(
+        `${resolveConfig("/LS") ?? ""}/auth/refresh-token`,
+        {},
+        { withCredentials: true }
+      );
+
+      const { accessToken, refreshToken: newRefreshToken } = res.data || {};
+      if (!accessToken) throw new Error("No access token from refresh");
+
+      const user = parseJwt(accessToken);
+      dispatch(setToken(accessToken));
+      dispatch(setUser(user));
+
+      localStorage.setItem("accessToken", accessToken);
+      if (newRefreshToken) {
+        localStorage.setItem("refreshToken", newRefreshToken);
+      }
+
+      refreshQueueRef.current.forEach((p) => p.resolve(accessToken));
+      refreshQueueRef.current = [];
+
+      return accessToken;
+    } catch (err) {
+      refreshQueueRef.current.forEach((p) => p.reject(err));
+      refreshQueueRef.current = [];
+      throw err;
+    } finally {
+      isRefreshingRef.current = false;
+    }
+  }, [dispatch]);
+
+  // ... Menu logic remains the same ...
+  const findMenuItem = useCallback((items, route) => {
+    if (!items?.length) return null;
+    for (const item of items) {
+      if (item.route === route) return item;
+      if (item.children?.length) {
+        if (route.includes("/choose-option/")) {
+          const param = route.split("/choose-option/")[1];
+          if (param === convertToKebabCase(item.title)) return item;
+        }
+        const found = findMenuItem(item.children, route);
+        if (found) return found;
+      }
+    }
+    return null;
+  }, []);
+
+  const currentMenuFromRoute = useMemo(
+    () => findMenuItem(menus, location.pathname),
+    [menus, location.pathname, findMenuItem]
+  );
+
+  const xRequestType = useMemo(
+    () => currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*",
+    [currentMenuFromRoute, selectedMenuItem]
+  );
+
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      const parts = url.split("/");
+      const service = parts[1];
+      parts[1] = resolveConfig(`/${service}`);
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      const getCurrentToken = () =>
+        extraConfig?.headers?.Authorization?.replace("Bearer ", "") ||
+        localStorage.getItem("accessToken") ||
+        token;
+
+      try {
+        const config = {
+          method,
+          url: Final_Url,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${getCurrentToken()}`,
+            "Content-Type": contentType,
+            "X-Request-Type": xRequestType,
+            ...(extraConfig.headers || {}),
+          },
+          ...extraConfig,
+        };
+
+        if (payload) {
+          method === "GET"
+            ? (config.params = payload)
+            : (config.data = payload);
+        }
+
+        const response = await axios(config);
+        setData(response.data);
+        return returnDataOnly ? response.data : response;
+      } catch (err) {
+        if (axios.isCancel(err)) return;
+
+        const status = err.response?.status;
+        const code = err.response?.data?.error || err.response?.data?.code;
+
+        /** HARD FAIL - Shows Dialog, stays on page */
+        if (
+          status === 401 &&
+          (code === "CONCURRENT_LOGIN" || code === "SESSION_EXPIRED")
+        ) {
+          handleSessionInvalid(code);
+          return;
+        }
+
+        /** TOKEN EXPIRED */
+        if (
+          status === 401 &&
+          code === "TOKEN_EXPIRED" &&
+          !extraConfig.__isRetry
+        ) {
+          try {
+            const newToken = await refreshToken();
+            return await callApi(
+              url,
+              payload,
+              method,
+              responseType,
+              contentType,
+              {
+                ...extraConfig,
+                __isRetry: true,
+                headers: {
+                  ...(extraConfig.headers || {}),
+                  Authorization: `Bearer ${newToken}`,
+                },
+              },
+              returnDataOnly
+            );
+          } catch {
+            // If refresh fails, performs actual logout
+            logout(); 
+            return;
+          }
+        }
+
+        const msg = err.response?.data?.message || err.message || "Error";
+        snackbar(msg, "error");
+        setError(err);
+        throw err;
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        if (!extraConfig.__isRetry) setLoading(false);
+      }
+    },
+    [token, xRequestType, snackbar, logout, handleSessionInvalid, refreshToken]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests };
 };
 
-export default SessionDialog;
+export default useApi;
+
+
+
+
+
+
+
 
 
 
@@ -93,21 +292,24 @@ export const AuthProvider = ({ children }) => {
   const warningTimerRef = useRef(null);
   const countdownRef = useRef(null);
 
-  /* ---------- 1. Clear Timers Helper ---------- */
+  // 1. Helper to Clear Timers
   const clearAllTimers = useCallback(() => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
   }, []);
 
-  /* ---------- 2. The Final Cleanup (Destructive) ---------- */
-  // This is only called when the user CLICKS the button in the dialog
-  // OR manually clicks a "Logout" button in the UI.
-  const completeLogout = useCallback(async () => {
-      clearAllTimers();
-      setWarningOpen(false);
-      
-      try {
+  // 2. Perform Logout (Destructive - Clears State & Redirects)
+  // This is called ONLY when the user clicks "Return to Login" or manually logs out.
+  const performLogout = useCallback(async () => {
+    clearAllTimers();
+    setWarningOpen(false);
+    setSessionDialogOpen(false);
+
+    try {
+      // Call API to clear cookies on server
+      // We explicitly pass the token here because we are about to delete it from Redux
+      if (token) {
         await axios.post(
           `${resolveConfig("/LS") ?? ""}/auth/logout`,
           {},
@@ -116,39 +318,33 @@ export const AuthProvider = ({ children }) => {
             withCredentials: true,
           }
         );
-      } catch (err) {
-        console.error("Logout API failed (ignoring)", err);
       }
-
-      // CRITICAL: This line triggers the Redirect. We only run it NOW.
+    } catch (err) {
+      console.warn("Logout API failed (ignoring)", err);
+    } finally {
+      // Clear Redux State -> Triggers PrivateRouter redirect
       dispatch(reduxLogout());
-      setSessionDialogOpen(false);
       window.location.replace("/");
+    }
   }, [token, dispatch, clearAllTimers]);
 
-
-  /* ---------- 3. System Triggered Logout (Non-Destructive UI) ---------- */
-  // This is called by Concurrent Login checks or Timeouts.
-  // It ONLY shows the dialog. It does NOT clear Redux state yet.
-  const triggerSessionDialog = useCallback((reason = "SESSION_EXPIRED") => {
-      // If already open, don't spam
-      setSessionDialogOpen((prev) => {
-        if (prev) return true;
-        
-        clearAllTimers();
-        setWarningOpen(false);
-        setSessionReason(reason);
-        return true;
-      });
+  // 3. Show Session Dialog (Safe - Does NOT clear state)
+  // This keeps the user on the current screen but blocks them with the dialog.
+  const showSessionDialog = useCallback((reason = "SESSION_EXPIRED") => {
+      clearAllTimers();
+      setWarningOpen(false);
+      setSessionReason(reason);
+      setSessionDialogOpen(true);
+      // NOTE: We do NOT call dispatch(reduxLogout()) here. 
+      // This keeps the underlying page rendered so the Dialog can sit on top.
   }, [clearAllTimers]);
 
-
-  /* ---------- 4. Start Inactivity Timers ---------- */
+  // 4. Inactivity Timer Logic
   const startInactivity = useCallback(() => {
     clearAllTimers();
     if (!user) return;
 
-    // Timer 1: Show Warning Dialog
+    // Warning Timer
     warningTimerRef.current = setTimeout(() => {
       setWarningOpen(true);
       setSecondsLeft(WARNING_SECONDS);
@@ -161,27 +357,22 @@ export const AuthProvider = ({ children }) => {
       }, 1000);
     }, INACTIVITY_TIMEOUT - WARNING_SECONDS * 1000);
 
-    // Timer 2: Trigger the Session Ended Dialog (Do NOT auto-redirect yet)
+    // Hard Stop Timer -> Show Dialog
     inactivityTimerRef.current = setTimeout(() => {
-      triggerSessionDialog("SESSION_EXPIRED");
+      showSessionDialog("SESSION_EXPIRED");
     }, INACTIVITY_TIMEOUT);
-  }, [user, clearAllTimers, triggerSessionDialog]);
+  }, [user, clearAllTimers, showSessionDialog]);
 
-  /* ---------- 5. Activity Handler ---------- */
+  // 5. Activity Listeners
   const onActivity = useCallback(
     throttle(() => {
-      // If dialog is open, stop tracking activity
       if (!user || sessionDialogOpen) return;
-      
-      // If warning was open, close it and reset
       if (warningOpen) setWarningOpen(false);
-      
       startInactivity();
     }, 2000),
     [user, startInactivity, sessionDialogOpen, warningOpen]
   );
 
-  /* ---------- 6. Watch User State ---------- */
   useEffect(() => {
     if (!user) {
       clearAllTimers();
@@ -190,7 +381,6 @@ export const AuthProvider = ({ children }) => {
     }
 
     startInactivity();
-
     const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
     events.forEach((e) => window.addEventListener(e, onActivity));
 
@@ -204,8 +394,8 @@ export const AuthProvider = ({ children }) => {
   return (
     <AuthContext.Provider
       value={{
-        logout: completeLogout,          // Manual User Logout (Immediate)
-        triggerSessionDialog,            // System Event (Shows Dialog, waits for click)
+        logout: performLogout,          // Manual Action (Clear state)
+        triggerSessionDialog: showSessionDialog, // System Event (Show UI only)
       }}
     >
       {children}
@@ -219,15 +409,16 @@ export const AuthProvider = ({ children }) => {
         }}
       />
 
-      {/* The Dialog runs completeLogout when confirmed */}
+      {/* When user confirms the dialog, WE CALL performLogout */}
       <SessionDialog
         open={sessionDialogOpen}
         reason={sessionReason}
-        onConfirm={completeLogout} 
+        onConfirm={performLogout} 
       />
-    </AuthContext.Provider>
-  );
-};
+    </
+
+
+
 
 
 
@@ -248,7 +439,7 @@ const PrivateRouter = () => {
   const { token, user } = useSelector((state) => state.auth);
   const tabId = useSelector((state) => state.tab.tabId);
   
-  // Use the context trigger
+  // Use SAFE trigger
   const { triggerSessionDialog } = useContext(AuthContext);
 
   useEffect(() => {
@@ -259,14 +450,12 @@ const PrivateRouter = () => {
     const handleMessage = (event) => {
       const { type, userId: eventUserId, tabId: eventTabId } = event.data || {};
 
-      // Concurrent Login Detection (Same User, Different Tab)
       if (
         type === "USER_LOGGED_IN" &&
         eventUserId === user.userId &&
         eventTabId !== tabId
       ) {
-        // Trigger the Dialog. 
-        // NOTE: This does NOT clear Redux, so <Outlet /> stays rendered below the dialog.
+        // Just show dialog. Do NOT redirect.
         triggerSessionDialog("CONCURRENT_LOGIN");
       }
     };
@@ -278,8 +467,6 @@ const PrivateRouter = () => {
     };
   }, [user, tabId, triggerSessionDialog]);
 
-  // If token is explicitly null (user manually logged out), redirect.
-  // But if concurrent login happened, token is STILL here until they click OK in dialog.
   if (!token) {
     return <Navigate to="/" replace />;
   }
