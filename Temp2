@@ -1,3 +1,131 @@
+    /**
+     * LOGOUT ENDPOINT (ROBUST & VERIFIED)
+     * Handles:
+     * 1. Valid Tokens -> Standard Logout
+     * 2. Expired Tokens -> Manually extracts claims -> Cleans up Redis if JTI matches
+     * 3. Concurrent Logins -> Blacklists current token, but PRESERVES the active session in Redis
+     * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
+     */
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<LoginResponseDTO>> logout(JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
+        
+        // 1. Always clear the Refresh Token Cookie (Idempotent)
+        response.addCookie(createEmptyCookie());
+
+        // 2. Resolve Token Strategy
+        String tokenString = null;
+        
+        // Strategy A: Spring Security Context (Valid Tokens)
+        if (jwtAuth != null && jwtAuth.getToken() != null) {
+            tokenString = jwtAuth.getToken().getTokenValue();
+        } 
+        // Strategy B: Manual Header Extraction (Expired Tokens)
+        else {
+            String header = request.getHeaders().getFirst("Authorization");
+            if (header != null && header.startsWith("Bearer ")) {
+                tokenString = header.substring(7);
+            }
+        }
+
+        // 3. Fast Exit: If no token found anywhere, just return success so frontend can clear state
+        if (tokenString == null || tokenString.isBlank()) {
+            log.warn("Logout called without token. Cleaning up cookies only.");
+            return Mono.just(ResponseEntity.ok(
+                LoginResponseDTO.builder().userId("anonymous").error("Logged out (No Token)").build()
+            ));
+        }
+
+        final String finalToken = tokenString;
+
+        // 4. Processing Chain
+        return Mono.fromCallable(() -> {
+            try {
+                // Try standard parsing
+                return extractClaims(finalToken);
+            } catch (ExpiredJwtException e) {
+                // CRITICAL FIX: If token is expired, we STILL want the claims to perform cleanup
+                log.info("Logout: Token is expired. Using claims from exception for cleanup.");
+                return e.getClaims();
+            }
+        })
+        .subscribeOn(Schedulers.boundedElastic())
+        .flatMap(claims -> {
+            String userId = claims.getSubject();
+            String incomingJti = claims.getId();
+
+            if (userId == null || incomingJti == null) {
+                return Mono.just(ResponseEntity.ok(
+                    LoginResponseDTO.builder().error("Invalid Token Claims").build()
+                ));
+            }
+
+            log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
+
+            // 5. Blacklist the Token (Always blacklist the incoming token)
+            return validator.blacklistToken(incomingJti)
+                    .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
+                    .flatMap(activeJti -> {
+                        // 6. Conditional Redis Cleanup
+                        if (activeJti != null && activeJti.equals(incomingJti)) {
+                            // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
+                            // Action: Delete it.
+                            log.info("Session MATCH. Deleting active session for user: {}", userId);
+                            return validator.clearUserSession(userId)
+                                    .then(Mono.just(ResponseEntity.ok(
+                                        LoginResponseDTO.builder().userId(userId).error("Logged out successfully").build()
+                                    )));
+                        } else {
+                            // SCENARIO: Concurrent Login.
+                            // The session in Redis belongs to a NEWER token (on another device/tab).
+                            // Action: Do NOT delete it. Just let the blacklist happen.
+                            log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
+                            return Mono.just(ResponseEntity.ok(
+                                LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build()
+                            ));
+                        }
+                    })
+                    // If key is missing in Redis (Already timed out), return success
+                    .switchIfEmpty(Mono.just(ResponseEntity.ok(
+                        LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build()
+                    )));
+        })
+        .onErrorResume(e -> {
+            // Safety Net: If anything explodes (Redis down, etc), allow frontend to logout
+            log.error("Logout Unexpected Error", e);
+            return Mono.just(ResponseEntity.ok(
+                LoginResponseDTO.builder().error("Logged out (System Error handled)").build()
+            ));
+        });
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import React, {
   createContext,
   useEffect,
@@ -32,25 +160,26 @@ export const AuthProvider = ({ children }) => {
   const warningTimerRef = useRef(null);
   const countdownRef = useRef(null);
 
-  // 1. Helper to Clear Timers
   const clearAllTimers = useCallback(() => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
   }, []);
 
-  // 2. Perform Logout (Destructive - Clears State & Redirects)
-  // This is called ONLY when the user clicks "Return to Login" or manually logs out.
+  /**
+   * PERFORM LOGOUT (Destructive)
+   * This handles the API call and Redux cleanup.
+   */
   const performLogout = useCallback(async () => {
+    console.log("Initiating Logout Sequence...");
     clearAllTimers();
     setWarningOpen(false);
     setSessionDialogOpen(false);
 
     try {
-      // Call API to clear cookies on server
-      // We explicitly pass the token here because we are about to delete it from Redux
       if (token) {
-        await axios.post(
+        // We await the response so the Network tab captures it
+        const response = await axios.post(
           `${resolveConfig("/LS") ?? ""}/auth/logout`,
           {},
           {
@@ -58,33 +187,42 @@ export const AuthProvider = ({ children }) => {
             withCredentials: true,
           }
         );
+        console.log("Logout API Response:", response.data);
       }
     } catch (err) {
-      console.warn("Logout API failed (ignoring)", err);
+      console.warn("Logout API failed or Network Error:", err);
     } finally {
-      // Clear Redux State -> Triggers PrivateRouter redirect
+      console.log("Clearing Client State and Redirecting...");
       dispatch(reduxLogout());
-      window.location.replace("/");
+      
+      // Optional: Small delay to allow logs/network to flush before unload
+      setTimeout(() => {
+          window.location.replace("/");
+      }, 100);
     }
   }, [token, dispatch, clearAllTimers]);
 
-  // 3. Show Session Dialog (Safe - Does NOT clear state)
-  // This keeps the user on the current screen but blocks them with the dialog.
+  /**
+   * SHOW DIALOG (Safe)
+   * This is triggered by Concurrent Login / Timeout.
+   * It does NOT clear the token, so the background stays visible.
+   */
   const showSessionDialog = useCallback((reason = "SESSION_EXPIRED") => {
-      clearAllTimers();
-      setWarningOpen(false);
-      setSessionReason(reason);
-      setSessionDialogOpen(true);
-      // NOTE: We do NOT call dispatch(reduxLogout()) here. 
-      // This keeps the underlying page rendered so the Dialog can sit on top.
+      // Prevent double-opening
+      setSessionDialogOpen(prev => {
+          if(prev) return true;
+          clearAllTimers();
+          setWarningOpen(false);
+          setSessionReason(reason);
+          return true;
+      });
   }, [clearAllTimers]);
 
-  // 4. Inactivity Timer Logic
+  // --- Inactivity Logic ---
   const startInactivity = useCallback(() => {
     clearAllTimers();
     if (!user) return;
 
-    // Warning Timer
     warningTimerRef.current = setTimeout(() => {
       setWarningOpen(true);
       setSecondsLeft(WARNING_SECONDS);
@@ -97,13 +235,11 @@ export const AuthProvider = ({ children }) => {
       }, 1000);
     }, INACTIVITY_TIMEOUT - WARNING_SECONDS * 1000);
 
-    // Hard Stop Timer -> Show Dialog
     inactivityTimerRef.current = setTimeout(() => {
       showSessionDialog("SESSION_EXPIRED");
     }, INACTIVITY_TIMEOUT);
   }, [user, clearAllTimers, showSessionDialog]);
 
-  // 5. Activity Listeners
   const onActivity = useCallback(
     throttle(() => {
       if (!user || sessionDialogOpen) return;
@@ -119,11 +255,9 @@ export const AuthProvider = ({ children }) => {
       setWarningOpen(false);
       return;
     }
-
     startInactivity();
     const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
     events.forEach((e) => window.addEventListener(e, onActivity));
-
     return () => {
       events.forEach((e) => window.removeEventListener(e, onActivity));
       onActivity.cancel();
@@ -134,8 +268,8 @@ export const AuthProvider = ({ children }) => {
   return (
     <AuthContext.Provider
       value={{
-        logout: performLogout,          // Manual Action (Clear state)
-        triggerSessionDialog: showSessionDialog, // System Event (Show UI only)
+        logout: performLogout,
+        triggerSessionDialog: showSessionDialog,
       }}
     >
       {children}
@@ -149,7 +283,6 @@ export const AuthProvider = ({ children }) => {
         }}
       />
 
-      {/* When user confirms the dialog, WE CALL performLogout */}
       <SessionDialog
         open={sessionDialogOpen}
         reason={sessionReason}
