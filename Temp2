@@ -1,131 +1,3 @@
-    /**
-     * LOGOUT ENDPOINT (ROBUST & VERIFIED)
-     * Handles:
-     * 1. Valid Tokens -> Standard Logout
-     * 2. Expired Tokens -> Manually extracts claims -> Cleans up Redis if JTI matches
-     * 3. Concurrent Logins -> Blacklists current token, but PRESERVES the active session in Redis
-     * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<LoginResponseDTO>> logout(JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
-        
-        // 1. Always clear the Refresh Token Cookie (Idempotent)
-        response.addCookie(createEmptyCookie());
-
-        // 2. Resolve Token Strategy
-        String tokenString = null;
-        
-        // Strategy A: Spring Security Context (Valid Tokens)
-        if (jwtAuth != null && jwtAuth.getToken() != null) {
-            tokenString = jwtAuth.getToken().getTokenValue();
-        } 
-        // Strategy B: Manual Header Extraction (Expired Tokens)
-        else {
-            String header = request.getHeaders().getFirst("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
-                tokenString = header.substring(7);
-            }
-        }
-
-        // 3. Fast Exit: If no token found anywhere, just return success so frontend can clear state
-        if (tokenString == null || tokenString.isBlank()) {
-            log.warn("Logout called without token. Cleaning up cookies only.");
-            return Mono.just(ResponseEntity.ok(
-                LoginResponseDTO.builder().userId("anonymous").error("Logged out (No Token)").build()
-            ));
-        }
-
-        final String finalToken = tokenString;
-
-        // 4. Processing Chain
-        return Mono.fromCallable(() -> {
-            try {
-                // Try standard parsing
-                return extractClaims(finalToken);
-            } catch (ExpiredJwtException e) {
-                // CRITICAL FIX: If token is expired, we STILL want the claims to perform cleanup
-                log.info("Logout: Token is expired. Using claims from exception for cleanup.");
-                return e.getClaims();
-            }
-        })
-        .subscribeOn(Schedulers.boundedElastic())
-        .flatMap(claims -> {
-            String userId = claims.getSubject();
-            String incomingJti = claims.getId();
-
-            if (userId == null || incomingJti == null) {
-                return Mono.just(ResponseEntity.ok(
-                    LoginResponseDTO.builder().error("Invalid Token Claims").build()
-                ));
-            }
-
-            log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
-
-            // 5. Blacklist the Token (Always blacklist the incoming token)
-            return validator.blacklistToken(incomingJti)
-                    .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
-                    .flatMap(activeJti -> {
-                        // 6. Conditional Redis Cleanup
-                        if (activeJti != null && activeJti.equals(incomingJti)) {
-                            // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
-                            // Action: Delete it.
-                            log.info("Session MATCH. Deleting active session for user: {}", userId);
-                            return validator.clearUserSession(userId)
-                                    .then(Mono.just(ResponseEntity.ok(
-                                        LoginResponseDTO.builder().userId(userId).error("Logged out successfully").build()
-                                    )));
-                        } else {
-                            // SCENARIO: Concurrent Login.
-                            // The session in Redis belongs to a NEWER token (on another device/tab).
-                            // Action: Do NOT delete it. Just let the blacklist happen.
-                            log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
-                            return Mono.just(ResponseEntity.ok(
-                                LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build()
-                            ));
-                        }
-                    })
-                    // If key is missing in Redis (Already timed out), return success
-                    .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                        LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build()
-                    )));
-        })
-        .onErrorResume(e -> {
-            // Safety Net: If anything explodes (Redis down, etc), allow frontend to logout
-            log.error("Logout Unexpected Error", e);
-            return Mono.just(ResponseEntity.ok(
-                LoginResponseDTO.builder().error("Logged out (System Error handled)").build()
-            ));
-        });
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import React, {
   createContext,
   useEffect,
@@ -153,6 +25,8 @@ export const AuthProvider = ({ children }) => {
 
   const [warningOpen, setWarningOpen] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(WARNING_SECONDS);
+  
+  // Dialog State
   const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
   const [sessionReason, setSessionReason] = useState("");
 
@@ -160,25 +34,24 @@ export const AuthProvider = ({ children }) => {
   const warningTimerRef = useRef(null);
   const countdownRef = useRef(null);
 
+  // --- 1. Helper to Clear Timers ---
   const clearAllTimers = useCallback(() => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
   }, []);
 
-  /**
-   * PERFORM LOGOUT (Destructive)
-   * This handles the API call and Redux cleanup.
-   */
+  // --- 2. PERFORM LOGOUT (Destructive) ---
+  // Called when user clicks "Return to Login" or manually clicks Logout button.
   const performLogout = useCallback(async () => {
     console.log("Initiating Logout Sequence...");
     clearAllTimers();
     setWarningOpen(false);
-    setSessionDialogOpen(false);
+    setSessionDialogOpen(false); // Close dialog immediately
 
     try {
       if (token) {
-        // We await the response so the Network tab captures it
+        // Await the response so it appears in Network tab
         const response = await axios.post(
           `${resolveConfig("/LS") ?? ""}/auth/logout`,
           {},
@@ -195,34 +68,35 @@ export const AuthProvider = ({ children }) => {
       console.log("Clearing Client State and Redirecting...");
       dispatch(reduxLogout());
       
-      // Optional: Small delay to allow logs/network to flush before unload
+      // OPTIONAL: Add a small delay (e.g., 500ms) to ensure 
+      // the network request is visible in DevTools before the page reloads.
       setTimeout(() => {
           window.location.replace("/");
-      }, 100);
+      }, 500);
     }
   }, [token, dispatch, clearAllTimers]);
 
-  /**
-   * SHOW DIALOG (Safe)
-   * This is triggered by Concurrent Login / Timeout.
-   * It does NOT clear the token, so the background stays visible.
-   */
+  // --- 3. TRIGGER SESSION DIALOG (Safe) ---
+  // Called by System Events (Concurrent Login, Timeout).
+  // Shows dialog but keeps page/token alive.
   const showSessionDialog = useCallback((reason = "SESSION_EXPIRED") => {
-      // Prevent double-opening
-      setSessionDialogOpen(prev => {
-          if(prev) return true;
-          clearAllTimers();
-          setWarningOpen(false);
-          setSessionReason(reason);
-          return true;
+      // Prevent spamming state updates if already open
+      setSessionDialogOpen((prev) => {
+        if (prev) return true;
+        
+        clearAllTimers();
+        setWarningOpen(false);
+        setSessionReason(reason);
+        return true;
       });
   }, [clearAllTimers]);
 
-  // --- Inactivity Logic ---
+  // --- 4. Inactivity Timer Logic ---
   const startInactivity = useCallback(() => {
     clearAllTimers();
     if (!user) return;
 
+    // Warning Timer
     warningTimerRef.current = setTimeout(() => {
       setWarningOpen(true);
       setSecondsLeft(WARNING_SECONDS);
@@ -235,11 +109,13 @@ export const AuthProvider = ({ children }) => {
       }, 1000);
     }, INACTIVITY_TIMEOUT - WARNING_SECONDS * 1000);
 
+    // Hard Stop Timer -> Show Dialog
     inactivityTimerRef.current = setTimeout(() => {
       showSessionDialog("SESSION_EXPIRED");
     }, INACTIVITY_TIMEOUT);
   }, [user, clearAllTimers, showSessionDialog]);
 
+  // --- 5. Activity Listener ---
   const onActivity = useCallback(
     throttle(() => {
       if (!user || sessionDialogOpen) return;
@@ -255,9 +131,11 @@ export const AuthProvider = ({ children }) => {
       setWarningOpen(false);
       return;
     }
+
     startInactivity();
     const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
     events.forEach((e) => window.addEventListener(e, onActivity));
+
     return () => {
       events.forEach((e) => window.removeEventListener(e, onActivity));
       onActivity.cancel();
@@ -268,8 +146,8 @@ export const AuthProvider = ({ children }) => {
   return (
     <AuthContext.Provider
       value={{
-        logout: performLogout,
-        triggerSessionDialog: showSessionDialog,
+        logout: performLogout,          // Use for Manual Logout
+        triggerSessionDialog: showSessionDialog, // Use for System Events
       }}
     >
       {children}
@@ -283,6 +161,7 @@ export const AuthProvider = ({ children }) => {
         }}
       />
 
+      {/* When user confirms dialog, execute the destructive logout */}
       <SessionDialog
         open={sessionDialogOpen}
         reason={sessionReason}
@@ -291,5 +170,324 @@ export const AuthProvider = ({ children }) => {
     </AuthContext.Provider>
   );
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import {
+  useState,
+  useRef,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+} from "react";
+import axios from "axios";
+import { useLocation } from "react-router-dom";
+import { useDispatch, useSelector } from "react-redux";
+import useCustomSnackbar from "../utils/useCustomSnackbar";
+import { resolveConfig } from "../config/EnvironmentConfig";
+import { convertToKebabCase } from "../utils/CommonUtilities";
+import { AuthContext } from "../context/AuthContext";
+import { parseJwt } from "../utils/EncryptionUtilities";
+import { setToken, setUser } from "../store/slices/authSlice";
+
+const useApi = () => {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const location = useLocation();
+  const snackbar = useCustomSnackbar();
+  const dispatch = useDispatch();
+
+  // Get both functions from context
+  const { triggerSessionDialog, logout } = useContext(AuthContext);
+  
+  const token = useSelector((state) => state.auth.token);
+  const menus = useSelector((s) => s.menus.menus);
+  const selectedMenuItem = useSelector((s) => s.menus.selectedMenuItem);
+
+  const activeRequestsRef = useRef(new Set());
+  const isRefreshingRef = useRef(false);
+  const refreshQueueRef = useRef([]);
+  const sessionInvalidatedRef = useRef(false);
+
+  // Cancel requests helper
+  const cancelAllRequests = useCallback(() => {
+    activeRequestsRef.current.forEach((controller) => {
+      if (!controller.signal.aborted) controller.abort();
+    });
+    activeRequestsRef.current.clear();
+    setLoading(false);
+  }, []);
+
+  useEffect(() => cancelAllRequests, [cancelAllRequests]);
+
+  // Handler for hard session failures (Concurrent/Expired)
+  const handleSessionInvalid = useCallback(
+    (reason) => {
+      if (sessionInvalidatedRef.current) return;
+      sessionInvalidatedRef.current = true;
+      
+      cancelAllRequests();
+      
+      // CRITICAL: Call the SAFE trigger. 
+      // Do NOT call logout() here, or the page will vanish before dialog appears.
+      triggerSessionDialog(reason);
+    },
+    [cancelAllRequests, triggerSessionDialog]
+  );
+
+  const refreshToken = useCallback(async () => {
+    if (isRefreshingRef.current) {
+      return new Promise((resolve, reject) => {
+        refreshQueueRef.current.push({ resolve, reject });
+      });
+    }
+
+    isRefreshingRef.current = true;
+
+    try {
+      const res = await axios.post(
+        `${resolveConfig("/LS") ?? ""}/auth/refresh-token`,
+        {},
+        { withCredentials: true }
+      );
+
+      const { accessToken, refreshToken: newRefreshToken } = res.data || {};
+      if (!accessToken) throw new Error("No access token from refresh");
+
+      const user = parseJwt(accessToken);
+      dispatch(setToken(accessToken));
+      dispatch(setUser(user));
+
+      localStorage.setItem("accessToken", accessToken);
+      if (newRefreshToken) {
+        localStorage.setItem("refreshToken", newRefreshToken);
+      }
+
+      refreshQueueRef.current.forEach((p) => p.resolve(accessToken));
+      refreshQueueRef.current = [];
+
+      return accessToken;
+    } catch (err) {
+      refreshQueueRef.current.forEach((p) => p.reject(err));
+      refreshQueueRef.current = [];
+      throw err;
+    } finally {
+      isRefreshingRef.current = false;
+    }
+  }, [dispatch]);
+
+  // ... Menu logic (unchanged) ...
+  const findMenuItem = useCallback((items, route) => {
+    if (!items?.length) return null;
+    for (const item of items) {
+      if (item.route === route) return item;
+      if (item.children?.length) {
+        if (route.includes("/choose-option/")) {
+          const param = route.split("/choose-option/")[1];
+          if (param === convertToKebabCase(item.title)) return item;
+        }
+        const found = findMenuItem(item.children, route);
+        if (found) return found;
+      }
+    }
+    return null;
+  }, []);
+
+  const currentMenuFromRoute = useMemo(
+    () => findMenuItem(menus, location.pathname),
+    [menus, location.pathname, findMenuItem]
+  );
+
+  const xRequestType = useMemo(
+    () => currentMenuFromRoute?.requestType || selectedMenuItem?.requestType || "*",
+    [currentMenuFromRoute, selectedMenuItem]
+  );
+
+  // Main API Call Logic
+  const callApi = useCallback(
+    async (
+      url,
+      payload = null,
+      method = "GET",
+      responseType = "json",
+      contentType = "application/json",
+      extraConfig = {},
+      returnDataOnly = true
+    ) => {
+      const parts = url.split("/");
+      const service = parts[1];
+      parts[1] = resolveConfig(`/${service}`);
+      const Final_Url = parts.slice(1).join("/");
+
+      const controller = new AbortController();
+      activeRequestsRef.current.add(controller);
+
+      setLoading(true);
+      setError(null);
+
+      const getCurrentToken = () =>
+        extraConfig?.headers?.Authorization?.replace("Bearer ", "") ||
+        localStorage.getItem("accessToken") ||
+        token;
+
+      try {
+        const config = {
+          method,
+          url: Final_Url,
+          responseType,
+          withCredentials: true,
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${getCurrentToken()}`,
+            "Content-Type": contentType,
+            "X-Request-Type": xRequestType,
+            ...(extraConfig.headers || {}),
+          },
+          ...extraConfig,
+        };
+
+        if (payload) {
+          method === "GET"
+            ? (config.params = payload)
+            : (config.data = payload);
+        }
+
+        const response = await axios(config);
+        setData(response.data);
+        return returnDataOnly ? response.data : response;
+      } catch (err) {
+        if (axios.isCancel(err)) return;
+
+        const status = err.response?.status;
+        const code = err.response?.data?.error || err.response?.data?.code;
+
+        /** HARD FAIL - Shows Dialog */
+        if (
+          status === 401 &&
+          (code === "CONCURRENT_LOGIN" || code === "SESSION_EXPIRED")
+        ) {
+          handleSessionInvalid(code);
+          return; // Stop here, dialog takes over
+        }
+
+        /** TOKEN EXPIRED - Retry Logic */
+        if (
+          status === 401 &&
+          code === "TOKEN_EXPIRED" &&
+          !extraConfig.__isRetry
+        ) {
+          try {
+            const newToken = await refreshToken();
+            return await callApi(
+              url,
+              payload,
+              method,
+              responseType,
+              contentType,
+              {
+                ...extraConfig,
+                __isRetry: true,
+                headers: {
+                  ...(extraConfig.headers || {}),
+                  Authorization: `Bearer ${newToken}`,
+                },
+              },
+              returnDataOnly
+            );
+          } catch {
+            // If refresh fails, then we do a hard logout
+            logout(); 
+            return;
+          }
+        }
+
+        const msg = err.response?.data?.message || err.message || "Error";
+        snackbar(msg, "error");
+        setError(err);
+        throw err;
+      } finally {
+        activeRequestsRef.current.delete(controller);
+        if (!extraConfig.__isRetry) setLoading(false);
+      }
+    },
+    [token, xRequestType, snackbar, logout, handleSessionInvalid, refreshToken]
+  );
+
+  return { data, error, loading, callApi, cancelAllRequests };
+};
+
+export default useApi;
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useEffect, useContext } from "react";
+import { Navigate, Outlet } from "react-router-dom";
+import { useSelector } from "react-redux";
+import { AuthContext } from "../context/AuthContext";
+
+const PrivateRouter = () => {
+  const { token, user } = useSelector((state) => state.auth);
+  const tabId = useSelector((state) => state.tab.tabId);
+  
+  // Use SAFE trigger
+  const { triggerSessionDialog } = useContext(AuthContext);
+
+  useEffect(() => {
+    if (!user?.userId || !tabId) return;
+
+    const bc = new BroadcastChannel("auth");
+
+    const handleMessage = (event) => {
+      const { type, userId: eventUserId, tabId: eventTabId } = event.data || {};
+
+      if (
+        type === "USER_LOGGED_IN" &&
+        eventUserId === user.userId &&
+        eventTabId !== tabId
+      ) {
+        // Just show dialog. Do NOT redirect.
+        triggerSessionDialog("CONCURRENT_LOGIN");
+      }
+    };
+
+    bc.onmessage = handleMessage;
+
+    return () => {
+      bc.close();
+    };
+  }, [user, tabId, triggerSessionDialog]);
+
+  if (!token) {
+    return <Navigate to="/" replace />;
+  }
+
+  return <Outlet />;
+};
+
+export default PrivateRouter;
 
 
