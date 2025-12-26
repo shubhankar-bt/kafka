@@ -1114,6 +1114,7 @@ import com.fincore.ReportService.dto.ReportStreamResponse;
 import com.fincore.ReportService.dto.ReportTypeDto;
 import com.fincore.ReportService.exception.ResourceNotFoundException;
 import com.fincore.ReportService.model.AppConfig;
+import com.fincore.ReportService.model.ReportType;
 import com.fincore.ReportService.repository.AppConfigRepository;
 import com.fincore.ReportService.repository.ReportTypeRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -1132,6 +1133,7 @@ import java.io.IOException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -1184,12 +1186,17 @@ public class ReportServiceImpl implements ReportService {
     @Override
     public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
         // 1. Authorization Check (Remains the same)
-        boolean isAuthorized = reportTypeRepository.existsByFileNameAndRoles_roleId(fileName, userRoleId);
-        if (!isAuthorized) {
-            log.warn("Access Denied: User {} is not authorized for report {}.", userId, fileName);
-            sendNotification(userId, "Access Denied for report: " + fileName, "/glif-reports", fileName + "_" + date);
-            throw new AccessDeniedException("Access Denied for report: " + fileName);
-        }
+        ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
+                .orElseThrow(() -> {
+                    log.warn("Access Denied: User {} -> Report {}", userId, fileName);
+                    sendNotification(userId, "Access Denied for report: " + fileName, "/glif-reports", fileName + "_" + date);
+                    return new AccessDeniedException("Access Denied for report: " + fileName);
+                });
+
+        log.info("Fetched report from db : {}", reportType);
+        // This is the human-readable name (e.g., "Daily Balance Sheet")
+        String reportDisplayName = reportType.getReportName();
+
 
         // 2. Prepare Paths with the CORRECT format "dd-MM-yyyy"
         String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE); 
@@ -1234,12 +1241,14 @@ public class ReportServiceImpl implements ReportService {
                 }
                 
                 // Notification is only sent AFTER all files are confirmed found and streamed
-                sendNotification(userId, "Report(s) downloaded successfully.", "/glif-reports", fileName + "_" + date);
+                String successMsg = String.format("Report %s downloaded successfully.", reportDisplayName);
+                sendNotification(userId, successMsg, "/glif-reports", fileName + "_" + date);
+//                sendNotification(userId, "Report(s) downloaded successfully.", "/glif-reports", fileName + "_" + date);
 
             } catch (ResourceNotFoundException e) {
                 // If a resource error happens before streaming starts, it's caught here
                 log.error("Resource not found error: {}", e.getMessage());
-                sendNotification(userId, "Requested report is not available.", "/glif-reports", fileName + "_" + date);
+                sendNotification(userId, "Requested report "+reportDisplayName+" is not available.", "/glif-reports", fileName + "_" + date);
                 // Note: The controller must catch this exception to return a proper 404
             } catch (IOException e) {
                 // If an I/O error happens DURING streaming, the client will see a failed download
@@ -1270,7 +1279,6 @@ public class ReportServiceImpl implements ReportService {
                 .orElseThrow(() -> new ResourceNotFoundException("Required App Configurations are missing for key: " + REPORTS_START_DATE_KEY));
     }
 }
-
 
 
 
