@@ -1,89 +1,3 @@
-package com.fincore.gateway.dto;
-
-import com.fasterxml.jackson.annotation.JsonInclude;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.Setter;
-
-import java.time.LocalDateTime;
-
-/**
- * Standardized API Response Wrapper.
- * * FIXES:
- * - Renamed factory methods to avoid "Ambiguous method call" compiler errors
- * when T is String.
- * - Added strict typing.
- */
-@Getter
-@Setter
-@NoArgsConstructor
-@JsonInclude(JsonInclude.Include.NON_NULL)
-public class ApiResponse<T> {
-
-    private boolean success;
-    private String message;
-    private T data;
-    private LocalDateTime timestamp;
-
-    private ApiResponse(boolean success, String message, T data) {
-        this.success = success;
-        this.message = message;
-        this.data = data;
-        this.timestamp = LocalDateTime.now();
-    }
-
-    // ==========================================
-    // SUCCESS FACTORY METHODS
-    // ==========================================
-
-    /**
-     * Use when you have BOTH data and a custom message.
-     */
-    public static <T> ApiResponse<T> success(T data, String message) {
-        return new ApiResponse<>(true, message, data);
-    }
-
-    /**
-     * Use when you ONLY have data (Default message: "Operation successful").
-     * Renamed from 'success' to 'successData' to avoid ambiguity.
-     */
-    public static <T> ApiResponse<T> successData(T data) {
-        return new ApiResponse<>(true, "Operation successful", data);
-    }
-
-    /**
-     * Use when you ONLY have a message (Data is null).
-     * Renamed from 'success' to 'successMessage' to avoid ambiguity.
-     */
-    public static <T> ApiResponse<T> successMessage(String message) {
-        return new ApiResponse<>(true, message, null);
-    }
-
-    // ==========================================
-    // ERROR FACTORY METHODS
-    // ==========================================
-
-    public static <T> ApiResponse<T> error(String message) {
-        return new ApiResponse<>(false, message, null);
-    }
-
-    public static <T> ApiResponse<T> error(String message, T data) {
-        return new ApiResponse<>(false, message, data);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.gateway.Controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -199,9 +113,8 @@ public class AuthController {
         log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
 
         if (isIpBlocked(clientIp)) {
-            // Strict type witness <LoginResponseDTO> to match return type
-            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(ApiResponse.<LoginResponseDTO>error("Access denied: Your IP address is blocked.")));
+            ApiResponse<LoginResponseDTO> errorResponse = ApiResponse.error("Access denied: Your IP address is blocked.");
+            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorResponse));
         }
 
         return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
@@ -210,10 +123,9 @@ public class AuthController {
                     // 1. Credentials Check
                     if (!user.isValidCredentials()) {
                         log.warn("Invalid credentials for user: {}", payload.getUserId());
-                        return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                                .body(ApiResponse.<LoginResponseDTO>error(
-                                        user.getMessage() != null ? user.getMessage() : "Invalid credentials"
-                                )));
+                        String msg = user.getMessage() != null ? user.getMessage() : "Invalid credentials";
+                        ApiResponse<LoginResponseDTO> errorResponse = ApiResponse.error(msg);
+                        return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(errorResponse));
                     }
 
                     if (hmacSecret == null || hmacSecret.isBlank()) {
@@ -235,7 +147,6 @@ public class AuthController {
                     response.addCookie(createRefreshTokenCookie(refreshToken));
 
                     // 4. Register Session & Fetch Roles
-                    // We use flatMap/then chaining to ensure Redis write completes before response
                     return validator.registerUserSession(user.getUserId(), jti)
                             .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
                                     .subscribeOn(Schedulers.boundedElastic())))
@@ -251,15 +162,14 @@ public class AuthController {
                                         .roleData(roleData)
                                         .build();
 
-                                // Use correct ApiResponse method
                                 return ResponseEntity.ok(ApiResponse.success(dto, "Login successful"));
                             });
                 })
                 .onErrorResume(e -> {
                     log.error("Login Error for user {}", payload.getUserId(), e);
-                    // FIXED: Strict type witness matching Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>>
-                    return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                            .body(ApiResponse.<LoginResponseDTO>error("Login failed: " + e.getMessage())));
+                    // Explicitly type the response to avoid inference errors in Mono.just
+                    ApiResponse<LoginResponseDTO> errorResponse = ApiResponse.error("Login failed: " + e.getMessage());
+                    return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse));
                 });
     }
 
@@ -269,8 +179,8 @@ public class AuthController {
         String refreshToken = (cookie != null) ? cookie.getValue() : null;
 
         if (refreshToken == null || refreshToken.isBlank()) {
-            return Mono.just(ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                    .body(ApiResponse.<LoginResponseDTO>error("Missing refresh token cookie")));
+            ApiResponse<LoginResponseDTO> errorResponse = ApiResponse.error("Missing refresh token cookie");
+            return Mono.just(ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse));
         }
 
         return Mono.fromCallable(() -> extractClaims(refreshToken))
@@ -323,14 +233,15 @@ public class AuthController {
                                                     });
                                         });
                             })
-                            .switchIfEmpty(Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                                    .body(ApiResponse.<LoginResponseDTO>error("Session expired. Please login again."))));
+                            .switchIfEmpty(Mono.defer(() -> {
+                                ApiResponse<LoginResponseDTO> sessionExpired = ApiResponse.error("Session expired. Please login again.");
+                                return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(sessionExpired));
+                            }));
                 })
                 .onErrorResume(e -> {
                     log.warn("Refresh Token Error: {}", e.getMessage());
-                    // FIXED: Strict type witness matching Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>>
-                    return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
-                            .body(ApiResponse.<LoginResponseDTO>error("Invalid or expired refresh token")));
+                    ApiResponse<LoginResponseDTO> errorResponse = ApiResponse.error("Invalid or expired refresh token");
+                    return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(errorResponse));
                 });
     }
 
@@ -349,8 +260,8 @@ public class AuthController {
         }
 
         if (tokenString == null || tokenString.isBlank()) {
-            // Correct usage of renamed method
-            return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (No active session found)")));
+            ApiResponse<String> successResponse = ApiResponse.successMessage("Logged out (No active session found)");
+            return Mono.just(ResponseEntity.ok(successResponse));
         }
 
         final String finalToken = tokenString;
@@ -368,7 +279,8 @@ public class AuthController {
             String incomingJti = claims.getId();
 
             if (userId == null || incomingJti == null) {
-                return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Invalid token)")));
+                ApiResponse<String> invalidTokenResponse = ApiResponse.successMessage("Logged out (Invalid token)");
+                return Mono.just(ResponseEntity.ok(invalidTokenResponse));
             }
 
             // Blacklist -> Check Active Session -> Clear if Match
@@ -382,12 +294,15 @@ public class AuthController {
                             return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Concurrent session preserved)")));
                         }
                     })
-                    .switchIfEmpty(Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Session already expired)"))));
+                    .switchIfEmpty(Mono.defer(() -> {
+                        ApiResponse<String> alreadyExpired = ApiResponse.successMessage("Logged out (Session already expired)");
+                        return Mono.just(ResponseEntity.ok(alreadyExpired));
+                    }));
         })
         .onErrorResume(e -> {
-             // FIXED: Strict type witness <String> to match Mono<ResponseEntity<ApiResponse<String>>>
-             // Also using successMessage since data is null
-             return Mono.just(ResponseEntity.ok(ApiResponse.<String>successMessage("Logged out (System handled error)")));
+             // Explicitly type the variable to fix Mono.just ambiguity
+             ApiResponse<String> errorHandledResponse = ApiResponse.successMessage("Logged out (System handled error)");
+             return Mono.just(ResponseEntity.ok(errorHandledResponse));
         });
     }
 
@@ -397,8 +312,8 @@ public class AuthController {
         String userId = body.get("userId");
 
         if (isIpBlocked(rawClientIp)) {
-            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(ApiResponse.<VerifyUserDTO>error("Access denied: Your IP address is blocked.")));
+            ApiResponse<VerifyUserDTO> errorResponse = ApiResponse.error("Access denied: Your IP address is blocked.");
+            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorResponse));
         }
 
         return Mono.fromCallable(() -> loginService.checkUser(userId))
