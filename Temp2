@@ -9,13 +9,10 @@ import java.time.LocalDateTime;
 
 /**
  * Standardized API Response Wrapper.
- * * Guarantees a consistent JSON structure for all API responses:
- * {
- * "success": true|false,
- * "message": "...",
- * "data": { ... } | null,
- * "timestamp": "..."
- * }
+ * * FIXES:
+ * - Renamed factory methods to avoid "Ambiguous method call" compiler errors
+ * when T is String.
+ * - Added strict typing.
  */
 @Getter
 @Setter
@@ -35,16 +32,37 @@ public class ApiResponse<T> {
         this.timestamp = LocalDateTime.now();
     }
 
-    // --- Success Factories ---
+    // ==========================================
+    // SUCCESS FACTORY METHODS
+    // ==========================================
+
+    /**
+     * Use when you have BOTH data and a custom message.
+     */
     public static <T> ApiResponse<T> success(T data, String message) {
         return new ApiResponse<>(true, message, data);
     }
 
-    public static <T> ApiResponse<T> success(String message) {
+    /**
+     * Use when you ONLY have data (Default message: "Operation successful").
+     * Renamed from 'success' to 'successData' to avoid ambiguity.
+     */
+    public static <T> ApiResponse<T> successData(T data) {
+        return new ApiResponse<>(true, "Operation successful", data);
+    }
+
+    /**
+     * Use when you ONLY have a message (Data is null).
+     * Renamed from 'success' to 'successMessage' to avoid ambiguity.
+     */
+    public static <T> ApiResponse<T> successMessage(String message) {
         return new ApiResponse<>(true, message, null);
     }
 
-    // --- Error Factories ---
+    // ==========================================
+    // ERROR FACTORY METHODS
+    // ==========================================
+
     public static <T> ApiResponse<T> error(String message) {
         return new ApiResponse<>(false, message, null);
     }
@@ -53,325 +71,6 @@ public class ApiResponse<T> {
         return new ApiResponse<>(false, message, data);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.gateway.Service;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.LoginAttempt;
-import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.model.User;
-import com.fincore.gateway.model.UserRoles;
-import com.fincore.gateway.repository.LoginAttemptRepository;
-import com.fincore.gateway.repository.LoginParamRepository;
-import com.fincore.gateway.repository.RolePermissionsRepository;
-import com.fincore.gateway.repository.UserRepository;
-import com.fincore.gateway.utility.Constants;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-
-@Slf4j
-@Service("LoginService")
-@RequiredArgsConstructor
-public class LoginServiceImpl implements LoginService {
-
-    // Ideally, this should be a Bean. Keeping local as per existing pattern for now.
-    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
-
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long ttlSeconds;
-
-    private final UserRepository userRepository;
-    private final LoginAttemptRepository loginAttemptRepository;
-    private final LoginParamRepository loginParamRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final MenuService menuService;
-    private final ObjectMapper mapper;
-
-    @Transactional(readOnly = true)
-    @Override
-    public MenuResponse fetchRoleWiseData(String userId) {
-        log.info("Fetching role-wise data for userId: {}", userId);
-        try {
-            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
-            if (rows == null || rows.isEmpty()) {
-                return new MenuResponse(Collections.emptyList());
-            }
-            return menuService.transformFromProjection(rows);
-        } catch (Exception e) {
-            log.error("Error fetching permissions for userId: {}", userId, e);
-            return new MenuResponse(Collections.emptyList());
-        }
-    }
-
-    @Transactional
-    @Override
-    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
-        final String userId = userCredentials.getUserId();
-        final String rawPassword = userCredentials.getPassword();
-
-        UserDto result = new UserDto();
-        User user = userRepository.findByUserId(userId);
-
-        if (user == null) {
-            result.setValidCredentials(false);
-            result.setUserStatus(Constants.INVALID);
-            log.info("Login attempt for invalid userId: {}", userId);
-            return result;
-        }
-
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        LoginAttempt attempt = new LoginAttempt();
-        attempt.setLoginMethod(loginParam.getActiveLoginMode() == 'P' ? Constants.PASSWORD_BASED_LOGIN : Constants.SSO_BASED_LOGIN);
-        attempt.setSuccess("N");
-        attempt.setIpAddress(clientIp);
-        attempt.setUserId(userId);
-
-        result.setLoginMethod(loginParam.getActiveLoginMode());
-        result.setUserId(user.getUserId());
-
-        UserRoles userRole = userRepository.getUserRole(userId);
-        result.setRoleStatus(userRole.getRoleStatus());
-        result.setUserStatus(user.getAccountStatus());
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-
-        // 1. Check Role Status
-        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
-            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            result.setMessage("User role is " + userRole.getRoleStatus());
-            return result;
-        }
-
-        // 2. Check User Status
-        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            result.setMessage("User account is " + user.getAccountStatus());
-            return result;
-        }
-
-        // 3. Authenticate
-        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
-            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-            } else {
-                result.setValidCredentials(false);
-                result.setMessage("Password login is currently disabled for this user.");
-                attempt.setFailureReason("Password login disabled");
-            }
-        } else {
-            // SSO
-            attempt.setSuccess("Y");
-            attempt.setFailureReason("SUCCESS");
-            result.setValidCredentials(true);
-
-            // Re-enable password login if it was inactive
-            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                user.setPasswordLogin(Constants.ACTIVE);
-                user.setUserWrongPasswordCount(0);
-                userRepository.save(user);
-            }
-        }
-
-        // 4. Populate Token Data on Success
-        if (result.isValidCredentials()) {
-            UserTokenDataDto tokenData = initializeTokenData(user, userRole);
-            result.setUser(tokenData);
-        }
-
-        loginAttemptRepository.save(attempt);
-        return result;
-    }
-
-    /**
-     * Handles password validation and enforces lock-out policies.
-     * FIX: Unconditionally resets wrong password count on success.
-     */
-    @Transactional
-    @Override
-    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
-        log.info("Processing password login for userId={}", user.getUserId());
-
-        int failedCount = user.getUserWrongPasswordCount();
-        int permitted = loginParam.getWrongPasswordAttempts();
-
-        // Security check: If already locked (though account status should catch this), double check logic
-        if (failedCount >= permitted) {
-            loginAttempt.setFailureReason("Exceeded attempt limit");
-            userInfo.setMessage("Account is locked due to multiple failed attempts.");
-            userInfo.setValidCredentials(false);
-            return;
-        }
-
-        if (encoder.matches(password, user.getPasswordHash())) {
-            // --- SUCCESS ---
-            loginAttempt.setSuccess("Y");
-            loginAttempt.setFailureReason("Success");
-            userInfo.setValidCredentials(true);
-
-            // CRITICAL FIX: Always reset count to 0 on success
-            user.setUserWrongPasswordCount(0);
-            userRepository.save(user);
-            log.info("Login successful. Wrong password count reset for userId={}", user.getUserId());
-            return;
-        }
-
-        // --- FAILURE ---
-        log.warn("Password mismatch for userId={}", user.getUserId());
-        
-        // Logic to increment or lock
-        if (failedCount >= permitted - 1) {
-            // Reached the limit
-            user.setPasswordLogin(Constants.INACTIVE);
-            user.setUserWrongPasswordCount(0); // Resetting to 0 here implies "Locked and reset cycle"
-            log.warn("User {} exceeded password attempts. Account Locked.", user.getUserId());
-            userInfo.setMessage("Invalid credentials. Account has been locked.");
-        } else {
-            // Increment
-            user.setUserWrongPasswordCount(failedCount + 1);
-            userInfo.setMessage("Invalid credentials. Attempts remaining: " + (permitted - failedCount - 1));
-        }
-
-        userRepository.save(user);
-        
-        loginAttempt.setSuccess("N");
-        loginAttempt.setFailureReason("Wrong password");
-        userInfo.setValidCredentials(false);
-        userInfo.setAttemptsLeft(Math.max(0, permitted - failedCount - 1));
-    }
-
-    @Override
-    public String generateStatusMessage(String status, String type) {
-        return String.format("Trying to login with a %s %s", status, type);
-    }
-
-    @Transactional(readOnly = true)
-    public VerifyUserDTO checkUser(String userId) {
-        VerifyUserDTO out = new VerifyUserDTO();
-        out.setUserId(userId);
-
-        User user = userRepository.findByUserId(userId);
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        out.setLoginMethod(loginParam.getActiveLoginMode());
-
-        if (user == null) {
-            out.setUserCheck(false);
-            out.setUserStatus(Constants.INVALID);
-            out.setMessage("Invalid User");
-            return out;
-        }
-
-        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            Timestamp setAt = user.getTempPasswordSetAt();
-            boolean isPasswordValid = false;
-            if (setAt != null) {
-                isPasswordValid = LocalDateTime.now().isBefore(setAt.toLocalDateTime().plusHours(loginParam.getPasswordValidity()));
-            }
-            UserRoles userRole = userRepository.getUserRole(userId);
-            out.setRoleStatus(userRole.getRoleStatus());
-            out.setUpdatePassword(user.getPasswordHash() == null || !isPasswordValid);
-            out.setUserStatus(Constants.ACTIVE);
-            out.setMessage(Constants.ACTIVE_USER);
-            out.setPasswordLoginStatus(user.getPasswordLogin());
-        } else {
-            out.setUserCheck(true);
-            out.setUserStatus(user.getAccountStatus());
-            out.setMessage("User account is " + user.getAccountStatus());
-        }
-        return out;
-    }
-
-    @Transactional
-    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
-        String userId = userCredentials.getUserId();
-        // Clear Sensitive
-        userCredentials.setUpdateFlag(false);
-        
-        try {
-            User user = userRepository.findByUserId(userId);
-            if (user == null) {
-                userCredentials.setMessage("Invalid user id");
-                return userCredentials;
-            }
-            user.setPasswordHash(encoder.encode(userCredentials.getPassword()));
-            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
-            userRepository.save(user);
-
-            userCredentials.setMessage("User password successfully updated");
-            userCredentials.setUpdateFlag(true);
-        } catch (DataIntegrityViolationException e) {
-            log.warn("Data violation during password update: {}", userId);
-            userCredentials.setMessage("Failed to update password");
-        } catch (Exception e) {
-            log.error("Error updating password for {}", userId, e);
-            userCredentials.setMessage("System error while updating password");
-        }
-        
-        userCredentials.setPassword(""); // Ensure password is not returned
-        return userCredentials;
-    }
-
-    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
-        UserTokenDataDto tokenData = new UserTokenDataDto();
-        tokenData.setFirstName(user.getFirstName());
-        tokenData.setLastName(user.getLastName());
-        tokenData.setPhoneNumber(user.getPhoneNumber());
-        tokenData.setUserId(user.getUserId());
-        tokenData.setBranch(user.getBranch());
-        tokenData.setEmail(user.getEmail());
-        tokenData.setRole(userRole.getRole());
-        tokenData.setRoleName(userRole.getRoleName());
-        return tokenData;
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public UserDto getUserProfile(String userId) {
-        User user = userRepository.findByUserId(userId);
-        UserRoles userRole = userRepository.getUserRole(userId);
-        if (user == null) return null;
-
-        UserDto userDto = new UserDto();
-        userDto.setUserId(user.getUserId());
-        userDto.setUserStatus(user.getAccountStatus());
-        userDto.setPasswordLoginStatus(user.getPasswordLogin());
-        userDto.setUser(initializeTokenData(user, userRole));
-        return userDto;
-    }
-}
-
-
-
-
-
 
 
 
@@ -445,7 +144,9 @@ public class AuthController {
     @Value("${security.login.blocked-ips:}")
     private String blockedIpsConfig;
 
-    // --- Helpers ---
+    // ------------------------------------------------------------------------
+    // HELPER METHODS
+    // ------------------------------------------------------------------------
 
     private String sanitizeIp(String rawIp) {
         if (rawIp == null) return "";
@@ -468,7 +169,7 @@ public class AuthController {
     private ResponseCookie createRefreshTokenCookie(String token) {
         return ResponseCookie.from("refresh_token", token)
                 .httpOnly(true)
-                .secure(true) // Should be true in production
+                .secure(true) // Ensure true in production
                 .path("/")
                 .maxAge(Duration.ofSeconds(refreshTokenTtl))
                 .sameSite("Lax")
@@ -488,7 +189,9 @@ public class AuthController {
         return Jwts.parser().verifyWith(Keys.hmacShaKeyFor(secretBytes)).build().parseSignedClaims(token).getPayload();
     }
 
-    // --- Endpoints ---
+    // ------------------------------------------------------------------------
+    // ENDPOINTS
+    // ------------------------------------------------------------------------
 
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
@@ -496,7 +199,7 @@ public class AuthController {
         log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
 
         if (isIpBlocked(clientIp)) {
-            // Strict Type Witnessing for safety
+            // Strict type witness <LoginResponseDTO> to match return type
             return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
                     .body(ApiResponse.<LoginResponseDTO>error("Access denied: Your IP address is blocked.")));
         }
@@ -504,6 +207,7 @@ public class AuthController {
         return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(user -> {
+                    // 1. Credentials Check
                     if (!user.isValidCredentials()) {
                         log.warn("Invalid credentials for user: {}", payload.getUserId());
                         return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -517,7 +221,7 @@ public class AuthController {
                         return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Server Configuration Error"));
                     }
 
-                    // 1. Generate Tokens
+                    // 2. Generate Tokens
                     @SuppressWarnings("unchecked")
                     Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
                     String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
@@ -527,11 +231,11 @@ public class AuthController {
 
                     String jti = extractClaims(accessToken).getId();
 
-                    // 2. Set Cookie
+                    // 3. Set Cookie
                     response.addCookie(createRefreshTokenCookie(refreshToken));
 
-                    // 3. Register Session & Fetch Data
-                    // Note: Returning Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>>
+                    // 4. Register Session & Fetch Roles
+                    // We use flatMap/then chaining to ensure Redis write completes before response
                     return validator.registerUserSession(user.getUserId(), jti)
                             .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
                                     .subscribeOn(Schedulers.boundedElastic())))
@@ -546,13 +250,14 @@ public class AuthController {
                                         .jti(jti)
                                         .roleData(roleData)
                                         .build();
-                                
+
+                                // Use correct ApiResponse method
                                 return ResponseEntity.ok(ApiResponse.success(dto, "Login successful"));
                             });
                 })
                 .onErrorResume(e -> {
                     log.error("Login Error for user {}", payload.getUserId(), e);
-                    // Explicit type witness to ensure type safety with the return signature
+                    // FIXED: Strict type witness matching Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>>
                     return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                             .body(ApiResponse.<LoginResponseDTO>error("Login failed: " + e.getMessage())));
                 });
@@ -576,14 +281,14 @@ public class AuthController {
 
                     return redisTemplate.opsForValue().get(userKey)
                             .flatMap(currentJti -> {
-                                // 1. Fetch Profile
+                                // 1. Fetch User Profile
                                 return Mono.fromCallable(() -> loginService.getUserProfile(userId))
                                         .subscribeOn(Schedulers.boundedElastic())
                                         .flatMap(userDto -> {
                                             if (userDto == null) {
                                                 return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
                                             }
-                                            
+
                                             // 2. Fetch Roles
                                             return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
                                                     .subscribeOn(Schedulers.boundedElastic())
@@ -592,14 +297,14 @@ public class AuthController {
                                                         @SuppressWarnings("unchecked")
                                                         Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
                                                         String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
-                                                        
+
                                                         Map<String, Object> refreshClaims = Map.of("type", "refresh");
                                                         String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-                                                        
+
                                                         String newJti = extractClaims(newAccessToken).getId();
                                                         response.addCookie(createRefreshTokenCookie(newRefreshToken));
 
-                                                        // 4. Update Redis (FIXED: Chained correctly using flatMap, not fire-and-forget)
+                                                        // 4. Update Redis
                                                         return validator.registerUserSession(userId, newJti)
                                                                 .then(Mono.fromCallable(() -> {
                                                                     LoginResponseDTO responseDTO = LoginResponseDTO.builder()
@@ -623,6 +328,7 @@ public class AuthController {
                 })
                 .onErrorResume(e -> {
                     log.warn("Refresh Token Error: {}", e.getMessage());
+                    // FIXED: Strict type witness matching Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>>
                     return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                             .body(ApiResponse.<LoginResponseDTO>error("Invalid or expired refresh token")));
                 });
@@ -643,7 +349,8 @@ public class AuthController {
         }
 
         if (tokenString == null || tokenString.isBlank()) {
-            return Mono.just(ResponseEntity.ok(ApiResponse.success("Logged out (No active session found)")));
+            // Correct usage of renamed method
+            return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (No active session found)")));
         }
 
         final String finalToken = tokenString;
@@ -652,7 +359,7 @@ public class AuthController {
             try {
                 return extractClaims(finalToken);
             } catch (ExpiredJwtException e) {
-                // Allow logout even if token expired
+                // Allow logout flow to continue even if token is expired
                 return e.getClaims();
             }
         }).subscribeOn(Schedulers.boundedElastic())
@@ -661,25 +368,26 @@ public class AuthController {
             String incomingJti = claims.getId();
 
             if (userId == null || incomingJti == null) {
-                return Mono.just(ResponseEntity.ok(ApiResponse.success("Logged out (Invalid token)")));
+                return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Invalid token)")));
             }
 
-            // Blacklist token -> Check Redis -> Clear Session if matches
+            // Blacklist -> Check Active Session -> Clear if Match
             return validator.blacklistToken(incomingJti)
                     .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
                     .flatMap(activeJti -> {
                         if (activeJti != null && activeJti.equals(incomingJti)) {
                             return validator.clearUserSession(userId)
-                                    .then(Mono.just(ResponseEntity.ok(ApiResponse.success("Logged out successfully"))));
+                                    .then(Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out successfully"))));
                         } else {
-                            return Mono.just(ResponseEntity.ok(ApiResponse.success("Logged out (Concurrent session preserved)")));
+                            return Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Concurrent session preserved)")));
                         }
                     })
-                    .switchIfEmpty(Mono.just(ResponseEntity.ok(ApiResponse.success("Logged out (Session already expired)"))));
+                    .switchIfEmpty(Mono.just(ResponseEntity.ok(ApiResponse.successMessage("Logged out (Session already expired)"))));
         })
         .onErrorResume(e -> {
-             // Explicit Type Witness to match Mono<ResponseEntity<ApiResponse<String>>>
-             return Mono.just(ResponseEntity.ok(ApiResponse.<String>success("Logged out (System handled error)")));
+             // FIXED: Strict type witness <String> to match Mono<ResponseEntity<ApiResponse<String>>>
+             // Also using successMessage since data is null
+             return Mono.just(ResponseEntity.ok(ApiResponse.<String>successMessage("Logged out (System handled error)")));
         });
     }
 
@@ -718,81 +426,5 @@ public class AuthController {
                 });
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.gateway.advice;
-
-import com.fincore.gateway.dto.ApiResponse;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.JwtException;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.support.DefaultMessageSourceResolvable;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.bind.support.WebExchangeBindException;
-import org.springframework.web.server.ResponseStatusException;
-
-import java.util.stream.Collectors;
-
-/**
- * Handles exceptions globally for the WebFlux application and returns
- * standardized ApiResponse structures.
- */
-@Slf4j
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(ResponseStatusException.class)
-    public ResponseEntity<ApiResponse<Void>> handleResponseStatusException(ResponseStatusException ex) {
-        log.warn("API Error: {}", ex.getReason());
-        return ResponseEntity
-                .status(ex.getStatusCode())
-                .body(ApiResponse.error(ex.getReason()));
-    }
-
-    @ExceptionHandler(WebExchangeBindException.class)
-    public ResponseEntity<ApiResponse<Void>> handleValidationException(WebExchangeBindException ex) {
-        String errors = ex.getBindingResult().getAllErrors().stream()
-                .map(DefaultMessageSourceResolvable::getDefaultMessage)
-                .collect(Collectors.joining(", "));
-        log.warn("Validation Failed: {}", errors);
-        return ResponseEntity
-                .status(HttpStatus.BAD_REQUEST)
-                .body(ApiResponse.error("Validation failed: " + errors));
-    }
-
-    @ExceptionHandler({ExpiredJwtException.class, JwtException.class})
-    public ResponseEntity<ApiResponse<Void>> handleJwtException(Exception ex) {
-        log.error("Security Error: {}", ex.getMessage());
-        return ResponseEntity
-                .status(HttpStatus.UNAUTHORIZED)
-                .body(ApiResponse.error("Invalid or expired token"));
-    }
-
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiResponse<Void>> handleGeneralException(Exception ex) {
-        log.error("Unexpected System Error", ex);
-        return ResponseEntity
-                .status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(ApiResponse.error("An unexpected system error occurred."));
-    }
-}
-
-
-
 
 
