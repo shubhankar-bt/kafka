@@ -66,7 +66,7 @@ public class AuthController {
     private String blockedIpsConfig;
 
     // =================================================================================================
-    // HELPERS
+    //                                              HELPERS
     // =================================================================================================
 
     private String sanitizeIp(String rawIp) {
@@ -127,11 +127,12 @@ public class AuthController {
     }
 
     // =================================================================================================
-    // ENDPOINTS
+    //                                           ENDPOINTS
     // =================================================================================================
 
     @PostMapping(value = "/check-user")
-    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body) {
+    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
+    {
         final String rawClientIp = LoginUtility.getClientIp(request);
         log.info("Check-User info user id: {} , ip : {}", body.get("userId"), rawClientIp);
 
@@ -161,47 +162,70 @@ public class AuthController {
      * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
      */
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
+    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(
+            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload)
+    {
         final String clientIp = LoginUtility.getClientIp(request);
         log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
 
         // 1. IP BLOCK CHECK
         if (isIpBlocked(clientIp)) {
-            log.warn("Login BLOCKED for user: {} from IP: {}", payload.getUserId(), clientIp);
-            return Mono.error(new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied: Your IP address is blocked."));
+            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
         }
 
         return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(user -> {
+
+                    // =========================================================
+                    // CASE 1: INVALID CREDENTIALS (Wrong Password / Locked)
+                    // =========================================================
                     if (!user.isValidCredentials()) {
-                        log.warn("Invalid credentials for user: {}", payload.getUserId());
-                        return Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED,
-                                user.getMessage() != null ? user.getMessage() : "Invalid credentials"));
+                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
+
+                        // Build response to show Attempts Left
+                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .userStatus(user.getUserStatus())
+                                .passwordLoginStatus(user.getPasswordLoginStatus())
+                                .attemptsLeft(user.getAttemptsLeft()) // <--- PASS COUNT TO FRONTEND
+                                .error(user.getMessage())
+                                .build();
+
+                        // Determine status code: 403 if Locked, 401 if just wrong password
+                        HttpStatus status = (user.getAttemptsLeft() == 0 || "INACTIVE".equals(user.getPasswordLoginStatus()))
+                                ? HttpStatus.FORBIDDEN
+                                : HttpStatus.UNAUTHORIZED;
+
+                        return Mono.just(ResponseEntity.status(status)
+                                .body(ApiResponse.success(errorResponse, user.getMessage())));
                     }
 
+                    // =========================================================
+                    // CASE 2: CONFIG ERROR
+                    // =========================================================
                     if (hmacSecret == null || hmacSecret.isBlank()) {
-                        log.error("Server Config Error: HMAC secret is missing.");
-                        return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Config Error"));
+                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
                     }
 
-                    // 1. Generate Tokens
+                    // =========================================================
+                    // CASE 3: SUCCESS
+                    // =========================================================
                     @SuppressWarnings("unchecked")
                     Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
-                    // Access Token (Short TTL)
+
                     String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
 
-                    // Refresh Token (Long TTL)
                     Map<String, Object> refreshClaims = Map.of("type", "refresh");
                     String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
 
                     String jti = extractClaims(accessToken).getId();
 
-                    // 2. Set Refresh Token in HttpOnly Cookie
                     response.addCookie(createRefreshTokenCookie(refreshToken));
-                    log.info("Login Success. Access Token TTL: {}s. Refresh Cookie Set.", accessTokenTtl);
 
-                    // 3. Register Session (JTI) in Redis & Fetch Menus
                     return validator.registerUserSession(user.getUserId(), jti)
                             .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
                                     .subscribeOn(Schedulers.boundedElastic())))
@@ -217,12 +241,12 @@ public class AuthController {
                                         .roleData(roleData)
                                         .userStatus(user.getUserStatus())
                                         .passwordLoginStatus(user.getPasswordLoginStatus())
+                                        .attemptsLeft(null) // No need to show attempts on success
                                         .build();
 
-                                return ApiResponse.success(loginResponse, "Login successful");
+                                return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
                             });
                 });
-        // Note: onErrorResume is removed because GlobalAuthExceptionHandler handles errors now
     }
 
 
@@ -234,7 +258,8 @@ public class AuthController {
      * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
      */
     @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
+    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response)
+    {
 
         org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
         String refreshToken = (cookie != null) ? cookie.getValue() : null;
@@ -317,7 +342,9 @@ public class AuthController {
      * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
      */
     @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
+    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
+            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response)
+    {
 
         // 1. Always clear the Refresh Token Cookie (Idempotent)
         response.addCookie(createEmptyCookie());
@@ -427,8 +454,6 @@ public class AuthController {
                 .map(result -> ApiResponse.success(result, result.getMessage()));
     }
 }
-
-
 
 
 
@@ -679,14 +704,9 @@ package com.fincore.gateway.Service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.MenuResponse;
-import com.fincore.gateway.dto.UpdatePasswordDTO;
-import com.fincore.gateway.dto.UserDto;
-import com.fincore.gateway.dto.UserTokenDataDto;
-import com.fincore.gateway.dto.VerifyUserDTO;
+import com.fincore.gateway.dto.*;
 import com.fincore.gateway.model.LoginAttempt;
 import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.dto.PermissionRow;
 import com.fincore.gateway.model.User;
 import com.fincore.gateway.model.UserRoles;
 import com.fincore.gateway.repository.LoginAttemptRepository;
@@ -707,7 +727,6 @@ import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * Service implementation handling user login/verification, menu resolution, and password updates.
@@ -739,27 +758,24 @@ public class LoginServiceImpl implements LoginService {
 
 
     // ======= Config =======
+    private final UserRepository userRepository;
+    private final LoginAttemptRepository loginAttemptRepository;
 
+    // ======= Dependencies =======
+    private final LoginParamRepository loginParamRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final MenuService menuService;
+    private final ObjectMapper mapper;
     /**
      * Base64-encoded HMAC secret used to sign HS256 JWTs.
      */
     @Value("${security.jwt.hmac-base64-secret:}")
     private String hmacSecret;
-
     /**
      * Token time-to-live in seconds.
      */
     @Value("${security.jwt.ttl-seconds:900}")
     private long ttlSeconds;
-
-    // ======= Dependencies =======
-
-    private final UserRepository userRepository;
-    private final LoginAttemptRepository loginAttemptRepository;
-    private final LoginParamRepository loginParamRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final MenuService menuService;
-    private final ObjectMapper mapper;
 
     // ======= Public API =======
 
@@ -895,6 +911,9 @@ public class LoginServiceImpl implements LoginService {
 
     /**
      * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
+     * 1. Increments count on failure.
+     * 2. Calculates remaining attempts.
+     * 3. Locks account immediately if limit reached.
      *
      * @param password     raw password from the request
      * @param loginAttempt login attempt entity to be updated with success/failure
@@ -902,23 +921,20 @@ public class LoginServiceImpl implements LoginService {
      * @param user         the user entity being authenticated
      * @param loginParam   login parameter configuration (e.g., permitted attempts)
      */
-    /**
-     * UPDATED LOGIC:
-     * Unconditionally resets the wrong password count to 0 upon a successful login.
-     */
     @Transactional
     @Override
     public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
         log.info("Password-based login for userId={}", user.getUserId());
 
-        int failedCount = user.getUserWrongPasswordCount();
-        int permitted = loginParam.getWrongPasswordAttempts();
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
 
-        // 1. Check if already beyond limit (Double check, though account status usually catches this)
-        if (failedCount >= permitted) {
-            loginAttempt.setFailureReason("Exceeded attempt limit");
-            userInfo.setMessage("Account is locked due to multiple failed attempts.");
+        // 1. Check if ALREADY locked (Double safety, though verifyUserCredentials checks status earlier)
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            loginAttempt.setFailureReason("Account Locked");
             userInfo.setValidCredentials(false);
+            userInfo.setMessage("Your account is locked. Please reset password or contact admin.");
+            userInfo.setAttemptsLeft(0);
             return;
         }
 
@@ -928,39 +944,57 @@ public class LoginServiceImpl implements LoginService {
             loginAttempt.setSuccess("Y");
             loginAttempt.setFailureReason("Success");
             userInfo.setValidCredentials(true);
+            userInfo.setMessage("Login Successful");
 
-            // FIX: Unconditionally reset the counter on ANY success
+            // Reset count on success
             user.setUserWrongPasswordCount(0);
             userRepository.save(user);
-            log.info("User {} login successful. Wrong password count reset to 0.", user.getUserId());
             return;
         }
 
         // --- FAILURE CASE ---
         log.warn("Password mismatch for user {}", user.getUserId());
 
-        // Check if this failure pushes them over the limit
-        if (failedCount >= permitted - 1) {
-            // Lock the account
+        // Increment the count immediately
+        int newFailedCount = currentFailedCount + 1;
+        user.setUserWrongPasswordCount(newFailedCount);
+        loginAttempt.setSuccess("N");
+
+        // Mark credentials invalid
+        userInfo.setValidCredentials(false);
+
+        // If max attempts reached → LOCK ACCOUNT
+        if (newFailedCount >= maxAllowed) {
             user.setPasswordLogin(Constants.INACTIVE);
-            // Optional: Reset count to 0 so when admin unlocks, they start fresh?
-            // Or keep it max to show why it was locked?
-            // Logic: Set to 0 usually implies "Session Closed".
-            // But here we just set status to INACTIVE.
-            user.setUserWrongPasswordCount(0);
-            log.warn("User {} exceeded password attempts. Account Locked.", user.getUserId());
+            user.setAccountStatus(Constants.LOCKED);
+            loginAttempt.setFailureReason("Account Locked: Maximum Login Attempts Reached");
+            userInfo.setMessage(
+                    "Your account has been locked due to multiple unsuccessful login attempts. "
+                            + "Please reset your password or contact support."
+            );
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
         } else {
-            // Increment count
-            user.setUserWrongPasswordCount(failedCount + 1);
+            int remaining = maxAllowed - newFailedCount;
+            loginAttempt.setFailureReason("Wrong Password");
+            // Conditional professional messages
+            if (remaining > 1) {
+                // First & second wrong attempt
+                userInfo.setMessage(
+                        "Incorrect password. Please check your credentials and try again."
+                );
+            } else {
+                // Last attempt warning
+                userInfo.setMessage(
+                        "Incorrect password. ⚠️ This is your final attempt. "
+                                + "One more failed login will lock your account."
+                );
+            }
+            userInfo.setAttemptsLeft(remaining);
         }
 
+        // Persist user state
         userRepository.save(user);
-
-        loginAttempt.setSuccess("N");
-        loginAttempt.setFailureReason("Wrong password");
-        userInfo.setValidCredentials(false);
-        userInfo.setMessage("Invalid credentials");
-        userInfo.setAttemptsLeft(Math.max(0, permitted - failedCount - 1));
     }
 
     /**
@@ -1021,8 +1055,9 @@ public class LoginServiceImpl implements LoginService {
             String accountStatus = user.getAccountStatus();
             out.setUserCheck(true);
             out.setUserStatus(accountStatus);
+//            out.setPasswordLoginStatus(user.getPasswordLogin());
             out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Locked User"
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please reset password or contact admin."
                             : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
             );
         }
@@ -1095,7 +1130,6 @@ public class LoginServiceImpl implements LoginService {
     }
 
 
-
     /**
      * Retrieves the full user profile for Token Refresh.
      * Uses the exact same structure as verifyUserCredentials to ensure token claims are identical.
@@ -1118,8 +1152,6 @@ public class LoginServiceImpl implements LoginService {
         return userDto;
     }
 }
-
-
 
 
 
@@ -2639,8 +2671,10 @@ public class ChildMenu {
 
 package com.fincore.gateway.dto;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 /**
  * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
@@ -2657,6 +2691,8 @@ import lombok.Data;
  */
 @Data
 @Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class LoginResponseDTO implements UserLoginDTO {
 
     /**
@@ -2713,9 +2749,18 @@ public class LoginResponseDTO implements UserLoginDTO {
      * The status specific to the password validation result (e.g., SUCCESS, EXPIRED, TEMP_PASSWORD).
      */
     private String passwordLoginStatus;
+
+    /**
+     * Re-generated token for continue session valid for 12 hours
+     */
+    private String refreshToken;
+
+    /**
+     * Invalid password attempt count
+     */
+    private Integer attemptsLeft;
+
 }
-
-
 
 
 
