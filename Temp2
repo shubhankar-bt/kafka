@@ -1,475 +1,99 @@
-spring.application.name=DashboardService
-spring.profiles.active=dev
-server.port=9015
-
-# --- Management & Actuator ---
-management.endpoints.web.exposure.include=*
-management.endpoint.health.show-details=always
-info.app.name=DashboardService
-info.app.description=Service for managing Different Screen requests.
-info.app.version=1.0.0
-
-spring.jackson.date-format=dd/MM/yyyy
-spring.jackson.serialization.write-dates-as-timestamps=false
-
-# --- Redis Configuration ---
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
-spring.cache.type=redis
-
-# --- Security ---
-jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
-
-# ===================================================================
-# MULTI-DATASOURCE CONFIGURATION
-# ===================================================================
-
-# --- 1. Primary DataSource (Oracle) ---
-# Used for existing Dashboard Logic, Auth, CommonReq, etc.
-spring.datasource.oracle.jdbc-url=jdbc:oracle:thin:@//localhost:1521/XEPDB1
-spring.datasource.oracle.username=FINCORE
-spring.datasource.oracle.password=password
-spring.datasource.oracle.driver-class-name=oracle.jdbc.OracleDriver
-# Hibernate specific config for Oracle
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
-spring.jpa.show-sql=true
-
-# --- 2. Secondary DataSource (Hive / Thrift / Delta Lake) ---
-# Used for Data Lake connectivity
-spring.datasource.hive.jdbc-url=jdbc:hive2://spark-thrift:10000/default
-spring.datasource.hive.username=hive
-spring.datasource.hive.password=hive
-spring.datasource.hive.driver-class-name=org.apache.hive.jdbc.HiveDriver
-# Validation query to ensure connection is alive (Hive specific)
-spring.datasource.hive.test-on-borrow=true
-spring.datasource.hive.validation-query=SELECT 1
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.config;
-
-import jakarta.persistence.EntityManagerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
-import org.springframework.orm.jpa.JpaTransactionManager;
-import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.annotation.EnableTransactionManagement;
-
-import javax.sql.DataSource;
-import java.util.HashMap;
-import java.util.Map;
-
-/**
- * PRIMARY DATASOURCE CONFIGURATION (Oracle)
- * * This class ensures that all existing JPA Repositories and Entities 
- * continue to work using the Oracle database.
- * * We mark beans as @Primary so Spring injects this datasource by default
- * into existing services.
- */
-@Configuration
-@EnableTransactionManagement
-@EnableJpaRepositories(
-        basePackages = "com.fincore.DashboardService.repository", // Location of existing Repos
-        entityManagerFactoryRef = "oracleEntityManagerFactory",
-        transactionManagerRef = "oracleTransactionManager"
-)
-public class OracleDbConfig {
-
-    @Primary
-    @Bean(name = "oracleDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.oracle")
-    public DataSource oracleDataSource() {
-        return DataSourceBuilder.create().build();
-    }
-
-    @Primary
-    @Bean(name = "oracleEntityManagerFactory")
-    public LocalContainerEntityManagerFactoryBean oracleEntityManagerFactory(
-            EntityManagerFactoryBuilder builder,
-            @Qualifier("oracleDataSource") DataSource dataSource) {
-        
-        Map<String, Object> properties = new HashMap<>();
-        properties.put("hibernate.dialect", "org.hibernate.dialect.OracleDialect");
-        properties.put("hibernate.hbm2ddl.auto", "update"); // Or 'validate' for prod
-
-        return builder
-                .dataSource(dataSource)
-                .packages("com.fincore.DashboardService.model") // Location of existing Entities
-                .persistenceUnit("oracle")
-                .properties(properties)
-                .build();
-    }
-
-    @Primary
-    @Bean(name = "oracleTransactionManager")
-    public PlatformTransactionManager oracleTransactionManager(
-            @Qualifier("oracleEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
-        return new JpaTransactionManager(entityManagerFactory);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.config;
-
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.core.JdbcTemplate;
-
-import javax.sql.DataSource;
-
-/**
- * SECONDARY DATASOURCE CONFIGURATION (Hive/Thrift)
- * * Configures the connection to the Data Lake (Delta Lake).
- * Uses JdbcTemplate for direct SQL execution, suitable for analytics queries.
- */
-@Configuration
-public class HiveDbConfig {
-
-    @Bean(name = "hiveDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.hive")
-    public DataSource hiveDataSource() {
-        return DataSourceBuilder.create().build();
-    }
-
-    @Bean(name = "hiveJdbcTemplate")
-    public JdbcTemplate hiveJdbcTemplate(@Qualifier("hiveDataSource") DataSource dataSource) {
-        return new JdbcTemplate(dataSource);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class DataLakeUpdateDto {
-    private String id;
-    private String name;
-}
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class DataLakeRecordDto {
-    private String id;
-    private String name;
-    // Add other columns from testtable2 if needed
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.repository;
-
-import com.fincore.DashboardService.dto.DataLakeRecordDto;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.RowMapper;
-import org.springframework.stereotype.Repository;
-
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.List;
-
-@Repository
-public class DataLakeRepository {
-
-    private final JdbcTemplate hiveJdbcTemplate;
-
-    // Table Constants
-    private static final String DB_NAME = "fincoredatalakefinal";
-    private static final String TABLE_NAME = "testtable2";
-
-    // Constructor Injection specifying the hiveJdbcTemplate bean
-    public DataLakeRepository(@Qualifier("hiveJdbcTemplate") JdbcTemplate hiveJdbcTemplate) {
-        this.hiveJdbcTemplate = hiveJdbcTemplate;
-    }
-
-    /**
-     * Fetch all records from the Data Lake table.
-     */
-    public List<DataLakeRecordDto> findAll() {
-        String sql = String.format("SELECT * FROM %s.%s", DB_NAME, TABLE_NAME);
-        return hiveJdbcTemplate.query(sql, new DataLakeRowMapper());
-    }
-
-    /**
-     * Update the name for a specific ID.
-     * Note: Delta Lake on Hive/Thrift supports ANSI Update if the underlying engine allows it.
-     */
-    public int updateName(String id, String newName) {
-        String sql = String.format("UPDATE %s.%s SET name = ? WHERE id = ?", DB_NAME, TABLE_NAME);
-        return hiveJdbcTemplate.update(sql, newName, id);
-    }
-
-    // RowMapper to convert ResultSet to Java Object
-    private static class DataLakeRowMapper implements RowMapper<DataLakeRecordDto> {
-        @Override
-        public DataLakeRecordDto mapRow(ResultSet rs, int rowNum) throws SQLException {
-            return DataLakeRecordDto.builder()
-                    // Assuming columns in Hive are named 'id' and 'name'
-                    .id(rs.getString("id"))
-                    .name(rs.getString("name"))
-                    .build();
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.service;
-
-import com.fincore.DashboardService.dto.DataLakeRecordDto;
-import com.fincore.DashboardService.dto.DataLakeUpdateDto;
-import com.fincore.DashboardService.repository.DataLakeRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DataLakeService {
-
-    private final DataLakeRepository dataLakeRepository;
-
-    public List<DataLakeRecordDto> getAllRecords() {
-        log.info("Fetching all records from Data Lake: fincoredatalakefinal.testtable2");
-        return dataLakeRepository.findAll();
-    }
-
-    public boolean updateRecord(DataLakeUpdateDto payload) {
-        log.info("Initiating Update on Data Lake for ID: {}", payload.getId());
-        
-        try {
-            int rowsAffected = dataLakeRepository.updateName(payload.getId(), payload.getName());
-            if (rowsAffected > 0) {
-                log.info("Successfully updated name to '{}' for ID: {}", payload.getName(), payload.getId());
-                return true;
-            } else {
-                log.warn("No records found with ID: {}", payload.getId());
-                return false;
-            }
-        } catch (Exception e) {
-            log.error("Error updating Data Lake: {}", e.getMessage());
-            throw new RuntimeException("Data Lake Update Failed: " + e.getMessage());
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.controller;
-
-import com.fincore.DashboardService.dto.ApiResponse;
-import com.fincore.DashboardService.dto.DataLakeRecordDto;
-import com.fincore.DashboardService.dto.DataLakeUpdateDto;
-import com.fincore.DashboardService.service.DataLakeService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
-
-/**
- * Controller for Data Lake interactions (Hive/Thrift).
- * Separated from DashboardController to maintain Single Responsibility Principle.
- */
-@RestController
-@RequestMapping("/datalake")
-@RequiredArgsConstructor
-public class DataLakeController {
-
-    private final DataLakeService dataLakeService;
-
-    @GetMapping("/records")
-    public ResponseEntity<ApiResponse<List<DataLakeRecordDto>>> getAllRecords() {
-        List<DataLakeRecordDto> data = dataLakeService.getAllRecords();
-        return ResponseEntity.ok(ApiResponse.success(data, "Records fetched from Data Lake successfully"));
-    }
-
-    @PutMapping("/update")
-    public ResponseEntity<ApiResponse<String>> updateRecord(@RequestBody DataLakeUpdateDto payload) {
-        if (payload.getId() == null || payload.getName() == null) {
-            return ResponseEntity.badRequest()
-                    .body(ApiResponse.success(null, "Invalid Payload: ID and Name are required"));
-        }
-
-        boolean success = dataLakeService.updateRecord(payload);
-
-        if (success) {
-            return ResponseEntity.ok(ApiResponse.success("Success", "Record updated successfully"));
-        } else {
-            return ResponseEntity.status(404)
-                    .body(ApiResponse.success("Failed", "ID not found or update failed"));
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-<!-- ===================================================================== -->
-<!--  ADD THESE DEPENDENCIES FOR HIVE / THRIFT SERVER CONNECTIVITY         -->
-<!-- ===================================================================== -->
-
-<dependency>
-    <groupId>org.apache.hive</groupId>
-    <artifactId>hive-jdbc</artifactId>
-    <!-- Use version 3.1.3 or match your Spark/Hive cluster version -->
-    <version>3.1.3</version> 
-    <exclusions>
-        <!-- CRITICAL: Exclude old logging to prevent conflicts with Spring Boot (Logback) -->
-        <exclusion>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-slf4j-impl</artifactId>
-        </exclusion>
-        <!-- Exclude embedded Jetty server often bundled with Hive -->
-        <exclusion>
-            <groupId>org.eclipse.jetty.aggregate</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <!-- Exclude Tomcat servlet APIs if they conflict with Spring Boot's Tomcat -->
-        <exclusion>
-            <groupId>javax.servlet</groupId>
-            <artifactId>servlet-api</artifactId>
-        </exclusion>
-    </exclusions>
-</dependency>
-
-<!-- 
-    Required for connection pooling with Hive if not already present.
-    Spring Boot usually handles this, but Hive sometimes needs specific 
-    Hadoop common libs if the connection handshake fails.
--->
-<dependency>
-    <groupId>org.apache.hadoop</groupId>
-    <artifactId>hadoop-common</artifactId>
-    <version>3.3.4</version>
-    <exclusions>
-        <exclusion>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-        </exclusion>
-    </exclusions>
-</dependency>
-
-
-
-
-
-
+HikariPool-1 - Added connection oracle.jdbc.driver.T4CConnection@320f29b3
+2025-12-30T13:08:56.029+05:30  INFO 3768 --- [DashboardService] [  restartedMain] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.
+2025-12-30T13:08:56.206+05:30  WARN 3768 --- [DashboardService] [  restartedMain] org.hibernate.orm.deprecation            : HHH90000025: OracleDialect does not need to be specified explicitly using 'hibernate.dialect' (remove the property setting and it will be selected by default)
+2025-12-30T13:08:57.100+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.h.e.t.j.p.i.JtaPlatformInitiator       : HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)
+Hibernate: alter table ANNOUNCEMENTS modify CREATED_BY varchar2(255 char)
+Hibernate: alter table ANNOUNCEMENTS modify IS_ACTIVE varchar2(255 char)
+Hibernate: alter table ANNOUNCEMENTS modify MESSAGE varchar2(255 char)
+Hibernate: alter table ANNOUNCEMENTS modify SEVERITY varchar2(255 char)
+Hibernate: alter table ANNOUNCEMENTS modify TITLE varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify BATCH_ID varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify CHANGE_TYPE varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify CREATOR_ID varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify EXECUTOR_ID varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify JOURNAL_ID varchar2(255 char)
+Hibernate: alter table JOURNAL_REQUEST modify REQ_STATUS varchar2(255 char)
+Hibernate: alter table PERMISSIONS modify MAPPED_REQUEST_TYPE varchar2(50 char)
+Hibernate: alter table PERMISSIONS modify MENU_ACTION varchar2(200 char)
+Hibernate: alter table PERMISSIONS modify MENU_COMPONENT_PATH varchar2(200 char)
+Hibernate: alter table PERMISSIONS modify MENU_ICON varchar2(100 char)
+Hibernate: alter table PERMISSIONS modify MENU_SUBMENU varchar2(100 char)
+Hibernate: alter table PERMISSIONS modify MENU_TITLE varchar2(100 char)
+Hibernate: alter table PERMISSIONS modify MENU_URL varchar2(200 char)
+2025-12-30T13:08:59.158+05:30  INFO 3768 --- [DashboardService] [  restartedMain] j.LocalContainerEntityManagerFactoryBean : Initialized JPA EntityManagerFactory for persistence unit 'oracle'
+2025-12-30T13:08:59.803+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.s.d.j.r.query.QueryEnhancerFactory     : Hibernate is in classpath; If applicable, HQL parser will be used.
+2025-12-30T13:09:00.443+05:30  WARN 3768 --- [DashboardService] [  restartedMain] JpaBaseConfiguration$JpaWebConfiguration : spring.jpa.open-in-view is enabled by default. Therefore, database queries may be performed during view rendering. Explicitly configure spring.jpa.open-in-view to disable this warning
+2025-12-30T13:09:00.471+05:30  WARN 3768 --- [DashboardService] [  restartedMain] .s.s.UserDetailsServiceAutoConfiguration : 
+
+Using generated security password: 1323f9ef-acb7-494f-9512-d645ac4e5073
+
+This generated password is for development use only. Your security configuration must be updated before running your application in production.
+
+2025-12-30T13:09:00.487+05:30  INFO 3768 --- [DashboardService] [  restartedMain] r$InitializeUserDetailsManagerConfigurer : Global AuthenticationManager configured with UserDetailsService bean with name inMemoryUserDetailsManager
+2025-12-30T13:09:00.967+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.s.b.a.e.web.EndpointLinksResolver      : Exposing 14 endpoints beneath base path '/actuator'
+2025-12-30T13:09:01.073+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.s.s.web.DefaultSecurityFilterChain     : Will secure any request with [org.springframework.security.web.session.DisableEncodeUrlFilter@8e4394f, org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter@1d8cf12b, org.springframework.security.web.context.SecurityContextHolderFilter@7d71729, org.springframework.security.web.header.HeaderWriterFilter@6c41410e, org.springframework.web.filter.CorsFilter@32beff04, org.springframework.security.web.authentication.logout.LogoutFilter@634f8a77, com.fincore.commonutilities.security.ContextRbacFilter@5b8f124d, org.springframework.security.web.savedrequest.RequestCacheAwareFilter@787bb7ea, org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter@1680a956, org.springframework.security.web.authentication.AnonymousAuthenticationFilter@72887632, org.springframework.security.web.session.SessionManagementFilter@4a0dec5c, org.springframework.security.web.access.ExceptionTranslationFilter@179667c6, org.springframework.security.web.access.intercept.AuthorizationFilter@52d54e6]
+2025-12-30T13:09:01.538+05:30  WARN 3768 --- [DashboardService] [  restartedMain] o.s.b.d.a.OptionalLiveReloadServer       : Unable to start LiveReload server
+2025-12-30T13:09:01.605+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.a.c.c.C.[Tomcat].[localhost].[/]       : Marking servlet [jsp] as unavailable
+2025-12-30T13:09:01.612+05:30  WARN 3768 --- [DashboardService] [  restartedMain] ConfigServletWebServerApplicationContext : Exception encountered during context initialization - cancelling refresh attempt: org.springframework.context.ApplicationContextException: Failed to start bean 'webServerStartStop'
+2025-12-30T13:09:01.624+05:30  INFO 3768 --- [DashboardService] [  restartedMain] j.LocalContainerEntityManagerFactoryBean : Closing JPA EntityManagerFactory for persistence unit 'oracle'
+2025-12-30T13:09:01.624+05:30  INFO 3768 --- [DashboardService] [  restartedMain] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown initiated...
+2025-12-30T13:09:01.811+05:30  INFO 3768 --- [DashboardService] [  restartedMain] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Shutdown completed.
+2025-12-30T13:09:01.817+05:30  INFO 3768 --- [DashboardService] [  restartedMain] o.apache.catalina.core.StandardService   : Stopping service [Tomcat]
+2025-12-30T13:09:01.827+05:30  INFO 3768 --- [DashboardService] [  restartedMain] .s.b.a.l.ConditionEvaluationReportLogger : 
+
+Error starting ApplicationContext. To display the condition evaluation report re-run your application with 'debug' enabled.
+2025-12-30T13:09:01.842+05:30 ERROR 3768 --- [DashboardService] [  restartedMain] o.s.boot.SpringApplication               : Application run failed
+
+org.springframework.context.ApplicationContextException: Failed to start bean 'webServerStartStop'
+	at org.springframework.context.support.DefaultLifecycleProcessor.doStart(DefaultLifecycleProcessor.java:291) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.DefaultLifecycleProcessor$LifecycleGroup.start(DefaultLifecycleProcessor.java:471) ~[spring-context-6.1.8.jar:6.1.8]
+	at java.base/java.lang.Iterable.forEach(Iterable.java:75) ~[na:na]
+	at org.springframework.context.support.DefaultLifecycleProcessor.startBeans(DefaultLifecycleProcessor.java:260) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.DefaultLifecycleProcessor.onRefresh(DefaultLifecycleProcessor.java:205) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.AbstractApplicationContext.finishRefresh(AbstractApplicationContext.java:981) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:627) ~[spring-context-6.1.8.jar:6.1.8]
+	at org.springframework.boot.web.servlet.context.ServletWebServerApplicationContext.refresh(ServletWebServerApplicationContext.java:146) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.refresh(SpringApplication.java:754) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.refreshContext(SpringApplication.java:456) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:335) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1363) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1352) ~[spring-boot-3.3.0.jar:3.3.0]
+	at com.fincore.DashboardService.DashboardServiceApplication.main(DashboardServiceApplication.java:10) ~[classes/:na]
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
+	at org.springframework.boot.devtools.restart.RestartLauncher.run(RestartLauncher.java:50) ~[spring-boot-devtools-3.3.0.jar:3.3.0]
+Caused by: org.springframework.boot.web.server.WebServerException: Unable to start embedded Tomcat server
+	at org.springframework.boot.web.embedded.tomcat.TomcatWebServer.start(TomcatWebServer.java:251) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.web.servlet.context.WebServerStartStopLifecycle.start(WebServerStartStopLifecycle.java:44) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.context.support.DefaultLifecycleProcessor.doStart(DefaultLifecycleProcessor.java:288) ~[spring-context-6.1.8.jar:6.1.8]
+	... 16 common frames omitted
+Caused by: org.springframework.boot.web.server.WebServerException: Servlet [jsp] in web application [] threw load() exception
+	at org.springframework.boot.web.embedded.tomcat.TomcatEmbeddedContext.load(TomcatEmbeddedContext.java:89) ~[spring-boot-3.3.0.jar:3.3.0]
+	at java.base/java.util.stream.ForEachOps$ForEachOp$OfRef.accept(ForEachOps.java:184) ~[na:na]
+	at java.base/java.util.ArrayList$ArrayListSpliterator.forEachRemaining(ArrayList.java:1709) ~[na:na]
+	at java.base/java.util.stream.ReferencePipeline$Head.forEach(ReferencePipeline.java:782) ~[na:na]
+	at java.base/java.util.stream.ReferencePipeline$7$1.accept(ReferencePipeline.java:291) ~[na:na]
+	at java.base/java.util.TreeMap$ValueSpliterator.forEachRemaining(TreeMap.java:3252) ~[na:na]
+	at java.base/java.util.stream.AbstractPipeline.copyInto(AbstractPipeline.java:556) ~[na:na]
+	at java.base/java.util.stream.AbstractPipeline.wrapAndCopyInto(AbstractPipeline.java:546) ~[na:na]
+	at java.base/java.util.stream.ForEachOps$ForEachOp.evaluateSequential(ForEachOps.java:151) ~[na:na]
+	at java.base/java.util.stream.ForEachOps$ForEachOp$OfRef.evaluateSequential(ForEachOps.java:174) ~[na:na]
+	at java.base/java.util.stream.AbstractPipeline.evaluate(AbstractPipeline.java:265) ~[na:na]
+	at java.base/java.util.stream.ReferencePipeline.forEach(ReferencePipeline.java:611) ~[na:na]
+	at org.springframework.boot.web.embedded.tomcat.TomcatEmbeddedContext.lambda$deferredLoadOnStartup$0(TomcatEmbeddedContext.java:67) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.web.embedded.tomcat.TomcatEmbeddedContext.doWithThreadContextClassLoader(TomcatEmbeddedContext.java:108) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.web.embedded.tomcat.TomcatEmbeddedContext.deferredLoadOnStartup(TomcatEmbeddedContext.java:66) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.web.embedded.tomcat.TomcatWebServer.performDeferredLoadOnStartup(TomcatWebServer.java:333) ~[spring-boot-3.3.0.jar:3.3.0]
+	at org.springframework.boot.web.embedded.tomcat.TomcatWebServer.start(TomcatWebServer.java:239) ~[spring-boot-3.3.0.jar:3.3.0]
+	... 18 common frames omitted
+Caused by: jakarta.servlet.ServletException: Class [org.apache.jasper.servlet.JspServlet] is not a Servlet
+	at org.apache.catalina.core.StandardWrapper.loadServlet(StandardWrapper.java:762) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.StandardWrapper.load(StandardWrapper.java:698) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.springframework.boot.web.embedded.tomcat.TomcatEmbeddedContext.load(TomcatEmbeddedContext.java:84) ~[spring-boot-3.3.0.jar:3.3.0]
+	... 34 common frames omitted
+Caused by: java.lang.ClassCastException: class org.apache.jasper.servlet.JspServlet cannot be cast to class jakarta.servlet.Servlet (org.apache.jasper.servlet.JspServlet and jakarta.servlet.Servlet are in unnamed module of loader 'app')
+	at org.apache.catalina.core.StandardWrapper.loadServlet(StandardWrapper.java:758) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	... 36 common frames omitted
+
+
+Process finished with exit code 1
