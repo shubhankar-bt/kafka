@@ -1,82 +1,364 @@
-<!-- ===================================================================== -->
-<!--  HIVE / THRIFT DEPENDENCY (FIXED FOR SPRING BOOT 3)                   -->
-<!-- ===================================================================== -->
-<dependency>
-    <groupId>org.apache.hive</groupId>
-    <artifactId>hive-jdbc</artifactId>
-    <version>3.1.3</version>
-    <exclusions>
-        <!-- 1. Exclude Logging Conflicts -->
-        <exclusion>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-slf4j-impl</artifactId>
-        </exclusion>
+public static final String DELETE = "DELETE";
+public static final String INACTIVE = "INACTIVE";
 
-        <!-- 2. CRITICAL: Exclude Old Servlet APIs (Javax vs Jakarta conflict) -->
-        <exclusion>
-            <groupId>javax.servlet</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>javax.servlet.jsp</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.datanucleus</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
 
-        <!-- 3. CRITICAL: Exclude Embedded Web Servers & JSP Engines -->
-        <!-- These cause the JspServlet Cast Exception -->
-        <exclusion>
-            <groupId>org.eclipse.jetty.aggregate</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.eclipse.jetty</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.apache.tomcat</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>tomcat</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-    </exclusions>
-</dependency>
 
-<!-- Keep Hadoop Common (Cleaned) -->
-<dependency>
-    <groupId>org.apache.hadoop</groupId>
-    <artifactId>hadoop-common</artifactId>
-    <version>3.3.4</version>
-    <exclusions>
-        <exclusion>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>javax.servlet</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-        <exclusion>
-            <groupId>org.eclipse.jetty</groupId>
-            <artifactId>*</artifactId>
-        </exclusion>
-    </exclusions>
-</dependency>
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.service;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.ResponseVO;
+import com.tcs.userservice.dto.*;
+import com.tcs.userservice.model.*;
+import com.tcs.userservice.repository.*;
+import com.tcs.userservice.utility.ClobUtil;
+import com.tcs.userservice.utility.Constant;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class UserRequestServiceImpl implements UserRequestService {
+
+    private static final String EVENT_SOURCE = "USER_SERVICE";
+    private static final String REQUEST_TYPE_KEY = "USER_MANAGEMENT";
+
+    private final UserRequestRepository userRequestRepository;
+    private final UserRepository userRepository;
+    private final UserRoleRepository userRoleRepository;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> createNewRequest(UserRequestCreateDto dto, String userId) {
+        String targetUserId = dto.getTargetUserId();
+        String requestType = dto.getRequestType();
+
+        // 1. Conflict Checks
+        if (userRequestRepository.countUserPendingRequests(targetUserId) > 0) {
+            return buildError(HttpStatus.CONFLICT, "Pending request already exists for this user");
+        }
+        
+        User existingUser = userRepository.findUserByUserId(targetUserId);
+        
+        // Case: Create but User Exists
+        if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
+            return buildError(HttpStatus.CONFLICT, "User already exists");
+        }
+        
+        // Case: Modify/Lock/Delete but User Not Found
+        if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
+            return buildError(HttpStatus.NOT_FOUND, "User does not exist");
+        }
+
+        // --- NEW LOGIC: Delete Validation ---
+        if (Constant.DELETE.equalsIgnoreCase(requestType) && 
+            existingUser != null && 
+            "Y".equalsIgnoreCase(existingUser.getIsDeleted())) {
+            return buildError(HttpStatus.CONFLICT, "User is already deleted");
+        }
+        // ------------------------------------
+
+        // 2. Create Entity
+        UserRequest request = new UserRequest();
+        request.setRequestType(requestType);
+        request.setTargetUserId(targetUserId);
+        request.setRequestorUserId(userId);
+        request.setRequestStatus(Constant.PENDING);
+        request.setRequestDate(new Timestamp(System.currentTimeMillis()));
+
+        // 3. Handle Payload
+        try {
+            String jsonPayload;
+            Object payloadObj = dto.getRequestPayload();
+            
+            // Handle null payload for DELETE requests gracefully
+            if (payloadObj == null) {
+                payloadObj = new HashMap<>(); // Empty map
+            }
+
+            if (payloadObj instanceof String) {
+                jsonPayload = (String) payloadObj;
+                objectMapper.readTree(jsonPayload); // Validate JSON
+            } else {
+                jsonPayload = objectMapper.writeValueAsString(payloadObj);
+            }
+            request.setRequestPayload(jsonPayload);
+        } catch (Exception e) {
+            throw new RuntimeException("Invalid Payload format", e);
+        }
+
+        // 4. Save
+        UserRequest saved = userRequestRepository.save(request);
+
+        // 5. Notification
+        String notifMsg = String.format("New User Request (ID: %s) for User %s (%s) is pending approval.",
+                saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
+
+        NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
+        
+        createNotification(
+                null, 
+                config.getTargetRoles(), 
+                config.getTargetUrl(),
+                notifMsg,
+                String.valueOf(saved.getRequestId())
+        );
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ResponseVO.<Map<String, Object>>builder()
+                        .statusCode(HttpStatus.CREATED)
+                        .message("Request Created")
+                        .result(Map.of("userRequest", saved))
+                        .build());
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getPendingRequests(Map<String, Object> params, String userId) {
+        List<UserRequestProjection> rawList = userRequestRepository.findUserPendingRequests(userId);
+        return processProjections(rawList, "pendingRequests");
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRequests(Map<String, String> params, String userId) {
+        List<UserRequestProjection> rawList = userRequestRepository.findUserRequestsByRequestorUserId(userId);
+        return processProjections(rawList, "myRequests");
+    }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> processProjections(List<UserRequestProjection> rawList, String key) {
+        List<Map<String, Object>> processed = rawList.stream().map(req -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("requestId", req.getRequestId());
+            map.put("requestType", req.getRequestType());
+            map.put("targetUserId", req.getTargetUserId());
+            map.put("requestStatus", req.getRequestStatus());
+            map.put("requestDate", req.getRequestDate());
+            map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
+            map.put("approverId", req.getApproverUserId());
+            map.put("approvalDate", req.getApprovalDate());
+            map.put("rejectionReason", req.getReasonForRejection());
+            return map;
+        }).collect(Collectors.toList());
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(Map.of(key, processed, "count", processed.size()))
+                .build());
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectUserRequest(UserRequestDto dto, String ipAddress, String userId) {
+        UserRequest request = userRequestRepository.findUserRequestsByRequestId(dto.getRequestId());
+        if (request == null) return buildError(HttpStatus.NOT_FOUND, "Request not found");
+
+        request.setApproverUserId(userId);
+        request.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        
+        dto.setRequesterUserId(request.getRequestorUserId());
+        dto.setRequestType(request.getRequestType());
+
+        Map<String, Object> result = new HashMap<>();
+        String action = dto.getActionFlag();
+        boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(action) || Constant.APPROVE.equalsIgnoreCase(action);
+
+        if (isApproved) {
+            handleAccept(request, result, dto);
+        } else {
+            request.setRequestStatus(Constant.REJECTED);
+            request.setReasonForRejection(dto.getRemarks() != null ? dto.getRemarks() : "NO REMARKS");
+            request.setExecutionDetails("REJECTED");
+            userRequestRepository.save(request);
+            result.put("status", true);
+            result.put("message", "Rejected");
+        }
+
+        if (isApproved && Boolean.TRUE.equals(result.get("status"))) {
+            request.setRequestStatus(Constant.ACCEPTED);
+            request.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+            request.setExecutionDetails("SUCCESS");
+            userRequestRepository.save(request);
+        }
+
+        String statusText = isApproved ? "ACCEPTED" : "REJECTED";
+        String notifMsg = String.format("Your User Request (ID: %s) for User %s has been %s.",
+                request.getRequestId(), request.getTargetUserId(), statusText);
+
+        if (!isApproved && dto.getRemarks() != null) {
+            notifMsg += " Reason: " + dto.getRemarks();
+        }
+
+        createNotification(request.getRequestorUserId(), null, "/user-management", notifMsg, String.valueOf(request.getRequestId()));
+
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(result)
+                .build());
+    }
+
+    private void handleAccept(UserRequest request, Map<String, Object> result, UserRequestDto dto) {
+        try {
+            String jsonPayload = ClobUtil.clobToString(request.getRequestPayload());
+            Map<String, Object> payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<>() {});
+
+            User user = userRepository.findUserByUserId(request.getTargetUserId());
+            String type = request.getRequestType();
+
+            // Create Validation
+            if (Constant.CREATE.equalsIgnoreCase(type)) {
+                if (user != null) throw new RuntimeException("User already exists");
+                user = new User();
+                user.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+                user.setAccountStatus(Constant.ACTIVE);
+                user.setIsDeleted("N");
+                user.setUserWrongPasswordCount(0);
+            } else if (user == null) {
+                throw new RuntimeException("User not found");
+            }
+
+            // --- Apply Logic based on Request Type ---
+            if (Constant.CREATE.equalsIgnoreCase(type) || Constant.MODIFY.equalsIgnoreCase(type)) {
+                applyUserChanges(user, request.getTargetUserId(), payloadMap);
+                userRepository.save(user);
+                updateUserRole(user.getUserId(), payloadMap);
+            } else if (Constant.LOCK.equalsIgnoreCase(type)) {
+                user.setAccountStatus(Constant.LOCKED);
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+                userRepository.save(user);
+            } else if (Constant.UNLOCK.equalsIgnoreCase(type)) {
+                user.setAccountStatus(Constant.ACTIVE);
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+                userRepository.save(user);
+            } else if (Constant.DELETE.equalsIgnoreCase(type)) {
+                // --- NEW LOGIC: Soft Delete ---
+                user.setIsDeleted("Y");
+                user.setAccountStatus(Constant.INACTIVE); // Ensure Constant.INACTIVE exists or use "INACTIVE"
+                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+                userRepository.save(user);
+            }
+
+            result.put("status", true);
+            result.put("message", "User Request Processed Successfully");
+
+        } catch (Exception e) {
+            log.error("Error applying user changes", e);
+            result.put("status", false);
+            result.put("message", "Failed to apply changes: " + e.getMessage());
+            throw new RuntimeException("Transaction Failed: " + e.getMessage(), e);
+        }
+    }
+
+    private void applyUserChanges(User user, String targetUserId, Map<String, Object> payload) {
+        user.setUserId(targetUserId);
+        if(payload.containsKey("firstName")) user.setFirstName((String) payload.get("firstName"));
+        if(payload.containsKey("lastName")) user.setLastName((String) payload.get("lastName"));
+        if(payload.containsKey("email")) user.setEmail((String) payload.get("email"));
+        if(payload.containsKey("phoneNumber")) user.setPhoneNumber((String) payload.get("phoneNumber"));
+        if(payload.containsKey("branch")) {
+             Object b = payload.get("branch");
+             if(b != null) user.setBranch(Integer.parseInt(String.valueOf(b)));
+        }
+        user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+    }
+
+    private void updateUserRole(String userId, Map<String, Object> payload) {
+        if(payload.containsKey("roleId")) {
+            UserRole ur = userRoleRepository.getUserRolesByUserId(userId);
+            if(ur == null) ur = new UserRole();
+            ur.setUserId(userId);
+            ur.setRoleId(Integer.parseInt(String.valueOf(payload.get("roleId"))));
+            userRoleRepository.save(ur);
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity cancelRequest(Map<String, Object> requestMap) {
+        try {
+            long requestId = Long.parseLong(String.valueOf(requestMap.get("requestId")));
+            UserRequest req = userRequestRepository.findUserRequestsByRequestId(requestId);
+
+            if (req == null) return buildError(HttpStatus.NOT_FOUND, "Request not found");
+            
+            String userId = (String) requestMap.get("userId");
+            if (!req.getRequestorUserId().equals(userId)) {
+                return buildError(HttpStatus.UNAUTHORIZED, "Unauthorized to cancel this request");
+            }
+
+            req.setRequestStatus(Constant.CANCEL);
+            req.setExecutionDetails("CANCELLED BY USER");
+            req.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+            userRequestRepository.save(req);
+
+            createNotification(req.getRequestorUserId(), null, "/user-management",
+                    "User Request (ID: " + requestId + ") has been cancelled.", String.valueOf(requestId));
+
+            return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                    .statusCode(HttpStatus.OK)
+                    .message("Cancelled")
+                    .result(Map.of("status", true))
+                    .build());
+
+        } catch (Exception e) {
+            log.error("Cancel failed", e);
+            return buildError(HttpStatus.BAD_REQUEST, "Cancel failed: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public ResponseEntity getUserDetails(Map<String, String> params) {
+        String userId = params.get("id");
+        Integer role = params.get("roleId") != null ? Integer.parseInt(params.get("roleId")) : null;
+
+        if (userId == null && role == null) {
+             return buildError(HttpStatus.BAD_REQUEST, "Please provide User ID or Role ID to filter.");
+        }
+
+        List<Map<String, Object>> users = userRepository.getUsers(userId, role);
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(Map.of("users", users, "count", users.size()))
+                .build());
+    }
+
+    private void createNotification(String targetUser, String roles, String url, String msg, String refId) {
+        try {
+            notificationWriterService.createNotification(targetUser, roles, msg, url, refId, EVENT_SOURCE);
+        } catch (Exception e) {
+            log.error("Notification failed (non-fatal)", e);
+        }
+    }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> buildError(HttpStatus status, String msg) {
+        return ResponseEntity.status(status).body(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(status)
+                .message(msg)
+                .result(Map.of("status", false, "message", msg))
+                .build());
+    }
+}
+
 
