@@ -1,112 +1,225 @@
+package com.fincore.gateway.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class LoginResponseDTO implements UserLoginDTO {
+
+    private String userId;
+    private String accessToken;
+    private String tokenType;
+    private long expiresIn;
+    private String sub;
+    private String jti;
+    private MenuResponse roleData;
+    private String error;
+    private boolean validCredentials;
+    private String userStatus;
+    private String passwordLoginStatus;
+    
+    // --- ADD THIS FIELD ---
+    private Integer attemptsLeft; 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     /**
-     * LOGOUT ENDPOINT (ROBUST & VERIFIED)
-     * Handles:
-     * 1. Valid Tokens -> Standard Logout
-     * 2. Expired Tokens -> Manually extracts claims -> Cleans up Redis if JTI matches
-     * 3. Concurrent Logins -> Blacklists current token, but PRESERVES the active session in Redis
-     * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
+     * UPDATED LOGIC:
+     * 1. Increments count on failure.
+     * 2. Calculates remaining attempts.
+     * 3. Locks account immediately if limit reached.
      */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
+    @Transactional
+    @Override
+    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
+        log.info("Password-based login for userId={}", user.getUserId());
 
-        // 1. Always clear the Refresh Token Cookie (Idempotent)
-        response.addCookie(createEmptyCookie());
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
 
-        String tokenString = null;
-
-        // Strategy A: Valid Context
-        if (jwtAuth != null && jwtAuth.getToken() != null) {
-            tokenString = jwtAuth.getToken().getTokenValue();
-        }
-        // Strategy B: Manual Header Extraction (Expired Tokens)
-        else {
-            String header = request.getHeaders().getFirst("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
-                tokenString = header.substring(7);
-            }
+        // 1. Check if ALREADY locked (Double safety, though verifyUserCredentials checks status earlier)
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            loginAttempt.setFailureReason("Account Locked");
+            userInfo.setValidCredentials(false);
+            userInfo.setMessage("Your account is locked. Please reset password or contact admin.");
+            userInfo.setAttemptsLeft(0);
+            return;
         }
 
-        // 3. Fast Exit: If no token found anywhere, just return success so frontend can clear state
-        if (tokenString == null || tokenString.isBlank()) {
-            log.warn("Logout called without token. Cleaning up cookies only.");
-            return Mono.just(ResponseEntity.ok(
-                    ApiResponse.<LoginResponseDTO>success(
-                            LoginResponseDTO.builder().userId("anonymous").build(),
-                            "Logged out (No Token)"
-                    )
-            ));
+        // 2. Validate Password
+        if (encoder.matches(password, user.getPasswordHash())) {
+            // --- SUCCESS CASE ---
+            loginAttempt.setSuccess("Y");
+            loginAttempt.setFailureReason("Success");
+            userInfo.setValidCredentials(true);
+            userInfo.setMessage("Login Successful");
+            
+            // Reset count on success
+            user.setUserWrongPasswordCount(0);
+            userRepository.save(user);
+            return;
         }
 
-        final String finalToken = tokenString;
+        // --- FAILURE CASE ---
+        log.warn("Password mismatch for user {}", user.getUserId());
+        
+        // Increment the count immediately
+        int newFailedCount = currentFailedCount + 1;
+        user.setUserWrongPasswordCount(newFailedCount);
 
-        // 4. Processing Chain
-        return Mono.fromCallable(() -> {
-                    try {
-                        // Try standard parsing
-                        return extractClaims(finalToken);
-                    } catch (ExpiredJwtException e) {
-                        // CRITICAL FIX: If token is expired, we STILL want the claims to perform cleanup
-                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
-                        return e.getClaims();
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
+        loginAttempt.setSuccess("N");
+        userInfo.setValidCredentials(false);
 
-                    if (userId == null || incomingJti == null) {
-                        return Mono.just(ResponseEntity.ok(
-                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
-                        ));
-                    }
+        // Check if this specific failure reached or exceeded the limit
+        if (newFailedCount >= maxAllowed) {
+            // LOCK THE ACCOUNT
+            user.setPasswordLogin(Constants.INACTIVE);
+            
+            // Optional: You might want to set accountStatus to LOCKED as well, depending on your business rule
+            // user.setAccountStatus("LOCKED"); 
 
-                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
+            loginAttempt.setFailureReason("Account Locked: Max Attempts Reached");
+            userInfo.setMessage("Maximum login attempts exceeded. Your account has been locked.");
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
+        } else {
+            // STILL HAS ATTEMPTS LEFT
+            int remaining = maxAllowed - newFailedCount;
+            loginAttempt.setFailureReason("Wrong Password");
+            userInfo.setMessage("Invalid credentials");
+            userInfo.setAttemptsLeft(remaining);
+        }
 
-                    // 5. Blacklist the Token (Always blacklist the incoming token)
-                    return validator.blacklistToken(incomingJti)
-                            .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
-                            .flatMap(activeJti -> {
-                                // 6. Conditional Redis Cleanup
-                                if (activeJti != null && activeJti.equals(incomingJti)) {
-                                    // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
-                                    // Action: Delete it.
-                                    log.info("Session MATCH. Deleting active session for user: {}", userId);
-                                    return validator.clearUserSession(userId)
-                                            .then(Mono.just(ResponseEntity.ok(
-                                                    ApiResponse.<LoginResponseDTO>success(
-                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
-                                                            "Logged out successfully"
-                                                    )
-                                            )));
-                                } else {
-                                    // SCENARIO: Concurrent Login.
-                                    // The session in Redis belongs to a NEWER token (on another device/tab).
-                                    // Action: Do NOT delete it. Just let the blacklist happen.
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
-                                    return Mono.just(ResponseEntity.ok(
-                                            ApiResponse.<LoginResponseDTO>success(
-                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
-                                                    "Logged out (Concurrent Session Preserved)"
-                                            )
-                                    ));
-                                }
-                            })
-                            // If key is missing in Redis (Already timed out), return success
-                            .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                                    ApiResponse.<LoginResponseDTO>success(
-                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
-                                            "Logged out (Session already expired)"
-                                    )
-                            )));
-                })
-                .onErrorResume(e -> {
-                    // Safety Net: If anything explodes (Redis down, etc), allow frontend to logout
-                    log.error("Logout Unexpected Error", e);
-                    return Mono.just(ResponseEntity.ok(
-                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
-                    ));
-                });
+        userRepository.save(user);
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /**
+     * LOGIN ENDPOINT (Updated)
+     * Handles Valid and Invalid credentials with structured responses.
+     */
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
+        final String clientIp = LoginUtility.getClientIp(request);
+        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+
+        // 1. IP BLOCK CHECK
+        if (isIpBlocked(clientIp)) {
+            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
+        }
+
+        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(user -> {
+                    
+                    // =========================================================
+                    // CASE 1: INVALID CREDENTIALS (Wrong Password / Locked)
+                    // =========================================================
+                    if (!user.isValidCredentials()) {
+                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
+
+                        // Build response to show Attempts Left
+                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .userStatus(user.getUserStatus())
+                                .passwordLoginStatus(user.getPasswordLoginStatus())
+                                .attemptsLeft(user.getAttemptsLeft()) // <--- PASS COUNT TO FRONTEND
+                                .error(user.getMessage())
+                                .build();
+
+                        // Determine status code: 403 if Locked, 401 if just wrong password
+                        HttpStatus status = (user.getAttemptsLeft() == 0 || "INACTIVE".equals(user.getPasswordLoginStatus())) 
+                                            ? HttpStatus.FORBIDDEN 
+                                            : HttpStatus.UNAUTHORIZED;
+
+                        return Mono.just(ResponseEntity.status(status)
+                                .body(ApiResponse.success(errorResponse, user.getMessage())));
+                    }
+
+                    // =========================================================
+                    // CASE 2: CONFIG ERROR
+                    // =========================================================
+                    if (hmacSecret == null || hmacSecret.isBlank()) {
+                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
+                    }
+
+                    // =========================================================
+                    // CASE 3: SUCCESS
+                    // =========================================================
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
+                    
+                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+
+                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+                    String jti = extractClaims(accessToken).getId();
+
+                    response.addCookie(createRefreshTokenCookie(refreshToken));
+
+                    return validator.registerUserSession(user.getUserId(), jti)
+                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                    .subscribeOn(Schedulers.boundedElastic())))
+                            .map(roleData -> {
+                                LoginResponseDTO loginResponse = LoginResponseDTO.builder()
+                                        .userId(user.getUserId())
+                                        .validCredentials(true)
+                                        .accessToken(accessToken)
+                                        .tokenType("Bearer")
+                                        .expiresIn(accessTokenTtl)
+                                        .sub(user.getUserId())
+                                        .jti(jti)
+                                        .roleData(roleData)
+                                        .userStatus(user.getUserStatus())
+                                        .passwordLoginStatus(user.getPasswordLoginStatus())
+                                        .attemptsLeft(null) // No need to show attempts on success
+                                        .build();
+
+                                return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
+                            });
+                });
+    }
 
