@@ -3423,6 +3423,7 @@ import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
 import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
 import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestTypeStrategy;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -3466,12 +3467,16 @@ public class RequestServiceImpl implements RequestService {
             String token
     ) throws JsonProcessingException {
 
-        // --- LAYER 2 SECURITY CHECK ---
+        // 1. RBAC LAYER 2 SECURITY CHECK ---------> 1st check in filter [shubhankar]
         // Validate that the user is allowed to perform this SPECIFIC ChangeType (e.g. BLOCK)
         businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
 
-        KeyablePayload payload = (KeyablePayload) dto.getPayload();
+        // 2. STRATEGY VALIDATION (Business Rules)
+        RequestTypeStrategy strategy = strategyFactory.getStrategy(dto.getRequestType());
+        strategy.validateRequest(dto);
 
+        // 3. TARGET ID EXTRACTION
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
         // --- PRE CHECKS ---
         String targetId = payload.getKey();
         if (targetId == null || targetId.isBlank()) {
@@ -3479,6 +3484,7 @@ public class RequestServiceImpl implements RequestService {
         }
         log.info("Determined targetId for new request as: {}", targetId);
 
+        // 4. DUPLICATE PENDING REQUEST CHECK
         List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
                 RequestStatus.PENDING);
 
@@ -3514,15 +3520,12 @@ public class RequestServiceImpl implements RequestService {
             String action = request.getChangeType().name(); // ADD/ DELETE/ UPDATE / BLOCK
 
             // Validate payload to detect "Block", "UNBLOCK action
+            // Custom Logic for Block/Unblock labels
             if (request.getChangeType() == ChangeType.BLOCK || request.getChangeType() == ChangeType.UNBLOCK) {
-                // Parse payload to check if status is 0 (Blocked)
-                CGLMaster payload2 = objectMapper.readValue(request.getPayload(), CGLMaster.class);
-                if (payload2.getStatus() == 0) {
-                    action = "BLOCK"; // Override action name for the message
-                } else if (payload2.getStatus() == 1) {
-                    action = "UNBLOCK"; // Override action name for the message
-                }
+                if (request.getChangeType() == ChangeType.BLOCK) action = "BLOCK";
+                if (request.getChangeType() == ChangeType.UNBLOCK) action = "UNBLOCK";
             }
+
             String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
 
             // 3. Send to Group (1-to-Many via Outbox)
@@ -3706,7 +3709,6 @@ public class RequestServiceImpl implements RequestService {
     }
 
 }
-
 
 
 
