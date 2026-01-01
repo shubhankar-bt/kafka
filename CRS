@@ -4146,11 +4146,10 @@ public class RequestStrategyFactory {
 
 
 
-
-
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
 import com.tcs.fincore.CommonRequestService.model.CommonReq;
 import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
 
@@ -4167,10 +4166,16 @@ public interface RequestTypeStrategy {
      */
     void processApproval(CommonReq request) throws JsonProcessingException;
 
-
     RequestType getRequestType();
-}
 
+    /**
+     * Validates the payload BEFORE creating the Pending Request.
+     * Default implementation does nothing (hook for strategies to override).
+     */
+    default void validateRequest(CreateRequestDto requestDto) throws JsonProcessingException {
+        // Default: No validation. Override in specific strategies.
+    }
+}
 
 
 
@@ -4284,7 +4289,13 @@ public class SegmentCodeStrategy implements RequestTypeStrategy {
 
 package com.tcs.fincore.CommonRequestService.service.strategy;
 
+import com.tcs.fincore.CommonRequestService.dto.BranchRequestPayloadDTO;
+import com.tcs.fincore.CommonRequestService.dto.CreateRequestDto;
+import com.tcs.fincore.CommonRequestService.exception.BusinessRuleViolationException;
 import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.repository.CircleMasterRepository;
+import com.tcs.fincore.CommonRequestService.repository.StateMasterRepository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 
@@ -4299,6 +4310,10 @@ import com.tcs.fincore.CommonRequestService.repository.BranchMasterRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Date;
+
 /**
  * A strategy component responsible for processing approval requests related to the
  * {@link BranchMaster} entity. This class implements the {@link RequestTypeStrategy}
@@ -4311,7 +4326,10 @@ import lombok.extern.slf4j.Slf4j;
 public class BranchMasterStrategy implements RequestTypeStrategy {
 
     private final BranchMasterRepository branchMasterRepository;
+    private final CircleMasterRepository circleMasterRepository;
+    private final StateMasterRepository stateMasterRepository;
     private final ObjectMapper objectMapper;
+
 
     /**
      * Returns the request type handled by this strategy.
@@ -4322,6 +4340,71 @@ public class BranchMasterStrategy implements RequestTypeStrategy {
     public RequestType getRequestType() {
         return RequestType.BRANCH;
     }
+
+    /**
+     * CORE VALIDATION LOGIC
+     * Runs before the CommonReq is created.
+     */
+    @Override
+    public void validateRequest(CreateRequestDto requestDto) throws JsonProcessingException {
+        // Convert Payload to DTO
+        BranchRequestPayloadDTO payload = objectMapper.convertValue(requestDto.getPayload(), BranchRequestPayloadDTO.class);
+        String branchCode = payload.getCode();
+
+        // Rule 1: Duplicate Check (Only for ADD)
+        if (requestDto.getChangeType() == ChangeType.ADD) {
+            if (branchMasterRepository.existsById(branchCode)) {
+                throw new BusinessRuleViolationException("Branch with Code " + branchCode + " already exists.");
+            }
+        }
+
+        // Rule 2: Master Data Presence (Circle & State)
+        if (!circleMasterRepository.existsById(payload.getCircleCode())) {
+            throw new BusinessRuleViolationException("Invalid Circle Code: " + payload.getCircleCode() + ". Circle does not exist in Circle Master.");
+        }
+        if (!stateMasterRepository.existsById(payload.getState())) {
+            throw new BusinessRuleViolationException("Invalid State Code: " + payload.getState() + ". State does not exist in State Master.");
+        }
+
+        // Rule 3: Email Format Validation
+        // Format: sbi.{branchCode}@sbi.co.in (Must be Case Insensitive)
+        String expectedEmail = "sbi." + branchCode.toLowerCase() + "@sbi.co.in";
+        if (!expectedEmail.equalsIgnoreCase(payload.getEmailId())) {
+            throw new BusinessRuleViolationException("Invalid Email ID. Expected format: " + expectedEmail);
+        }
+
+        // Rule 4 & 6: Branch Status & Type Logic
+        // Assumption: Boolean TRUE = LIVE, Boolean FALSE = CLOSED
+        boolean isLive = Boolean.TRUE.equals(payload.getStatus());
+        String branchType = payload.getBranchType(); // 'A' or 'M'
+
+        if (isLive) {
+            // "if branch status is live... branch type is Automated"
+            if (!"A".equalsIgnoreCase(branchType)) {
+                throw new BusinessRuleViolationException("Live branches must be of Type 'Automated' (A).");
+            }
+        } else {
+            // "if branch status closed... close date is mandatory"
+            if (payload.getCloseDate() == null) {
+                throw new BusinessRuleViolationException("Close Date is mandatory for Closed/Inactive branches.");
+            }
+            // "if branch status closed... branch type must be manual"
+            if (!"M".equalsIgnoreCase(branchType)) {
+                throw new BusinessRuleViolationException("Closed branches must be of Type 'Manual' (M).");
+            }
+        }
+
+        // Rule 5: Merge Logic
+        // "merge date and merge with branch... if one provided other is necessary"
+        boolean hasMergeDate = payload.getMergeDate() != null;
+        boolean hasMergeBranch = payload.getMergedWithBranch() != null && !payload.getMergedWithBranch().isBlank();
+
+        // XOR Logic: If one is true and the other is false, throw error
+        if (hasMergeDate != hasMergeBranch) {
+            throw new BusinessRuleViolationException("Merge Date and 'Merged With Branch' must both be provided if one is present.");
+        }
+    }
+
 
     /**
      * Processes the approval of a {@link CommonReq} for branch master data.
@@ -4413,7 +4496,9 @@ public class BranchMasterStrategy implements RequestTypeStrategy {
         existing.setCloseDate(updated.getCloseDate());
         existing.setMergeDate(updated.getMergeDate());
         existing.setMergedWithBranch(updated.getMergedWithBranch());
-        existing.setLastChangeDate(updated.getLastChangeDate());
+
+        existing.setLastChangeDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        
         existing.setCpcFlag(updated.getCpcFlag());
         existing.setFoodCreditFlag(updated.getFoodCreditFlag());
         existing.setCurrChestFlag(updated.getCurrChestFlag());
