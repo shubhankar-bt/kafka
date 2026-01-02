@@ -1419,13 +1419,15 @@ public class RolePermissions {
 
 
 
-
 package com.tcs.userservice.model;
 
 import jakarta.persistence.*;
 import lombok.Data;
+import org.springframework.cglib.core.Local;
 
 import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 
 @Entity
 @Data
@@ -1452,11 +1454,11 @@ public class RoleRequest {
 	@Column(name = "REQUEST_STATUS")
 	private String requestStatus;
 
-	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
-	private Timestamp requestDate;
+	@Column(name = "REQUEST_DATE", nullable = false, updatable = false)
+	private LocalDateTime requestDate;
 
 	@Column(name = "APPROVAL_DATE")
-	private Timestamp approvalDate;
+	private LocalDateTime approvalDate;
 
 	@Column(name = "APPROVER_USER_ID")
 	private String approverUserId;
@@ -1465,13 +1467,18 @@ public class RoleRequest {
 	private String reasonForRejection;
 
 	@Column(name = "EXECUTION_DATE")
-	private Timestamp executionDate;
+	private LocalDateTime executionDate;
 
 	@Column(name = "EXECUTION_DETAILS")
 	private String executionDetails;
 
 }
 
+
+
+
+
+ 	
 
 
 
@@ -1645,6 +1652,7 @@ import lombok.Setter;
 import lombok.ToString;
 
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
 
 @Entity
 @Getter
@@ -1672,11 +1680,11 @@ public class UserRequest {
 	@Column(name = "REQUEST_STATUS")
 	private String requestStatus;
 	
-	@Column(name = "REQUEST_DATE", nullable = false, insertable = false, updatable = false)
-	private Timestamp requestDate;
+	@Column(name = "REQUEST_DATE", nullable = false, updatable = false)
+	private LocalDateTime requestDate;
 	
 	@Column(name = "APPROVAL_DATE")
-	private Timestamp approvalDate;
+	private LocalDateTime approvalDate;
 	
 	@Column(name = "APPROVER_USER_ID")
 	private String approverUserId;
@@ -1685,7 +1693,7 @@ public class UserRequest {
 	private String reasonForRejection;
 	
 	@Column(name = "EXECUTION_DATE")
-	private Timestamp executionDate;
+	private LocalDateTime executionDate;
 	
 	@Column(name = "EXECUTION_DETAILS")
 	private String executionDetails;
@@ -2860,7 +2868,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -2872,7 +2882,7 @@ public class RoleRequestServiceImpl implements RoleRequestService {
     // =============== CONFIGURATION CONSTANTS ======
     private static final String EVENT_SOURCE = "USER_SERVICE";
     private static final String REQUEST_TYPE_KEY = "ROLE_MANAGEMENT";
-    private static final List<String> HIDDEN_ROLES = Arrays.asList("F1/Bog", "ADMIN");
+    private static final List<String> HIDDEN_ROLES = Arrays.asList("ADMIN");
     private static final String RESTRICTED_PERMISSION_TITLE = "Role Management";
 
     private final RoleRequestRepository roleRequestRepository;
@@ -2885,6 +2895,13 @@ public class RoleRequestServiceImpl implements RoleRequestService {
     private final PermissionConfigService permissionConfigService;
     private final NotificationWriterService notificationWriterService;
 
+    private String formatTimestamp(Timestamp ts) {
+        if (ts == null) return null;
+        // Use SimpleDateFormat to strictly control output string
+        // This produces "2026-01-02T14:14:00.123"
+        return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS").format(ts);
+    }
+
     @Override
     @Transactional(rollbackFor = Exception.class)
     public ResponseEntity<ResponseVO<RoleRequest>> createNewRoleRequest(RoleRequestCreateDto dto, String userId) {
@@ -2894,7 +2911,8 @@ public class RoleRequestServiceImpl implements RoleRequestService {
         roleRequest.setTargetRoleId(dto.getTargetRoleId());
         roleRequest.setRequestorUserId(userId);
         roleRequest.setRequestStatus(Constant.PENDING);
-        roleRequest.setRequestDate(new Timestamp(System.currentTimeMillis()));
+        roleRequest.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+
 
         String finalJsonPayload;
         Map<String, Object> payloadMap;
@@ -2985,12 +3003,12 @@ public class RoleRequestServiceImpl implements RoleRequestService {
             map.put("requestorUserId", req.getRequestorUserId());
             map.put("targetRoleId", req.getTargetRoleId());
             map.put("requestStatus", req.getRequestStatus());
-            map.put("requestDate", req.getRequestDate());
+            map.put("requestDate", formatTimestamp(req.getRequestDate()));
             map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
 
             // add approver details
             map.put("approverId", req.getApproverUserId());
-            map.put("approvalDate", req.getApprovalDate());
+            map.put("approvalDate", formatTimestamp(req.getApprovalDate()));
             map.put("rejectionReason", req.getReasonForRejection());
             return map;
         }).collect(Collectors.toList());
@@ -3014,7 +3032,7 @@ public class RoleRequestServiceImpl implements RoleRequestService {
 
         RoleRequest roleRequest = roleRequestRepository.findRoleRequestByRequestId(requestId);
         roleRequest.setApproverUserId(userId);
-        roleRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        roleRequest.setApprovalDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
         Map<String, Object> result = new HashMap<>();
         boolean isApproved = Constant.ACCEPT.equalsIgnoreCase(actionFlag);
@@ -3070,7 +3088,7 @@ public class RoleRequestServiceImpl implements RoleRequestService {
                 evictPermissionCache(payload.getPermissions());
 
                 roleRequest.setRequestStatus(Constant.ACCEPTED);
-                roleRequest.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+                roleRequest.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
                 roleRequest.setExecutionDetails("SUCCESS");
                 roleRequestRepository.save(roleRequest);
 
@@ -3085,7 +3103,7 @@ public class RoleRequestServiceImpl implements RoleRequestService {
             try{
                 roleRequest.setRequestStatus(Constant.REJECTED);
                 roleRequest.setReasonForRejection("Rejected by approver");
-                roleRequest.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+                roleRequest.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
                 roleRequest.setExecutionDetails("SUCCESS");
                 roleRequestRepository.save(roleRequest);
                 result.put(Constant.STATUS, true);
@@ -3154,7 +3172,7 @@ public class RoleRequestServiceImpl implements RoleRequestService {
         roleRequest.setRequestStatus(Constant.CANCEL);
         // update creator id as approver for cancel case
         roleRequest.setApproverUserId(userId);
-        roleRequest.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        roleRequest.setApprovalDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
         roleRequest.setReasonForRejection("CANCELLED BY USER: " +  remarks);
 
         roleRequestRepository.save(roleRequest);
@@ -3258,7 +3276,19 @@ public class RoleRequestServiceImpl implements RoleRequestService {
         }
 
     }
+
+    private ResponseEntity<ResponseVO<Map<String, Object>>> buildError(HttpStatus status, String msg) {
+        return ResponseEntity.status(status).body(ResponseVO.<Map<String, Object>>builder()
+                .statusCode(status)
+                .message(msg)
+                .result(Map.of("status", false, "message", msg))
+                .build());
+    }
 }
+
+
+
+
 
 
 
@@ -3530,6 +3560,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -3547,6 +3580,19 @@ public class UserRequestServiceImpl implements UserRequestService {
     private final ObjectMapper objectMapper;
     private final NotificationWriterService notificationWriterService;
     private final PermissionConfigService permissionConfigService;
+    private final RoleRepository roleRepository;
+
+    private static final int RESTRICTED_F1_ROLE_ID = 11;
+
+    // Format: "yyyy-MM-dd'T'HH:mm:ss.SSS" (No 'Z' or offset)
+
+    private String formatTimestamp(Timestamp ts) {
+        if (ts == null) return null;
+        // Use SimpleDateFormat to strictly control output string
+        // This produces "2026-01-02T14:14:00.123"
+        return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS").format(ts);
+    }
+
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -3562,8 +3608,20 @@ public class UserRequestServiceImpl implements UserRequestService {
         if (Constant.CREATE.equalsIgnoreCase(requestType) && existingUser != null) {
             return buildError(HttpStatus.CONFLICT, "User already exists");
         }
+        // Case: Modify/Lock/Delete but User Not Found
         if (!Constant.CREATE.equalsIgnoreCase(requestType) && existingUser == null) {
             return buildError(HttpStatus.NOT_FOUND, "User does not exist");
+        }
+
+        // --- NEW LOGIC: Delete Validation ---
+        if (Constant.DELETE.equalsIgnoreCase(requestType) &&
+                existingUser != null &&
+                "Y".equalsIgnoreCase(String.valueOf(existingUser.getIsDeleted()))) {
+            return buildError(HttpStatus.CONFLICT, "User is already deleted");
+        }
+
+        if (targetUserId == null || targetUserId.trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "User Id is mandatory");
         }
 
         // 2. Create Entity
@@ -3572,28 +3630,78 @@ public class UserRequestServiceImpl implements UserRequestService {
         request.setTargetUserId(targetUserId);
         request.setRequestorUserId(userId);
         request.setRequestStatus(Constant.PENDING);
-        request.setRequestDate(new Timestamp(System.currentTimeMillis()));
+        request.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
-        // 3. Handle Payload (String vs Map support)
-        try {
-            String jsonPayload;
-            if (dto.getRequestPayload() instanceof String) {
-                jsonPayload = (String) dto.getRequestPayload();
-                // Validate it's valid JSON
-                objectMapper.readTree(jsonPayload);
-            } else {
-                jsonPayload = objectMapper.writeValueAsString(dto.getRequestPayload());
-            }
-            request.setRequestPayload(jsonPayload);
-        } catch (Exception e) {
-            throw new RuntimeException("Invalid Payload", e);
-        }
+
         // ----------------------------------------------
-        // 4. Save
+        // 4. Field Validations
+        // 1. Parse Payload Early
+        Map<String, Object> payloadMap;
+        String jsonPayload;
+        try {
+            Object payloadObj = dto.getRequestPayload();
+            if (payloadObj == null) payloadObj = new HashMap<>();
+            if (payloadObj instanceof String) {
+                jsonPayload = (String) payloadObj;
+                objectMapper.readTree(jsonPayload);
+                payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<Map<String, Object>>() {});
+            } else {
+                payloadMap = (Map<String, Object>) payloadObj;
+                jsonPayload = objectMapper.writeValueAsString(payloadMap);
+            }
+        } catch (Exception e) {
+            return buildError(HttpStatus.BAD_REQUEST, "Invalid Payload format");
+        }
+
+        if (!payloadMap.containsKey("email") ||
+                payloadMap.get("email") == null ||
+                payloadMap.get("email").toString().trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "Email is mandatory");
+        }
+
+        String email = payloadMap.get("email").toString().trim();
+        if (!email.matches("^[a-zA-Z0-9._%+-]+@sbi\\.co\\.in$")) {
+            return buildError(HttpStatus.BAD_REQUEST, "Email must be a valid @sbi.co.in address");
+        }
+
+        //role id
+        int roleId;
+        if (!payloadMap.containsKey("roleId") || payloadMap.get("roleId") == null) {
+            return buildError(HttpStatus.BAD_REQUEST, "Role is mandatory");
+        }
+        try {
+            roleId = Integer.parseInt(payloadMap.get("roleId").toString());
+
+        } catch (Exception e) {
+            return buildError(HttpStatus.BAD_REQUEST, "Invalid roleId");
+        }
+
+
+        // 3. --- NEW F1/BOG VALIDATION LOGIC ---
+        // Capture the validation result. If it returns a ResponseEntity, it means there was an error.
+        ResponseEntity<ResponseVO<Map<String, Object>>> validationError = validateF1BogConstraints(requestType, payloadMap, existingUser, userId);
+        if (validationError != null) {
+            return validationError;
+        }
+
+        if (!roleRepository.existsById(roleId)) {
+            return buildError(HttpStatus.BAD_REQUEST, "Role does not exist");
+        }
+
+        //firstname
+        if (!payloadMap.containsKey("firstName") ||
+                payloadMap.get("firstName") == null ||
+                payloadMap.get("firstName").toString().trim().isEmpty()) {
+            return buildError(HttpStatus.BAD_REQUEST, "First name is mandatory");
+        }
+
+        // 5. Save
+        request.setRequestPayload(jsonPayload);
         UserRequest saved = userRequestRepository.save(request);
-        // 5. Notification (To Approvers)
+
+        // 6. Notification (To Approvers)
         // Msg: "New User Request (ID: 123) for User 1015698 (CREATE) is pending approval."
-        String notifMsg = String.format("New User Request (ID: %s) for User %s (%s) is pending approval.",
+        String notifMsg = String.format("New User Request (id: %s) for user %s (%s) is pending approval.",
                 saved.getRequestId(), saved.getTargetUserId(), saved.getRequestType());
 
         // fetch permissions
@@ -3625,6 +3733,9 @@ public class UserRequestServiceImpl implements UserRequestService {
     public ResponseEntity<ResponseVO<Map<String, Object>>> getMyRequests(Map<String, String> params, String userId) {
         log.info("received request to fetch for my requests for user : {}", userId);
         List<UserRequestProjection> rawList = userRequestRepository.findUserRequestsByRequestorUserId(userId);
+        for (UserRequestProjection u : rawList) {
+            log.info("raw list : {}", u);
+        }
         return processProjections(rawList, "myRequests");
     }
 
@@ -3635,11 +3746,12 @@ public class UserRequestServiceImpl implements UserRequestService {
             map.put("requestType", req.getRequestType());
             map.put("targetUserId", req.getTargetUserId());
             map.put("requestStatus", req.getRequestStatus());
-            map.put("requestDate", req.getRequestDate());
+            map.put("requestDate", formatTimestamp(req.getRequestDate()));
             map.put("requestPayload", ClobUtil.clobToString(req.getRequestPayload()));
-
+            log.info("approverId id : {}", req.getApprovalDate());
+            map.put("requestorUserId", req.getRequestorUserId());
             map.put("approverId", req.getApproverUserId());
-            map.put("approvalDate", req.getApprovalDate());
+            map.put("approvalDate", formatTimestamp(req.getApprovalDate()));
             map.put("rejectionReason", req.getReasonForRejection());
             return map;
         }).collect(Collectors.toList());
@@ -3655,7 +3767,7 @@ public class UserRequestServiceImpl implements UserRequestService {
     public ResponseEntity<ResponseVO<Map<String, Object>>> acceptOrRejectUserRequest(UserRequestDto dto, String ipAddress, String userId) {
         UserRequest request = userRequestRepository.findUserRequestsByRequestId(dto.getRequestId());
         request.setApproverUserId(userId);
-        request.setApprovalDate(new Timestamp(System.currentTimeMillis()));
+        request.setApprovalDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
         // set values to dto for logging purpose
         dto.setRequesterUserId(request.getRequestorUserId());
@@ -3671,7 +3783,7 @@ public class UserRequestServiceImpl implements UserRequestService {
         } else {
             request.setRequestStatus(Constant.REJECTED);
             request.setReasonForRejection(dto.getRemarks() != null ? dto.getRemarks() : "NO REMARKS");
-            request.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+            request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
             request.setExecutionDetails("SUCCESS");
             userRequestRepository.save(request);
             result.put("status", true);
@@ -3679,9 +3791,9 @@ public class UserRequestServiceImpl implements UserRequestService {
         }
 
         boolean success = (boolean) result.get("status");
-        if(success && isApproved) {
+        if (success && isApproved) {
             request.setRequestStatus(Constant.ACCEPTED);
-            request.setExecutionDate(new Timestamp(System.currentTimeMillis()));
+            request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
             request.setExecutionDetails("SUCCESS");
             userRequestRepository.save(request);
         }
@@ -3690,7 +3802,7 @@ public class UserRequestServiceImpl implements UserRequestService {
         // Msg: "Your User Request (ID: 123) for User 1015698 has been ACCEPTED."
         // Or: "Your User Request (ID: 123) ... has been REJECTED. Reason: ..."
         String status = isApproved ? "ACCEPTED" : "REJECTED";
-        String notifMsg = String.format("Your User Request (ID: %s) for User %s has been %s.",
+        String notifMsg = String.format("Your Request (ID: %s) for User %s has been %s.",
                 request.getRequestId(), request.getTargetUserId(), status.toLowerCase());
 
         if (!isApproved && dto.getRemarks() != null && !dto.getRemarks().isEmpty()) {
@@ -3698,7 +3810,7 @@ public class UserRequestServiceImpl implements UserRequestService {
         }
 
         // Pass requestorUserId to target specifically the maker
-        createNotification(request.getRequestorUserId(),null, "/user-management/create", notifMsg,
+        createNotification(request.getRequestorUserId(), null, "/user-management/create", notifMsg,
                 String.valueOf(request.getRequestId()));
 
         return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
@@ -3710,7 +3822,8 @@ public class UserRequestServiceImpl implements UserRequestService {
     private void handleAccept(UserRequest request, Map<String, Object> result, UserRequestDto dto, String ip) {
         try {
             String jsonPayload = ClobUtil.clobToString(request.getRequestPayload());
-            Map<String, Object> payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<>() {});
+            Map<String, Object> payloadMap = objectMapper.readValue(jsonPayload, new TypeReference<>() {
+            });
 
             User user = userRepository.findUserByUserId(request.getTargetUserId());
             String type = request.getRequestType();
@@ -3719,7 +3832,7 @@ public class UserRequestServiceImpl implements UserRequestService {
             if (Constant.CREATE.equalsIgnoreCase(type)) {
                 if (user != null) throw new RuntimeException("User already exists");
                 user = new User();
-                user.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+                user.setCreatedAt(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
                 user.setAccountStatus(Constant.ACTIVE);
                 user.setIsDeleted('N');
                 user.setUserWrongPasswordCount(0);
@@ -3736,7 +3849,11 @@ public class UserRequestServiceImpl implements UserRequestService {
                 if (payloadMap.containsKey("middleName")) user.setMiddleName((String) payloadMap.get("middleName"));
                 if (payloadMap.containsKey("lastName")) user.setLastName((String) payloadMap.get("lastName"));
                 if (payloadMap.containsKey("email")) user.setEmail((String) payloadMap.get("email"));
-                if (payloadMap.containsKey("mobileNumber")) user.setPhoneNumber((String) payloadMap.get("mobileNumber"));
+
+                Object phone = payloadMap.get("phoneNumber");
+                if (phone != null && !phone.toString().trim().isEmpty()) {
+                    user.setPhoneNumber(phone.toString());
+                }
 
                 if (payloadMap.containsKey("branch")) {
                     Object branchObj = payloadMap.get("branch");
@@ -3745,14 +3862,13 @@ public class UserRequestServiceImpl implements UserRequestService {
                     }
                 }
 
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
+                user.setUpdatedAt(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
                 userRepository.save(user);
 
-
                 // Update User Role linkage
-                if(payloadMap.containsKey("roleId")) {
+                if (payloadMap.containsKey("roleId")) {
                     UserRole ur = userRoleRepository.getUserRolesByUserId(user.getUserId());
-                    if(ur == null) ur = new UserRole();
+                    if (ur == null) ur = new UserRole();
                     ur.setUserId(user.getUserId());
                     ur.setRoleId(Integer.parseInt(String.valueOf(payloadMap.get("roleId"))));
                     userRoleRepository.save(ur);
@@ -3760,12 +3876,16 @@ public class UserRequestServiceImpl implements UserRequestService {
 
             } else if (Constant.LOCK.equalsIgnoreCase(type)) {
                 user.setAccountStatus(Constant.LOCKED);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Lock
+                user.setUpdatedAt(LocalDateTime.now(ZoneId.of("Asia/Kolkata"))); // Fix for Lock
                 userRepository.save(user);
             } else if (Constant.UNLOCK.equalsIgnoreCase(type)) {
                 user.setAccountStatus(Constant.ACTIVE);
-                user.setUpdatedAt(new Timestamp(System.currentTimeMillis())); // Fix for Unlock
+                user.setUpdatedAt(LocalDateTime.now(ZoneId.of("Asia/Kolkata"))); // Fix for Unlock
                 userRepository.save(user);
+            } else if (Constant.DELETE.equalsIgnoreCase(type)) {
+                // --- Hard Delete ---
+                userRepository.deleteById(user.getUserId());
+                log.info("User Id {} Deleted Permanently.", user.getUserId());
             }
 
             result.put("status", true);
@@ -3779,21 +3899,46 @@ public class UserRequestServiceImpl implements UserRequestService {
         }
     }
 
+
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public ResponseEntity cancelRequest(Map<String, Object> requestMap) {
-        long id = Long.parseLong(String.valueOf(requestMap.get("requestId")));
-        UserRequest req = userRequestRepository.findUserRequestsByRequestId(id);
+    public ResponseEntity cancelRequest(Map<String, Object> request, String userId) {
 
-        userRequestRepository.delete(req);
-        createNotification(req.getRequestorUserId(),null, "/user-management/create",
-                "User Request (ID: " + id + ") has been cancelled.", String.valueOf(id));
+        int requestId = Integer.parseInt(String.valueOf(request.get("requestId")));
+        String remarks = (String) request.get("reason") != null ? (String) request.get("reason") : "No Remarks";
+        UserRequest userRequest = userRequestRepository.findUserRequestsByRequestId(requestId);
+
+        if (!userRequest.getRequestorUserId().equals(userId)) {
+            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}",
+                    userId, requestId, userRequest.getRequestorUserId());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        // 3. State Check: Must be PENDING
+        if (!userRequest.getRequestStatus().equals(Constant.PENDING)) {
+            log.warn("Attempted to cancel a processed request. ID: {}, Status: {}", requestId, userRequest.getRequestStatus());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).build();
+        }
+
+        // update cancel status
+        userRequest.setRequestStatus(Constant.CANCEL);
+        // update creator id as approver for cancel case
+        userRequest.setApproverUserId(userId);
+        userRequest.setApprovalDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        userRequest.setReasonForRejection("CANCELLED BY USER: " + remarks);
+
+        userRequestRepository.save(userRequest);
+
+        createNotification(userRequest.getRequestorUserId(), null, "/user-create",
+                "User Request (ID: " + requestId + ") has been cancelled.",
+                String.valueOf(requestId));
 
         return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder()
                 .statusCode(HttpStatus.OK)
                 .message("Cancelled")
                 .result(Map.of("status", true))
                 .build());
+
     }
 
 
@@ -3828,6 +3973,10 @@ public class UserRequestServiceImpl implements UserRequestService {
         log.info("Role :{}", role);
 
         List<Map<String, Object>> users = userRepository.getUsers(userId, role);
+        users = users.stream().filter(u -> {
+            Object roleId = u.get("role_id");
+            return roleId == null || Integer.parseInt(roleId.toString()) != 10;
+        }).toList();
         if (users.isEmpty()) {
             result.put("status", false);
             result.put("message", "Users not found");
@@ -3841,9 +3990,118 @@ public class UserRequestServiceImpl implements UserRequestService {
         responseVo.setMessage(HttpStatus.OK.getReasonPhrase());
         return new ResponseEntity<>(responseVo, responseVo.getStatusCode());
     }
+
+    private boolean isValidUserId(String userId) {
+        return userId != null && userId.toLowerCase().matches("^(\\d{7}|v\\d{7}|tcs\\d{7}|tcsv\\d{7})");
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<Map<String, Object>>> validateUserId(String userId) {
+        if (!isValidUserId(userId)) {
+            return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder().statusCode(HttpStatus.OK)
+                    .message("Ivalid User Id format").result(Map.of("valid", false, "reason", "'INVALID_USER_ID_FORMAT")).build());
+        }
+        boolean exists = (userRepository.existsByUserId(userId));
+        return ResponseEntity.ok(ResponseVO.<Map<String, Object>>builder().statusCode(HttpStatus.OK)
+                .message(exists ? "User already exists" : "User id does not exist").result(Map.of("exists", exists)).build());
+    }
+
+    /**
+     * strict validation for F1/Bog Role (ID 11)
+     */
+    /**
+     * Strict validation for F1/Bog Role (ID 11)
+     */
+    /**
+     * Strict validation for F1/Bog Role (ID 11).
+     * Returns a ResponseEntity with error details if validation fails, otherwise returns null.
+     */
+    private ResponseEntity<ResponseVO<Map<String, Object>>> validateF1BogConstraints(String requestType, Map<String, Object> payload, User existingUser, String requestorId) {
+        Integer payloadRoleId = null;
+        if (payload.containsKey("roleId") && payload.get("roleId") != null) {
+            try {
+                payloadRoleId = Integer.parseInt(String.valueOf(payload.get("roleId")));
+            } catch (NumberFormatException e) {
+                return buildError(HttpStatus.BAD_REQUEST, "Invalid Role ID format");
+            }
+        }
+        // --- SCENARIO A: CREATE REQUEST ---
+        if (Constant.CREATE.equalsIgnoreCase(requestType)) {
+            if (payloadRoleId != null && payloadRoleId == RESTRICTED_F1_ROLE_ID) {
+                return buildError(HttpStatus.BAD_REQUEST, "Creation of F1/Bog (Role ID 11) users is not allowed.");
+            }
+        }
+        // --- SCENARIO B: MODIFY REQUEST ---
+        if (Constant.MODIFY.equalsIgnoreCase(requestType) && existingUser != null) {
+            // Fetch Current Role from DB
+            UserRole currentRoleEntity = userRoleRepository.getUserRolesByUserId(existingUser.getUserId());
+            int currentRoleId = (currentRoleEntity != null) ? currentRoleEntity.getRoleId() : -1;
+            // Validate Role Transitions
+            if (payloadRoleId != null) {
+                // Switching FROM F1
+//                if (currentRoleId == RESTRICTED_F1_ROLE_ID && payloadRoleId != RESTRICTED_F1_ROLE_ID) {
+//                    return buildError(HttpStatus.BAD_REQUEST, "Cannot change Role FROM F1/Bog (11) to another role.");
+//                }
+                // Switching TO F1
+                if (currentRoleId != RESTRICTED_F1_ROLE_ID && payloadRoleId == RESTRICTED_F1_ROLE_ID) {
+                    return buildError(HttpStatus.BAD_REQUEST, "Cannot change Role TO F1/Bog (11).");
+                }
+            }
+
+            // Validate F1 User Editing Restrictions (Target is F1 AND Requestor is F1)
+//            if (currentRoleId == RESTRICTED_F1_ROLE_ID) {
+//                UserRole requestorRoleEntity = userRoleRepository.getUserRolesByUserId(requestorId);
+//                int requestorRoleId = (requestorRoleEntity != null) ? requestorRoleEntity.getRoleId() : -1;
+//                if (requestorRoleId == RESTRICTED_F1_ROLE_ID) {
+//                    // Rule 1: Cannot change Role ID
+////                    if (payloadRoleId != null && payloadRoleId != RESTRICTED_F1_ROLE_ID) {
+////                        return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users cannot change roles.");
+////                    }
+////                    // Rule 2: Strict Field Check
+////                    if (isFieldChanged(payload, "firstName", existingUser.getFirstName())) {
+////                        return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users can only modify their Email. Changing firstName is not allowed.");
+////                    }
+////                    if (isFieldChanged(payload, "lastName", existingUser.getLastName())) {
+////                        return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users can only modify their Email. Changing lastName is not allowed.");
+////                    }
+////                    if (isFieldChanged(payload, "phoneNumber", existingUser.getPhoneNumber())) {
+////                        return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users can only modify their Email. Changing phoneNumber is not allowed.");
+////                    }
+////                    if (isFieldChanged(payload, "accountStatus", existingUser.getAccountStatus())) {
+////                        return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users can only modify their Email. Changing accountStatus is not allowed.");
+////                    }
+////                    // Branch Check
+////                    if (payload.containsKey("branch")) {
+////                        Object bObj = payload.get("branch");
+////                        if (bObj != null) {
+////                            int newBranch = Integer.parseInt(String.valueOf(bObj));
+////                            if (existingUser.getBranch() != null && existingUser.getBranch() != newBranch) {
+////                                return buildError(HttpStatus.BAD_REQUEST, "F1/Bog users can only modify their Email. Branch change is not allowed.");
+////                            }
+////                        }
+////                    }
+//                }
+//            }
+        }
+        return null; // Validation Passed
+    }
+
+    /**
+     * Helper to check if a specific field has changed in the payload vs DB.
+     * Returns TRUE if changed, FALSE if same.
+     */
+    private boolean isFieldChanged(Map<String, Object> payload, String key, String dbValue) {
+        if (payload.containsKey(key)) {
+            String newValue = payload.get(key) != null ? String.valueOf(payload.get(key)) : null;
+            if (dbValue == null) {
+                return newValue != null;
+            } else {
+                return newValue == null || !dbValue.equals(newValue);
+            }
+        }
+        return false;
+    }
 }
-
-
 
 
 
