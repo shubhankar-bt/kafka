@@ -1,75 +1,405 @@
- common req cgl : 
- 
- cgl create reponse :
- "success": true,
-    "message": "Operation completed successfully.",
-    "data": {
-        "id": 1882,
-        "reqType": "CGL_CODE",
-        "changeType": "UPDATE",
-        "reqStatus": "PENDING",
-        "reqDate": "2026-01-02T14:14:00.414704268",
-        "creatorId": "2488766",
-        "executionDate": null,
-        "executionRemarks": null,
-        "executorId": null,
-        "executorRemarks": null,
-		
-		
-my request response: 
-		
-		 "success": true,
-    "message": "Operation completed successfully.",
-    "data": [
-        {
-            "id": 1882,
-            "reqType": "CGL_CODE",
-            "changeType": "UPDATE",
-            "reqStatus": "PENDING",
-            "reqDate": "2026-01-02T14:14:00",
-            "creatorId": "2488766",
-            "executionDate": null,
-            "executionRemarks": null,
-            "executorId": null,
-            "executorRemarks": null,
-			
-			
-			
-// user
-user create/modify response :			
-{
-    "statusCode": "CREATED",
-    "message": "Request Created",
-    "result": {
-        "userRequest": {
-            "requestId": 256,
-            "requestType": "MODIFY",
-            "requestorUserId": "2488766",
-            "targetUserId": "1021253",
-            "requestPayload": "{\"userId\":\"1021253\",\"firstName\":\"Adeshbhjn\",\"lastName\":null,\"email\":\"adesh@sbi.co.in\",\"phoneNumber\":\"1234560012\",\"roleId\":51,\"roleName\":\"UCO\",\"accountStatus\":\"ACTIVE\"}",
-            "requestStatus": "PENDING",
-            "requestDate": "2026-01-02T14:16:09.134120259",
-            "approvalDate": null,
-            "approverUserId": null,
-            "reasonForRejection": null,
-            "executionDate": null,
-            "executionDetails": null
+package com.tcs.fincore.CommonMasterService.service;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.TimeZone;
+
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.tcs.fincore.CommonMasterService.Specification.CglSpecification;
+import com.tcs.fincore.CommonMasterService.dto.BalanceRequestDTO;
+import com.tcs.fincore.CommonMasterService.dto.BalanceResponseDTO;
+import com.tcs.fincore.CommonMasterService.dto.BranchStateCircleResponseDTO;
+import com.tcs.fincore.CommonMasterService.dto.CGLSegmentResponseDTO;
+import com.tcs.fincore.CommonMasterService.dto.CglSearchRequest;
+import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
+import com.tcs.fincore.CommonMasterService.exception.NoDataFoundException;
+import com.tcs.fincore.CommonMasterService.model.BalanceRecord;
+import com.tcs.fincore.CommonMasterService.model.BranchCodeNameOnly;
+import com.tcs.fincore.CommonMasterService.model.BranchMaster;
+import com.tcs.fincore.CommonMasterService.model.BranchMasterWithCircleState;
+import com.tcs.fincore.CommonMasterService.model.CGLCodeDescriptionOnly;
+import com.tcs.fincore.CommonMasterService.model.CGLMaster;
+import com.tcs.fincore.CommonMasterService.model.CGLMasterWithSegment;
+import com.tcs.fincore.CommonMasterService.model.CalenderConfigModel;
+import com.tcs.fincore.CommonMasterService.model.CircleMaster;
+import com.tcs.fincore.CommonMasterService.model.CurrencyCodeNameOnly;
+import com.tcs.fincore.CommonMasterService.model.CurrencyMasterModel;
+import com.tcs.fincore.CommonMasterService.model.CurrencyRateChange;
+import com.tcs.fincore.CommonMasterService.model.SegmentCodeMaster;
+import com.tcs.fincore.CommonMasterService.model.StateMaster;
+import com.tcs.fincore.CommonMasterService.model.ZoneMaster;
+import com.tcs.fincore.CommonMasterService.repository.AnnouncementsRepository;
+import com.tcs.fincore.CommonMasterService.repository.BalanceRecordRepository;
+import com.tcs.fincore.CommonMasterService.repository.BranchMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.BranchMasterWithStateCircleRepository;
+import com.tcs.fincore.CommonMasterService.repository.CGLMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.CGLMasterWithSegmentRepository;
+import com.tcs.fincore.CommonMasterService.repository.CalenderConfigRepository;
+import com.tcs.fincore.CommonMasterService.repository.CircleMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.CurrencyMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.CurrencyRateChangeRepo;
+import com.tcs.fincore.CommonMasterService.repository.SegmentCodeMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.StateMasterRepository;
+import com.tcs.fincore.CommonMasterService.repository.ZoneMasterRepository;
+
+import lombok.RequiredArgsConstructor;
+
+@Service
+@RequiredArgsConstructor
+public class CommonMasterServiceImpl implements CommonMasterService {
+
+    private final SegmentCodeMasterRepository repository;
+    private final CGLMasterRepository cglMasterRepository;
+    private final StateMasterRepository stateMasterRepository;
+    private final BranchMasterRepository branchMasterRepository;
+    private final ZoneMasterRepository zoneMasterRepository;
+    private final CircleMasterRepository circleMatserRepository;
+    private final CurrencyMasterRepository currencyMasterRepo;
+    private final CalenderConfigRepository calenderConfigRepository;
+    private final CurrencyRateChangeRepo currencyRateChangeRepo;
+    private final BalanceRecordRepository balanceRecordRepository;
+    private final AnnouncementsRepository announcementsRepository;
+    private final CGLMasterWithSegmentRepository cglWithSegmentRepository;
+    private final BranchMasterWithStateCircleRepository branchMasterWithStateCircleRepository;
+    private final JwtUtil jwtUtil;
+
+    private static final int EXPORT_CHUNK_SIZE = 500;
+    
+    // Define the specific TimeZone for India
+    private static final String ZONE_IST = "Asia/Kolkata";
+
+    @Override
+    public List<SegmentCodeMaster> getSegmentCodes() {
+        return (List<SegmentCodeMaster>) repository.findAll();
+    }
+
+    @Override
+    public PaginatedResponseDto<CGLMaster> getCGLs(CglSearchRequest request) {
+
+        PageRequest pageRequest = PageRequest.of(request.getPage(), request.getSize());
+
+        Page<CGLMaster> pageResult;
+
+        if (request.getFilters() == null || request.getFilters().isEmpty()) {
+            pageResult = cglMasterRepository.findAll(pageRequest);
+        } else {
+            pageResult = cglMasterRepository.findAll(
+                    CglSpecification.build(request.getFilters()),
+                    pageRequest);
         }
-    },
-	
-my request response :
-	"myRequests": [
-            {
-                "approvalDate": null,
-                "requestType": "MODIFY",
-                "requestId": "256",
-                "requestPayload": "{\"userId\":\"1021253\",\"firstName\":\"Adeshbhjn\",\"lastName\":null,\"email\":\"adesh@sbi.co.in\",\"phoneNumber\":\"1234560012\",\"roleId\":51,\"roleName\":\"UCO\",\"accountStatus\":\"ACTIVE\"}",
-                "approverId": null,
-                "requestorUserId": "2488766",
-                "requestDate": "2026-01-02T14:16:09.134+00:00",
-                "targetUserId": "1021253",
-                "rejectionReason": null,
-                "requestStatus": "PENDING"
-            },
-	
-	
+
+        PaginatedResponseDto<CGLMaster> response = new PaginatedResponseDto<>();
+
+        response.setData(pageResult.getContent());
+        response.setTotalElements(pageResult.getTotalElements());
+        response.setTotalPages(pageResult.getTotalPages());
+        response.setPageSize(pageResult.getSize());
+        response.setCurrentPage(pageResult.getNumber());
+
+        return response;
+    }
+
+    @Override
+    public List<CGLCodeDescriptionOnly> getCGLsCodeDescriptionOnly(String query) {
+        return cglMasterRepository.findBycglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCase(query, query);
+    }
+
+    @Override
+    public List<String> getCGLCodes() {
+        return cglMasterRepository.findAllCGLNumbers();
+    }
+
+    @Override
+    public List<String> getCurrencys() {
+        return currencyMasterRepo.findAllCurrency();
+    }
+
+    @Override
+    public List<StateMaster> getStateList() {
+        return (List<StateMaster>) stateMasterRepository.findAll();
+    }
+
+    @Override
+    public List<BranchMaster> getBranches() {
+        return (List<BranchMaster>) branchMasterRepository.findAll();
+    }
+
+    @Override
+    public List<BranchCodeNameOnly> getBranchesCodeNameOnly(String query) {
+        return branchMasterRepository.findTop100ByCodeContainingIgnoreCaseOrNameContainingIgnoreCase(query, query);
+    }
+
+    @Override
+    public List<ZoneMaster> getZoneCodes() {
+        return zoneMasterRepository.findAll();
+    }
+
+    @Override
+    public List<CircleMaster> getCircleList() {
+        return circleMatserRepository.findAll();
+    }
+
+    @Override
+    public List<CurrencyMasterModel> getCurrency() {
+        return (List<CurrencyMasterModel>) currencyMasterRepo.findAll();
+    }
+
+    @Override
+    public List<CurrencyCodeNameOnly> getCurrencyCodeNameOnly() {
+        return currencyMasterRepo.findAllBy();
+    }
+
+    @Override
+    public CalenderConfigModel getCalenderConfig() {
+        return calenderConfigRepository.findFirstByOrderByIdDesc();
+    }
+
+    @Override
+    public List<CurrencyRateChange> getRateChange() {
+        return (List<CurrencyRateChange>) currencyRateChangeRepo.findAll();
+    }
+
+    /**
+     * Helper Method: Forces the date to Start of Day (00:00:00) in Asia/Kolkata
+     * regardless of Server TimeZone.
+     */
+    private Date convertToStartOfDay(Date date) {
+        if (date == null) return null;
+        // Use Calendar with Specific TimeZone to avoid UTC shifts
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone(ZONE_IST));
+        calendar.setTime(date);
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        return calendar.getTime();
+    }
+
+    /**
+     * Helper Method: Forces the date to End of Day (23:59:59) in Asia/Kolkata
+     * regardless of Server TimeZone.
+     */
+    private Date convertToEndOfDay(Date date) {
+        if (date == null) return null;
+        // Use Calendar with Specific TimeZone to avoid UTC shifts
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone(ZONE_IST));
+        calendar.setTime(date);
+        calendar.set(Calendar.HOUR_OF_DAY, 23);
+        calendar.set(Calendar.MINUTE, 59);
+        calendar.set(Calendar.SECOND, 59);
+        calendar.set(Calendar.MILLISECOND, 999);
+        return calendar.getTime();
+    }
+
+    @Override
+    public PaginatedResponseDto<BalanceResponseDTO> getBalanceDetails(BalanceRequestDTO request) {
+        if (request.getEndDate().before(request.getStartDate())) {
+            throw new IllegalArgumentException("End date must be after start date");
+        }
+
+        // --- CRITICAL FIX START ---
+        // 1. Force Start Date to 00:00:00 IST
+        Date adjustedStartDate = convertToStartOfDay(request.getStartDate());
+        // 2. Force End Date to 23:59:59 IST
+        Date adjustedEndDate = convertToEndOfDay(request.getEndDate());
+        // --- CRITICAL FIX END ---
+
+        int page = (request.getPage() != null && request.getPage() >= 0) ? request.getPage() : 0;
+        int size = (request.getSize() != null && request.getSize() >= 0) ? request.getSize() : 10;
+
+        String sortIn = (request.getSortIn() != null && !request.getSortIn().isBlank())
+                ? request.getSortIn().toUpperCase()
+                : "ASC";
+
+        Sort sort = sortIn.equals("DESC") ? Sort.by("date").descending() : Sort.by("date").ascending();
+        PageRequest pageRequest = PageRequest.of(page, size, sort);
+
+        // Pass adjusted dates to repository
+        Page<BalanceRecord> records = balanceRecordRepository.findByBranchAndCglAndCurrencyAndDateBetween(
+                request.getBranch(), request.getCgl(), request.getCurrency(), 
+                adjustedStartDate, adjustedEndDate, 
+                pageRequest);
+
+        if (records.isEmpty()) {
+            throw new NoDataFoundException("No records found for given filters");
+        }
+
+        List<BalanceResponseDTO> list = records.stream()
+                .map(r -> new BalanceResponseDTO(
+                        r.getId(), r.getDate(), r.getBranch(), r.getCgl(), r.getCurrency(), r.getBalance()))
+                .toList();
+
+        String actualSort = records.getSort().stream().findFirst().map(order -> order.getDirection().name())
+                .orElse("UNSORTED");
+
+        return new PaginatedResponseDto<>(
+                records.getNumber(), records.getTotalPages(), records.getSize(), records.getTotalElements(), actualSort,
+                list);
+
+    }
+
+    @Override
+    public byte[] exportBalanceToExcel(BalanceRequestDTO request) {
+
+        if (request.getEndDate().before(request.getStartDate())) {
+            throw new IllegalArgumentException("End date must be after start date");
+        }
+        
+        // --- CRITICAL FIX START ---
+        Date adjustedStartDate = convertToStartOfDay(request.getStartDate());
+        Date adjustedEndDate = convertToEndOfDay(request.getEndDate());
+        // --- CRITICAL FIX END ---
+
+        int chunkSize = EXPORT_CHUNK_SIZE;
+        try (Workbook workbook = new XSSFWorkbook();
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            Sheet sheet = workbook.createSheet("Balance Enquiry");
+
+            CellStyle headerStyle = workbook.createCellStyle();
+            Font headereFont = workbook.createFont();
+            headereFont.setBold(true);
+            headerStyle.setFont(headereFont);
+
+            CellStyle dateStyle = workbook.createCellStyle();
+            CreationHelper creationHelper = workbook.getCreationHelper();
+            short dateFormat = creationHelper.createDataFormat().getFormat("dd-MM-yyyy");
+            dateStyle.setDataFormat(dateFormat);
+
+            CellStyle balanceStyle = workbook.createCellStyle();
+            short balanceFormat = creationHelper.createDataFormat().getFormat("#,##0.00");
+            balanceStyle.setDataFormat(balanceFormat);
+
+            String[] columns = { "ID", "Date", "Branch", "CGL", "Currency", "Balance" };
+            Row header = sheet.createRow(0);
+            for (int i = 0; i < columns.length; i++) {
+                Cell cell = header.createCell(i);
+                cell.setCellValue(columns[i]);
+                cell.setCellStyle(headerStyle);
+            }
+
+            int rowIdx = 1;
+            int page = 0;
+            Page<BalanceRecord> recordsPage;
+
+            do {
+                Pageable pageable = PageRequest.of(page, chunkSize, Sort.by("date").ascending());
+
+                // Pass adjusted dates to repository
+                recordsPage = balanceRecordRepository.findByBranchAndCglAndCurrencyAndDateBetween(
+                        request.getBranch(),
+                        request.getCgl(), 
+                        request.getCurrency(), 
+                        adjustedStartDate, 
+                        adjustedEndDate,
+                        pageable);
+
+                if (page == 0 && recordsPage.isEmpty()) {
+                    workbook.write(out);
+                    return out.toByteArray();
+                }
+                for (BalanceRecord r : recordsPage.getContent()) {
+                    Row row = sheet.createRow(rowIdx++);
+                    if (r.getId() != null) {
+                        row.createCell(0).setCellValue(r.getId());
+                    } else {
+                        row.createCell(0).setCellValue("");
+                    }
+                    Cell dateCell = row.createCell(1);
+                    if (r.getDate() != null) {
+                        dateCell.setCellValue(r.getDate());
+                        dateCell.setCellStyle(dateStyle);
+                    } else {
+                        dateCell.setCellValue("");
+                    }
+
+                    row.createCell(2).setCellValue(r.getBranch() != null ? r.getBranch() : "");
+                    row.createCell(3).setCellValue(r.getCgl() != null ? r.getCgl() : "");
+                    row.createCell(4).setCellValue(r.getCurrency() != null ? r.getCurrency() : "");
+                    Cell balanceCell = row.createCell(5);
+                    balanceCell.setCellValue(r.getBalance());
+                    balanceCell.setCellStyle(balanceStyle);
+                }
+                page++;
+            } while (!recordsPage.isLast());
+
+            for (int i = 0; i < columns.length; i++) {
+                sheet.autoSizeColumn(i);
+            }
+            workbook.write(out);
+            return out.toByteArray();
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to generate Excel file", e);
+        }
+    }
+
+    @Override
+    public Page<BranchMaster> getBranchNames(Pageable pageable) {
+        return branchMasterRepository.findAll(pageable);
+    }
+
+    @Override
+    @Transactional
+    public PaginatedResponseDto<CGLSegmentResponseDTO> searchCglWithSegment(String text, Integer page, Integer size) {
+        int pageNo = (page == null || page < 0) ? 0 : page;
+        int pageSize = (size == null || size <= 0) ? 10 : size;
+
+        Pageable pageable = PageRequest.of(pageNo, pageSize);
+
+        Page<CGLMasterWithSegment> pageResult = cglWithSegmentRepository
+                .findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCase(text.trim(), text.trim(),
+                        pageable);
+
+        List<CGLSegmentResponseDTO> list = pageResult.getContent().stream().map(this::toCGLDto).toList();
+        if (list.isEmpty()) {
+            throw new NoDataFoundException("No records found for " + text + " !!");
+        }
+        return new PaginatedResponseDto<>(pageResult.getNumber(), pageResult.getTotalPages(), pageResult.getSize(),
+                pageResult.getTotalElements(), null, list);
+
+    }
+
+    // Helper Class for searchCglWithSegment to convert entity to DTO
+    public CGLSegmentResponseDTO toCGLDto(CGLMasterWithSegment c) {
+        return new CGLSegmentResponseDTO(c.getCglNumber(), c.getDescription(), c.getComp1(), c.getComp2(),
+                c.getAcClassification(), c.getSegmentCode(),
+                (c.getSegment() != null ? c.getSegment().getDescription() : null), c.getBalFwd(), c.getDefBalType(),
+                c.getStatus(), c.getOpenDate(), c.getCloseDate(), c.getBalCompare(), c.getManualPosting());
+    }
+
+    public List<BranchStateCircleResponseDTO> searchByBranchNameORCode(String name) {
+
+        List<BranchMasterWithCircleState> branches = branchMasterWithStateCircleRepository
+                .findByCodeContainingIgnoreCaseOrNameContainingIgnoreCase(name.trim(), name.trim());
+
+        if (branches.isEmpty()) {
+            throw new NoDataFoundException("No branches found for " + name + " !!");
+        }
+
+        return branches.stream().map(this::toBranchDto).toList();
+
+    }
+
+    // Helper Class for searchByBranchNameORCode to convert entity to DTO
+    public BranchStateCircleResponseDTO toBranchDto(BranchMasterWithCircleState b) {
+        return new BranchStateCircleResponseDTO(b.getCode(), b.getName(), b.getCity(), b.getCircleCode(),
+                (b.getCircle() != null ? b.getCircle().getCircleName() : null), b.getStateCode(),
+                (b.getState() != null ? b.getState().getStateName() : null), b.getAddress(), b.getPinCode(),
+                b.getPhoneNumber(), b.getEmailId(), b.getNmrCode(), b.getStatus(), b.getOpenDate(), b.getCloseDate(),
+                b.getMergeDate(), b.getMergedWithBranch(), b.getLastChangeDate(), b.getCpcFlag(), b.getFoodCreditFlag(),
+                b.getCurrChestFlag(), b.getBranchType());
+    }
+}
+
