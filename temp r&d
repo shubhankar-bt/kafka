@@ -408,64 +408,7 @@ _____________
 
 
 
-
-
-
-
-
-
 validation speed up :: 
-
-
-package com.fincore.JournalService.Service;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class ValidationMasterService {
-
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
-
-    // Cache this result for 5-10 minutes if possible, or fetch fresh per upload.
-    // Given the criticality, fetching fresh per upload is safer and still takes < 1 second.
-
-    public Set<String> getAllActiveBranches() {
-        long start = System.currentTimeMillis();
-        // Adjust table/column names to match your DB
-        String sql = "SELECT BRANCH_CODE FROM BRANCH_MASTER WHERE ACTIVE_FLAG = 'Y'"; 
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        log.debug("Fetched {} branches in {}ms", list.size(), System.currentTimeMillis() - start);
-        return new HashSet<>(list);
-    }
-
-    public Set<String> getAllActiveCurrencies() {
-        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE ACTIVE_FLAG = 'Y'";
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        return new HashSet<>(list);
-    }
-
-    public Set<String> getAllActiveCgls() {
-        String sql = "SELECT CGL_CODE FROM CGL_MASTER WHERE ACTIVE_FLAG = 'Y'";
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        return new HashSet<>(list);
-    }
-}
-
-
 
 
 
@@ -484,24 +427,99 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 
+/**
+ * Configuration for Redis to handle compressed binary data.
+ * This prevents Out-Of-Memory errors by offloading large datasets to Redis.
+ */
 @Configuration
 public class RedisConfig {
 
-    // Optimized template for storing Compressed Data (byte[])
     @Bean(name = "byteArrayRedisTemplate")
     public RedisTemplate<String, byte[]> byteArrayRedisTemplate(RedisConnectionFactory connectionFactory) {
         RedisTemplate<String, byte[]> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
         
-        // Keys are Strings (e.g., "JRNL_DATA_123")
+        // Keys are Strings (e.g., "JRNL_DATA_UUID") - Readable in Redis CLI
         template.setKeySerializer(new StringRedisSerializer());
         
-        // Values are Byte Arrays (Compressed GZIP data) - No serializer needed, raw bytes
+        // Values are raw Byte Arrays (GZIP Compressed Data) - No serialization overhead
         template.setEnableDefaultSerializer(false);
         
         return template;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Helper service to fetch Master Data for bulk validation.
+ * Fetches entire active sets to allow O(1) in-memory validation.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ValidationMasterService {
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    public Set<String> getAllActiveBranches() {
+        long start = System.currentTimeMillis();
+        // Ensure table names match your Oracle DB
+        String sql = "SELECT BRANCH_CODE FROM BRANCH_MASTER WHERE ACTIVE_FLAG = 'Y'"; 
+        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
+        log.info("Loaded {} Active Branches in {}ms", list.size(), System.currentTimeMillis() - start);
+        return new HashSet<>(list);
+    }
+
+    public Set<String> getAllActiveCurrencies() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE ACTIVE_FLAG = 'Y'";
+        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
+        log.info("Loaded {} Active Currencies in {}ms", list.size(), System.currentTimeMillis() - start);
+        return new HashSet<>(list);
+    }
+
+    public Set<String> getAllActiveCgls() {
+        long start = System.currentTimeMillis();
+        String sql = "SELECT CGL_CODE FROM CGL_MASTER WHERE ACTIVE_FLAG = 'Y'";
+        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
+        log.info("Loaded {} Active CGLs in {}ms", list.size(), System.currentTimeMillis() - start);
+        return new HashSet<>(list);
+    }
+}
+
+
+
+
+
+
+
 
 
 
@@ -521,6 +539,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.JournalService.Dto.BulkUploadStateDto;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
@@ -534,11 +554,20 @@ import org.springframework.stereotype.Service;
 import java.io.*;
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
+/**
+ * Service to handle high-volume Excel validation.
+ * Features:
+ * 1. Async Processing (Non-blocking UI).
+ * 2. In-Memory Master Data Checks (No N+1 DB calls).
+ * 3. Group Balance Validation (Net Zero check).
+ * 4. Redis + GZIP Storage (Stateless, Low Memory).
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -547,150 +576,364 @@ public class JournalBulkValidationService {
     private final ValidationMasterService validationMasterService;
     private final ObjectMapper objectMapper;
 
-    // Inject the Redis Template we just created
     @Autowired
     @Qualifier("byteArrayRedisTemplate")
     private RedisTemplate<String, byte[]> redisTemplate;
 
-    // Keys & TTL
-    private static final String KEY_DATA = "JRNL_DATA::";
-    private static final String KEY_STATUS = "JRNL_STAT::";
-    private static final String KEY_ERR = "JRNL_ERR::";
-    private static final long CACHE_TTL_MINUTES = 30;
+    // Redis Keys & Config
+    private static final String KEY_DATA = "JRNL_DATA::";   // Valid Data (Compressed)
+    private static final String KEY_STATUS = "JRNL_STAT::"; // Status DTO (JSON)
+    private static final String KEY_ERR = "JRNL_ERR::";     // Error Report (Excel Bytes)
+    private static final long CACHE_TTL_MINUTES = 60;       // Auto-delete after 1 hour
 
+    // --- DTO Definition (Inner Class for Self-Containment) ---
     @Data
     @Builder
-    // Ensure NoArgsConstructor is available for Jackson
+    @NoArgsConstructor
+    @AllArgsConstructor
     public static class ExcelRowData implements Serializable {
-        public ExcelRowData() {} 
-        public ExcelRowData(int r, String b, String c, String cg, BigDecimal a, String t, String rem, String p, String sd, boolean sf, List<String> err) {
-            this.rowIndex=r; this.branch=b; this.currency=c; this.cgl=cg; this.amount=a; this.txnType=t; this.remarks=rem; this.productCode=p; this.sysDate=sd; this.isSystemFormat=sf; this.errors=err;
-        }
         public int rowIndex;
         public String branch;
         public String currency;
         public String cgl;
         public BigDecimal amount;
-        public String txnType;
+        public String txnType; // Credit / Debit
         public String remarks;
         public String productCode;
-        public String sysDate;
+        public String sysDate; // Raw date from Excel
         public boolean isSystemFormat;
         public List<String> errors;
     }
 
-    // --- MAIN ENTRY POINT ---
+    // ==================================================================================
+    // 1. PUBLIC ENTRY POINTS
+    // ==================================================================================
+
+    /**
+     * Called by Controller to start the process. Returns Request ID immediately.
+     */
     public String initiateValidation(byte[] fileBytes, String fileName, LocalDate postingDate) {
         String requestId = UUID.randomUUID().toString();
-        // Set initial status in Redis
-        updateStatus(requestId, "QUEUED", "Waiting for processor", 0, 0);
+        log.info("Init Validation. ReqID: {}, File: {} ({} bytes)", requestId, fileName, fileBytes.length);
+        
+        // Set Initial Status in Redis
+        updateStatus(requestId, "QUEUED", "Waiting for processor...", 0, 0);
+
+        // Fire Async Process
         processValidationAsync(requestId, fileBytes, fileName, postingDate);
+        
         return requestId;
     }
+
+    /**
+     * Retrieve current status from Redis.
+     */
+    public BulkUploadStateDto getState(String reqId) {
+        try {
+            byte[] bytes = redisTemplate.opsForValue().get(KEY_STATUS + reqId);
+            if (bytes == null) return null;
+            return objectMapper.readValue(bytes, BulkUploadStateDto.class);
+        } catch (Exception e) {
+            log.error("Error reading status for {}", reqId, e);
+            return null;
+        }
+    }
+
+    /**
+     * Retrieve Valid Rows (Decompresses from Redis).
+     * Used by CreateBatch API.
+     */
+    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
+        byte[] bytes = redisTemplate.opsForValue().get(KEY_DATA + requestId);
+        if (bytes == null) {
+            log.warn("Cache miss for ReqID: {}", requestId);
+            return null;
+        }
+        try {
+            return decompress(bytes);
+        } catch (IOException e) {
+            log.error("Decompression failed for ReqID: {}", requestId, e);
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Retrieve Error Report file.
+     */
+    public byte[] getFileBytes(String reqId, String type) {
+        if ("ERROR".equals(type)) {
+            return redisTemplate.opsForValue().get(KEY_ERR + reqId);
+        }
+        return null; // Can implement Success File download if needed
+    }
+
+    public byte[] generateTemplateBytes() { 
+        // Implement template generation logic if needed
+        return new byte[0]; 
+    }
+
+    // ==================================================================================
+    // 2. ASYNC PROCESSOR
+    // ==================================================================================
 
     @Async("bulkExecutor")
     public void processValidationAsync(String requestId, byte[] fileBytes, String fileName, LocalDate postingDate) {
         long startTime = System.currentTimeMillis();
-        log.info("Starting Validation for ReqID: {}", requestId);
-        updateStatus(requestId, "PROCESSING", "Reading File...", 0, 0);
+        log.info(">>> ASYNC VALIDATION START: {}", requestId);
+        updateStatus(requestId, "PROCESSING", "Initializing & Fetching Master Data...", 0, 0);
 
         List<ExcelRowData> validRows = new ArrayList<>();
         List<ExcelRowData> errorRows = new ArrayList<>();
 
         try {
-            // 1. Fetch Masters
+            // STEP A: Fetch Master Data (Batch Fetch for Performance)
             Set<String> validBranches = validationMasterService.getAllActiveBranches();
             Set<String> validCurrencies = validationMasterService.getAllActiveCurrencies();
             Set<String> validCgls = validationMasterService.getAllActiveCgls();
+            
+            updateStatus(requestId, "PROCESSING", "Parsing Excel File...", 0, 0);
 
-            // 2. Parse & Validate
+            // STEP B: Parse & Row-Level Validation
             try (Workbook workbook = new XSSFWorkbook(new ByteArrayInputStream(fileBytes))) {
                 Sheet sheet = workbook.getSheetAt(0);
-                DataFormatter formatter = new DataFormatter();
+                DataFormatter formatter = new DataFormatter(); // Handles formatted cells (dates/numbers) safely
+                
                 int rowIdx = 0;
                 for (Row row : sheet) {
-                    if (rowIdx++ == 0) continue; 
+                    if (rowIdx++ == 0) continue; // Skip Header
                     if (isRowEmpty(row)) continue;
 
+                    // Parse
                     ExcelRowData data = parseRow(row, rowIdx, formatter);
+
+                    // Validate (Level 1 & 2)
                     validateRow(data, validBranches, validCurrencies, validCgls);
 
-                    if (!data.errors.isEmpty()) errorRows.add(data);
-                    else validRows.add(data);
-
-                    if (rowIdx % 10000 == 0) updateStatus(requestId, "PROCESSING", "Processed " + rowIdx + " rows...", 0, 0);
+                    if (!data.errors.isEmpty()) {
+                        errorRows.add(data);
+                    } else {
+                        validRows.add(data);
+                    }
+                    
+                    // Update Progress every 10k rows
+                    if (rowIdx % 10000 == 0) {
+                        updateStatus(requestId, "PROCESSING", "Processed " + rowIdx + " rows...", validRows.size(), errorRows.size());
+                    }
                 }
             }
 
-            // 3. Group Checks
-            if (!validRows.isEmpty()) validateGroupBalances(validRows, errorRows);
-            validRows.removeAll(errorRows);
+            // STEP C: Group Level Balance Check (Level 3)
+            // "If 10 Credit, checking 10 Debit matches" -> Net Zero Sum check per Group
+            if (!validRows.isEmpty()) {
+                updateStatus(requestId, "PROCESSING", "Performing Group Balance Checks...", validRows.size(), errorRows.size());
+                validateGroupBalances(validRows, errorRows);
+            }
 
-            // 4. SAVE TO REDIS (COMPRESSED)
+            // STEP D: Final Clean up
+            // Remove any rows that failed the Group Check from the Valid List
+            validRows.removeAll(errorRows); 
+
+            // STEP E: Save Result to Redis
             if (errorRows.isEmpty()) {
-                // Happy Path: Compress 600k rows (~60MB -> ~5MB) and store in Redis
-                byte[] compressedData = compress(validRows);
-                redisTemplate.opsForValue().set(KEY_DATA + requestId, compressedData, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
-                
-                updateStatus(requestId, "COMPLETED", "Validation Successful", validRows.size(), 0);
+                // SUCCESS: Compress valid rows and store
+                if (validRows.isEmpty()) {
+                     updateStatus(requestId, "FAILED", "File contains no valid data.", 0, 0);
+                } else {
+                    byte[] compressedData = compress(validRows);
+                    redisTemplate.opsForValue().set(KEY_DATA + requestId, compressedData, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
+                    updateStatus(requestId, "COMPLETED", "Validation Successful.", validRows.size(), 0);
+                }
             } else {
-                // Error Path
+                // FAILURE: Generate Error Report and store
                 byte[] errorReport = generateErrorReport(errorRows);
-                // Store error file in Redis too (also compressed usually, or raw if small)
                 if (errorReport != null) {
                     redisTemplate.opsForValue().set(KEY_ERR + requestId, errorReport, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
                 }
-                updateStatus(requestId, "FAILED", "Validation Failed. Download Error Report.", validRows.size(), errorRows.size());
+                updateStatus(requestId, "FAILED", "Validation Failed. Please download the error report.", validRows.size(), errorRows.size());
             }
 
-            log.info("Validation Finished. ReqID: {}. Time: {}ms", requestId, System.currentTimeMillis() - startTime);
+            log.info(">>> ASYNC VALIDATION DONE: {}. Time: {}ms. Valid: {}, Errors: {}", 
+                     requestId, System.currentTimeMillis() - startTime, validRows.size(), errorRows.size());
 
         } catch (Exception e) {
-            log.error("Validation Failed", e);
+            log.error("Fatal Validation Error for {}", requestId, e);
             updateStatus(requestId, "ERROR", "System Error: " + e.getMessage(), 0, 0);
         }
     }
 
-    // --- REDIS HELPERS ---
+    // ==================================================================================
+    // 3. VALIDATION LOGIC
+    // ==================================================================================
 
-    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
-        // 1. Fetch Compressed Bytes
-        byte[] bytes = redisTemplate.opsForValue().get(KEY_DATA + requestId);
-        if (bytes == null) return null; // Expired or invalid
+    private void validateRow(ExcelRowData row, Set<String> branches, Set<String> currencies, Set<String> cgls) {
+        // 1. Mandatory Checks
+        if (isEmpty(row.branch)) row.errors.add("Branch Code is mandatory");
+        if (isEmpty(row.currency)) row.errors.add("Currency is mandatory");
+        if (isEmpty(row.cgl)) row.errors.add("CGL is mandatory");
+        if (row.amount == null) row.errors.add("Amount is missing or invalid format");
+        if (isEmpty(row.txnType)) row.errors.add("Transaction Type (Credit/Debit) is mandatory");
 
-        // 2. Decompress & Deserialize
-        try {
-            return decompress(bytes);
-        } catch (IOException e) {
-            log.error("Failed to decompress data for {}", requestId, e);
-            return Collections.emptyList();
+        // 2. Master Data Existence Checks (O(1) lookup)
+        if (!isEmpty(row.branch) && !branches.contains(row.branch)) {
+            row.errors.add("Invalid Branch Code (Not found/Inactive)");
+        }
+        if (!isEmpty(row.currency) && !currencies.contains(row.currency)) {
+            row.errors.add("Invalid Currency Code (Not found/Inactive)");
+        }
+        if (!isEmpty(row.cgl) && !cgls.contains(row.cgl)) {
+            row.errors.add("Invalid CGL Code (Not found/Inactive)");
+        }
+        
+        // 3. Transaction Type Format
+        if (!isEmpty(row.txnType)) {
+            String type = row.txnType.trim().toUpperCase();
+            if (!type.equals("CREDIT") && !type.equals("DEBIT") && !type.equals("CR") && !type.equals("DR") && !type.equals("C") && !type.equals("D")) {
+                row.errors.add("Invalid Transaction Type. Use Credit/Debit.");
+            }
         }
     }
 
-    public BulkUploadStateDto getState(String reqId) {
-        byte[] bytes = redisTemplate.opsForValue().get(KEY_STATUS + reqId);
-        if (bytes == null) return null;
-        try {
-            return objectMapper.readValue(bytes, BulkUploadStateDto.class);
-        } catch (Exception e) { return null; }
+    /**
+     * Checks if the Sum of Debits equals Sum of Credits for each Branch+Currency+CGL group.
+     */
+    private void validateGroupBalances(List<ExcelRowData> validRows, List<ExcelRowData> errorAccumulator) {
+        // Key: Branch|Currency|CGL
+        Map<String, BigDecimal> groupSums = new HashMap<>();
+        Map<String, List<ExcelRowData>> groupRows = new HashMap<>();
+
+        for (ExcelRowData row : validRows) {
+            String key = row.branch + "|" + row.currency + "|" + row.cgl;
+            
+            // Normalize Amount: Credit is Negative, Debit is Positive
+            BigDecimal val = row.amount;
+            String type = row.txnType.trim().toUpperCase();
+            if (type.startsWith("C")) { // Credit, Cr, C
+                val = val.negate();
+            }
+            
+            groupSums.merge(key, val, BigDecimal::add);
+            groupRows.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+        }
+
+        // Check for Imbalance
+        for (Map.Entry<String, BigDecimal> entry : groupSums.entrySet()) {
+            // Compare to Zero (Use compareTo for BigDecimal safety)
+            if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
+                // Imbalance found! Mark all rows in this group as errors.
+                List<ExcelRowData> badRows = groupRows.get(entry.getKey());
+                for (ExcelRowData r : badRows) {
+                    r.errors.add("Group Balance Mismatch: Net sum for Branch/Curr/CGL is " + entry.getValue() + " (Should be 0)");
+                    // Add to error list (Note: These will be removed from valid list in main method)
+                    errorAccumulator.add(r);
+                }
+            }
+        }
     }
 
-    public byte[] getFileBytes(String reqId, String type) {
-        if ("ERROR".equals(type)) {
-            return redisTemplate.opsForValue().get(KEY_ERR + reqId);
+    // ==================================================================================
+    // 4. EXCEL PARSING & GENERATION
+    // ==================================================================================
+
+    private ExcelRowData parseRow(Row row, int rowIndex, DataFormatter formatter) {
+        ExcelRowData data = new ExcelRowData();
+        data.rowIndex = rowIndex;
+        data.errors = new ArrayList<>();
+
+        try {
+            // Adjust column indices based on your Template
+            // Assuming: Branch(0), Currency(1), CGL(2), Amount(3), Type(4), Remarks(5), Date(6), Product(7)
+            data.branch = getCellVal(row, 0, formatter);
+            data.currency = getCellVal(row, 1, formatter);
+            data.cgl = getCellVal(row, 2, formatter);
+            
+            String amtStr = getCellVal(row, 3, formatter);
+            if (amtStr != null) {
+                try {
+                    // Remove commas for currency formatting (e.g., "1,000.00")
+                    data.amount = new BigDecimal(amtStr.replace(",", ""));
+                } catch (Exception e) {
+                    data.errors.add("Invalid Amount Format");
+                }
+            }
+            
+            data.txnType = getCellVal(row, 4, formatter);
+            data.remarks = getCellVal(row, 5, formatter);
+            
+            data.sysDate = getCellVal(row, 6, formatter);
+            if (!isEmpty(data.sysDate)) {
+                data.isSystemFormat = true; // Flag to attempt parsing later
+            }
+            
+            data.productCode = getCellVal(row, 7, formatter);
+
+        } catch (Exception e) {
+            log.warn("Row parse error at index {}", rowIndex, e);
+            data.errors.add("Critical Error parsing row data");
         }
-        return null;
+        return data;
     }
+
+    private String getCellVal(Row row, int idx, DataFormatter formatter) {
+        Cell c = row.getCell(idx, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+        return c == null ? null : formatter.formatCellValue(c).trim();
+    }
+    
+    private boolean isEmpty(String s) { return s == null || s.trim().isEmpty(); }
+    
+    private boolean isRowEmpty(Row row) {
+        if (row == null) return true;
+        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            if (cell != null && cell.getCellType() != CellType.BLANK && !cell.toString().trim().isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private byte[] generateErrorReport(List<ExcelRowData> errorRows) {
+        try (Workbook wb = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            Sheet s = wb.createSheet("Validation Errors");
+            
+            // Header
+            Row head = s.createRow(0);
+            String[] headers = {"Row No", "Errors", "Branch", "Currency", "CGL", "Amount", "Type"};
+            for(int i=0; i<headers.length; i++) head.createCell(i).setCellValue(headers[i]);
+
+            // Data
+            int rowIdx = 1;
+            for(ExcelRowData r : errorRows) {
+                Row row = s.createRow(rowIdx++);
+                row.createCell(0).setCellValue(r.rowIndex);
+                row.createCell(1).setCellValue(String.join(" | ", r.errors));
+                row.createCell(2).setCellValue(r.branch);
+                row.createCell(3).setCellValue(r.currency);
+                row.createCell(4).setCellValue(r.cgl);
+                row.createCell(5).setCellValue(r.amount != null ? r.amount.toString() : "");
+                row.createCell(6).setCellValue(r.txnType);
+            }
+            wb.write(out);
+            return out.toByteArray();
+        } catch(IOException e) {
+            log.error("Failed to generate error report", e);
+            return null;
+        }
+    }
+
+    // ==================================================================================
+    // 5. REDIS & COMPRESSION UTILS
+    // ==================================================================================
 
     private void updateStatus(String id, String status, String msg, int valid, int error) {
         try {
             BulkUploadStateDto dto = new BulkUploadStateDto(status, msg, valid, error);
-            // Store status as JSON bytes
-            redisTemplate.opsForValue().set(KEY_STATUS + id, objectMapper.writeValueAsBytes(dto), CACHE_TTL_MINUTES, TimeUnit.MINUTES);
-        } catch (Exception e) { log.error("Status Update Failed", e); }
+            // Serialize to JSON Bytes
+            byte[] bytes = objectMapper.writeValueAsBytes(dto);
+            redisTemplate.opsForValue().set(KEY_STATUS + id, bytes, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            log.error("Status Update Failed", e);
+        }
     }
-
-    // --- COMPRESSION LOGIC (GZIP) ---
 
     private byte[] compress(List<ExcelRowData> rows) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -705,96 +948,7 @@ public class JournalBulkValidationService {
             return objectMapper.readValue(gzipIn, new TypeReference<List<ExcelRowData>>() {});
         }
     }
-
-    // --- BUSINESS LOGIC (Same as before) ---
-
-    private void validateRow(ExcelRowData row, Set<String> branches, Set<String> currencies, Set<String> cgls) {
-        if (isEmpty(row.branch)) row.errors.add("Branch is missing");
-        if (isEmpty(row.currency)) row.errors.add("Currency is missing");
-        if (isEmpty(row.cgl)) row.errors.add("CGL is missing");
-        if (row.amount == null) row.errors.add("Amount is invalid");
-
-        if (!isEmpty(row.branch) && !branches.contains(row.branch)) row.errors.add("Invalid Branch Code");
-        if (!isEmpty(row.currency) && !currencies.contains(row.currency)) row.errors.add("Invalid Currency Code");
-        if (!isEmpty(row.cgl) && !cgls.contains(row.cgl)) row.errors.add("Invalid CGL Code");
-    }
-
-    private void validateGroupBalances(List<ExcelRowData> validRows, List<ExcelRowData> errorAccumulator) {
-        Map<String, BigDecimal> groupBalances = new HashMap<>();
-        Map<String, List<ExcelRowData>> groupRows = new HashMap<>();
-
-        for (ExcelRowData row : validRows) {
-            String key = row.branch + "|" + row.currency + "|" + row.cgl;
-            BigDecimal val = row.amount;
-            if ("Credit".equalsIgnoreCase(row.txnType) || "Cr".equalsIgnoreCase(row.txnType)) {
-                val = val.negate();
-            }
-            groupBalances.merge(key, val, BigDecimal::add);
-            groupRows.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
-        }
-
-        for (Map.Entry<String, BigDecimal> entry : groupBalances.entrySet()) {
-            if (entry.getValue().compareTo(BigDecimal.ZERO) != 0) {
-                List<ExcelRowData> badRows = groupRows.get(entry.getKey());
-                for (ExcelRowData r : badRows) {
-                    r.errors.add("Group Imbalance: Net " + entry.getValue());
-                    errorAccumulator.add(r);
-                }
-            }
-        }
-    }
-
-    private ExcelRowData parseRow(Row row, int rowIndex, DataFormatter formatter) {
-        // ... (Same parsing logic as provided in previous step) ...
-        // Re-implementing briefly for completeness of file
-        List<String> errs = new ArrayList<>();
-        ExcelRowData d = new ExcelRowData();
-        d.rowIndex = rowIndex; d.errors = errs;
-        try {
-            d.branch = getCellVal(row, 0, formatter);
-            d.currency = getCellVal(row, 1, formatter);
-            d.cgl = getCellVal(row, 2, formatter);
-            String a = getCellVal(row, 3, formatter);
-            try { if(a!=null) d.amount=new BigDecimal(a.replace(",","")); } catch(Exception e){ errs.add("Amt Format"); }
-            d.txnType = getCellVal(row, 4, formatter);
-            d.remarks = getCellVal(row, 5, formatter);
-            d.sysDate = getCellVal(row, 6, formatter);
-            if(d.sysDate != null) d.isSystemFormat = true;
-        } catch(Exception e) { errs.add("Parse Error"); }
-        return d;
-    }
-
-    private String getCellVal(Row row, int idx, DataFormatter formatter) {
-        Cell c = row.getCell(idx, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
-        return c == null ? null : formatter.formatCellValue(c).trim();
-    }
-    private boolean isEmpty(String s) { return s == null || s.trim().isEmpty(); }
-    private boolean isRowEmpty(Row row) {
-        if (row == null) return true;
-        for (int c = row.getFirstCellNum(); c < row.getLastCellNum(); c++) {
-            Cell cell = row.getCell(c);
-            if (cell != null && cell.getCellType() != CellType.BLANK) return false;
-        }
-        return true;
-    }
-    public byte[] generateTemplateBytes() { return new byte[0]; } // Mock
-    private byte[] generateErrorReport(List<ExcelRowData> errorRows) {
-        try (Workbook wb = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            Sheet s = wb.createSheet("Errors");
-            Row head = s.createRow(0); head.createCell(0).setCellValue("Row"); head.createCell(1).setCellValue("Error");
-            int i=1; 
-            for(ExcelRowData r : errorRows) {
-                Row row = s.createRow(i++);
-                row.createCell(0).setCellValue(r.rowIndex);
-                row.createCell(1).setCellValue(String.join(", ", r.errors));
-            }
-            wb.write(out); return out.toByteArray();
-        } catch(IOException e) { return null; }
-    }
 }
-
-
-
 
 
 
