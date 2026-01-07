@@ -1916,6 +1916,1773 @@ public class Permissions {
 
 repository:
 
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.BranchMaster;
+
+import java.util.List;
+
+@Repository
+public interface BranchMasterRepository extends JpaRepository<BranchMaster, String> {
+
+    List<BranchMaster> findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(String name, String code, Pageable pageable);
+}
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.CglMaster;
+
+import java.util.List;
+
+@Repository
+public interface CglMasterRepository extends JpaRepository<CglMaster, String> {
+
+    List<CglMaster> findByCglNumberContainingOrDescriptionContainingIgnoreCase(String cglNumber, String description, Pageable pageable);
+}
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.CurrencyMaster;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface CurrencyMasterRepository extends JpaRepository<CurrencyMaster, String> {
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+
+import com.fincore.JournalService.Models.FincoreDate;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+
+@Repository
+public interface FincoreDateRepository extends JpaRepository<FincoreDate, LocalDate> {
+
+    @Query(value = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY", nativeQuery = true)
+    LocalDate findCurrentPostingDate();
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.GlBalance;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface GlBalanceRepository extends JpaRepository<GlBalance, Long> {
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.GlTransaction;
+
+@Repository
+public interface GlTransactionRepository extends JpaRepository<GlTransaction, Long> {
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import com.fincore.JournalService.Models.JournalLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+
+@Repository
+public interface JournalLogRepository extends JpaRepository<JournalLog, Long> {
+}
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.stereotype.Repository;
+import org.springframework.data.repository.query.Param;
+
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+
+@Repository
+public interface JournalRequestRepository extends JpaRepository<JournalRequest, Long>, JpaSpecificationExecutor<JournalRequest> {
+
+    // --- 1. APPROVAL SCREEN (Pending Batches) ---
+    // Logic: Debit = Amount > 0. Credit = Amount < 0 (Taken as Absolute for display)
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR
+        FROM JOURNAL_REQUEST 
+        WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findPendingBatchSummariesNative();
+
+    // --- 2. STATUS SCREEN (All History) ---
+    @Query(value = """
+        SELECT 
+            BATCH_ID, 
+            MAX(CREATOR_ID) as CREATOR, 
+            MAX(REQ_DATE) as RDATE, 
+            MAX(COMMON_BATCH_REMARKS) as REM,
+            COUNT(*) as CNT,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) > 0 THEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) ELSE 0 END) as TOT_DR,
+            SUM(CASE WHEN TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount')) < 0 THEN ABS(TO_NUMBER(JSON_VALUE(PAYLOAD, '$.amount'))) ELSE 0 END) as TOT_CR,
+            MAX(REQ_STATUS) as STATUS,
+            MAX(EXECUTOR_ID) as EXEC_ID,
+            MAX(EXECUTOR_REMARKS) as EXEC_REM
+        FROM JOURNAL_REQUEST 
+        GROUP BY BATCH_ID
+        ORDER BY MAX(REQ_DATE) DESC
+    """, nativeQuery = true)
+    List<Object[]> findAllBatchSummariesNative();
+
+    // --- 3. PAGINATED DETAIL FETCH ---
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId ORDER BY JOURNAL_ID ASC",
+            countQuery = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId",
+            nativeQuery = true)
+    Page<JournalRequest> findByBatchIdPaginated(@Param("batchId") String batchId, Pageable pageable);
+
+    // --- 4. FAST DELETE ---
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = :batchId AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    void deleteBatchNative(@Param("batchId") String batchId, @Param("userId") String userId);
+
+    @Modifying
+    @Query(value = "DELETE FROM JOURNAL_REQUEST WHERE JOURNAL_ID IN (:journalIds) AND UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:userId)) AND TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    void deleteJournalsNative(@Param("journalIds") List<String> journalIds, @Param("userId") String userId);
+
+    // --- 5. STANDARD METHODS ---
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE TRIM(REQ_STATUS) IN ('P', 'PENDING')", nativeQuery = true)
+    List<JournalRequest> findAllPendingNative();
+
+    @Query(value = "SELECT * FROM JOURNAL_REQUEST WHERE UPPER(TRIM(CREATOR_ID)) = UPPER(TRIM(:creatorId))", nativeQuery = true)
+    List<JournalRequest> findAllByCreatorIdNative(@Param("creatorId") String creatorId);
+
+    // --- 6. RESTORED MISSING METHODS ---
+    List<JournalRequest> findByBatchId(String batchId);
+    List<JournalRequest> findByCreatorId(String creatorId);
+    List<JournalRequest> findByRequestStatus(RequestStatus status);
+
+    // This was the specific one causing your error:
+    List<JournalRequest> findByJournalIdStartingWithAndCreatorIdAndRequestStatus(String journalIdPrefix, String creatorId, RequestStatus status);
+
+    // Keeping this just in case:
+    List<JournalRequest> findByJournalIdStartingWithAndRequestStatus(String journalIdPrefix, RequestStatus status);
+}
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.MasterJournal;
+
+@Repository
+public interface MasterJournalRepository extends JpaRepository<MasterJournal, Long>{
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import com.fincore.JournalService.Models.Notifications;
+import java.util.UUID;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, UUID> {
+}
+
+
+
+
+
+package com.fincore.JournalService.Repository;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.JournalService.Models.Permissions;
+
+import java.util.List;
+
+@Repository
+public interface PermissionRepository extends JpaRepository<Permissions, Integer> {
+
+    @Query(value = """
+       SELECT p.MENU_URL, rp.ROLE_ID
+       FROM PERMISSIONS p
+       JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+       JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+       WHERE p.MAPPED_REQUEST_TYPE = :requestType
+         AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+         AND r.ROLE_STATUS = 'ACTIVE'
+   """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+***********************************************************************************************************
+
+service :
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.BranchDto;
+import com.fincore.JournalService.Models.BranchMaster;
+import com.fincore.JournalService.Repository.BranchMasterRepository;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class BranchService {
+
+    private final BranchMasterRepository branchMasterRepository;
+
+    public Map<String, String> getBranchCodeAndNameMap() {
+        // This method is likely cached or used rarely, leaving as is
+        List<BranchMaster> branches = branchMasterRepository.findAll();
+        return branches.stream()
+                .collect(Collectors.toMap(BranchMaster::getCode, BranchMaster::getName));
+    }
+
+    public List<BranchDto> searchBranches(String query) {
+        log.info("Searching branches for: '{}'", query);
+
+        Pageable limit = PageRequest.of(0, 50);
+
+
+        List<BranchMaster> results = branchMasterRepository
+                .findByNameContainingIgnoreCaseOrCodeContainingIgnoreCase(query, query, limit);
+
+        return results.stream()
+                .map(branch -> new BranchDto(branch.getCode(), branch.getName()))
+                .collect(Collectors.toList());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import com.fincore.JournalService.Dto.CglDto;
+import com.fincore.JournalService.Models.CglMaster;
+import com.fincore.JournalService.Repository.CglMasterRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CglService {
+
+    private final CglMasterRepository cglMasterRepository;
+
+    private CglDto convertToDto(CglMaster cgl) {
+        return new CglDto(cgl.getCglNumber(), cgl.getDescription());
+    }
+
+    public List<CglDto> searchCgls(String query) {
+
+
+
+        if (!StringUtils.hasText(query)) {
+            return List.of();
+        }
+
+        log.info("Searching CGLs for: '{}'", query);
+
+        Pageable limit = PageRequest.of(0, 50);
+
+        List<CglMaster> results = cglMasterRepository
+                .findByCglNumberContainingOrDescriptionContainingIgnoreCase(query, query, limit);
+
+        return results.stream()
+                .map(this::convertToDto)
+                .collect(Collectors.toList());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.BulkUploadStateDto;
+import com.fincore.JournalService.Repository.*;
+import com.fincore.JournalService.Models.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalBulkValidationService {
+
+    private final BranchMasterRepository branchRepo;
+    private final CglMasterRepository cglRepo;
+    private final CurrencyMasterRepository currencyRepo;
+
+    private final Map<String, BulkUploadStateDto> statusCache = new ConcurrentHashMap<>();
+    private final Map<String, List<ExcelRowData>> dataCache = new ConcurrentHashMap<>();
+    private final Map<String, byte[]> fileCache = new ConcurrentHashMap<>();
+
+    @Autowired @Lazy private JournalBulkValidationService self;
+
+    // --- REGEX PATTERNS ---
+    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
+    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
+    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
+    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
+
+    public static class ExcelRowData {
+        public int rowIndex;
+        public String branch = "", currency = "", cgl = "", txnType = "", remarks = "", productCode = "";
+        public BigDecimal amount;
+
+        public boolean isSystemFormat = false;
+        public String sysSite="", sysDate="", sysYear="", sysPeriod="";
+
+        public List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
+        public List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
+        public List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
+
+        public boolean hasErrors() { return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty(); }
+        public String getAllErrors() {
+            List<String> all = new ArrayList<>();
+            all.addAll(formatErrors); all.addAll(dbErrors); all.addAll(balErrors);
+            return String.join("; ", all);
+        }
+    }
+
+    public BulkUploadStateDto getState(String reqId) { return statusCache.get(reqId); }
+    public byte[] getFileBytes(String reqId, String type) { return fileCache.get(reqId + "_" + type); }
+    public List<ExcelRowData> getValidRowsFromCache(String requestId) { return dataCache.get(requestId); }
+
+    public String initiateValidation(byte[] fileBytes, String filename, LocalDate postingDate) throws IOException {
+        String requestId = UUID.randomUUID().toString();
+        BulkUploadStateDto state = new BulkUploadStateDto();
+        state.setRequestId(requestId);
+        state.setStatus("PROCESSING");
+        state.setCurrentStage(1);
+        state.setMessage("Initializing Upload...");
+        state.setTotalRows(0);
+
+        statusCache.put(requestId, state);
+        self.processAsync(requestId, fileBytes, filename, postingDate);
+        return requestId;
+    }
+
+    @Async("bulkExecutor")
+    public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate) {
+        log.info("Starting Async Validation for ReqID: {}", requestId);
+        try {
+            updateState(requestId, s -> s.setMessage("Parsing File..."));
+            List<ExcelRowData> parsedRows;
+            boolean isCsv = filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"));
+
+            if (isCsv) parsedRows = parseCsvBytes(fileBytes, postingDate);
+            else parsedRows = parseExcelBytes(fileBytes, postingDate);
+
+            updateState(requestId, s -> { s.setTotalRows(parsedRows.size()); s.setMessage("Validating Formats..."); });
+
+            if (runFormatCheck(parsedRows)) {
+                failRequest(requestId, parsedRows, "Format Validation Failed", 1);
+                return;
+            }
+
+            updateState(requestId, s -> { s.setCurrentStage(2); s.setMessage("Checking Database..."); });
+            if (runDbCheck(parsedRows)) { failRequest(requestId, parsedRows, "Database Validation Failed", 2); return; }
+
+            updateState(requestId, s -> { s.setCurrentStage(3); s.setMessage("Checking Balances..."); });
+            if (runBalanceCheck(parsedRows)) { failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3); return; }
+
+            completeRequest(requestId, parsedRows, postingDate, isCsv);
+        } catch (Exception e) {
+            log.error("Async Validation Error", e);
+            updateState(requestId, s -> { s.setStatus("ERROR"); s.setMessage("System Error: " + e.getMessage()); s.setHasErrorFile(false); });
+        }
+    }
+
+    private List<ExcelRowData> parseCsvBytes(byte[] bytes, LocalDate postingDate) throws IOException {
+        List<ExcelRowData> list = new ArrayList<>();
+        try(BufferedReader br = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8))) {
+            String line; int i=0;
+            while((line=br.readLine())!=null) {
+                if(line.trim().isEmpty()) continue;
+                String[] c = line.split(",", -1);
+
+                if (i == 0) {
+                    String h = c.length > 0 ? c[0].trim().toLowerCase() : "";
+                    if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) { i++; continue; }
+                }
+                ExcelRowData d = new ExcelRowData(); d.rowIndex = i++;
+
+                if(c.length > 0) d.sysSite = c[0].trim();
+                if(c.length > 1) d.sysDate = c[1].trim();
+                if(c.length > 2) d.sysYear = c[2].trim();
+                if(c.length > 3) d.sysPeriod = c[3].trim();
+                if(c.length > 4) d.branch = c[4].trim();
+                if(c.length > 5) d.currency = c[5].trim().toUpperCase();
+                if(c.length > 6) d.cgl = c[6].trim();
+
+                String amtRaw = (c.length > 7) ? c[7].trim() : "";
+                String txnRaw = (c.length > 8) ? c[8].trim() : "";
+                parseAmount(d, amtRaw, txnRaw);
+
+                if(c.length > 9) d.remarks = c[9].trim();
+                String rawProd = (c.length > 10) ? c[10].trim() : "";
+                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
+
+                if (c.length != 14) {
+                    d.formatErrors.add("Invalid CSV Format: Row has " + c.length + " columns. Expected 14.");
+                } else {
+                    d.isSystemFormat = true;
+                    if(d.sysSite.isEmpty()) d.formatErrors.add("Batch ID is Mandatory");
+                    if(d.branch.isEmpty()) d.formatErrors.add("Branch is Mandatory");
+                    if(d.currency.isEmpty()) d.formatErrors.add("Currency is Mandatory");
+                    if(d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+                    if(amtRaw.isEmpty()) d.formatErrors.add("Amount is Mandatory");
+                    validateSystemColumns(d, d.sysSite, d.sysDate, d.sysYear, d.sysPeriod, c[11], c[12], c[13], postingDate);
+                }
+                list.add(d);
+            }
+        }
+        return list;
+    }
+
+    private List<ExcelRowData> parseExcelBytes(byte[] bytes, LocalDate postingDate) throws IOException {
+        try(Workbook wb = new XSSFWorkbook(new ByteArrayInputStream(bytes))) { return parseSheet(wb.getSheetAt(0), postingDate); }
+    }
+
+    private List<ExcelRowData> parseSheet(Sheet sheet, LocalDate postingDate) {
+        List<ExcelRowData> list = new ArrayList<>();
+        DataFormatter fmt = new DataFormatter();
+        for(Row r : sheet) {
+            if(isRowEmpty(r)) continue;
+            if (r.getRowNum() == 0) {
+                String h = fmt.formatCellValue(r.getCell(0)).toLowerCase();
+                if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) continue;
+            }
+            ExcelRowData d = new ExcelRowData(); d.rowIndex = r.getRowNum();
+
+            String col0 = parseCode(r.getCell(0), fmt);
+
+            if (col0.equals("01")) {
+                d.isSystemFormat = true;
+                d.sysSite=col0;
+                d.sysDate=parseCode(r.getCell(1), fmt);
+                d.sysYear=parseCode(r.getCell(2), fmt);
+                d.sysPeriod=parseCode(r.getCell(3), fmt);
+                d.branch = parseCode(r.getCell(4), fmt);
+                d.currency = fmt.formatCellValue(r.getCell(5)).trim().toUpperCase();
+                d.cgl = parseCode(r.getCell(6), fmt);
+                parseAmount(d, fmt.formatCellValue(r.getCell(7)), fmt.formatCellValue(r.getCell(8)));
+                d.remarks = fmt.formatCellValue(r.getCell(9));
+                String rawProd = parseCode(r.getCell(10), fmt);
+                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
+
+                if(isCellEmpty(r.getCell(0))) d.formatErrors.add("Batch ID is Mandatory");
+                validateSystemColumns(d, col0, d.sysDate, d.sysYear, d.sysPeriod,
+                        parseCode(r.getCell(11), fmt), parseCode(r.getCell(12), fmt), parseCode(r.getCell(13), fmt), postingDate);
+            } else {
+                d.branch = col0;
+                d.currency = fmt.formatCellValue(r.getCell(1)).trim().toUpperCase();
+                d.cgl = parseCode(r.getCell(2), fmt);
+                parseAmount(d, fmt.formatCellValue(r.getCell(3)), fmt.formatCellValue(r.getCell(4)));
+                d.remarks = fmt.formatCellValue(r.getCell(5));
+                String rawProd = parseCode(r.getCell(6), fmt);
+                d.productCode = rawProd.isEmpty() ? "A" : rawProd;
+            }
+            list.add(d);
+        }
+        return list;
+    }
+
+    private boolean runFormatCheck(List<ExcelRowData> rows) {
+        rows.parallelStream().forEach(d -> {
+            if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
+                d.formatErrors.add("Amount cannot be Zero or Null");
+            } else {
+                if (d.amount.signum() < 0) d.formatErrors.add("Amount cannot be negative");
+                if (d.amount.precision() > 20 || d.amount.scale() > 4) d.formatErrors.add("Amount exceeds format (Max 16.4)");
+                if ("INR".equalsIgnoreCase(d.currency)) {
+                    if (d.amount.stripTrailingZeros().scale() > 2) {
+                        d.formatErrors.add("INR Amount cannot have more than 2 decimal places");
+                    }
+                }
+            }
+            if (d.productCode != null && !d.productCode.isEmpty()) {
+                if (!d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) {
+                    d.formatErrors.add("Product Code must be 'A' or 8 digits");
+                }
+            }
+            if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
+            else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
+
+            if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency must be exactly 3 characters");
+            if (d.cgl == null || d.cgl.isEmpty()) d.formatErrors.add("CGL is Mandatory");
+            else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL must be exactly 10 digits");
+            if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch is Mandatory");
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
+
+    private void validateSystemColumns(ExcelRowData d, String c0, String cDate, String cYear, String cMonth, String c11, String c12, String c13, LocalDate postingDate) {
+        if (!"01".equals(c0)) d.formatErrors.add("Batch ID must be '01'");
+        LocalDate parsedDate = null;
+        if (cDate == null || cDate.trim().length() != 8) d.formatErrors.add("Invalid Date Format (ddMMyyyy)");
+        else {
+            try {
+                parsedDate = LocalDate.parse(cDate.trim(), SYSTEM_DATE_FMT);
+                if (!parsedDate.equals(postingDate)) d.formatErrors.add("Date Mismatch with Posting Date (" + postingDate + ")");
+            } catch (Exception e) { d.formatErrors.add("Invalid Calendar Date"); }
+        }
+        if (parsedDate != null) {
+            String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
+            String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
+            if (cYear == null || !cYear.trim().equals(expectedYear)) d.formatErrors.add("Invalid Fin Year. Expected: " + expectedYear);
+            if (cMonth == null || !cMonth.trim().equals(expectedMonth)) d.formatErrors.add("Invalid Fin Month. Expected: " + expectedMonth);
+        }
+        if (c11 == null || !"B".equalsIgnoreCase(c11.trim())) d.formatErrors.add("Col 12 must be 'B'");
+        if (c12 == null || !"C".equalsIgnoreCase(c12.trim())) d.formatErrors.add("Col 13 must be 'C'");
+        if (c13 == null || !"D".equalsIgnoreCase(c13.trim())) d.formatErrors.add("Col 14 must be 'D'");
+    }
+
+    private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
+        try {
+            if (amountRaw == null) amountRaw = ""; if (typeRaw == null) typeRaw = "";
+            if (amountRaw.contains("-") || amountRaw.contains("(") || amountRaw.contains(")")) d.formatErrors.add("Amount cannot be negative");
+            String clean = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
+            if (clean.isEmpty()) { d.amount = BigDecimal.ZERO; return; }
+            BigDecimal v = new BigDecimal(clean);
+            if (v.signum() < 0) d.formatErrors.add("Amount cannot be negative");
+            boolean isCredit = typeRaw.toUpperCase().contains("C") || typeRaw.toUpperCase().contains("CR");
+            d.txnType = isCredit ? "Credit" : "Debit";
+            d.amount = v; // Store absolute, type determines sign later
+        } catch(Exception e) { d.amount = BigDecimal.ZERO; }
+    }
+
+    private boolean runBalanceCheck(List<ExcelRowData> rows) {
+        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
+        rows.parallelStream().forEach(d -> {
+            if (d.amount != null) {
+                BigDecimal val = d.amount;
+                if ("Credit".equals(d.txnType)) val = val.negate();
+                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+                String key = d.branch + "_" + d.currency + "_" + type;
+                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
+            }
+        });
+        rows.parallelStream().forEach(d -> {
+            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
+            String key = d.branch + "_" + d.currency + "_" + type;
+            LongAdder adder = balanceMap.get(key);
+            if (adder != null && adder.sum() != 0) {
+                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
+                synchronized(d.balErrors) { if (d.balErrors.isEmpty()) d.balErrors.add(type + " Balance Mismatch: Total " + diff.toPlainString()); }
+            }
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
+
+    private boolean runDbCheck(List<ExcelRowData> rows) {
+        Set<String> branches = rows.parallelStream().map(r -> r.branch).collect(Collectors.toSet());
+        Set<String> cgls = rows.parallelStream().map(r -> r.cgl).collect(Collectors.toSet());
+        Set<String> currs = rows.parallelStream().map(r -> r.currency).collect(Collectors.toSet());
+        Set<String> validBranches = branchRepo.findAllById(branches).stream().map(BranchMaster::getCode).collect(Collectors.toSet());
+        Set<String> validCgls = cglRepo.findAllById(cgls).stream().map(CglMaster::getCglNumber).collect(Collectors.toSet());
+        Set<String> validCurrs = currencyRepo.findAllById(currs).stream().map(CurrencyMaster::getCurrencyCode).collect(Collectors.toSet());
+        rows.parallelStream().forEach(d -> {
+            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found: " + d.branch);
+            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found: " + d.currency);
+            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found: " + d.cgl);
+        });
+        return rows.stream().anyMatch(ExcelRowData::hasErrors);
+    }
+
+    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage) throws IOException {
+        byte[] excel = generateErrorExcelFast(rows);
+        fileCache.put(reqId + "_ERROR", excel);
+        updateState(reqId, s -> { s.setStatus("ERROR"); s.setMessage(msg); s.setCurrentStage(stage); s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count()); s.setHasErrorFile(true); });
+    }
+
+    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv) throws IOException {
+        dataCache.put(reqId, rows);
+        if (!isCsv) { byte[] csv = generateSuccessCsv(rows, pDate); fileCache.put(reqId + "_SUCCESS", csv); }
+        List<Map<String, Object>> preview = rows.stream().limit(2000).map(this::mapToPreview).collect(Collectors.toList());
+        updateState(reqId, s -> { s.setCurrentStage(4); s.setStatus("SUCCESS"); s.setMessage("Validation Successful"); s.setHasSuccessFile(!isCsv); try { s.setPreviewDataJson(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(preview)); } catch(Exception e){} });
+    }
+
+    private byte[] generateSuccessCsv(List<ExcelRowData> rows, LocalDate postingDate) {
+        StringBuilder csv = new StringBuilder(rows.size() * 100);
+        DateTimeFormatter ddMMyyyy = DateTimeFormatter.ofPattern("ddMMyyyy");
+        String col2 = postingDate.format(ddMMyyyy);
+        String year = (postingDate.getMonthValue() >= 4) ? String.valueOf(postingDate.getYear()) : String.valueOf(postingDate.getYear() - 1);
+        String month = String.format("%02d", (postingDate.getMonthValue() >= 4) ? (postingDate.getMonthValue() - 3) : (postingDate.getMonthValue() + 9));
+        for (ExcelRowData row : rows) {
+            String cDate = row.isSystemFormat ? row.sysDate : col2;
+            String cYear = row.isSystemFormat ? row.sysYear : year;
+            String cMonth = row.isSystemFormat ? row.sysPeriod : month;
+            String col5 = String.format("%5s", row.branch).replace(' ', '0');
+            String col6 = (row.currency == null || row.currency.isEmpty()) ? "INR" : row.currency;
+            String plainAmt = row.amount.abs().setScale(4, RoundingMode.HALF_UP).toPlainString();
+            int dotIndex = plainAmt.indexOf('.');
+            String intPart = (dotIndex == -1) ? plainAmt : plainAmt.substring(0, dotIndex);
+            String decPart = (dotIndex == -1) ? "0000" : plainAmt.substring(dotIndex + 1);
+            String col8 = String.format("%16s", intPart).replace(' ', '0') + "." + decPart;
+            String col9 = "Credit".equalsIgnoreCase(row.txnType) ? "Cr" : "Dr";
+            String col10 = (row.remarks != null) ? row.remarks.replace(",", " ") : "";
+            String col11 = (row.productCode != null && !row.productCode.isEmpty()) ? row.productCode : "A";
+            csv.append("01,").append(cDate).append(",").append(cYear).append(",").append(cMonth).append(",")
+                    .append(col5).append(",").append(col6).append(",").append(row.cgl).append(",").append(col8).append(",")
+                    .append(col9).append(",").append(col10).append(",").append(col11).append(",B,C,D\n");
+        }
+        return csv.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] generateErrorExcelFast(List<ExcelRowData> rows) throws IOException {
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(100)) {
+            Sheet sheet = workbook.createSheet("Error Report");
+            CellStyle errStyle = workbook.createCellStyle(); Font f = workbook.createFont(); f.setColor(IndexedColors.RED.getIndex()); errStyle.setFont(f);
+            Row h = sheet.createRow(0);
+            List<String> headerList = new ArrayList<>();
+            boolean isSystem = rows.stream().anyMatch(r -> r.isSystemFormat);
+            if (isSystem) { headerList.add("BatchID"); headerList.add("Date"); headerList.add("Year"); headerList.add("Month"); }
+            headerList.addAll(Arrays.asList("Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product", "ERRORS"));
+            for(int i=0; i<headerList.size(); i++) h.createCell(i).setCellValue(headerList.get(i));
+            int idx = 1;
+            for(ExcelRowData d : rows) {
+                Row r = sheet.createRow(idx++);
+                int col = 0;
+                if (isSystem) {
+                    r.createCell(col++).setCellValue(d.sysSite);
+                    r.createCell(col++).setCellValue(d.sysDate);
+                    r.createCell(col++).setCellValue(d.sysYear);
+                    r.createCell(col++).setCellValue(d.sysPeriod);
+                }
+                r.createCell(col++).setCellValue(d.branch);
+                r.createCell(col++).setCellValue(d.currency);
+                r.createCell(col++).setCellValue(d.cgl);
+                r.createCell(col++).setCellValue(d.amount != null ? d.amount.toString() : "");
+                r.createCell(col++).setCellValue(d.txnType);
+                r.createCell(col++).setCellValue(d.remarks);
+                r.createCell(col++).setCellValue(d.productCode);
+                Cell c = r.createCell(col);
+                if (d.hasErrors()) { c.setCellValue(d.getAllErrors()); c.setCellStyle(errStyle); }
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream(); workbook.write(out); return out.toByteArray();
+        }
+    }
+
+    public byte[] generateTemplateBytes() throws IOException {
+        try (SXSSFWorkbook wb = new SXSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("Journal Template"); Row row = sheet.createRow(0);
+            String[] headers = {"Branch", "Currency", "CGL", "Amount", "TxnType", "Remarks", "Product"};
+            for (int i = 0; i < headers.length; i++) { Cell cell = row.createCell(i); cell.setCellValue(headers[i]); sheet.setColumnWidth(i, 4000); }
+            ByteArrayOutputStream out = new ByteArrayOutputStream(); wb.write(out); return out.toByteArray();
+        }
+    }
+
+    private String parseCode(Cell c, DataFormatter f) { if(c==null) return ""; if(c.getCellType()==CellType.NUMERIC) return BigDecimal.valueOf(c.getNumericCellValue()).toPlainString().split("\\.")[0]; return f.formatCellValue(c).trim(); }
+    private boolean isRowEmpty(Row r) { if(r==null) return true; for(int c=r.getFirstCellNum(); c<r.getLastCellNum(); c++) if(r.getCell(c)!=null && r.getCell(c).getCellType()!=CellType.BLANK && !r.getCell(c).toString().trim().isEmpty()) return false; return true; }
+    private boolean isCellEmpty(Cell c) { return c == null || c.getCellType() == CellType.BLANK || c.toString().trim().isEmpty(); }
+    private Map<String, Object> mapToPreview(ExcelRowData r) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency); m.put("cgl", r.cgl);
+        m.put("amount", r.amount!=null?r.amount.toString():"");
+        m.put("txnType", r.txnType); m.put("remarks", r.remarks); m.put("productCode", r.productCode);
+        return m;
+    }
+    private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) { BulkUploadStateDto state = statusCache.getOrDefault(requestId, new BulkUploadStateDto()); updater.accept(state); statusCache.put(requestId, state); }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Models.JournalRequest;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+public interface JournalRequestService {
+    // --- DATE & SUMMARIES ---
+    LocalDate getCurrentPostingDate();
+    List<Map<String, Object>> getPendingBatchSummaries();
+    List<Map<String, Object>> getAllBatchSummaries();
+
+    // --- BATCH CREATION ---
+    // 1. Manual Creation (From Screen)
+    List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+
+    // 2. Bulk Creation (From File Cache)
+    String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException;
+
+    // 3. Core Logic (Helper)
+    String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException;
+
+    // --- PROCESSING ---
+    Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException;
+    List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole);
+
+    // --- FETCHING ---
+    List<JournalRequest> getMyRequests(String userId);
+    List<JournalRequest> getPendingRequests(String userId, Integer userRole);
+    List<JournalRequest> getRequestsByBatchId(String batchId);
+    Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable);
+    List<JournalRequestStatusDto> getJournalRequestStatusList();
+
+    // --- CANCELLATION ---
+    void cancelMyRequest(Long requestId, String userId);
+    void cancelMyRequestsByBatchId(String batchId, String userId);
+    void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId);
+    void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.GlTransaction;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
+
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JournalBulkValidationService journalBulkValidationService;
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hivejdbcTemplate1;
+
+    private static final DateTimeFormatter CSV_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
+
+    // --- 0. DATE FETCHING (Preserved) ---
+    @Override
+    public LocalDate getCurrentPostingDate() {
+        try {
+            String sql = "SELECT USERS_DATE FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
+            return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
+                Timestamp ts = rs.getTimestamp("USERS_DATE");
+                if (ts != null) return ts.toLocalDateTime().toLocalDate();
+                return LocalDate.now();
+            });
+        } catch (Exception e) {
+            log.error("Error fetching USERS_DATE. Using System Date.", e);
+            return LocalDate.now();
+        }
+    }
+
+    // --- 1. SUMMARIES (Preserved) ---
+    @Override
+    public List<Map<String, Object>> getPendingBatchSummaries() {
+        return mapToSummaryDto(journalRequestRepository.findPendingBatchSummariesNative());
+    }
+
+    @Override
+    public List<Map<String, Object>> getAllBatchSummaries() {
+        return mapToSummaryDto(journalRequestRepository.findAllBatchSummariesNative());
+    }
+
+    private List<Map<String, Object>> mapToSummaryDto(List<Object[]> rawData) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object[] row : rawData) {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", row[0]);
+            map.put("creatorId", row[1]);
+            map.put("requestDate", row[2]);
+            map.put("commonBatchRemarks", row[3]);
+            map.put("requestCount", row[4]);
+            map.put("totalDebit", row[5]);
+            map.put("totalCredit", row[6]);
+            String fullStatus = "PENDING";
+            if (row.length > 7 && row[7] != null) {
+                String raw = (String) row[7];
+                if ("A".equalsIgnoreCase(raw) || "ACCEPTED".equalsIgnoreCase(raw)) fullStatus = "ACCEPTED";
+                else if ("R".equalsIgnoreCase(raw) || "REJECTED".equalsIgnoreCase(raw)) fullStatus = "REJECTED";
+            }
+            map.put("requestStatus", fullStatus);
+            if (row.length > 9) {
+                map.put("executorId", row[8]);
+                map.put("executorRemarks", row[9]);
+            }
+            result.add(map);
+        }
+        return result;
+    }
+
+    // --- 2. PAGINATION (Preserved) ---
+    @Override
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) {
+        return journalRequestRepository.findByBatchIdPaginated(batchId, pageable);
+    }
+
+    // --- 3. BATCH CREATION - CACHE (Preserved) ---
+    @Override
+    @Transactional
+    public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
+        List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        if (cachedRows == null || cachedRows.isEmpty()) throw new ResourceNotFoundException("Upload session timed out or server restarted. Please re-upload.");
+
+        BatchRequestDto batchDto = new BatchRequestDto();
+        batchDto.setCommonBatchRemarks(commonRemarks);
+
+        // Logic fix applied: Flip sign for Credits
+        List<BatchRequestDto.JournalRequestRow> dtoRows = cachedRows.stream().map(r -> {
+            BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
+            dto.setChangeType(ChangeType.ADD);
+
+            if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                try {
+                    dto.setCsvDate(LocalDate.parse(r.sysDate, CSV_DATE_FMT));
+                } catch (Exception e) {
+                    dto.setCsvDate(LocalDate.now());
+                }
+            } else {
+                dto.setCsvDate(LocalDate.now());
+            }
+
+            dto.setBranch(r.branch);
+            dto.setCurrency(r.currency);
+            dto.setCgl(r.cgl);
+
+            BigDecimal finalAmount = r.amount.abs();
+            if ("Credit".equalsIgnoreCase(r.txnType)) {
+                finalAmount = finalAmount.negate();
+            }
+            dto.setAmount(finalAmount);
+
+            dto.setProductType(r.productCode);
+            dto.setRemarks(r.remarks);
+            dto.setArFlag("A");
+            dto.setAcClassification("A");
+            return dto;
+        }).collect(Collectors.toList());
+
+        batchDto.setRows(dtoRows);
+        return createBulkBatchRequest(batchDto, creatorId, creatorRole);
+    }
+
+    // --- 4. MANUAL BATCH (Preserved) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = createBulkBatchRequest(batchDto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
+    }
+
+    // --- 5. CORE INSERT LOGIC (Preserved) ---
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        String batchId = sequenceService.getNextBatchId();
+        LocalDate fallbackDate = getCurrentPostingDate();
+
+        String commonRemarks = (batchDto.getCommonBatchRemarks() != null && !batchDto.getCommonBatchRemarks().isEmpty())
+                ? batchDto.getCommonBatchRemarks()
+                : "Batch " + batchId;
+
+        Map<String, List<BatchRequestDto.JournalRequestRow>> groupedRows = batchDto.getRows().stream()
+                .collect(Collectors.groupingBy(row -> row.getBranch() + ":" + row.getCurrency()));
+
+        int totalJournals = groupedRows.size();
+        List<String> journalPrefixes = fetchJournalSequences(totalJournals);
+        Iterator<String> prefixIterator = journalPrefixes.iterator();
+        DateTimeFormatter dateFmt = DateTimeFormatter.ISO_DATE;
+
+        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        final int INSERT_BATCH_SIZE = 1000;
+        List<Object[]> batchArgs = new ArrayList<>(INSERT_BATCH_SIZE);
+        int processedCount = 0;
+
+        for (Map.Entry<String, List<BatchRequestDto.JournalRequestRow>> entry : groupedRows.entrySet()) {
+            String journalIdPrefix = prefixIterator.next();
+            int journalSequence = 1;
+            for (BatchRequestDto.JournalRequestRow rowDto : entry.getValue()) {
+                String journalId = String.format("%s-%03d", journalIdPrefix, journalSequence);
+                LocalDate rowDate = (rowDto.getCsvDate() != null) ? rowDto.getCsvDate() : fallbackDate;
+                String payload = buildJsonPayloadFast(rowDto, rowDate, batchId, journalId, commonRemarks, journalSequence, dateFmt);
+
+                batchArgs.add(new Object[]{
+                        RequestStatus.PENDING.getCode(),
+                        rowDto.getChangeType().name(),
+                        LocalDateTime.now(),
+                        creatorId,
+                        creatorRole,
+                        batchId,
+                        journalId,
+                        commonRemarks,
+                        payload
+                });
+
+                if (batchArgs.size() >= INSERT_BATCH_SIZE) {
+                    jdbcTemplate.batchUpdate(sql, batchArgs);
+                    batchArgs.clear();
+                }
+                journalSequence++;
+                processedCount++;
+            }
+        }
+        if (!batchArgs.isEmpty()) {
+            jdbcTemplate.batchUpdate(sql, batchArgs);
+        }
+
+        createNotification(batchId, creatorId, processedCount);
+        return batchId;
+    }
+
+    // --- 6. APPROVAL PROCESS (PERFORMANCE OPTIMIZED) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        long startTime = System.currentTimeMillis();
+
+        if (!StringUtils.hasText(dto.getBatchId()) && (dto.getJournalIdPrefixes() == null || dto.getJournalIdPrefixes().isEmpty())) {
+            throw new IllegalArgumentException("Batch ID or Journal Prefixes required.");
+        }
+
+        String targetClause;
+        List<Object> args = new ArrayList<>();
+        if (StringUtils.hasText(dto.getBatchId())) {
+            targetClause = "jr.BATCH_ID = ?";
+            args.add(dto.getBatchId());
+        } else {
+            List<String> conds = new ArrayList<>();
+            for (String p : dto.getJournalIdPrefixes()) {
+                conds.add("jr.JOURNAL_ID LIKE ?");
+                args.add(p + "%");
+            }
+            targetClause = "(" + String.join(" OR ", conds) + ")";
+        }
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info(">>> STARTING APPROVAL PROCESS (PARALLEL & COMPACT) <<<");
+
+            // STEP 0: Fetch Rates
+            Map<String, BigDecimal> currencyRates = new HashMap<>();
+            try {
+                jdbcTemplate.query("SELECT CURRENCY_CODE, CURRENCY_RATE FROM CURRENCY_MASTER WHERE FLAG = 1", rs -> {
+                    String code = rs.getString("CURRENCY_CODE");
+                    BigDecimal rate = rs.getBigDecimal("CURRENCY_RATE");
+                    if (code != null && rate != null) {
+                        currencyRates.put(code.toUpperCase(), rate);
+                    }
+                });
+                currencyRates.put("INR", BigDecimal.ONE);
+                log.info("Loaded rates for {} currencies.", currencyRates.size());
+            } catch (Exception e) {
+                log.warn("Failed to fetch currency rates. Defaulting to 1.0", e);
+            }
+
+            // STEP A: Fetch Raw Payloads
+            String fetchSql = "SELECT jr.PAYLOAD FROM JOURNAL_REQUEST jr WHERE jr.REQ_STATUS = 'P' AND jr.CREATOR_ID != ? AND " + targetClause;
+            List<Object> fetchArgs = new ArrayList<>();
+            fetchArgs.add(executorId);
+            fetchArgs.addAll(args);
+
+            List<String> payloads = jdbcTemplate.queryForList(fetchSql, String.class, fetchArgs.toArray());
+
+            if (payloads.isEmpty()) {
+                log.info("No pending requests found to process.");
+                return Collections.emptyList();
+            }
+            log.info("Fetched {} raw payloads. Starting Parallel Processing...", payloads.size());
+
+            Map<String, GlAggregatedDataDto> aggregationMap = new ConcurrentHashMap<>();
+            // Synchronized List for audit logs
+            List<GlTransaction> transactionList = Collections.synchronizedList(new ArrayList<>(payloads.size()));
+
+            // PARALLEL STREAM:
+            payloads.parallelStream().forEach(json -> {
+                try {
+                    JsonNode root = objectMapper.readTree(json);
+
+                    String branch = root.has("branch") ? root.get("branch").asText().trim() : "";
+                    String currency = root.has("currency") ? root.get("currency").asText().trim().toUpperCase() : "INR";
+                    String cgl = root.has("cgl") ? root.get("cgl").asText().trim() : "";
+
+                    LocalDate tempDate = LocalDate.now();
+                    if (root.has("csvDate") && !root.get("csvDate").isNull()) {
+                        try { tempDate = LocalDate.parse(root.get("csvDate").asText(), DateTimeFormatter.ISO_DATE); } catch (Exception ignored) {}
+                    } else if (root.has("pDate") && !root.get("pDate").isNull()) {
+                        try { tempDate = LocalDate.parse(root.get("pDate").asText(), DateTimeFormatter.ISO_DATE); } catch (Exception ignored) {}
+                    }
+
+                    final LocalDate txnDate = tempDate;
+                    String key = branch + "|" + currency + "|" + cgl + "|" + txnDate.toString();
+
+                    // Thread-safe aggregation
+                    aggregationMap.compute(key, (k, agg) -> {
+                        if (agg == null) {
+                            agg = new GlAggregatedDataDto(null, branch, currency, cgl, txnDate, BigDecimal.ZERO, BigDecimal.ZERO);
+                        }
+
+                        BigDecimal rawAmount = root.has("amount") ? new BigDecimal(root.get("amount").asText()) : BigDecimal.ZERO;
+
+                        BigDecimal convertedAmount;
+                        if ("INR".equalsIgnoreCase(currency)) {
+                            convertedAmount = rawAmount;
+                        } else {
+                            BigDecimal rate = currencyRates.getOrDefault(currency, BigDecimal.ONE);
+                            convertedAmount = rawAmount.multiply(rate);
+                        }
+
+                        agg.setRawAmount(agg.getRawAmount().add(rawAmount));
+                        agg.setConvertedAmount(agg.getConvertedAmount().add(convertedAmount));
+                        return agg;
+                    });
+
+                    // Audit Log (No need to lock map, just add to synchronized list)
+                    BigDecimal rawAmountForAudit = root.has("amount") ? new BigDecimal(root.get("amount").asText()) : BigDecimal.ZERO;
+                    GlTransaction txn = new GlTransaction();
+                    txn.setBatchId(root.has("batchId") ? root.get("batchId").asText() : "");
+                    txn.setJournalId(root.has("journalId") ? root.get("journalId").asText() : "");
+                    txn.setTransactionDate(txnDate);
+                    txn.setBranchCode(branch);
+                    txn.setCurrency(currency);
+                    txn.setCgl(cgl);
+                    txn.setNarration(root.has("remarks") ? root.get("remarks").asText() : "");
+                    txn.setDebitAmount(rawAmountForAudit.compareTo(BigDecimal.ZERO) > 0 ? rawAmountForAudit : BigDecimal.ZERO);
+                    txn.setCreditAmount(rawAmountForAudit.compareTo(BigDecimal.ZERO) < 0 ? rawAmountForAudit.abs() : BigDecimal.ZERO);
+                    txn.setTransactionCount(root.has("transactionCount") ? root.get("transactionCount").asInt() : 1);
+                    transactionList.add(txn);
+
+                } catch (Exception e) {
+                    log.error("JSON Parse Error during parallel processing: " + e.getMessage());
+                }
+            });
+
+            log.info("Aggregation complete. Unique DB Entries: {}", aggregationMap.size());
+
+
+            List<GlAggregatedDataDto> finalAggregates = new ArrayList<>(aggregationMap.values());
+            log.info(finalAggregates.toString());
+            int mergeChunkSize = 1000;
+            int totalUpdated = 0;
+
+            for (int i = 0; i < finalAggregates.size(); i += mergeChunkSize) {
+                List<GlAggregatedDataDto> chunk = finalAggregates.subList(i, Math.min(i + mergeChunkSize, finalAggregates.size()));
+                String jsonInput = convertToCompactJsonArray(chunk); // New Compact Method
+
+                String mergeSql = """
+                    MERGE INTO GL_BALANCE T
+                    USING (
+                      SELECT branch, currency, cgl, bdate, raw_amt, conv_amt
+                      FROM JSON_TABLE(?, '$[*]' COLUMNS (
+                        branch   VARCHAR2(50) PATH '$[0]',
+                        currency VARCHAR2(3)  PATH '$[1]',
+                        cgl      VARCHAR2(50) PATH '$[2]',
+                        bdate    VARCHAR2(10) PATH '$[3]',
+                        raw_amt  NUMBER       PATH '$[4]',
+                        conv_amt NUMBER       PATH '$[5]'
+                      ))
+                    ) S
+                    ON (
+                        T.BRANCH_CODE = S.branch 
+                        AND T.CURRENCY = S.currency 
+                        AND T.CGL = S.cgl 
+                        AND T.BALANCE_DATE = TO_DATE(S.bdate, 'YYYY-MM-DD')
+                    )
+                    WHEN MATCHED THEN 
+                        UPDATE SET 
+                            T.BALANCE = T.BALANCE + S.raw_amt, 
+                            T.INR_BALANCE = NVL(T.INR_BALANCE, 0) + S.conv_amt
+                    WHEN NOT MATCHED THEN 
+                        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+                        VALUES (
+                            GL_BALANCE_SEQ.nextval, 
+                            TO_DATE(S.bdate, 'YYYY-MM-DD'), 
+                            S.branch, 
+                            S.currency, 
+                            S.cgl, 
+                            S.raw_amt, 
+                            S.conv_amt
+                        )
+                """;
+
+                int rows = jdbcTemplate.update(mergeSql, jsonInput);
+                totalUpdated += rows;
+            }
+            log.info("GL_BALANCE Merge Complete. Total DB rows touched: {}", totalUpdated);
+
+            // STEP D: Audit Trail (Batch 5000)
+            if (!transactionList.isEmpty()) {
+                // Increased batch size for inserts
+                int batchSize = 5000;
+                log.info("Inserting {} Audit Log entries in chunks of {}...", transactionList.size(), batchSize);
+
+                for (int k = 0; k < transactionList.size(); k += batchSize) {
+                    List<GlTransaction> batch = transactionList.subList(k, Math.min(k + batchSize, transactionList.size()));
+                    String txnInsertSql = "INSERT INTO GL_TRANSACTIONS (TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE, " +
+                            "BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, TRANSACTION_COUNT, SOURCE_FLAG) " +
+                            "VALUES (GL_TRANSACTIONS_SEQ.nextval, ?, ?, ?, SYSTIMESTAMP, ?, ?, ?, ?, ?, ?, ?, 'J')";
+
+                    jdbcTemplate.batchUpdate(txnInsertSql, new BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(PreparedStatement ps, int j) throws SQLException {
+                            GlTransaction txn = batch.get(j);
+                            ps.setString(1, txn.getBatchId());
+                            ps.setString(2, txn.getJournalId());
+                            ps.setDate(3, java.sql.Date.valueOf(txn.getTransactionDate()));
+                            ps.setString(4, txn.getBranchCode());
+                            ps.setString(5, txn.getCurrency());
+                            ps.setString(6, txn.getCgl());
+                            ps.setString(7, txn.getNarration());
+                            ps.setBigDecimal(8, txn.getDebitAmount());
+                            ps.setBigDecimal(9, txn.getCreditAmount());
+                            ps.setInt(10, txn.getTransactionCount() != null ? txn.getTransactionCount() : 0);
+                        }
+                        @Override
+                        public int getBatchSize() { return batch.size(); }
+                    });
+                }
+            }
+        }
+
+        // STEP E: Update Status
+        String updateTarget = targetClause.replace("jr.", "");
+        String updateStatusSql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE " +
+                "WHERE REQ_STATUS = 'P' AND CREATOR_ID != ? AND " + updateTarget;
+
+        List<Object> uArgs = new ArrayList<>();
+        uArgs.add(dto.getStatus().getCode());
+        uArgs.add(executorId);
+        uArgs.add(dto.getRemarks());
+        uArgs.add(executorId);
+        uArgs.addAll(args);
+
+        jdbcTemplate.update(updateStatusSql, uArgs.toArray());
+        log.info("Process Completed in {} ms", System.currentTimeMillis() - startTime);
+        return Collections.emptyList();
+    }
+
+    private String convertToCompactJsonArray(List<GlAggregatedDataDto> chunk) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        for (int i = 0; i < chunk.size(); i++) {
+            GlAggregatedDataDto d = chunk.get(i);
+            if (i > 0) sb.append(",");
+            BigDecimal roundedConv = d.getConvertedAmount().setScale(2, RoundingMode.HALF_UP);
+
+            // Format as JSON Array: ["Branch", "Curr", "CGL", "Date", RawAmt, ConvAmt]
+            sb.append(String.format(Locale.US,
+                    "[\"%s\",\"%s\",\"%s\",\"%s\",%f,%f]",
+                    d.getBranch(), d.getCurrency(), d.getCgl(), d.getTxnDate().toString(),
+                    d.getRawAmount(), roundedConv
+            ));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+
+    // Keeping this for reference/fallback if needed, but not used in processBulkRequests now
+    private String convertToJsonArray(List<GlAggregatedDataDto> chunk) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        for (int i = 0; i < chunk.size(); i++) {
+            GlAggregatedDataDto d = chunk.get(i);
+            if (i > 0) sb.append(",");
+            BigDecimal roundedConv = d.getConvertedAmount().setScale(2, RoundingMode.HALF_UP);
+            sb.append(String.format(Locale.US,
+                    "{\"b\":\"%s\",\"c\":\"%s\",\"g\":\"%s\",\"d\":\"%s\",\"r\":%f,\"v\":%f}",
+                    d.getBranch(), d.getCurrency(), d.getCgl(), d.getTxnDate().toString(),
+                    d.getRawAmount(), roundedConv
+            ));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        StringBuilder sb = new StringBuilder(400);
+        sb.append("{")
+                .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
+                .append("\"masterJournalId\":").append(row.getMasterJournalId()==null?"null":row.getMasterJournalId()).append(",")
+                .append("\"csvDate\":\"").append(pDate.format(fmt)).append("\",")
+                .append("\"branch\":\"").append(row.getBranch()).append("\",")
+                .append("\"currency\":\"").append(row.getCurrency()).append("\",")
+                .append("\"cgl\":\"").append(row.getCgl()).append("\",")
+                .append("\"amount\":").append(row.getAmount()).append(",")
+                .append("\"productType\":").append(row.getProductType()==null?"null":"\""+row.getProductType()+"\"").append(",")
+                .append("\"remarks\":").append(row.getRemarks()==null?"null":"\""+escapeJson(row.getRemarks())+"\"").append(",")
+                .append("\"arFlag\":\"").append(row.getArFlag()==null?"A":row.getArFlag()).append("\",")
+                .append("\"acClassification\":\"").append(row.getAcClassification()==null?"A":row.getAcClassification()).append("\",")
+                .append("\"batchId\":\"").append(batchId).append("\",")
+                .append("\"journalId\":\"").append(jId).append("\",")
+                .append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",")
+                .append("\"transactionCount\":").append(count)
+                .append("}");
+        return sb.toString();
+    }
+
+    private String escapeJson(String s) {
+        if(s==null) return "";
+        return s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Notification failed", e);
+        }
+    }
+
+    @Override @Transactional public void cancelMyRequest(Long id, String u) {
+        JournalRequest r = journalRequestRepository.findById(id).orElseThrow(() -> new ResourceNotFoundException("Not found"));
+        if(!u.equals(r.getCreatorId())) throw new IllegalStateException("Unauthorized");
+        if(r.getRequestStatus()!=RequestStatus.PENDING) throw new IllegalStateException("Processed");
+        journalRequestRepository.delete(r);
+    }
+    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { journalRequestRepository.deleteBatchNative(b, u); }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) {
+        List<JournalRequest> l = journalRequestRepository.findByJournalIdStartingWithAndCreatorIdAndRequestStatus(p, u, RequestStatus.PENDING);
+        if(l.isEmpty()) throw new ResourceNotFoundException("Empty");
+        journalRequestRepository.deleteAll(l);
+    }
+    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> ps, String u) { journalRequestRepository.deleteJournalsNative(ps, u); }
+
+    private List<String> fetchJournalSequences(int count) {
+        if(count==0) return Collections.emptyList();
+        return jdbcTemplate.queryForList("SELECT JRNL_SEQ.nextval FROM dual CONNECT BY LEVEL <= ?", Long.class, count)
+                .stream().map(id -> String.format("%07d", id)).collect(Collectors.toList());
+    }
+
+    @Override @Transactional public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String i, Integer r) { return Optional.empty(); }
+    @Override public List<JournalRequest> getPendingRequests(String userId, Integer userRole) { return journalRequestRepository.findAllPendingNative(); }
+    @Override public List<JournalRequest> getMyRequests(String userId) { return journalRequestRepository.findAllByCreatorIdNative(userId); }
+    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
+    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList()); }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.fincore.JournalService.Models.Notifications;
+import com.fincore.JournalService.Repository.NotificationRepository;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationWriterService {
+
+    private final NotificationRepository notificationRepository;
+
+    @Transactional(propagation = Propagation.MANDATORY) 
+    public void createNotification(String userId, String targetRole, String message, String linkUrl, String aggregateId, String eventSource) {
+
+        if (userId == null && targetRole == null) {
+            log.warn("Skipping notification creation: Both userId and targetRole are null. AggregateID: {}", aggregateId);
+            return;
+        }
+
+        if (message == null || message.isBlank()) {
+            log.warn("Skipping notification creation: Message is null or blank. AggregateID: {}", aggregateId);
+            throw new IllegalArgumentException("Notification message cannot be null or blank.");
+        }
+
+        Notifications notification = Notifications.builder()
+                .userId(userId)
+                .targetRole(targetRole)
+                .message(message)
+                .linkUrl(linkUrl)
+                .aggregateId(aggregateId)
+                .eventSource(eventSource)
+                .build();
+
+        notificationRepository.save(notification);
+
+        if (userId != null) {
+            log.info("Saved 1-to-1 notification event for user: {} (AggregateID: {})", userId, aggregateId);
+        } else {
+            log.info("Saved 1-to-many notification event for role: {} (AggregateID: {})", targetRole, aggregateId);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import com.fincore.JournalService.Dto.NotificationConfigDto;
+import com.fincore.JournalService.Repository.PermissionRepository;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionConfigService {
+
+    private final PermissionRepository permissionRepository;
+
+    @Cacheable(value = "notification_configs", key = "#requestType")
+    public NotificationConfigDto getConfig(String requestType) {
+
+        log.info("Cache Miss: Fetching DB permissions for MOC notification type: {}", requestType);
+
+        List<Object[]> results = permissionRepository.findUrlAndRolesByRequestType(requestType);
+
+        if (results.isEmpty()) {
+            log.warn("No notification config found for request type {}. Using defaults.", requestType);
+            return new NotificationConfigDto("/dashboard", null); // Default to no roles
+        }
+
+        String url = (String) results.get(0)[0];
+        if (url == null) url = "/dashboard";
+
+        String roles = results.stream()
+                .map(row -> String.valueOf(row[1])) // Role ID
+                .distinct()
+                .collect(Collectors.joining(","));
+
+        if (roles.isEmpty()) {
+             log.warn("No roles found for request type {}. Notification will not be sent to a group.", requestType);
+             return new NotificationConfigDto(url, null);
+        }
+        
+        log.info("Fetched Notification Config for {}: URL=[{}], Roles=[{}]", requestType, url, roles);
+        return new NotificationConfigDto(url, roles);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import jakarta.transaction.Transactional;
+
+@Service
+@RequiredArgsConstructor
+public class SequenceService {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    /**
+     * Pads the given number with leading zeros to a total length of 7.
+     */
+    private String padToSevenDigits(Long id) {
+        if (id == null) {
+            throw new IllegalStateException("Sequence query returned null");
+        }
+        return String.format("%07d", id);
+    }
+
+    /**
+     * Gets the next BATCH_ID from the BATCH_SEQ sequence. 
+     */
+    @Transactional
+    public String getNextBatchId() {
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select BATCH_SEQ.nextval from dual")
+                .getSingleResult();
+        
+        return padToSevenDigits(nextId.longValue());
+    }
+
+    /**
+     * Gets the next JOURNAL_ID prefix from the JRNL_SEQ sequence.
+     */
+    @Transactional
+    public String getNextJournalIdPrefix() {
+        
+      
+        Number nextId = (Number) entityManager
+                .createNativeQuery("select JRNL_SEQ.nextval from dual")
+                .getSingleResult();
+      
+
+        return padToSevenDigits(nextId.longValue());
+    }
+}
+
+
+
+
+***************************************************************************************************
+
+package com.fincore.JournalService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+
+@SpringBootApplication
+@EnableCaching
+
+    public class JournalServiceApplication {
+	public static void main(String[] args) {
+		SpringApplication.run(JournalServiceApplication.class, args);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*************************************************************************************************
+spring.application.name=JournalService
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.profiles.active=dev
+server.port=9999
+
+#todo Expose all actuator endpoints over HTTP.
+management.endpoints.web.exposure.include=*
+
+# Always show full details on the health endpoint (e.g., database connection status)
+management.endpoint.health.show-details=always
+
+# Add some custom info to the /info endpoint
+info.app.name=JournalService
+info.app.description=Service for managing journals.
+info.app.version=1.0.0
+
+
+# --- Redis Configuration ---
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.cache.type=redis
+
+
+# LOGIN SERVICE KEY
+jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
+
+
+spring.servlet.multipart.max-file-size=-1
+spring.servlet.multipart.max-request-size=-1
+spring.datasource.oracle.jdbc-url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.oracle.username=fincore
+spring.datasource.oracle.password=Password#1234
+spring.datasource.oracle.driver-class-name=oracle.jdbc.OracleDriver
+# Hibernate specific config for Oracle
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.OracleDialect
+spring.jpa.show-sql=true
+
+# --- 2. Secondary DataSource (Hive / Thrift / Delta Lake) ---
+# Used for Data Lake connectivity
+spring.datasource.hive.jdbc-url=jdbc:hive2://spark-thrift:10000/default
+spring.datasource.hive.driver-class-name=org.apache.hive.jdbc.HiveDriver
+# Validation query to ensure connection is alive (Hive specific)
+spring.datasource.hive.test-on-borrow=true
+spring.datasource.hive.validation-query=SELECT 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 tables: 
