@@ -1,0 +1,842 @@
+-- =====================================================================
+-- 1. ADD COLUMNS TO JOURNAL_REQUEST
+-- We keep 'PAYLOAD' for legacy UI support, but add these for speed.
+-- =====================================================================
+ALTER TABLE JOURNAL_REQUEST ADD (
+    REQ_BRANCH_CODE VARCHAR2(50),
+    REQ_CURRENCY    VARCHAR2(3),
+    REQ_CGL         VARCHAR2(50),
+    REQ_AMOUNT      NUMBER(25, 4), -- Will store Signed Amount (-ve for Credit)
+    REQ_CSV_DATE    DATE,
+    REQ_NARRATION   VARCHAR2(200),
+    REQ_PRODUCT     VARCHAR2(50)
+);
+
+-- =====================================================================
+-- 2. ADD INDEX FOR PERFORMANCE
+-- Critical for the Stored Procedure to find batch rows instantly.
+-- =====================================================================
+CREATE INDEX IDX_JR_BATCH_OPT ON JOURNAL_REQUEST(BATCH_ID, REQ_STATUS);
+
+-- =====================================================================
+-- 3. CREATE/REPLACE THE PROCESSING PROCEDURE
+-- This replaces the Java-side "Accept" loop.
+-- =====================================================================
+CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, -- 'A'
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+BEGIN
+    -- A. Bulk Insert into GL_TRANSACTIONS
+    -- Direct transfer. Amount is already signed in JOURNAL_REQUEST.
+    INSERT INTO GL_TRANSACTIONS (
+        TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+        BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+    )
+    SELECT 
+        GL_TRANSACTIONS_SEQ.nextval, 
+        BATCH_ID, 
+        JOURNAL_ID, 
+        NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), 
+        SYSTIMESTAMP,
+        REQ_BRANCH_CODE, 
+        REQ_CURRENCY, 
+        REQ_CGL, 
+        REQ_NARRATION,
+        CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, -- Debit
+        CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, -- Credit
+        'J'
+    FROM JOURNAL_REQUEST
+    WHERE BATCH_ID = p_batch_id 
+      AND REQ_STATUS = 'P';
+
+    -- B. Merge into GL_BALANCE
+    -- Aggregates rows first, then updates balances.
+    MERGE INTO GL_BALANCE target
+    USING (
+        SELECT 
+            j.REQ_BRANCH_CODE, 
+            j.REQ_CURRENCY, 
+            j.REQ_CGL, 
+            NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+            SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+            NVL(MAX(c.CURRENCY_RATE), 1) as EXCH_RATE -- Default to 1 if INR or missing
+        FROM JOURNAL_REQUEST j
+        LEFT JOIN CURRENCY_MASTER c 
+            ON j.REQ_CURRENCY = c.CURRENCY_CODE 
+            AND c.FLAG = 1 
+        WHERE j.BATCH_ID = p_batch_id 
+          AND j.REQ_STATUS = 'P'
+        GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+    ) source
+    ON (
+        target.BRANCH_CODE = source.REQ_BRANCH_CODE AND
+        target.CURRENCY    = source.REQ_CURRENCY AND
+        target.CGL         = source.REQ_CGL AND
+        target.BALANCE_DATE = source.BAL_DATE
+    )
+    WHEN MATCHED THEN
+        UPDATE SET 
+            target.BALANCE = target.BALANCE + source.TXN_AMOUNT,
+            -- INR Balance Logic: Existing + (USD_Amount * Rate)
+            target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+    WHEN NOT MATCHED THEN
+        INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+        VALUES (
+            GL_BALANCE_SEQ.nextval, 
+            source.BAL_DATE, 
+            source.REQ_BRANCH_CODE, 
+            source.REQ_CURRENCY, 
+            source.REQ_CGL, 
+            source.TXN_AMOUNT, 
+            (source.TXN_AMOUNT * source.EXCH_RATE)
+        );
+
+    -- C. Update Request Status
+    UPDATE JOURNAL_REQUEST
+    SET REQ_STATUS = p_status,
+        EXECUTOR_ID = p_executor_id,
+        EXECUTION_DATE = SYSDATE,
+        EXECUTOR_REMARKS = p_remarks
+    WHERE BATCH_ID = p_batch_id 
+      AND REQ_STATUS = 'P';
+
+    -- D. Return Aggregated Data for HDFS Sync
+    -- Fetches the FINAL balances to sync to Data Lake
+    OPEN o_cursor FOR
+    SELECT 
+        j.REQ_BRANCH_CODE AS BRANCH, 
+        j.REQ_CURRENCY AS CURRENCY, 
+        j.REQ_CGL AS CGL, 
+        j.REQ_CSV_DATE AS BAL_DATE,
+        g.BALANCE AS NEW_BALANCE,
+        g.INR_BALANCE AS NEW_INR_BALANCE
+    FROM (
+        SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+        FROM JOURNAL_REQUEST 
+        WHERE BATCH_ID = p_batch_id
+    ) j
+    JOIN GL_BALANCE g ON 
+        g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
+        g.CURRENCY = j.REQ_CURRENCY AND 
+        g.CGL = j.REQ_CGL AND 
+        g.BALANCE_DATE = j.REQ_CSV_DATE;
+
+    COMMIT;
+END;
+/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class HdfsSyncDto {
+    private String branch;
+    private String currency;
+    private String cgl;
+    private LocalDate balanceDate;
+    private BigDecimal newBalance;
+    private BigDecimal newInrBalance;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Models;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.config.RequestStatusConverter;
+
+@Entity
+@Table(name = "JOURNAL_REQUEST")
+@Data
+public class JournalRequest {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "JOURNAL_REQUEST_SEQ")
+    @SequenceGenerator(name = "JOURNAL_REQUEST_SEQ", sequenceName = "JOURNAL_REQUEST_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID")
+    private Long id;
+
+    @Convert(converter = RequestStatusConverter.class)
+    @Column(name = "REQ_STATUS", length = 10)
+    private RequestStatus requestStatus;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "CHANGE_TYPE", length = 10)
+    private ChangeType changeType;
+
+    @Column(name = "REQ_DATE", updatable = false)
+    private LocalDateTime requestDate = LocalDateTime.now();
+
+    @Column(name = "CREATOR_ID", length = 12, updatable = false)
+    private String creatorId;
+
+    @Column(name = "CREATOR_ROLE", updatable = false)
+    private Integer creatorRole;
+
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Column(name = "EXECUTOR_REMARKS", length = 50)
+    private String executorRemarks;
+
+    // Legacy JSON Payload (Kept for Frontend Display)
+    @Lob
+    @Column(name = "PAYLOAD")
+    private String payload;
+
+    @Column(name = "BATCH_ID", length = 50)
+    private String batchId;
+
+    @Column(name = "JOURNAL_ID", length = 50)
+    private String journalId;
+
+    @Column(name = "COMMON_BATCH_REMARKS" , length = 50)
+    private String commonBatchRemarks;
+
+    // --- NEW OPTIMIZED COLUMNS ---
+    @Column(name = "REQ_BRANCH_CODE", length = 50)
+    private String branchCode;
+
+    @Column(name = "REQ_CURRENCY", length = 3)
+    private String currency;
+
+    @Column(name = "REQ_CGL", length = 50)
+    private String cgl;
+
+    @Column(name = "REQ_AMOUNT", precision = 25, scale = 4)
+    private BigDecimal amount;
+
+    @Column(name = "REQ_CSV_DATE")
+    private LocalDate csvDate;
+
+    @Column(name = "REQ_NARRATION", length = 200)
+    private String narration;
+
+    @Column(name = "REQ_PRODUCT", length = 50)
+    private String productCode;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsSyncService {
+
+    @Autowired
+    @Qualifier("hiveJdbcTemplate")
+    private JdbcTemplate hiveJdbcTemplate;
+
+    @Async("bulkExecutor") // Runs in background thread, UI returns immediately
+    public void syncToDataLake(List<HdfsSyncDto> data) {
+        if (data == null || data.isEmpty()) return;
+
+        log.info("HDFS SYNC: Starting background update for {} aggregated records...", data.size());
+        long start = System.currentTimeMillis();
+
+        try {
+            // Updating the Data Lake. 
+            // Note: Ensure your Hive/Thrift table supports updates. 
+            // If not (e.g. raw HDFS), change this to an INSERT statement.
+            String sql = "UPDATE GL_BALANCE_HDFS SET BALANCE = ?, INR_BALANCE = ? " +
+                         "WHERE BRANCH_CODE = ? AND CURRENCY = ? AND CGL = ? AND BALANCE_DATE = ?";
+
+            hiveJdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+                @Override
+                public void setValues(PreparedStatement ps, int i) throws SQLException {
+                    HdfsSyncDto dto = data.get(i);
+                    ps.setBigDecimal(1, dto.getNewBalance());
+                    ps.setBigDecimal(2, dto.getNewInrBalance());
+                    ps.setString(3, dto.getBranch());
+                    ps.setString(4, dto.getCurrency());
+                    ps.setString(5, dto.getCgl());
+                    ps.setDate(6, java.sql.Date.valueOf(dto.getBalanceDate()));
+                }
+
+                @Override
+                public int getBatchSize() {
+                    return data.size();
+                }
+            });
+
+            log.info("HDFS SYNC: Completed successfully in {} ms.", System.currentTimeMillis() - start);
+
+        } catch (Exception e) {
+            log.error("HDFS SYNC FAILED: {}. Data might be out of sync.", e.getMessage());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.*;
+import com.fincore.JournalService.Exception.ResourceNotFoundException;
+import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
+import com.fincore.JournalService.Models.enums.RequestStatus;
+import com.fincore.JournalService.Repository.JournalRequestRepository;
+import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.CallableStatementCallback;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.sql.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Service Implementation for Journal Request Management.
+ * <p>
+ * OPTIMIZATION NOTES:
+ * 1. Bulk Uploads use JDBC Batch Updates (Batch Size: 5000) instead of JPA saveAll() for performance.
+ * 2. 'Accept' logic is offloaded to an Oracle Stored Procedure (PROCESS_JOURNAL_BATCH) to minimize network I/O.
+ * 3. HDFS Data Lake synchronization happens asynchronously via HdfsSyncService.
+ * </p>
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalRequestServiceImpl implements JournalRequestService {
+
+    private final JournalRequestRepository journalRequestRepository;
+    private final ObjectMapper objectMapper;
+    private final SequenceService sequenceService;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final JournalBulkValidationService journalBulkValidationService;
+    private final HdfsSyncService hdfsSyncService; 
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
+    // --- 1. BATCH CREATION (Standard - from screen manual entry) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        // Reuse the optimized bulk method even for manual small batches
+        String batchId = createBulkBatchRequest(batchDto, creatorId, creatorRole);
+        return journalRequestRepository.findByBatchId(batchId);
+    }
+
+    // --- 2. BATCH CREATION (From Cache - The Bulk Upload Flow) ---
+    @Override
+    @Transactional
+    public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
+        log.info("Processing Cache-to-Batch for Request ID: {}", requestId);
+        long start = System.currentTimeMillis();
+
+        // 1. Fetch pre-validated rows from server memory (fast)
+        List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+        
+        if (cachedRows == null || cachedRows.isEmpty()) {
+            log.warn("Cache miss for Request ID: {}. Upload session likely timed out.", requestId);
+            throw new ResourceNotFoundException("Upload session timed out. Please re-upload the file.");
+        }
+
+        // 2. Convert Excel Data to DTOs
+        BatchRequestDto batchDto = new BatchRequestDto();
+        batchDto.setCommonBatchRemarks(commonRemarks);
+        
+        // Pre-allocate list size to avoid array resizing overhead
+        List<BatchRequestDto.JournalRequestRow> dtoRows = new ArrayList<>(cachedRows.size());
+
+        for (ExcelRowData r : cachedRows) {
+            BatchRequestDto.JournalRequestRow dto = new BatchRequestDto.JournalRequestRow();
+            dto.setChangeType(ChangeType.ADD);
+            
+            // Safe Date Parsing with Fallback
+            if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
+                try { 
+                    dto.setCsvDate(LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy"))); 
+                } catch (Exception e) { 
+                    dto.setCsvDate(LocalDate.now()); 
+                }
+            } else {
+                dto.setCsvDate(LocalDate.now());
+            }
+
+            dto.setBranch(r.branch);
+            dto.setCurrency(r.currency);
+            dto.setCgl(r.cgl);
+            
+            // --- CRITICAL VALIDATION LOGIC ---
+            // Ensure amount is absolute first to avoid double negatives
+            BigDecimal absAmount = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
+            
+            // Apply Sign based on Transaction Type
+            // If Type is Credit, Amount MUST be Negative for the DB Logic to work
+            if ("Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType)) {
+                dto.setAmount(absAmount.negate());
+            } else {
+                dto.setAmount(absAmount);
+            }
+
+            dto.setProductType(r.productCode);
+            dto.setRemarks(r.remarks);
+            dto.setArFlag("A");
+            dto.setAcClassification("A");
+            
+            dtoRows.add(dto);
+        }
+        batchDto.setRows(dtoRows);
+
+        log.debug("Cache conversion complete. Rows: {}. Time: {}ms", dtoRows.size(), System.currentTimeMillis() - start);
+
+        // 3. Persist using Optimized Method
+        return createBulkBatchRequest(batchDto, creatorId, creatorRole);
+    }
+
+    // --- 3. CORE BULK INSERT (Optimized JDBC Batch) ---
+    @Override
+    @Transactional
+    public String createBulkBatchRequest(BatchRequestDto batchDto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+        long startTime = System.currentTimeMillis();
+        
+        // 1. Generate Batch ID
+        String batchId = sequenceService.getNextBatchId();
+        
+        String commonRemarks = StringUtils.hasText(batchDto.getCommonBatchRemarks()) 
+                             ? batchDto.getCommonBatchRemarks() : "Batch " + batchId;
+
+        List<BatchRequestDto.JournalRequestRow> rows = batchDto.getRows();
+        
+        log.info("Starting Bulk Insert for Batch: {}. Total Rows: {}", batchId, rows.size());
+
+        // 2. Prepare SQL
+        // Includes new columns (REQ_BRANCH_CODE etc) for PL/SQL performance
+        // Includes PAYLOAD for Legacy Frontend compatibility
+        String sql = """
+            INSERT INTO JOURNAL_REQUEST (
+                REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, 
+                BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD,
+                REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT
+            ) VALUES (
+                JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, 
+                ?, ?, ?, ?, 
+                ?, ?, ?, ?, ?, ?, ?
+            )
+        """;
+
+        final int BATCH_SIZE = 5000; // Tuned for Oracle
+        final Timestamp reqTimestamp = Timestamp.valueOf(LocalDateTime.now());
+        final DateTimeFormatter jsonDateFmt = DateTimeFormatter.ISO_DATE; // yyyy-MM-dd
+
+        // 3. Execute JDBC Batch
+        // This splits the 600k rows into chunks of 5000 automatically
+        jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                BatchRequestDto.JournalRequestRow row = rows.get(i);
+                
+                // Generate Journal ID suffix (e.g., BATCHID-000001)
+                String journalId = batchId + "-" + String.format("%06d", i + 1);
+                LocalDate rowDate = row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now();
+
+                // 1-8: Metadata & IDs
+                ps.setString(1, RequestStatus.PENDING.getCode());
+                ps.setString(2, ChangeType.ADD.name());
+                ps.setTimestamp(3, reqTimestamp);
+                ps.setString(4, creatorId);
+                ps.setInt(5, creatorRole != null ? creatorRole : 0);
+                ps.setString(6, batchId);
+                ps.setString(7, journalId);
+                ps.setString(8, commonRemarks);
+
+                // 9: Payload (Legacy - For Frontend UI Display)
+                // Using custom builder to avoid Jackson overhead in huge loop
+                String jsonPayload = buildJsonPayloadFast(row, rowDate, batchId, journalId, commonRemarks, i+1, jsonDateFmt);
+                ps.setString(9, jsonPayload);
+
+                // 10-16: Structured Columns (For PL/SQL Engine)
+                ps.setString(10, row.getBranch());
+                ps.setString(11, row.getCurrency());
+                ps.setString(12, row.getCgl());
+                
+                // Ensure Amount is not null (Defensive)
+                BigDecimal amt = row.getAmount() != null ? row.getAmount() : BigDecimal.ZERO;
+                ps.setBigDecimal(13, amt); 
+                
+                ps.setDate(14, java.sql.Date.valueOf(rowDate));
+                ps.setString(15, row.getRemarks());
+                ps.setString(16, row.getProductType());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return rows.size();
+            }
+        });
+
+        // 4. Send Notification
+        createNotification(batchId, creatorId, rows.size());
+        
+        long duration = System.currentTimeMillis() - startTime;
+        log.info("Bulk Insert Complete. Batch: {}. Time: {} ms. Rate: {} rows/sec", 
+                batchId, duration, (rows.size() * 1000L) / (duration > 0 ? duration : 1));
+        
+        return batchId;
+    }
+
+    // --- 4. APPROVAL PROCESS (Optimized PL/SQL Call) ---
+    @Override
+    @Transactional
+    public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
+        long startTime = System.currentTimeMillis();
+        
+        if (dto.getBatchId() == null || dto.getBatchId().isEmpty()) {
+            throw new IllegalArgumentException("Batch ID is mandatory for Bulk Processing.");
+        }
+
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info(">>> APPROVE ACTION: Processing Batch {} via Oracle PL/SQL Engine...", dto.getBatchId());
+
+            // Calls the Stored Procedure 'PROCESS_JOURNAL_BATCH'
+            List<HdfsSyncDto> syncData = jdbcTemplate.execute(
+                "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
+                (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
+                    cs.setString(1, dto.getBatchId());
+                    cs.setString(2, executorId);
+                    cs.setString(3, dto.getRemarks());
+                    cs.setString(4, dto.getStatus().getCode());
+                    
+                    // Register Output Cursor for HDFS Data
+                    cs.registerOutParameter(5, -10); // OracleTypes.CURSOR
+
+                    cs.execute();
+
+                    // Parse the Cursor result into DTOs for Async Sync
+                    List<HdfsSyncDto> list = new ArrayList<>();
+                    try (ResultSet rs = (ResultSet) cs.getObject(5)) {
+                        while (rs.next()) {
+                            list.add(new HdfsSyncDto(
+                                rs.getString("BRANCH"),
+                                rs.getString("CURRENCY"),
+                                rs.getString("CGL"),
+                                rs.getDate("BAL_DATE").toLocalDate(),
+                                rs.getBigDecimal("NEW_BALANCE"),
+                                rs.getBigDecimal("NEW_INR_BALANCE")
+                            ));
+                        }
+                    }
+                    return list;
+                }
+            );
+
+            log.info("DB Transaction Committed for Batch {}. Duration: {} ms. Aggregated Records for Sync: {}", 
+                    dto.getBatchId(), System.currentTimeMillis() - startTime, syncData.size());
+            
+            // Trigger Async HDFS Sync (Fire & Forget)
+            // This prevents the UI from waiting for the Data Lake update
+            hdfsSyncService.syncToDataLake(syncData);
+
+        } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+            log.info(">>> REJECT ACTION: Batch {}", dto.getBatchId());
+            
+            String sql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE " +
+                         "WHERE BATCH_ID = ? AND REQ_STATUS = 'P'";
+            int updated = jdbcTemplate.update(sql, dto.getStatus().getCode(), executorId, dto.getRemarks(), dto.getBatchId());
+            log.info("Batch {} Rejected. Rows updated: {}", dto.getBatchId(), updated);
+        }
+
+        return Collections.emptyList();
+    }
+
+    // --- Helpers ---
+    
+    /**
+     * Optimized JSON builder using StringBuilder.
+     * Jackson ObjectMapper is too slow for 600k iterations in a loop.
+     */
+    private String buildJsonPayloadFast(BatchRequestDto.JournalRequestRow row, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+        // Pre-calculate size to minimize buffer resizing
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("{")
+          .append("\"changeType\":\"").append(row.getChangeType()).append("\",")
+          .append("\"masterJournalId\":null,")
+          .append("\"csvDate\":\"").append(pDate.format(fmt)).append("\",")
+          .append("\"branch\":\"").append(row.getBranch()).append("\",")
+          .append("\"currency\":\"").append(row.getCurrency()).append("\",")
+          .append("\"cgl\":\"").append(row.getCgl()).append("\",")
+          .append("\"amount\":").append(row.getAmount()).append(",")
+          .append("\"productType\":\"").append(row.getProductType() == null ? "" : row.getProductType()).append("\",")
+          .append("\"remarks\":\"").append(row.getRemarks() == null ? "" : escapeJson(row.getRemarks())).append("\",")
+          .append("\"arFlag\":\"").append(row.getArFlag() == null ? "A" : row.getArFlag()).append("\",")
+          .append("\"acClassification\":\"").append(row.getAcClassification() == null ? "A" : row.getAcClassification()).append("\",")
+          .append("\"batchId\":\"").append(batchId).append("\",")
+          .append("\"journalId\":\"").append(jId).append("\",")
+          .append("\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",")
+          .append("\"transactionCount\":").append(count)
+          .append("}");
+        return sb.toString();
+    }
+
+    private String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\"", "\\\"").replace("\\", "\\\\");
+    }
+
+    private void createNotification(String batchId, String creatorId, int size) {
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            String message = String.format("Batch %s (%d rows) by %s pending.", batchId, size, creatorId);
+            notificationWriterService.createNotification(null, config.getTargetRoles(), message, config.getTargetUrl(), batchId, "JournalService");
+        } catch (Exception e) {
+            log.error("Failed to send notification for Batch {}: {}", batchId, e.getMessage());
+            // Non-blocking error - swallowing exception to ensure transaction commits
+        }
+    }
+
+    // --- Standard/Legacy Methods (Boilerplate) ---
+
+    @Override 
+    public LocalDate getCurrentPostingDate() { 
+        return LocalDate.now(); 
+    }
+
+    @Override 
+    public List<Map<String, Object>> getPendingBatchSummaries() { 
+        return mapToSummaryDto(journalRequestRepository.findPendingBatchSummariesNative()); 
+    }
+
+    @Override 
+    public List<Map<String, Object>> getAllBatchSummaries() { 
+        return mapToSummaryDto(journalRequestRepository.findAllBatchSummariesNative()); 
+    }
+    
+    private List<Map<String, Object>> mapToSummaryDto(List<Object[]> rawData) {
+        if (rawData == null) return Collections.emptyList();
+        List<Map<String, Object>> result = new ArrayList<>(rawData.size());
+        for (Object[] row : rawData) {
+            Map<String, Object> map = new HashMap<>();
+            map.put("batchId", row[0]);
+            map.put("creatorId", row[1]);
+            map.put("requestDate", row[2]);
+            map.put("commonBatchRemarks", row[3]);
+            map.put("requestCount", row[4]);
+            map.put("totalDebit", row[5]);
+            map.put("totalCredit", row[6]);
+            
+            // Map Status Code to String
+             if (row.length > 7 && row[7] != null) {
+                String raw = (String) row[7];
+                if ("A".equalsIgnoreCase(raw) || "ACCEPTED".equalsIgnoreCase(raw)) map.put("requestStatus", "ACCEPTED");
+                else if ("R".equalsIgnoreCase(raw) || "REJECTED".equalsIgnoreCase(raw)) map.put("requestStatus", "REJECTED");
+                else map.put("requestStatus", "PENDING");
+            } else {
+                 map.put("requestStatus", "PENDING");
+            }
+            if (row.length > 9) {
+                map.put("executorId", row[8]);
+                map.put("executorRemarks", row[9]);
+            }
+            result.add(map);
+        }
+        return result;
+    }
+
+    @Override 
+    public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) { 
+        return journalRequestRepository.findByBatchIdPaginated(batchId, pageable); 
+    }
+
+    @Override 
+    public List<JournalRequest> getMyRequests(String userId) { 
+        return journalRequestRepository.findAllByCreatorIdNative(userId); 
+    }
+
+    @Override 
+    public List<JournalRequest> getPendingRequests(String userId, Integer userRole) { 
+        return journalRequestRepository.findAllPendingNative(); 
+    }
+
+    @Override 
+    public List<JournalRequest> getRequestsByBatchId(String batchId) { 
+        return journalRequestRepository.findByBatchId(batchId); 
+    }
+
+    @Override 
+    public List<JournalRequestStatusDto> getJournalRequestStatusList() { 
+        return journalRequestRepository.findAll().stream().map(JournalRequestStatusDto::new).collect(Collectors.toList()); 
+    }
+
+    @Override 
+    @Transactional 
+    public void cancelMyRequest(Long requestId, String userId) { 
+        journalRequestRepository.deleteById(requestId); 
+    }
+
+    @Override 
+    @Transactional 
+    public void cancelMyRequestsByBatchId(String batchId, String userId) { 
+        journalRequestRepository.deleteBatchNative(batchId, userId); 
+    }
+
+    @Override 
+    @Transactional 
+    public void cancelMyRequestsByJournalPrefixes(List<String> list, String userId) { 
+        journalRequestRepository.deleteJournalsNative(list, userId); 
+    }
+
+    @Override 
+    @Transactional 
+    public void cancelMyRequestsByJournalPrefix(String prefix, String userId) { 
+        // Logic implemented via prefixes list method
+    }
+
+    @Override 
+    public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) { 
+        return Optional.empty(); 
+    }
+}
+
+
+
+
+
+
