@@ -1,0 +1,408 @@
+CREATE OR REPLACE PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, 
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+BEGIN
+    -- Enable Parallel DML
+    EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+    BEGIN
+        -- 1. Insert Transactions
+        INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
+            'J'
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        -- 2. Merge Balances
+        MERGE /*+ PARALLEL(target, 8) */ INTO GL_BALANCE target
+        USING (
+            SELECT /*+ PARALLEL(j, 8) */
+                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+                SUM(j.REQ_AMOUNT) as TXN_AMOUNT, NVL(MAX(c.CURRENCY_RATE), 1) as EXCH_RATE 
+            FROM JOURNAL_REQUEST j
+            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
+            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        ) source
+        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE AND target.CURRENCY = source.REQ_CURRENCY AND target.CGL = source.REQ_CGL AND target.BALANCE_DATE = source.BAL_DATE)
+        WHEN MATCHED THEN
+            UPDATE SET target.BALANCE = target.BALANCE + source.TXN_AMOUNT, target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+        WHEN NOT MATCHED THEN
+            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, (source.TXN_AMOUNT * source.EXCH_RATE));
+
+        -- 3. Update Status
+        UPDATE /*+ PARALLEL(JOURNAL_REQUEST, 8) */ JOURNAL_REQUEST
+        SET REQ_STATUS = p_status, EXECUTOR_ID = p_executor_id, EXECUTION_DATE = SYSDATE, EXECUTOR_REMARKS = p_remarks
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        COMMIT; -- Final Commit
+
+        -- 4. Return Cursor (For Sync)
+        OPEN o_cursor FOR
+        SELECT 
+            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, j.REQ_CSV_DATE AS BAL_DATE,
+            g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
+        JOIN GL_BALANCE g ON g.BRANCH_CODE = j.REQ_BRANCH_CODE AND g.CURRENCY = j.REQ_CURRENCY AND g.CGL = j.REQ_CGL AND g.BALANCE_DATE = j.REQ_CSV_DATE;
+    
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK; -- CRITICAL: If any line above fails, undo EVERYTHING
+            RAISE; -- Throw error back to Java so we know it failed
+    END;
+END;
+/
+
+
+
+
+
+
+
+
+
+
+
+// ... (Previous imports remain same)
+
+    // *** LOCATE THIS METHOD IN YOUR FILE AND UPDATE THE CATCH BLOCK ***
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
+        String batchId = dto.getBatchId();
+        
+        try {
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                List<HdfsSyncDto> syncData = null;
+
+                // 1. ORACLE TRANSACTION (Primary Source of Truth)
+                try {
+                    syncData = jdbcTemplate.execute(
+                        "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
+                        (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
+                            // ... (Same as before)
+                            cs.setString(1, batchId);
+                            cs.setString(2, executorId);
+                            cs.setString(3, dto.getRemarks());
+                            cs.setString(4, dto.getStatus().getCode());
+                            cs.registerOutParameter(5, -10);
+                            cs.execute();
+                            List<HdfsSyncDto> list = new ArrayList<>();
+                            try (ResultSet rs = (ResultSet) cs.getObject(5)) {
+                                while (rs.next()) {
+                                    list.add(new HdfsSyncDto(
+                                        rs.getString("BRANCH"), rs.getString("CURRENCY"), rs.getString("CGL"),
+                                        rs.getDate("BAL_DATE").toLocalDate(),
+                                        rs.getBigDecimal("NEW_BALANCE"), rs.getBigDecimal("NEW_INR_BALANCE")
+                                    ));
+                                }
+                            }
+                            return list;
+                        }
+                    );
+                    logAudit(executorId, "APPROVE_DB_SUCCESS", "BATCH_ASYNC", "DB Committed for " + batchId);
+                } catch (Exception e) {
+                    log.error("DB TRANSACTION FAILED", e);
+                    logAudit(executorId, "APPROVE_DB_FAIL", "BATCH_ASYNC", "DB Failed: " + e.getMessage());
+                    throw e; // Stop here.
+                }
+
+                // 2. HDFS TRANSACTION (Secondary)
+                try {
+                    hdfsSyncService.syncToDataLake(syncData);
+                } catch (Exception e) {
+                    log.error("HDFS SYNC FAILED for Batch {} (DB Committed). Queuing for Retry.", batchId, e);
+                    
+                    // *** SAFETY NET: Insert into Retry Queue ***
+                    // This ensures the Background Recovery Service picks it up in 5 minutes.
+                    try {
+                        jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
+                        logAudit(executorId, "HDFS_SYNC_QUEUED", "BATCH_ASYNC", "Queued for Recovery: " + batchId);
+                    } catch (Exception ex) {
+                        log.error("CRITICAL: Failed to queue batch for retry!", ex);
+                    }
+                }
+                
+            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+                // ... (Same as before)
+                 String sql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'";
+                jdbcTemplate.update(sql, dto.getStatus().getCode(), executorId, dto.getRemarks(), batchId);
+                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected " + batchId);
+            }
+        } catch (Exception e) {
+            log.error("FATAL ERROR in Async Process", e);
+        }
+    }
+    // ... (Rest of file remains same)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- Table to hold batches where HDFS Sync failed
+CREATE TABLE HDFS_SYNC_RETRY_QUEUE (
+    BATCH_ID      VARCHAR2(50) PRIMARY KEY,
+    CREATED_AT    TIMESTAMP DEFAULT SYSTIMESTAMP,
+    RETRY_COUNT   NUMBER DEFAULT 0,
+    STATUS        VARCHAR2(20) DEFAULT 'PENDING' -- PENDING, FAILED, COMPLETED
+);
+
+-- Index for the Scheduler to pick up pending items quickly
+CREATE INDEX IDX_HDFS_RETRY_STATUS ON HDFS_SYNC_RETRY_QUEUE(STATUS);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fincore.JournalService.Dto.HdfsSyncDto;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HdfsRecoveryService {
+
+    private final HdfsSyncService hdfsSyncService;
+
+    @Autowired
+    @Qualifier("oracleJdbcTemplate")
+    private JdbcTemplate oracleJdbcTemplate;
+
+    // Run every 5 minutes (300,000 ms)
+    @Scheduled(fixedDelay = 300000)
+    public void retryFailedHdfsSyncs() {
+        // 1. Fetch PENDING batches
+        String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5";
+        List<String> failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+
+        if (failedBatches.isEmpty()) return;
+
+        log.info("HDFS RECOVERY: Found {} failed batches. Starting self-healing...", failedBatches.size());
+
+        for (String batchId : failedBatches) {
+            try {
+                processRetry(batchId);
+            } catch (Exception e) {
+                log.error("HDFS RECOVERY: Failed to recover batch {}", batchId, e);
+                // Increment retry count
+                oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET RETRY_COUNT = RETRY_COUNT + 1 WHERE BATCH_ID = ?", batchId);
+            }
+        }
+    }
+
+    private void processRetry(String batchId) {
+        // 2. SELF-HEALING QUERY
+        // Instead of using old data, we join JOURNAL_REQUEST with GL_BALANCE
+        // to get the CURRENT REAL-TIME balance from Oracle.
+        // This fixes the "Race Condition" issue.
+        String freshDataSql = """
+            SELECT 
+                j.REQ_BRANCH_CODE AS BRANCH, 
+                j.REQ_CURRENCY AS CURRENCY, 
+                j.REQ_CGL AS CGL, 
+                j.REQ_CSV_DATE AS BAL_DATE,
+                g.BALANCE AS NEW_BALANCE,
+                g.INR_BALANCE AS NEW_INR_BALANCE
+            FROM (
+                SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE 
+                FROM JOURNAL_REQUEST 
+                WHERE BATCH_ID = ?
+            ) j
+            JOIN GL_BALANCE g ON 
+                g.BRANCH_CODE = j.REQ_BRANCH_CODE AND 
+                g.CURRENCY = j.REQ_CURRENCY AND 
+                g.CGL = j.REQ_CGL AND 
+                g.BALANCE_DATE = j.REQ_CSV_DATE
+        """;
+
+        List<HdfsSyncDto> freshSyncData = oracleJdbcTemplate.query(freshDataSql, 
+            (rs, rowNum) -> new HdfsSyncDto(
+                rs.getString("BRANCH"),
+                rs.getString("CURRENCY"),
+                rs.getString("CGL"),
+                rs.getDate("BAL_DATE").toLocalDate(),
+                rs.getBigDecimal("NEW_BALANCE"),
+                rs.getBigDecimal("NEW_INR_BALANCE")
+            ), batchId);
+
+        if (!freshSyncData.isEmpty()) {
+            // 3. Push the LATEST/CURRENT balance to HDFS
+            hdfsSyncService.syncToDataLake(freshSyncData);
+            log.info("HDFS RECOVERY: Successfully synced batch {}. Data is now consistent.", batchId);
+        }
+
+        // 4. Mark as Completed
+        oracleJdbcTemplate.update("UPDATE HDFS_SYNC_RETRY_QUEUE SET STATUS = 'COMPLETED' WHERE BATCH_ID = ?", batchId);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+// ... (Previous imports remain same)
+
+    // *** LOCATE THIS METHOD IN YOUR FILE AND UPDATE THE CATCH BLOCK ***
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
+        String batchId = dto.getBatchId();
+        
+        try {
+            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+                List<HdfsSyncDto> syncData = null;
+
+                // 1. ORACLE TRANSACTION (Primary Source of Truth)
+                try {
+                    syncData = jdbcTemplate.execute(
+                        "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
+                        (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
+                            // ... (Same as before)
+                            cs.setString(1, batchId);
+                            cs.setString(2, executorId);
+                            cs.setString(3, dto.getRemarks());
+                            cs.setString(4, dto.getStatus().getCode());
+                            cs.registerOutParameter(5, -10);
+                            cs.execute();
+                            List<HdfsSyncDto> list = new ArrayList<>();
+                            try (ResultSet rs = (ResultSet) cs.getObject(5)) {
+                                while (rs.next()) {
+                                    list.add(new HdfsSyncDto(
+                                        rs.getString("BRANCH"), rs.getString("CURRENCY"), rs.getString("CGL"),
+                                        rs.getDate("BAL_DATE").toLocalDate(),
+                                        rs.getBigDecimal("NEW_BALANCE"), rs.getBigDecimal("NEW_INR_BALANCE")
+                                    ));
+                                }
+                            }
+                            return list;
+                        }
+                    );
+                    logAudit(executorId, "APPROVE_DB_SUCCESS", "BATCH_ASYNC", "DB Committed for " + batchId);
+                } catch (Exception e) {
+                    log.error("DB TRANSACTION FAILED", e);
+                    logAudit(executorId, "APPROVE_DB_FAIL", "BATCH_ASYNC", "DB Failed: " + e.getMessage());
+                    throw e; // Stop here.
+                }
+
+                // 2. HDFS TRANSACTION (Secondary)
+                try {
+                    hdfsSyncService.syncToDataLake(syncData);
+                } catch (Exception e) {
+                    log.error("HDFS SYNC FAILED for Batch {} (DB Committed). Queuing for Retry.", batchId, e);
+                    
+                    // *** SAFETY NET: Insert into Retry Queue ***
+                    // This ensures the Background Recovery Service picks it up in 5 minutes.
+                    try {
+                        jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId);
+                        logAudit(executorId, "HDFS_SYNC_QUEUED", "BATCH_ASYNC", "Queued for Recovery: " + batchId);
+                    } catch (Exception ex) {
+                        log.error("CRITICAL: Failed to queue batch for retry!", ex);
+                    }
+                }
+                
+            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
+                // ... (Same as before)
+                 String sql = "UPDATE JOURNAL_REQUEST SET REQ_STATUS = ?, EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'";
+                jdbcTemplate.update(sql, dto.getStatus().getCode(), executorId, dto.getRemarks(), batchId);
+                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected " + batchId);
+            }
+        } catch (Exception e) {
+            log.error("FATAL ERROR in Async Process", e);
+        }
+    }
+    // ... (Rest of file remains same)
+
+
+
+
+
+
+
+
+
+_____________
+
+    @Scheduled(fixedDelay = 300000) // Runs every 5 mins
+    public void retryFailedHdfsSyncs() {
+        // OPTIMIZATION: Process only 50 at a time to prevent system overload during recovery
+        // If there are more, the next 5-min run will pick them up.
+        String fetchSql = "SELECT BATCH_ID FROM HDFS_SYNC_RETRY_QUEUE WHERE STATUS = 'PENDING' AND RETRY_COUNT < 5 FETCH FIRST 50 ROWS ONLY";
+        
+        List<String> failedBatches = oracleJdbcTemplate.query(fetchSql, (rs, rowNum) -> rs.getString("BATCH_ID"));
+
+        if (failedBatches.isEmpty()) {
+            return; // 99% of the time, code stops here. Instant return.
+        }
+
+        log.info("HDFS RECOVERY: Found {} failed batches...", failedBatches.size());
+        // ... rest of logic
+    }
+
+
+
+
+
+***************************************
+*******************************************
+
