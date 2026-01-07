@@ -1,405 +1,100 @@
-package com.tcs.fincore.CommonMasterService.service;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.util.Calendar;
-import java.util.Date;
-import java.util.List;
-import java.util.TimeZone;
-
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.tcs.fincore.CommonMasterService.Specification.CglSpecification;
-import com.tcs.fincore.CommonMasterService.dto.BalanceRequestDTO;
-import com.tcs.fincore.CommonMasterService.dto.BalanceResponseDTO;
-import com.tcs.fincore.CommonMasterService.dto.BranchStateCircleResponseDTO;
-import com.tcs.fincore.CommonMasterService.dto.CGLSegmentResponseDTO;
-import com.tcs.fincore.CommonMasterService.dto.CglSearchRequest;
-import com.tcs.fincore.CommonMasterService.dto.PaginatedResponseDto;
-import com.tcs.fincore.CommonMasterService.exception.NoDataFoundException;
-import com.tcs.fincore.CommonMasterService.model.BalanceRecord;
-import com.tcs.fincore.CommonMasterService.model.BranchCodeNameOnly;
-import com.tcs.fincore.CommonMasterService.model.BranchMaster;
-import com.tcs.fincore.CommonMasterService.model.BranchMasterWithCircleState;
-import com.tcs.fincore.CommonMasterService.model.CGLCodeDescriptionOnly;
-import com.tcs.fincore.CommonMasterService.model.CGLMaster;
-import com.tcs.fincore.CommonMasterService.model.CGLMasterWithSegment;
-import com.tcs.fincore.CommonMasterService.model.CalenderConfigModel;
-import com.tcs.fincore.CommonMasterService.model.CircleMaster;
-import com.tcs.fincore.CommonMasterService.model.CurrencyCodeNameOnly;
-import com.tcs.fincore.CommonMasterService.model.CurrencyMasterModel;
-import com.tcs.fincore.CommonMasterService.model.CurrencyRateChange;
-import com.tcs.fincore.CommonMasterService.model.SegmentCodeMaster;
-import com.tcs.fincore.CommonMasterService.model.StateMaster;
-import com.tcs.fincore.CommonMasterService.model.ZoneMaster;
-import com.tcs.fincore.CommonMasterService.repository.AnnouncementsRepository;
-import com.tcs.fincore.CommonMasterService.repository.BalanceRecordRepository;
-import com.tcs.fincore.CommonMasterService.repository.BranchMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.BranchMasterWithStateCircleRepository;
-import com.tcs.fincore.CommonMasterService.repository.CGLMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.CGLMasterWithSegmentRepository;
-import com.tcs.fincore.CommonMasterService.repository.CalenderConfigRepository;
-import com.tcs.fincore.CommonMasterService.repository.CircleMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.CurrencyMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.CurrencyRateChangeRepo;
-import com.tcs.fincore.CommonMasterService.repository.SegmentCodeMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.StateMasterRepository;
-import com.tcs.fincore.CommonMasterService.repository.ZoneMasterRepository;
-
-import lombok.RequiredArgsConstructor;
-
-@Service
-@RequiredArgsConstructor
-public class CommonMasterServiceImpl implements CommonMasterService {
-
-    private final SegmentCodeMasterRepository repository;
-    private final CGLMasterRepository cglMasterRepository;
-    private final StateMasterRepository stateMasterRepository;
-    private final BranchMasterRepository branchMasterRepository;
-    private final ZoneMasterRepository zoneMasterRepository;
-    private final CircleMasterRepository circleMatserRepository;
-    private final CurrencyMasterRepository currencyMasterRepo;
-    private final CalenderConfigRepository calenderConfigRepository;
-    private final CurrencyRateChangeRepo currencyRateChangeRepo;
-    private final BalanceRecordRepository balanceRecordRepository;
-    private final AnnouncementsRepository announcementsRepository;
-    private final CGLMasterWithSegmentRepository cglWithSegmentRepository;
-    private final BranchMasterWithStateCircleRepository branchMasterWithStateCircleRepository;
-    private final JwtUtil jwtUtil;
-
-    private static final int EXPORT_CHUNK_SIZE = 500;
-    
-    // Define the specific TimeZone for India
-    private static final String ZONE_IST = "Asia/Kolkata";
-
-    @Override
-    public List<SegmentCodeMaster> getSegmentCodes() {
-        return (List<SegmentCodeMaster>) repository.findAll();
-    }
-
-    @Override
-    public PaginatedResponseDto<CGLMaster> getCGLs(CglSearchRequest request) {
-
-        PageRequest pageRequest = PageRequest.of(request.getPage(), request.getSize());
-
-        Page<CGLMaster> pageResult;
-
-        if (request.getFilters() == null || request.getFilters().isEmpty()) {
-            pageResult = cglMasterRepository.findAll(pageRequest);
-        } else {
-            pageResult = cglMasterRepository.findAll(
-                    CglSpecification.build(request.getFilters()),
-                    pageRequest);
-        }
-
-        PaginatedResponseDto<CGLMaster> response = new PaginatedResponseDto<>();
-
-        response.setData(pageResult.getContent());
-        response.setTotalElements(pageResult.getTotalElements());
-        response.setTotalPages(pageResult.getTotalPages());
-        response.setPageSize(pageResult.getSize());
-        response.setCurrentPage(pageResult.getNumber());
-
-        return response;
-    }
-
-    @Override
-    public List<CGLCodeDescriptionOnly> getCGLsCodeDescriptionOnly(String query) {
-        return cglMasterRepository.findBycglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCase(query, query);
-    }
-
-    @Override
-    public List<String> getCGLCodes() {
-        return cglMasterRepository.findAllCGLNumbers();
-    }
-
-    @Override
-    public List<String> getCurrencys() {
-        return currencyMasterRepo.findAllCurrency();
-    }
-
-    @Override
-    public List<StateMaster> getStateList() {
-        return (List<StateMaster>) stateMasterRepository.findAll();
-    }
-
-    @Override
-    public List<BranchMaster> getBranches() {
-        return (List<BranchMaster>) branchMasterRepository.findAll();
-    }
-
-    @Override
-    public List<BranchCodeNameOnly> getBranchesCodeNameOnly(String query) {
-        return branchMasterRepository.findTop100ByCodeContainingIgnoreCaseOrNameContainingIgnoreCase(query, query);
-    }
-
-    @Override
-    public List<ZoneMaster> getZoneCodes() {
-        return zoneMasterRepository.findAll();
-    }
-
-    @Override
-    public List<CircleMaster> getCircleList() {
-        return circleMatserRepository.findAll();
-    }
-
-    @Override
-    public List<CurrencyMasterModel> getCurrency() {
-        return (List<CurrencyMasterModel>) currencyMasterRepo.findAll();
-    }
-
-    @Override
-    public List<CurrencyCodeNameOnly> getCurrencyCodeNameOnly() {
-        return currencyMasterRepo.findAllBy();
-    }
-
-    @Override
-    public CalenderConfigModel getCalenderConfig() {
-        return calenderConfigRepository.findFirstByOrderByIdDesc();
-    }
-
-    @Override
-    public List<CurrencyRateChange> getRateChange() {
-        return (List<CurrencyRateChange>) currencyRateChangeRepo.findAll();
-    }
-
-    /**
-     * Helper Method: Forces the date to Start of Day (00:00:00) in Asia/Kolkata
-     * regardless of Server TimeZone.
-     */
-    private Date convertToStartOfDay(Date date) {
-        if (date == null) return null;
-        // Use Calendar with Specific TimeZone to avoid UTC shifts
-        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone(ZONE_IST));
-        calendar.setTime(date);
-        calendar.set(Calendar.HOUR_OF_DAY, 0);
-        calendar.set(Calendar.MINUTE, 0);
-        calendar.set(Calendar.SECOND, 0);
-        calendar.set(Calendar.MILLISECOND, 0);
-        return calendar.getTime();
-    }
-
-    /**
-     * Helper Method: Forces the date to End of Day (23:59:59) in Asia/Kolkata
-     * regardless of Server TimeZone.
-     */
-    private Date convertToEndOfDay(Date date) {
-        if (date == null) return null;
-        // Use Calendar with Specific TimeZone to avoid UTC shifts
-        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone(ZONE_IST));
-        calendar.setTime(date);
-        calendar.set(Calendar.HOUR_OF_DAY, 23);
-        calendar.set(Calendar.MINUTE, 59);
-        calendar.set(Calendar.SECOND, 59);
-        calendar.set(Calendar.MILLISECOND, 999);
-        return calendar.getTime();
-    }
-
-    @Override
-    public PaginatedResponseDto<BalanceResponseDTO> getBalanceDetails(BalanceRequestDTO request) {
-        if (request.getEndDate().before(request.getStartDate())) {
-            throw new IllegalArgumentException("End date must be after start date");
-        }
-
-        // --- CRITICAL FIX START ---
-        // 1. Force Start Date to 00:00:00 IST
-        Date adjustedStartDate = convertToStartOfDay(request.getStartDate());
-        // 2. Force End Date to 23:59:59 IST
-        Date adjustedEndDate = convertToEndOfDay(request.getEndDate());
-        // --- CRITICAL FIX END ---
-
-        int page = (request.getPage() != null && request.getPage() >= 0) ? request.getPage() : 0;
-        int size = (request.getSize() != null && request.getSize() >= 0) ? request.getSize() : 10;
-
-        String sortIn = (request.getSortIn() != null && !request.getSortIn().isBlank())
-                ? request.getSortIn().toUpperCase()
-                : "ASC";
-
-        Sort sort = sortIn.equals("DESC") ? Sort.by("date").descending() : Sort.by("date").ascending();
-        PageRequest pageRequest = PageRequest.of(page, size, sort);
-
-        // Pass adjusted dates to repository
-        Page<BalanceRecord> records = balanceRecordRepository.findByBranchAndCglAndCurrencyAndDateBetween(
-                request.getBranch(), request.getCgl(), request.getCurrency(), 
-                adjustedStartDate, adjustedEndDate, 
-                pageRequest);
-
-        if (records.isEmpty()) {
-            throw new NoDataFoundException("No records found for given filters");
-        }
-
-        List<BalanceResponseDTO> list = records.stream()
-                .map(r -> new BalanceResponseDTO(
-                        r.getId(), r.getDate(), r.getBranch(), r.getCgl(), r.getCurrency(), r.getBalance()))
-                .toList();
-
-        String actualSort = records.getSort().stream().findFirst().map(order -> order.getDirection().name())
-                .orElse("UNSORTED");
-
-        return new PaginatedResponseDto<>(
-                records.getNumber(), records.getTotalPages(), records.getSize(), records.getTotalElements(), actualSort,
-                list);
-
-    }
-
-    @Override
-    public byte[] exportBalanceToExcel(BalanceRequestDTO request) {
-
-        if (request.getEndDate().before(request.getStartDate())) {
-            throw new IllegalArgumentException("End date must be after start date");
-        }
-        
-        // --- CRITICAL FIX START ---
-        Date adjustedStartDate = convertToStartOfDay(request.getStartDate());
-        Date adjustedEndDate = convertToEndOfDay(request.getEndDate());
-        // --- CRITICAL FIX END ---
-
-        int chunkSize = EXPORT_CHUNK_SIZE;
-        try (Workbook workbook = new XSSFWorkbook();
-                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            Sheet sheet = workbook.createSheet("Balance Enquiry");
-
-            CellStyle headerStyle = workbook.createCellStyle();
-            Font headereFont = workbook.createFont();
-            headereFont.setBold(true);
-            headerStyle.setFont(headereFont);
-
-            CellStyle dateStyle = workbook.createCellStyle();
-            CreationHelper creationHelper = workbook.getCreationHelper();
-            short dateFormat = creationHelper.createDataFormat().getFormat("dd-MM-yyyy");
-            dateStyle.setDataFormat(dateFormat);
-
-            CellStyle balanceStyle = workbook.createCellStyle();
-            short balanceFormat = creationHelper.createDataFormat().getFormat("#,##0.00");
-            balanceStyle.setDataFormat(balanceFormat);
-
-            String[] columns = { "ID", "Date", "Branch", "CGL", "Currency", "Balance" };
-            Row header = sheet.createRow(0);
-            for (int i = 0; i < columns.length; i++) {
-                Cell cell = header.createCell(i);
-                cell.setCellValue(columns[i]);
-                cell.setCellStyle(headerStyle);
-            }
-
-            int rowIdx = 1;
-            int page = 0;
-            Page<BalanceRecord> recordsPage;
-
-            do {
-                Pageable pageable = PageRequest.of(page, chunkSize, Sort.by("date").ascending());
-
-                // Pass adjusted dates to repository
-                recordsPage = balanceRecordRepository.findByBranchAndCglAndCurrencyAndDateBetween(
-                        request.getBranch(),
-                        request.getCgl(), 
-                        request.getCurrency(), 
-                        adjustedStartDate, 
-                        adjustedEndDate,
-                        pageable);
-
-                if (page == 0 && recordsPage.isEmpty()) {
-                    workbook.write(out);
-                    return out.toByteArray();
-                }
-                for (BalanceRecord r : recordsPage.getContent()) {
-                    Row row = sheet.createRow(rowIdx++);
-                    if (r.getId() != null) {
-                        row.createCell(0).setCellValue(r.getId());
-                    } else {
-                        row.createCell(0).setCellValue("");
-                    }
-                    Cell dateCell = row.createCell(1);
-                    if (r.getDate() != null) {
-                        dateCell.setCellValue(r.getDate());
-                        dateCell.setCellStyle(dateStyle);
-                    } else {
-                        dateCell.setCellValue("");
-                    }
-
-                    row.createCell(2).setCellValue(r.getBranch() != null ? r.getBranch() : "");
-                    row.createCell(3).setCellValue(r.getCgl() != null ? r.getCgl() : "");
-                    row.createCell(4).setCellValue(r.getCurrency() != null ? r.getCurrency() : "");
-                    Cell balanceCell = row.createCell(5);
-                    balanceCell.setCellValue(r.getBalance());
-                    balanceCell.setCellStyle(balanceStyle);
-                }
-                page++;
-            } while (!recordsPage.isLast());
-
-            for (int i = 0; i < columns.length; i++) {
-                sheet.autoSizeColumn(i);
-            }
-            workbook.write(out);
-            return out.toByteArray();
-
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to generate Excel file", e);
-        }
-    }
-
-    @Override
-    public Page<BranchMaster> getBranchNames(Pageable pageable) {
-        return branchMasterRepository.findAll(pageable);
-    }
-
-    @Override
-    @Transactional
-    public PaginatedResponseDto<CGLSegmentResponseDTO> searchCglWithSegment(String text, Integer page, Integer size) {
-        int pageNo = (page == null || page < 0) ? 0 : page;
-        int pageSize = (size == null || size <= 0) ? 10 : size;
-
-        Pageable pageable = PageRequest.of(pageNo, pageSize);
-
-        Page<CGLMasterWithSegment> pageResult = cglWithSegmentRepository
-                .findByCglNumberContainingIgnoreCaseOrDescriptionContainingIgnoreCase(text.trim(), text.trim(),
-                        pageable);
-
-        List<CGLSegmentResponseDTO> list = pageResult.getContent().stream().map(this::toCGLDto).toList();
-        if (list.isEmpty()) {
-            throw new NoDataFoundException("No records found for " + text + " !!");
-        }
-        return new PaginatedResponseDto<>(pageResult.getNumber(), pageResult.getTotalPages(), pageResult.getSize(),
-                pageResult.getTotalElements(), null, list);
-
-    }
-
-    // Helper Class for searchCglWithSegment to convert entity to DTO
-    public CGLSegmentResponseDTO toCGLDto(CGLMasterWithSegment c) {
-        return new CGLSegmentResponseDTO(c.getCglNumber(), c.getDescription(), c.getComp1(), c.getComp2(),
-                c.getAcClassification(), c.getSegmentCode(),
-                (c.getSegment() != null ? c.getSegment().getDescription() : null), c.getBalFwd(), c.getDefBalType(),
-                c.getStatus(), c.getOpenDate(), c.getCloseDate(), c.getBalCompare(), c.getManualPosting());
-    }
-
-    public List<BranchStateCircleResponseDTO> searchByBranchNameORCode(String name) {
-
-        List<BranchMasterWithCircleState> branches = branchMasterWithStateCircleRepository
-                .findByCodeContainingIgnoreCaseOrNameContainingIgnoreCase(name.trim(), name.trim());
-
-        if (branches.isEmpty()) {
-            throw new NoDataFoundException("No branches found for " + name + " !!");
-        }
-
-        return branches.stream().map(this::toBranchDto).toList();
-
-    }
-
-    // Helper Class for searchByBranchNameORCode to convert entity to DTO
-    public BranchStateCircleResponseDTO toBranchDto(BranchMasterWithCircleState b) {
-        return new BranchStateCircleResponseDTO(b.getCode(), b.getName(), b.getCity(), b.getCircleCode(),
-                (b.getCircle() != null ? b.getCircle().getCircleName() : null), b.getStateCode(),
-                (b.getState() != null ? b.getState().getStateName() : null), b.getAddress(), b.getPinCode(),
-                b.getPhoneNumber(), b.getEmailId(), b.getNmrCode(), b.getStatus(), b.getOpenDate(), b.getCloseDate(),
-                b.getMergeDate(), b.getMergedWithBranch(), b.getLastChangeDate(), b.getCpcFlag(), b.getFoodCreditFlag(),
-                b.getCurrChestFlag(), b.getBranchType());
-    }
-}
-
+journal_requests :
+
+REQ_ID	NUMBER	No		1	
+REQ_STATUS	VARCHAR2(10 CHAR)	No	'P' 	2	
+CHANGE_TYPE	VARCHAR2(10 CHAR)	No		3	
+REQ_DATE	DATE	No	SYSDATE 	4	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		5	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		6	
+EXECUTION_DATE	DATE	Yes		7	
+EXECUTOR_REMARKS	VARCHAR2(50 CHAR)	Yes		8	
+PAYLOAD	CLOB	Yes		9	
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		10	
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		11	
+COMMON_BATCH_REMARKS	VARCHAR2(50 CHAR)	Yes		12	
+CREATOR_ROLE	NUMBER(10,0)	Yes		13	
+
+
+data :
+
+1404594	A	ADD	31-12-25	3333333	1021253	31-12-25	DAS	{"changeType":"ADD","masterJournalId":null,"pDate":"2025-12-19","branch":"32098","currency":"USD","cgl":"5051501701","amount":-9997.15,"productType":"12345678","remarks":"Balanced_Txn_326_Cr","arFlag":"A","acClassification":"A","batchId":"0001063","journalId":"0004025-006","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":6}	0001063	0004025-006	Bulk Upload - 2025-12-17	11
+1408978	A	ADD	05-01-26	3333333	1021256	05-01-26	ASD	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-10000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001158","journalId":"0004707-002","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":2}	0001158	0004707-002	Bulk Upload - 2025-12-02	11
+1408977	A	ADD	05-01-26	3333333	1021256	05-01-26	ASD	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":10000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001158","journalId":"0004707-001","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":1}	0001158	0004707-001	Bulk Upload - 2025-12-02	11
+1408974	A	ADD	05-01-26	3333333	1021256	05-01-26	asd	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-10000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001156","journalId":"0004705-002","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":2}	0001156	0004705-002	Bulk Upload - 2025-12-02	11
+1408973	A	ADD	05-01-26	3333333	1021256	05-01-26	asd	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":10000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001156","journalId":"0004705-001","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":1}	0001156	0004705-001	Bulk Upload - 2025-12-02	11
+1408970	A	ADD	05-01-26	3333333	1021256	05-01-26	asd	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1122505001","amount":-10000,"productType":"12345679","remarks":"Normal","arFlag":"A","acClassification":"A","batchId":"0001154","journalId":"0004703-002","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":2}	0001154	0004703-002	Bulk Upload - 2025-12-02	11
+1408969	A	ADD	05-01-26	3333333	1021256	05-01-26	asd	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-02","branch":"32121","currency":"USD","cgl":"1208505003","amount":10000,"productType":"12345678","remarks":"ewreew","arFlag":"A","acClassification":"A","batchId":"0001154","journalId":"0004703-001","commonBatchRemarks":"Bulk Upload - 2025-12-02","transactionCount":1}	0001154	0004703-001	Bulk Upload - 2025-12-02	11
+1406631	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14443","currency":"USD","cgl":"5051220801","amount":9153.92,"productType":"12345678","remarks":"Balanced_Txn_555_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004367-005","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":5}	0001149	0004367-005	Bulk Upload - 2025-12-17	11
+1406630	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14443","currency":"USD","cgl":"2051070601","amount":-3325.87,"productType":"12345678","remarks":"Balanced_Txn_490_Cr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004367-004","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":4}	0001149	0004367-004	Bulk Upload - 2025-12-17	11
+1406629	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14443","currency":"USD","cgl":"2051070601","amount":3325.87,"productType":"12345678","remarks":"Balanced_Txn_490_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004367-003","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":3}	0001149	0004367-003	Bulk Upload - 2025-12-17	11
+1406628	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14443","currency":"USD","cgl":"5051080630","amount":-1428.23,"productType":"12345678","remarks":"Balanced_Txn_162_Cr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004367-002","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":2}	0001149	0004367-002	Bulk Upload - 2025-12-17	11
+1406627	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14443","currency":"USD","cgl":"5051080630","amount":1428.23,"productType":"12345678","remarks":"Balanced_Txn_162_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004367-001","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":1}	0001149	0004367-001	Bulk Upload - 2025-12-17	11
+1406626	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"31977","currency":"USD","cgl":"5051500130","amount":-9792.25,"productType":"12345678","remarks":"Balanced_Txn_488_Cr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004366-004","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":4}	0001149	0004366-004	Bulk Upload - 2025-12-17	11
+1406625	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"31977","currency":"USD","cgl":"5051500130","amount":9792.25,"productType":"12345678","remarks":"Balanced_Txn_488_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004366-003","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":3}	0001149	0004366-003	Bulk Upload - 2025-12-17	11
+1406624	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"31977","currency":"USD","cgl":"7456505002","amount":-8177.29,"productType":"12345678","remarks":"Balanced_Txn_138_Cr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004366-002","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":2}	0001149	0004366-002	Bulk Upload - 2025-12-17	11
+1406623	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"31977","currency":"USD","cgl":"7456505002","amount":8177.29,"productType":"12345678","remarks":"Balanced_Txn_138_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004366-001","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":1}	0001149	0004366-001	Bulk Upload - 2025-12-17	11
+1407047	A	ADD	05-01-26	3333333	1021256	05-01-26	qwe	{"changeType":"ADD","masterJournalId":null,"csvDate":"2025-12-17","branch":"14698","currency":"USD","cgl":"2080501103","amount":1590.84,"productType":"12345678","remarks":"Balanced_Txn_130_Dr","arFlag":"A","acClassification":"A","batchId":"0001149","journalId":"0004429-001","commonBatchRemarks":"Bulk Upload - 2025-12-17","transactionCount":1}	0001149	0004429-001	Bulk Upload - 2025-12-17	11
+
+
+gl_balance : 
+
+ID	NUMBER(19,0)	No	"FINCORE"."GL_BALANCE_SEQ"."NEXTVAL"	1	Id of the balance
+BALANCE_DATE	DATE	No	NULL 	2	Date of the balance recorded
+BRANCH_CODE	VARCHAR2(5 BYTE)	No		3	branchcodeis the foreign key of the branch_master
+CURRENCY	VARCHAR2(3 BYTE)	No		4	currency is foreign key of currency_master
+CGL	VARCHAR2(10 BYTE)	No		5	cgl is foreign key of cgl_master
+BALANCE	NUMBER(25,4)	No		6	balance recorded for a date
+INR_BALANCE	NUMBER(25,2)	Yes		7	Converted to INR Balance
+
+data :
+46232234	11-11-25	09298	USD	2248500101	-472.7385	
+46232237	11-11-25	09601	USD	2248500101	-539.044	
+46232238	11-11-25	09930	USD	2248500101	-13880.5559	
+46232239	11-11-25	09995	USD	2248500101	6693.2951	
+
+
+
+
+
+gl_transactions :
+TRANSACTION_ID	NUMBER(20,0)	No	"FINCORE"."GL_TRANSACTIONS_SEQ"."NEXTVAL"	1	
+BATCH_ID	VARCHAR2(50 CHAR)	Yes		2	
+JOURNAL_ID	VARCHAR2(50 CHAR)	Yes		3	
+TRANSACTION_DATE	DATE	Yes	NULL 	4	
+POST_DATE	TIMESTAMP(6)	Yes	SYSDATE 	5	
+BRANCH_CODE	VARCHAR2(50 CHAR)	Yes		6	
+CURRENCY	VARCHAR2(3 BYTE)	Yes		7	
+CGL	VARCHAR2(10 BYTE)	Yes		8	
+NARRATION	VARCHAR2(40 BYTE)	Yes		9	
+DEBIT_AMOUNT	NUMBER(25,4)	Yes		10	
+CREDIT_AMOUNT	NUMBER(25,4)	Yes		11	
+TRANSACTION_COUNT	NUMBER(10,0)	Yes		12	
+SOURCE_FLAG	VARCHAR2(1 BYTE)	Yes		13	
+
+sample data :
+
+316290541	0001170	0004739-485	02-12-25	06-01-26 04:50:26.062668000 PM	32121	USD	1208505003	ewreew	1000	0	485	J
+316290542	0001170	0004739-486	02-12-25	06-01-26 04:50:26.062668000 PM	32121	USD	1122505001	Normal	0	1000	486	J
+316290543	0001170	0004739-487	02-12-25	06-01-26 04:50:26.062668000 PM	32121	USD	1208505003	ewreew	1000	0	487	J
+316290544	0001170	0004739-488	02-12-25	06-01-26 04:50:26.062668000 PM	32121	USD	1122505001	Normal	0	1000	488	J
+
+
+
+currency master :
+
+CURRENCY_CODE	VARCHAR2(3 BYTE)	No		1	Currency Code of Currency
+CURRENCY_NAME	VARCHAR2(50 BYTE)	No		2	Name of Currency
+FLAG	NUMBER(1,0)	No	0	3	Currency Active or Inactive
+CURRENCY_RATE	NUMBER(12,6)	Yes		4	Current Rate of Currency
+RATE_DATE	DATE	Yes		5	Rate change date 
+CREATED_AT	TIMESTAMP(6)	Yes	CURRENT_TIMESTAMP	6	Currency created date
+UPDATED_AT	TIMESTAMP(6)	Yes	"CURRENT_TIMESTAMP
+   "	7	Currency updated date
+
+
+data :
+VCY	drtvce	0	1.134546		15-12-25 12:21:10.611561000 PM	15-12-25 12:21:10.611561000 PM
+RET	hfbdhfadbfhd	0	65.26565		15-12-25 12:52:50.394294000 PM	15-12-25 12:52:50.394294000 PM
+MAT	PAMN	0	12.121321		19-12-25 06:34:35.235474000 AM	19-12-25 06:34:35.235477000 AM
+GYK	gvkj 	0	1.1		15-12-25 11:39:22.736494000 AM	15-12-25 11:39:22.736494000 AM
+GHF	iutyjgtkgjykjhjkgjkggjgjhhghj	0	465564.465454		15-12-25 11:39:42.892401000 AM	15-12-25 11:39:42.892401000 AM
