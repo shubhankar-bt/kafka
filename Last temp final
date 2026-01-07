@@ -1,0 +1,511 @@
+create or replace PROCEDURE PROCESS_JOURNAL_BATCH (
+    p_batch_id      IN VARCHAR2,
+    p_executor_id   IN VARCHAR2,
+    p_remarks       IN VARCHAR2,
+    p_status        IN VARCHAR2, 
+    o_cursor        OUT SYS_REFCURSOR
+) AS
+    v_missing_rates NUMBER;
+BEGIN
+    -- Enable Parallel DML
+    EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+
+    -- 0. PRE-CHECK: INTEGRITY GUARD
+    -- Before processing, ensure ALL non-INR currencies in this batch have an active rate.
+    -- If even one is missing, FAIL the whole batch.
+    SELECT COUNT(*)
+    INTO v_missing_rates
+    FROM (
+        SELECT DISTINCT REQ_CURRENCY 
+        FROM JOURNAL_REQUEST 
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P'
+    ) req
+    LEFT JOIN CURRENCY_MASTER cm 
+        ON req.REQ_CURRENCY = cm.CURRENCY_CODE AND cm.FLAG = 1 -- Active Only
+    WHERE req.REQ_CURRENCY <> 'INR' -- Ignore Base Currency
+      AND cm.CURRENCY_RATE IS NULL;
+
+    IF v_missing_rates > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'CRITICAL: Active Exchange Rate missing for foreign currency in Batch. Operation Aborted.');
+    END IF;
+
+    -- BEGIN ATOMIC TRANSACTION
+    BEGIN
+        -- 1. Insert Transactions
+        INSERT /*+ PARALLEL(GL_TRANSACTIONS, 8) */ INTO GL_TRANSACTIONS (
+            TRANSACTION_ID, BATCH_ID, JOURNAL_ID, TRANSACTION_DATE, POST_DATE,
+            BRANCH_CODE, CURRENCY, CGL, NARRATION, DEBIT_AMOUNT, CREDIT_AMOUNT, SOURCE_FLAG
+        )
+        SELECT /*+ PARALLEL(JOURNAL_REQUEST, 8) */
+            GL_TRANSACTIONS_SEQ.nextval, BATCH_ID, JOURNAL_ID, NVL(REQ_CSV_DATE, TRUNC(SYSDATE)), SYSTIMESTAMP,
+            REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_NARRATION,
+            CASE WHEN REQ_AMOUNT > 0 THEN REQ_AMOUNT ELSE 0 END, 
+            CASE WHEN REQ_AMOUNT < 0 THEN ABS(REQ_AMOUNT) ELSE 0 END, 
+            'J'
+        FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        -- 2. Merge Balances (STRICT RATE LOGIC)
+        MERGE /*+ PARALLEL(target, 8) */ INTO GL_BALANCE target
+        USING (
+            SELECT /*+ PARALLEL(j, 8) */
+                j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, NVL(j.REQ_CSV_DATE, TRUNC(SYSDATE)) as BAL_DATE,
+                SUM(j.REQ_AMOUNT) as TXN_AMOUNT,
+                -- Logic: If INR, Rate is 1. If Foreign, Rate MUST exist (Checked in Step 0).
+                CASE 
+                    WHEN j.REQ_CURRENCY = 'INR' THEN 1 
+                    ELSE MAX(c.CURRENCY_RATE) 
+                END as EXCH_RATE 
+            FROM JOURNAL_REQUEST j
+            LEFT JOIN CURRENCY_MASTER c ON j.REQ_CURRENCY = c.CURRENCY_CODE AND c.FLAG = 1 
+            WHERE j.BATCH_ID = p_batch_id AND j.REQ_STATUS = 'P'
+            GROUP BY j.REQ_BRANCH_CODE, j.REQ_CURRENCY, j.REQ_CGL, j.REQ_CSV_DATE
+        ) source
+        ON (target.BRANCH_CODE = source.REQ_BRANCH_CODE AND target.CURRENCY = source.REQ_CURRENCY AND target.CGL = source.REQ_CGL AND target.BALANCE_DATE = source.BAL_DATE)
+        WHEN MATCHED THEN
+            UPDATE SET target.BALANCE = target.BALANCE + source.TXN_AMOUNT, target.INR_BALANCE = NVL(target.INR_BALANCE, 0) + (source.TXN_AMOUNT * source.EXCH_RATE)
+        WHEN NOT MATCHED THEN
+            INSERT (ID, BALANCE_DATE, BRANCH_CODE, CURRENCY, CGL, BALANCE, INR_BALANCE)
+            VALUES (GL_BALANCE_SEQ.nextval, source.BAL_DATE, source.REQ_BRANCH_CODE, source.REQ_CURRENCY, source.REQ_CGL, source.TXN_AMOUNT, (source.TXN_AMOUNT * source.EXCH_RATE));
+
+        -- 3. Update Status
+        UPDATE /*+ PARALLEL(JOURNAL_REQUEST, 8) */ JOURNAL_REQUEST
+        SET REQ_STATUS = p_status, EXECUTOR_ID = p_executor_id, EXECUTION_DATE = SYSDATE, EXECUTOR_REMARKS = p_remarks
+        WHERE BATCH_ID = p_batch_id AND REQ_STATUS = 'P';
+
+        COMMIT; 
+
+        -- 4. Return Cursor
+        OPEN o_cursor FOR
+        SELECT 
+            j.REQ_BRANCH_CODE AS BRANCH, j.REQ_CURRENCY AS CURRENCY, j.REQ_CGL AS CGL, j.REQ_CSV_DATE AS BAL_DATE,
+            g.BALANCE AS NEW_BALANCE, g.INR_BALANCE AS NEW_INR_BALANCE
+        FROM (SELECT DISTINCT REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_CSV_DATE FROM JOURNAL_REQUEST WHERE BATCH_ID = p_batch_id) j
+        JOIN GL_BALANCE g ON g.BRANCH_CODE = j.REQ_BRANCH_CODE AND g.CURRENCY = j.REQ_CURRENCY AND g.CGL = j.REQ_CGL AND g.BALANCE_DATE = j.REQ_CSV_DATE;
+    
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE; 
+    END;
+END;
+/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... [Existing imports and class structure]
+
+    // ADD THIS NEW METHOD
+    /**
+     * Clears the data from Redis to prevent duplicate batch creation.
+     */
+    public void clearCache(String requestId) {
+        try {
+            redisTemplate.delete(KEY_DATA + requestId);
+            redisTemplate.delete(KEY_STATUS + requestId);
+            redisTemplate.delete(KEY_ERR + requestId);
+            log.info("Cleared Redis Cache for ReqID: {}", requestId);
+        } catch (Exception e) {
+            log.warn("Failed to clear Redis cache for {}", requestId);
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... [Previous code imports]
+
+    @Async("bulkExecutor")
+    @Transactional
+    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
+        log.info("ASYNC CREATE: Batch {}", batchId);
+        long start = System.currentTimeMillis();
+        
+        try {
+            // ... [Fetch Cached Rows Logic] ...
+            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
+            if (cachedRows == null || cachedRows.isEmpty()) {
+                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired " + batchId);
+                return;
+            }
+
+            // ... [Batch Update Logic] ...
+            // (Keep your existing JDBC Batch Update code here)
+
+            // ... [Summary Table Insert Logic] ...
+            // (Keep existing Summary Insert code)
+
+            // --- NEW: REDIS CLEANUP ---
+            // Prevent double-spending / duplicate batch creation
+            journalBulkValidationService.clearCache(requestId);
+
+            createNotification(batchId, creatorId, cachedRows.size()); // use cachedRows.size() as totalRows
+            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
+            
+        } catch (Exception e) {
+            log.error("Async Create Failed", e);
+            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", e.getMessage());
+            throw e; 
+        }
+    }
+// ... [Rest of file]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------
+
+<dependency>
+    <groupId>com.monitorjbl</groupId>
+    <artifactId>xlsx-streamer</artifactId>
+    <version>2.1.0</version>
+</dependency>
+
+
+
+
+
+package com.fincore.JournalService.Service;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.JournalService.Dto.BulkUploadStateDto;
+import com.monitorjbl.xlsx.StreamingReader; // NEW IMPORT
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook; // Keep for generating Error Report (Write mode)
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class JournalBulkValidationService {
+
+    private final ValidationMasterService validationMasterService;
+    private final ObjectMapper objectMapper;
+
+    @Autowired
+    @Qualifier("byteArrayRedisTemplate")
+    private RedisTemplate<String, byte[]> redisTemplate;
+
+    private static final String KEY_DATA = "JRNL_DATA::";
+    private static final String KEY_STATUS = "JRNL_STAT::";
+    private static final String KEY_ERR = "JRNL_ERR::";
+    private static final long CACHE_TTL_MINUTES = 60;
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class ExcelRowData implements Serializable {
+        public int rowIndex;
+        public String branch;
+        public String currency;
+        public String cgl;
+        public BigDecimal amount;
+        public String txnType;
+        public String remarks;
+        public String productCode;
+        public String sysDate;
+        public boolean isSystemFormat;
+        public List<String> errors;
+    }
+
+    // --- ENTRY POINT ---
+    public String initiateValidation(byte[] fileBytes, String fileName, LocalDate postingDate) {
+        String requestId = UUID.randomUUID().toString();
+        log.info("Init Validation (Streaming). ReqID: {}", requestId);
+        updateStatus(requestId, "QUEUED", "Waiting...", 0, 0);
+        processValidationAsync(requestId, fileBytes, fileName, postingDate);
+        return requestId;
+    }
+
+    @Async("bulkExecutor")
+    public void processValidationAsync(String requestId, byte[] fileBytes, String fileName, LocalDate postingDate) {
+        long startTime = System.currentTimeMillis();
+        updateStatus(requestId, "PROCESSING", "Initializing...", 0, 0);
+
+        List<ExcelRowData> validRows = new ArrayList<>();
+        List<ExcelRowData> errorRows = new ArrayList<>();
+
+        try {
+            Set<String> validBranches = validationMasterService.getAllActiveBranches();
+            Set<String> validCurrencies = validationMasterService.getAllActiveCurrencies();
+            Set<String> validCgls = validationMasterService.getAllActiveCgls();
+            
+            updateStatus(requestId, "PROCESSING", "Streaming Excel File...", 0, 0);
+
+            // --- MEMORY OPTIMIZATION: STREAMING READER ---
+            try (InputStream is = new ByteArrayInputStream(fileBytes);
+                 Workbook workbook = StreamingReader.builder()
+                        .rowCacheSize(100)    // Keep only 100 rows in memory
+                        .bufferSize(4096)     // 4kb buffer
+                        .open(is)) {
+                
+                Sheet sheet = workbook.getSheetAt(0);
+                int rowIdx = 0;
+                
+                for (Row row : sheet) {
+                    if (rowIdx++ == 0) continue; // Skip Header
+
+                    // StreamingReader handles parsing internally
+                    ExcelRowData data = parseRowStreaming(row, rowIdx);
+                    validateRow(data, validBranches, validCurrencies, validCgls);
+
+                    if (!data.errors.isEmpty()) errorRows.add(data);
+                    else validRows.add(data);
+                    
+                    if (rowIdx % 10000 == 0) {
+                        updateStatus(requestId, "PROCESSING", "Scanned " + rowIdx + " rows...", validRows.size(), errorRows.size());
+                    }
+                }
+            }
+
+            // Group Checks
+            if (!validRows.isEmpty()) {
+                updateStatus(requestId, "PROCESSING", "Checking Group Balances...", validRows.size(), errorRows.size());
+                validateGroupBalances(validRows, errorRows);
+                validRows.removeAll(errorRows);
+            }
+
+            // Save to Redis
+            if (errorRows.isEmpty()) {
+                if (validRows.isEmpty()) updateStatus(requestId, "FAILED", "File empty or invalid.", 0, 0);
+                else {
+                    byte[] compressed = compress(validRows);
+                    redisTemplate.opsForValue().set(KEY_DATA + requestId, compressed, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
+                    updateStatus(requestId, "COMPLETED", "Success", validRows.size(), 0);
+                }
+            } else {
+                byte[] report = generateErrorReport(errorRows);
+                if (report != null) redisTemplate.opsForValue().set(KEY_ERR + requestId, report, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
+                updateStatus(requestId, "FAILED", "Validation Failed", validRows.size(), errorRows.size());
+            }
+            log.info("Validation Done. ReqID: {}. Time: {}ms", requestId, System.currentTimeMillis() - startTime);
+
+        } catch (Exception e) {
+            log.error("Validation Error", e);
+            updateStatus(requestId, "ERROR", "Sys Error: " + e.getMessage(), 0, 0);
+        }
+    }
+
+    // --- PARSING (Adapted for StreamingReader) ---
+    private ExcelRowData parseRowStreaming(Row row, int rowIndex) {
+        ExcelRowData data = new ExcelRowData();
+        data.rowIndex = rowIndex;
+        data.errors = new ArrayList<>();
+        try {
+            // StreamingReader cells behave slightly differently (getStringCellValue works for everything)
+            data.branch = getStr(row, 0);
+            data.currency = getStr(row, 1);
+            data.cgl = getStr(row, 2);
+            
+            String amtStr = getStr(row, 3);
+            if (amtStr != null) {
+                try { data.amount = new BigDecimal(amtStr.replace(",", "")); } 
+                catch (Exception e) { data.errors.add("Invalid Amount"); }
+            }
+            
+            data.txnType = getStr(row, 4);
+            data.remarks = getStr(row, 5);
+            data.sysDate = getStr(row, 6);
+            if(data.sysDate != null && !data.sysDate.isEmpty()) data.isSystemFormat = true;
+            data.productCode = getStr(row, 7);
+        } catch (Exception e) {
+            data.errors.add("Parse Error");
+        }
+        return data;
+    }
+
+    private String getStr(Row row, int idx) {
+        Cell c = row.getCell(idx);
+        return c == null ? null : c.getStringCellValue().trim();
+    }
+
+    // ... [KEEP ALL OTHER METHODS (validateRow, validateGroupBalances, compress, decompress, generateErrorReport) EXACTLY SAME] ...
+    // Just re-paste them from previous version here. They are logic-only and don't affect memory.
+    
+    // Redis Cleanup
+    public void clearCache(String requestId) {
+        redisTemplate.delete(Arrays.asList(KEY_DATA + requestId, KEY_STATUS + requestId, KEY_ERR + requestId));
+    }
+    
+    // --- Re-including necessary helpers for completeness ---
+    private void validateRow(ExcelRowData row, Set<String> b, Set<String> c, Set<String> cg) {
+        if(isEmpty(row.branch)) row.errors.add("Branch Missing"); 
+        if(isEmpty(row.currency)) row.errors.add("Currency Missing"); 
+        if(!isEmpty(row.branch) && !b.contains(row.branch)) row.errors.add("Invalid Branch");
+        if(!isEmpty(row.currency) && !c.contains(row.currency)) row.errors.add("Invalid Currency");
+        // ... (rest of validation)
+    }
+    private boolean isEmpty(String s) { return s == null || s.isEmpty(); }
+    
+    private void updateStatus(String id, String s, String m, int v, int e) {
+        try { redisTemplate.opsForValue().set(KEY_STATUS + id, objectMapper.writeValueAsBytes(new BulkUploadStateDto(s, m, v, e)), CACHE_TTL_MINUTES, TimeUnit.MINUTES); } catch(Exception ex){}
+    }
+    
+    // ... [Compression methods same as previous] ...
+     private byte[] compress(List<ExcelRowData> rows) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzipOut = new GZIPOutputStream(baos)) {
+            objectMapper.writeValue(gzipOut, rows);
+        }
+        return baos.toByteArray();
+    }
+
+    private List<ExcelRowData> decompress(byte[] compressed) throws IOException {
+        try (GZIPInputStream gzipIn = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
+            return objectMapper.readValue(gzipIn, new TypeReference<List<ExcelRowData>>() {});
+        }
+    }
+    
+    // ... [Error Report Generation (Write mode uses XSSFWorkbook, which is fine for error subset)] ...
+    private byte[] generateErrorReport(List<ExcelRowData> errorRows) {
+        try (Workbook wb = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            Sheet s = wb.createSheet("Errors");
+            Row h = s.createRow(0); h.createCell(0).setCellValue("Row"); h.createCell(1).setCellValue("Error");
+            int i=1; for(ExcelRowData r : errorRows) { Row row = s.createRow(i++); row.createCell(0).setCellValue(r.rowIndex); row.createCell(1).setCellValue(String.join(",", r.errors)); }
+            wb.write(out); return out.toByteArray();
+        } catch(IOException e) { return null; }
+    }
+    
+    // Accessors
+    public BulkUploadStateDto getState(String r) { try { return objectMapper.readValue(redisTemplate.opsForValue().get(KEY_STATUS + r), BulkUploadStateDto.class); } catch(Exception e){ return null; } }
+    public List<ExcelRowData> getValidRowsFromCache(String r) { try { return decompress(redisTemplate.opsForValue().get(KEY_DATA + r)); } catch(Exception e){ return null; } }
+    public byte[] getFileBytes(String r, String t) { return "ERROR".equals(t) ? redisTemplate.opsForValue().get(KEY_ERR + r) : null; }
+    public byte[] generateTemplateBytes() { return new byte[0]; }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... [Imports]
+
+    @Override
+    @Transactional
+    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
+        // 1. ATOMIC LOCK: Prevent Double-Submit
+        // Key: "LOCK_REQ_{requestId}"
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(
+            "LOCK_REQ_" + requestId, 
+            "LOCKED", 
+            5, TimeUnit.MINUTES // Lock expires in 5 mins
+        );
+
+        if (Boolean.FALSE.equals(acquired)) {
+            log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
+            throw new IllegalStateException("Batch creation already in progress.");
+        }
+
+        String batchId = sequenceService.getNextBatchId();
+        
+        // 2. Fire Async
+        try {
+            self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
+        } catch (Exception e) {
+            // If firing fails, release lock so user can try again
+            redisTemplate.delete("LOCK_REQ_" + requestId);
+            throw e;
+        }
+        
+        return batchId;
+    }
+    
+    // ... [Rest of the file remains exactly as provided in the previous step]
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- High-Cardinality Index for specific transaction search
+CREATE INDEX IDX_JR_JOURNAL_ID ON JOURNAL_REQUEST(JOURNAL_ID);
+
+-- Branch filtering speed
+CREATE INDEX IDX_JR_BRANCH_CODE ON JOURNAL_REQUEST(REQ_BRANCH_CODE);
+
+-- Note: We avoid indexing every column to keep Insertion speed high.
+-- These two are the most common search patterns.
+
+
