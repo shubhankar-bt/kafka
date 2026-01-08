@@ -1,819 +1,130 @@
-package com.fincore.JournalService.Service;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-/**
- * Helper service to fetch Master Data for bulk validation.
- * Fetches entire active sets to allow O(1) in-memory validation.
- * * CORRECTED QUERY MAPPINGS:
- * - BranchMaster: Table 'BRANCH_MASTER', Column 'CODE', Status 'STATUS' (1=Active)
- * - CglMaster: Table 'CGL_MASTER', Column 'CGL_NUMBER', Status 'STATUS' (1=Active)
- * - CurrencyMaster: Table 'CURRENCY_MASTER', Column 'CURRENCY_CODE', Flag 'FLAG' (1=Active)
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class ValidationMasterService {
-
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
-
-    public Set<String> getAllActiveBranches() {
-        long start = System.currentTimeMillis();
-        // Fixed Column Name: CODE instead of BRANCH_CODE
-        // Assuming STATUS=1 means active based on typical Integer status patterns
-        String sql = "SELECT CODE FROM BRANCH_MASTER WHERE STATUS = 1"; 
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        log.info("Loaded {} Active Branches in {}ms", list.size(), System.currentTimeMillis() - start);
-        return new HashSet<>(list);
-    }
-
-    public Set<String> getAllActiveCurrencies() {
-        long start = System.currentTimeMillis();
-        // Correct Column: CURRENCY_CODE, Flag: 1
-        String sql = "SELECT CURRENCY_CODE FROM CURRENCY_MASTER WHERE FLAG = 1";
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        log.info("Loaded {} Active Currencies in {}ms", list.size(), System.currentTimeMillis() - start);
-        return new HashSet<>(list);
-    }
-
-    public Set<String> getAllActiveCgls() {
-        long start = System.currentTimeMillis();
-        // Fixed Column Name: CGL_NUMBER instead of CGL_CODE
-        // Status is Boolean in Entity, maps to 1/0 in Oracle usually
-        String sql = "SELECT CGL_NUMBER FROM CGL_MASTER WHERE STATUS = 1";
-        List<String> list = jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString(1));
-        log.info("Loaded {} Active CGLs in {}ms", list.size(), System.currentTimeMillis() - start);
-        return new HashSet<>(list);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.JournalService.Service;
-
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.BulkUploadStateDto;
-import com.monitorjbl.xlsx.StreamingReader; 
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import lombok.AllArgsConstructor;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook; // For writing Error Report
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-
-import java.io.*;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.regex.Pattern;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
-
-/**
- * Optimized Validation Service.
- * Features: 
- * 1. StreamingReader (Low Memory)
- * 2. Redis+GZIP (Stateless Caching)
- * 3. STRICT Logic Restoration (Regex, System Format, Memo Balances)
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalBulkValidationService {
-
-    private final ValidationMasterService validationMasterService;
-    private final ObjectMapper objectMapper;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    private static final String KEY_DATA = "JRNL_DATA::";
-    private static final String KEY_STATUS = "JRNL_STAT::";
-    private static final String KEY_ERR = "JRNL_ERR::";
-    private static final long CACHE_TTL_MINUTES = 60;
-
-    // --- RESTORED REGEX PATTERNS (From Original Code) ---
-    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
-    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
-
-    @Data @Builder @NoArgsConstructor @AllArgsConstructor
-    public static class ExcelRowData implements Serializable {
-        public int rowIndex;
-        public String branch = "";
-        public String currency = "";
-        public String cgl = "";
-        public BigDecimal amount;
-        public String txnType = "";
-        public String remarks = "";
-        public String productCode = "";
-        
-        // System Specific
-        public boolean isSystemFormat = false;
-        public String sysSite="";
-        public String sysDate="";
-        public String sysYear="";
-        public String sysPeriod="";
-        
-        public List<String> errors = new ArrayList<>();
-    }
-
-    // --- 1. ENTRY POINT ---
-    public String initiateValidation(byte[] fileBytes, String fileName, LocalDate postingDate) {
-        String requestId = UUID.randomUUID().toString();
-        log.info("Starting Validation. ReqID: {}", requestId);
-        updateStatus(requestId, "QUEUED", "Waiting for processor...", 0, 0, null);
-        processValidationAsync(requestId, fileBytes, fileName, postingDate);
-        return requestId;
-    }
-
-    // --- 2. ASYNC PROCESS ---
-    @Async("bulkExecutor")
-    public void processValidationAsync(String requestId, byte[] fileBytes, String fileName, LocalDate postingDate) {
-        long startTime = System.currentTimeMillis();
-        updateStatus(requestId, "PROCESSING", "Initializing...", 0, 0, null);
-
-        List<ExcelRowData> validRows = new ArrayList<>();
-        List<ExcelRowData> errorRows = new ArrayList<>();
-        List<Map<String, Object>> previewList = new ArrayList<>();
-
-        try {
-            // A. Fetch Masters
-            Set<String> validBranches = validationMasterService.getAllActiveBranches();
-            Set<String> validCurrencies = validationMasterService.getAllActiveCurrencies();
-            Set<String> validCgls = validationMasterService.getAllActiveCgls();
-            
-            updateStatus(requestId, "PROCESSING", "Streaming Excel...", 0, 0, null);
-
-            // B. Stream Excel (Memory Safe)
-            try (InputStream is = new ByteArrayInputStream(fileBytes);
-                 Workbook workbook = StreamingReader.builder().rowCacheSize(100).bufferSize(4096).open(is)) {
-                
-                Sheet sheet = workbook.getSheetAt(0);
-                int rowIdx = 0;
-                
-                for (Row row : sheet) {
-                    // Header Skip Logic from Original Code
-                    if (rowIdx == 0) {
-                        String h = getStr(row, 0).toLowerCase();
-                        if ((h.contains("branch") || h.contains("batch")) && !h.equals("01")) { 
-                            rowIdx++; continue; 
-                        }
-                    }
-                    if (rowIdx++ == 0) continue; // Safety skip if not caught above
-
-                    // Parse
-                    ExcelRowData data = parseRowStreaming(row, rowIdx);
-                    
-                    // Validate
-                    validateRow(data, validBranches, validCurrencies, validCgls, postingDate);
-
-                    if (!data.errors.isEmpty()) errorRows.add(data);
-                    else validRows.add(data);
-                    
-                    // Preview first 50
-                    if (previewList.size() < 50) previewList.add(mapToPreview(data));
-
-                    if (rowIdx % 10000 == 0) updateStatus(requestId, "PROCESSING", "Scanned " + rowIdx + " rows...", validRows.size(), errorRows.size(), null);
-                }
-            }
-
-            // C. Group Checks (Memo vs Normal Balance)
-            if (!validRows.isEmpty()) {
-                updateStatus(requestId, "PROCESSING", "Checking Group Balances...", validRows.size(), errorRows.size(), null);
-                validateGroupBalances(validRows, errorRows);
-                validRows.removeAll(errorRows);
-            }
-
-            // D. Save to Redis
-            String previewJson = objectMapper.writeValueAsString(previewList);
-            
-            if (errorRows.isEmpty()) {
-                if(validRows.isEmpty()) {
-                    updateStatus(requestId, "FAILED", "File empty or invalid.", 0, 0, previewJson);
-                } else {
-                    byte[] compressed = compress(validRows);
-                    redisTemplate.opsForValue().set(KEY_DATA + requestId, compressed, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
-                    updateStatus(requestId, "SUCCESS", "Validation Successful.", validRows.size(), 0, previewJson);
-                }
-            } else {
-                byte[] report = generateErrorReport(errorRows);
-                if(report!=null) redisTemplate.opsForValue().set(KEY_ERR + requestId, report, CACHE_TTL_MINUTES, TimeUnit.MINUTES);
-                updateStatus(requestId, "ERROR", "Validation Failed (" + errorRows.size() + " errors).", validRows.size(), errorRows.size(), previewJson);
-            }
-            log.info("Validation Done. ReqID: {}. Time: {}ms", requestId, System.currentTimeMillis() - startTime);
-
-        } catch (Exception e) {
-            log.error("Validation Error", e);
-            updateStatus(requestId, "ERROR", "Sys Error: " + e.getMessage(), 0, 0, null);
-        }
-    }
-
-    // --- 3. PARSING LOGIC (RESTORED EXACTLY) ---
-    private ExcelRowData parseRowStreaming(Row row, int rowIndex) {
-        ExcelRowData data = new ExcelRowData();
-        data.rowIndex = rowIndex;
-        
-        try {
-            String col0 = getStr(row, 0);
-            
-            if ("01".equals(col0)) {
-                // SYSTEM FORMAT: 01, Date, Year, Month, Branch, Curr, CGL, Amt, Type, Rem, Prod
-                data.isSystemFormat = true;
-                data.sysSite = col0;
-                data.sysDate = getStr(row, 1);
-                data.sysYear = getStr(row, 2);
-                data.sysPeriod = getStr(row, 3);
-                
-                data.branch = getStr(row, 4);
-                data.currency = getStr(row, 5);
-                data.cgl = getStr(row, 6);
-                
-                String amtRaw = getStr(row, 7);
-                String typeRaw = getStr(row, 8);
-                parseAmount(data, amtRaw, typeRaw);
-                
-                data.remarks = getStr(row, 9);
-                String rawProd = getStr(row, 10);
-                data.productCode = (rawProd == null || rawProd.isEmpty()) ? "A" : rawProd;
-                
-                // Extra System Column Validation (B, C, D check)
-                validateSystemMetaCols(data, getStr(row, 11), getStr(row, 12), getStr(row, 13));
-                
-            } else {
-                // MANUAL FORMAT: Branch, Curr, CGL, Amt, Type, Rem, Prod
-                data.branch = col0;
-                data.currency = getStr(row, 1);
-                data.cgl = getStr(row, 2);
-                
-                String amtRaw = getStr(row, 3);
-                String typeRaw = getStr(row, 4);
-                parseAmount(data, amtRaw, typeRaw);
-                
-                data.remarks = getStr(row, 5);
-                String rawProd = getStr(row, 6);
-                data.productCode = (rawProd == null || rawProd.isEmpty()) ? "A" : rawProd;
-            }
-            
-            // Clean Currency
-            if(data.currency != null) data.currency = data.currency.trim().toUpperCase();
-            
-        } catch(Exception e) { data.errors.add("Parse Error"); }
-        return data;
-    }
-
-    private void parseAmount(ExcelRowData d, String amountRaw, String typeRaw) {
-        try {
-            if (amountRaw == null) amountRaw = "";
-            if (typeRaw == null) typeRaw = "";
-            
-            if (amountRaw.contains("-") || amountRaw.contains("(") || amountRaw.contains(")")) {
-                d.errors.add("Amount cannot be negative");
-            }
-            
-            String clean = CLEAN_AMOUNT_REGEX.matcher(amountRaw).replaceAll("");
-            if (clean.isEmpty()) { 
-                d.amount = BigDecimal.ZERO; 
-            } else {
-                d.amount = new BigDecimal(clean);
-                if (d.amount.signum() < 0) d.errors.add("Amount cannot be negative");
-            }
-            
-            boolean isCredit = typeRaw.toUpperCase().contains("C") || typeRaw.toUpperCase().contains("CR");
-            d.txnType = isCredit ? "Credit" : "Debit";
-            
-        } catch(Exception e) { 
-            d.amount = BigDecimal.ZERO; 
-            d.errors.add("Invalid Amount Format"); 
-        }
-    }
-
-    // --- 4. VALIDATION LOGIC (RESTORED EXACTLY) ---
-    private void validateRow(ExcelRowData d, Set<String> validBranches, Set<String> validCurrencies, Set<String> validCgls, LocalDate postingDate) {
-        // A. Format Checks
-        if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) {
-            d.errors.add("Amount cannot be Zero or Null");
-        } else {
-            if (d.amount.precision() > 20 || d.amount.scale() > 4) d.errors.add("Amount exceeds format (Max 16.4)");
-            if ("INR".equalsIgnoreCase(d.currency) && d.amount.stripTrailingZeros().scale() > 2) {
-                d.errors.add("INR Amount cannot have more than 2 decimal places");
-            }
-        }
-        
-        if (d.productCode != null && !d.productCode.isEmpty() && !"A".equals(d.productCode)) {
-            if (!PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) d.errors.add("Product Code must be 'A' or 8 digits");
-        }
-        
-        if (d.remarks == null || d.remarks.trim().isEmpty()) d.errors.add("Remarks is Mandatory");
-        else if (d.remarks.length() > 30) d.errors.add("Remarks length > 30");
-
-        if (d.currency == null || d.currency.length() != 3) d.errors.add("Currency must be 3 chars");
-        
-        if (d.cgl == null || d.cgl.isEmpty()) d.errors.add("CGL is Mandatory");
-        else if (!CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.errors.add("CGL must be 10 digits");
-        
-        if (d.branch == null || d.branch.trim().isEmpty()) d.errors.add("Branch is Mandatory");
-
-        // B. Database Checks (Using cached Sets for speed)
-        if (!d.branch.isEmpty() && !validBranches.contains(d.branch)) d.errors.add("Branch Not Found: " + d.branch);
-        if (!d.currency.isEmpty() && !validCurrencies.contains(d.currency)) d.errors.add("Currency Not Found: " + d.currency);
-        if (!d.cgl.isEmpty() && !validCgls.contains(d.cgl)) d.errors.add("CGL Not Found: " + d.cgl);
-
-        // C. System Column Logic (Date Check)
-        if (d.isSystemFormat) {
-            if(d.sysDate == null || d.sysDate.trim().length() != 8) d.errors.add("Invalid Date Format (ddMMyyyy)");
-            else {
-                try {
-                    LocalDate parsedDate = LocalDate.parse(d.sysDate.trim(), SYSTEM_DATE_FMT);
-                    if (!parsedDate.equals(postingDate)) d.errors.add("Date Mismatch with Posting Date (" + postingDate + ")");
-                    
-                    // Fiscal Year Logic
-                    String expectedYear = (parsedDate.getMonthValue() >= 4) ? String.valueOf(parsedDate.getYear()) : String.valueOf(parsedDate.getYear() - 1);
-                    String expectedMonth = String.format("%02d", (parsedDate.getMonthValue() >= 4) ? (parsedDate.getMonthValue() - 3) : (parsedDate.getMonthValue() + 9));
-                    
-                    if (!expectedYear.equals(d.sysYear)) d.errors.add("Invalid Fin Year. Expected: " + expectedYear);
-                    if (!expectedMonth.equals(d.sysPeriod)) d.errors.add("Invalid Fin Month. Expected: " + expectedMonth);
-                    
-                } catch (Exception e) { d.errors.add("Invalid Calendar Date"); }
-            }
-        }
-    }
-
-    private void validateSystemMetaCols(ExcelRowData d, String c11, String c12, String c13) {
-        if (!"B".equalsIgnoreCase(c11)) d.errors.add("Col 12 must be 'B'");
-        if (!"C".equalsIgnoreCase(c12)) d.errors.add("Col 13 must be 'C'");
-        if (!"D".equalsIgnoreCase(c13)) d.errors.add("Col 14 must be 'D'");
-    }
-
-    private void validateGroupBalances(List<ExcelRowData> validRows, List<ExcelRowData> errorAccumulator) {
-        // Using ConcurrentHashMap + LongAdder for high-speed summing
-        ConcurrentHashMap<String, LongAdder> balanceMap = new ConcurrentHashMap<>();
-        
-        // Parallel summing
-        validRows.parallelStream().forEach(d -> {
-            if (d.amount != null) {
-                BigDecimal val = d.amount;
-                if ("Credit".equals(d.txnType)) val = val.negate();
-                
-                // Logic: MEMO if starts with 5, else NORMAL
-                String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-                String key = d.branch + "_" + d.currency + "_" + type;
-                
-                // Multiply by 10000 to process as Long (avoid BigDecimal add overhead in loop)
-                balanceMap.computeIfAbsent(key, k -> new LongAdder()).add(val.multiply(new BigDecimal("10000")).longValue());
-            }
-        });
-
-        // Check discrepancies
-        validRows.parallelStream().forEach(d -> {
-            String type = (d.cgl != null && d.cgl.startsWith("5")) ? "MEMO" : "NORMAL";
-            String key = d.branch + "_" + d.currency + "_" + type;
-            LongAdder adder = balanceMap.get(key);
-            
-            if (adder != null && adder.sum() != 0) {
-                BigDecimal diff = BigDecimal.valueOf(adder.sum()).divide(new BigDecimal("10000"));
-                synchronized(d.errors) {
-                    // Only add error once per row
-                    boolean exists = d.errors.stream().anyMatch(e -> e.contains("Balance Mismatch"));
-                    if (!exists) d.errors.add(type + " Balance Mismatch: Total " + diff.toPlainString());
-                }
-                synchronized(errorAccumulator) {
-                    // This creates duplicates in list, but we can filter later or use Set.
-                    // For performance, adding is fine as we clear validRows later.
-                    errorAccumulator.add(d);
-                }
-            }
-        });
-    }
-
-    // --- 5. REDIS & HELPERS ---
-    public void clearCache(String r) { redisTemplate.delete(Arrays.asList(KEY_DATA+r, KEY_STATUS+r, KEY_ERR+r)); }
-    
-    private void updateStatus(String id, String s, String m, int valid, int error, String preview) { 
-        try { 
-            BulkUploadStateDto dto = BulkUploadStateDto.builder()
-                .requestId(id)
-                .status(s)
-                .message(m)
-                .totalRows(valid + error) 
-                .errorCount((long) error)
-                .currentStage(s.equals("SUCCESS") ? 4 : 2)
-                .previewDataJson(preview)
-                .hasErrorFile(error > 0)
-                .hasSuccessFile(error == 0 && valid > 0)
-                .build();
-            
-            redisTemplate.opsForValue().set(KEY_STATUS+id, objectMapper.writeValueAsBytes(dto), CACHE_TTL_MINUTES, TimeUnit.MINUTES); 
-        } catch(Exception ex){ log.error("Status update failed", ex); } 
-    }
-    
-    private Map<String, Object> mapToPreview(ExcelRowData r) {
-        Map<String, Object> m = new HashMap<>();
-        m.put("branch", r.branch); m.put("currency", r.currency); m.put("cgl", r.cgl);
-        m.put("amount", r.amount); m.put("txnType", r.txnType); m.put("remarks", r.remarks);
-        return m;
-    }
-
-    private String getStr(Row row, int idx) {
-        Cell c = row.getCell(idx);
-        return c == null ? null : c.getStringCellValue().trim();
-    }
-    private byte[] compress(List<ExcelRowData> l) throws IOException { ByteArrayOutputStream b=new ByteArrayOutputStream(); try(GZIPOutputStream z=new GZIPOutputStream(b)){ objectMapper.writeValue(z,l); } return b.toByteArray(); }
-    private List<ExcelRowData> decompress(byte[] b) throws IOException { try(GZIPInputStream z=new GZIPInputStream(new ByteArrayInputStream(b))){ return objectMapper.readValue(z, new TypeReference<List<ExcelRowData>>(){}); } }
-    
-    // Using SXSSFWorkbook to write Error Report efficiently (Saves memory)
-    private byte[] generateErrorReport(List<ExcelRowData> l) { 
-        try (SXSSFWorkbook wb = new SXSSFWorkbook(100); ByteArrayOutputStream out = new ByteArrayOutputStream()) { 
-            Sheet s = wb.createSheet("Errors"); 
-            Row h = s.createRow(0); 
-            h.createCell(0).setCellValue("Row"); 
-            h.createCell(1).setCellValue("Error"); 
-            h.createCell(2).setCellValue("Branch"); 
-            h.createCell(3).setCellValue("CGL");
-            
-            int i=1; 
-            for(ExcelRowData r : l) { 
-                Row row = s.createRow(i++); 
-                row.createCell(0).setCellValue(r.rowIndex); 
-                row.createCell(1).setCellValue(String.join(", ", r.errors)); 
-                row.createCell(2).setCellValue(r.branch); 
-                row.createCell(3).setCellValue(r.cgl);
-            } 
-            wb.write(out); return out.toByteArray(); 
-        } catch(IOException e) { return null; } 
-    }
-    
-    // Accessors
-    public BulkUploadStateDto getState(String r) { try { return objectMapper.readValue(redisTemplate.opsForValue().get(KEY_STATUS + r), BulkUploadStateDto.class); } catch(Exception e){ return null; } }
-    public List<ExcelRowData> getValidRowsFromCache(String r) { try { return decompress(redisTemplate.opsForValue().get(KEY_DATA + r)); } catch(Exception e){ return null; } }
-    public byte[] getFileBytes(String r, String t) { return "ERROR".equals(t) ? redisTemplate.opsForValue().get(KEY_ERR + r) : null; }
-    public byte[] generateTemplateBytes() { return new byte[0]; }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-&:&:&:₹₹:₹:&:&/&2992
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.JournalService.Service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Exception.ResourceNotFoundException;
-import com.fincore.JournalService.Models.JournalLog;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.ChangeType;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.Repository.JournalLogRepository;
-import com.fincore.JournalService.Repository.JournalRequestRepository;
-import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.jdbc.core.BatchPreparedStatementSetter;
-import org.springframework.jdbc.core.CallableStatementCallback;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.io.IOException;
-import java.math.BigDecimal;
-import java.sql.*;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalRequestServiceImpl implements JournalRequestService {
-
-    private final JournalRequestRepository journalRequestRepository;
-    private final JournalLogRepository journalLogRepository;
-    private final SequenceService sequenceService;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    private final JournalBulkValidationService journalBulkValidationService;
-    private final HdfsSyncService hdfsSyncService;
-    
-    @Autowired @Lazy private JournalRequestService self;
-
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    // ==================================================================================
-    // 1. ASYNC BATCH CREATION (Safe & Fast)
-    // ==================================================================================
-
-    @Override
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
-        String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
-        
-        if (Boolean.FALSE.equals(acquired)) throw new IllegalStateException("Batch creation already in progress.");
-
-        try {
-            String batchId = sequenceService.getNextBatchId();
-            self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
-            return batchId;
-        } catch (Exception e) {
-            redisTemplate.delete(lockKey);
-            throw e;
-        }
-    }
-
-    @Override
-    @Async("bulkExecutor")
-    @Transactional
-    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
-        long start = System.currentTimeMillis();
-        
-        try {
-            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-            if (cachedRows == null || cachedRows.isEmpty()) {
-                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
-                return;
-            }
-
-            final BigDecimal[] totals = {BigDecimal.ZERO, BigDecimal.ZERO}; 
-            final int totalRows = cachedRows.size();
-            final int CHUNK_SIZE = 5000;
-            
-            String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
-
-            for (int i = 0; i < totalRows; i += CHUNK_SIZE) {
-                int end = Math.min(i + CHUNK_SIZE, totalRows);
-                List<ExcelRowData> chunk = cachedRows.subList(i, end);
-                final int globalOffset = i;
-                
-                jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
-                    public void setValues(PreparedStatement ps, int k) throws SQLException {
-                        ExcelRowData r = chunk.get(k);
-                        String jId = batchId + "-" + (globalOffset + k + 1);
-                        
-                        LocalDate rDate = LocalDate.now();
-                        if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                             try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); } catch(Exception e){}
-                        }
-
-                        BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                        boolean isCredit = "Credit".equalsIgnoreCase(r.txnType);
-                        BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
-
-                        if (isCredit) totals[1] = totals[1].add(absAmt); else totals[0] = totals[0].add(absAmt);
-
-                        ps.setString(1, "P"); ps.setString(2, "ADD"); ps.setTimestamp(3, ts); 
-                        ps.setString(4, creatorId); ps.setInt(5, creatorRole != null ? creatorRole : 0);
-                        ps.setString(6, batchId); ps.setString(7, jId); ps.setString(8, commonRemarks);
-                        ps.setString(9, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalOffset + k + 1, jsonFmt));
-                        ps.setString(10, r.branch); ps.setString(11, r.currency); ps.setString(12, r.cgl);
-                        ps.setBigDecimal(13, signedAmt); ps.setDate(14, java.sql.Date.valueOf(rDate));
-                        ps.setString(15, r.remarks); ps.setString(16, r.productCode);
-                    }
-                    public int getBatchSize() { return chunk.size(); }
-                });
-            }
-
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows, totals[0], totals[1], "PENDING");
-
-            journalBulkValidationService.clearCache(requestId);
-            createNotification(batchId, creatorId, totalRows);
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
-
-        } catch (Exception e) {
-            log.error("Async Create Failed", e);
-            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", e.getMessage());
-            redisTemplate.delete("LOCK_REQ_" + requestId);
-            throw e;
-        }
-    }
-
-    // ==================================================================================
-    // 2. ASYNC APPROVAL
-    // ==================================================================================
-
-    @Override
-    public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
-        self.executeAsyncBatchProcessing(dto, executorId);
-    }
-
-    @Async("bulkExecutor")
-    @Transactional
-    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
-        String batchId = dto.getBatchId();
-        try {
-            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-                List<HdfsSyncDto> syncData = jdbcTemplate.execute("{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}", (CallableStatementCallback<List<HdfsSyncDto>>) cs -> {
-                    cs.setString(1, batchId); cs.setString(2, executorId); cs.setString(3, dto.getRemarks()); cs.setString(4, "A");
-                    cs.registerOutParameter(5, -10); cs.execute();
-                    List<HdfsSyncDto> list = new ArrayList<>();
-                    try (ResultSet rs = (ResultSet) cs.getObject(5)) { while (rs.next()) list.add(new HdfsSyncDto(rs.getString(1), rs.getString(2), rs.getString(3), rs.getDate(4).toLocalDate(), rs.getBigDecimal(5), rs.getBigDecimal(6))); }
-                    return list;
-                });
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-                try { hdfsSyncService.syncToDataLake(syncData); } catch (Exception e) { jdbcTemplate.update("INSERT INTO HDFS_SYNC_RETRY_QUEUE (BATCH_ID, STATUS) VALUES (?, 'PENDING')", batchId); }
-                logAudit(executorId, "APPROVE_SUCCESS", "BATCH_ASYNC", "Approved " + batchId);
-            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
-                jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS='P'", executorId, dto.getRemarks(), batchId);
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", executorId, dto.getRemarks(), batchId);
-                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected " + batchId);
-            }
-        } catch (Exception e) { log.error("Process Fail", e); logAudit(executorId, "PROCESS_FAIL", "BATCH_ASYNC", e.getMessage()); }
-    }
-
-    // ==================================================================================
-    // 3. ASYNC DELETION
-    // ==================================================================================
-
-    @Override
-    public void cancelMyRequestsByBatchIdAsync(String batchId, String userId) {
-        self.executeAsyncBatchCancellation(batchId, userId);
-    }
-
-    @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCancellation(String batchId, String userId) {
-        try {
-            String status = null;
-            try { status = jdbcTemplate.queryForObject("SELECT BATCH_STATUS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ? AND CREATOR_ID = ?", String.class, batchId, userId); }
-            catch (Exception e) { return; }
-            
-            if(!"PENDING".equals(status)) return;
-            while(self.deleteBatchChunk(batchId, userId) > 0) Thread.sleep(50);
-            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
-            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted " + batchId);
-        } catch(Exception e) { log.error("Cancel Fail", e); }
-    }
-    @Override @Transactional(propagation = Propagation.REQUIRES_NEW) public int deleteBatchChunk(String b, String u) { return jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID=? AND CREATOR_ID=? AND REQ_STATUS='P' AND ROWNUM<=10000", b, u); }
-
-    // ==================================================================================
-    // 4. OPTIMIZED SUMMARIES (CORRECTED MAPPING)
-    // ==================================================================================
-
-    @Override
-    public List<Map<String, Object>> getPendingBatchSummaries() {
-        String sql = """
-            SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS 
-            FROM JOURNAL_BATCH_MASTER 
-            WHERE BATCH_STATUS = 'PENDING' 
-            ORDER BY REQ_DATE DESC
-        """;
-        
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            // Mapped to match EXACTLY what Frontend expects (Original DTO keys)
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS")); // Master has 'PENDING'
-            return map;
-        });
-    }
-
-    @Override
-    public List<Map<String, Object>> getAllBatchSummaries() {
-        String sql = """
-            SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, 
-                   BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS 
-            FROM JOURNAL_BATCH_MASTER 
-            ORDER BY REQ_DATE DESC 
-            FETCH FIRST 100 ROWS ONLY
-        """;
-
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS"));
-            map.put("executorId", rs.getString("EXECUTOR_ID"));
-            map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
-            return map;
-        });
-    }
-    
-    @Override
-    public long getRequestCountByBatchId(String batchId) {
-        try { return jdbcTemplate.queryForObject("SELECT TOTAL_ROWS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId); } 
-        catch (Exception e) { return 0; }
-    }
-
-    // --- HELPER / LEGACY ---
-    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-        return new StringBuilder(500).append("{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"").append(pDate.format(fmt)).append("\",\"branch\":\"").append(row.branch).append("\",\"currency\":\"").append(row.currency).append("\",\"cgl\":\"").append(row.cgl).append("\",\"amount\":").append(amount).append(",\"productType\":\"").append(row.productCode==null?"":row.productCode).append("\",\"remarks\":\"").append(row.remarks==null?"":escapeJson(row.remarks)).append("\",\"arFlag\":\"A\",\"acClassification\":\"A\",\"batchId\":\"").append(batchId).append("\",\"journalId\":\"").append(jId).append("\",\"commonBatchRemarks\":\"").append(escapeJson(rem)).append("\",\"transactionCount\":").append(count).append("}").toString();
-    }
-    private String escapeJson(String s) { return s == null ? "" : s.replace("\"", "\\\"").replace("\\", "\\\\"); }
-    private void createNotification(String bId, String uId, int size) { try { notificationWriterService.createNotification(null, permissionConfigService.getConfig("JOURNAL_AUTH").getTargetRoles(), "Batch "+bId+" Pending", "", bId, "Journal"); } catch(Exception e){} }
-    private void logAudit(String u, String a, String t, String v) { try { JournalLog l=new JournalLog(); l.setUserId(u); l.setActionType(a); l.setChangeType(t); l.setNewValue(v.length()>3900?v.substring(0,3900):v); l.setActionTime(LocalDateTime.now()); journalLogRepository.save(l); } catch(Exception e){} }
-
-    @Override public LocalDate getCurrentPostingDate() { return LocalDate.now(); }
-    @Override public Page<JournalRequest> getRequestsByBatchIdPaginated(String b, Pageable p) { return journalRequestRepository.findByBatchIdPaginated(b, p); }
-    @Override public List<JournalRequest> getRequestsByBatchId(String b) { return journalRequestRepository.findByBatchId(b); }
-    @Override public List<JournalRequest> getMyRequests(String u) { return new ArrayList<>(); }
-    @Override public List<JournalRequest> getPendingRequests(String u, Integer r) { return new ArrayList<>(); }
-    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return new ArrayList<>(); }
-    @Override @Transactional public void cancelMyRequest(Long r, String u) { journalRequestRepository.deleteById(r); }
-    @Override @Transactional public void cancelMyRequestsByBatchId(String b, String u) { cancelMyRequestsByBatchIdAsync(b, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefixes(List<String> l, String u) { journalRequestRepository.deleteJournalsNative(l, u); }
-    @Override @Transactional public void cancelMyRequestsByJournalPrefix(String p, String u) { }
-    @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto d, String u, Integer r) { return Optional.empty(); }
-    @Override public List<JournalRequest> createBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return new ArrayList<>(); }
-    @Override public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException { return ""; }
-    @Override public String createBatchFromCache(String r, String m, String u, Integer o) throws IOException { return createBatchFromCacheAsync(r,m,u,o); }
-    @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto d, String u, Integer r) { processBulkRequestsAsync(d,u,r); return Collections.emptyList(); }
-}
-
-
-
+2026-01-08T13:43:55.372+05:30  INFO 35736 --- [JournalService] [nio-9999-exec-3] c.f.J.S.JournalBulkValidationService     : Starting Validation. ReqID: 0ac1b18a-f037-414a-ba1e-95bda81cce08
+2026-01-08T13:44:49.687+05:30  INFO 35736 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.ValidationMasterService    : Loaded 25760 Active Branches in 54264ms
+2026-01-08T13:44:49.774+05:30  INFO 35736 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.ValidationMasterService    : Loaded 33 Active Currencies in 85ms
+2026-01-08T13:45:04.228+05:30  INFO 35736 --- [JournalService] [nio-9999-exec-3] c.f.J.Service.ValidationMasterService    : Loaded 6886 Active CGLs in 14454ms
+2026-01-08T13:45:05.080+05:30  WARN 35736 --- [JournalService] [nio-9999-exec-3] o.apache.poi.openxml4j.opc.ZipPackage    : Error in zip file C:\Users\v1018405\AppData\Local\Temp\tmp-15171829696777321198.xlsx - falling back to stream processing (i.e. ignoring zip central directory)
+2026-01-08T13:45:05.216+05:30 ERROR 35736 --- [JournalService] [nio-9999-exec-3] c.f.J.S.JournalBulkValidationService     : Validation Error
+
+org.apache.poi.openxml4j.exceptions.NotOfficeXmlFileException: No valid entries or contents found, this is not a valid OOXML (Office Open XML) file
+	at org.apache.poi.openxml4j.util.ZipArchiveThresholdInputStream.getNextEntry(ZipArchiveThresholdInputStream.java:159) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.util.ZipInputStreamZipEntrySource.<init>(ZipInputStreamZipEntrySource.java:94) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.ZipPackage.openZipEntrySourceStream(ZipPackage.java:258) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.ZipPackage.openZipEntrySourceStream(ZipPackage.java:242) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.ZipPackage.openZipEntrySourceStream(ZipPackage.java:216) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.ZipPackage.<init>(ZipPackage.java:197) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.OPCPackage.open(OPCPackage.java:285) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at org.apache.poi.openxml4j.opc.OPCPackage.open(OPCPackage.java:192) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	at com.monitorjbl.xlsx.impl.StreamingWorkbookReader.init(StreamingWorkbookReader.java:113) ~[xlsx-streamer-2.2.0.jar:na]
+	at com.monitorjbl.xlsx.impl.StreamingWorkbookReader.init(StreamingWorkbookReader.java:91) ~[xlsx-streamer-2.2.0.jar:na]
+	at com.monitorjbl.xlsx.StreamingReader$Builder.open(StreamingReader.java:251) ~[xlsx-streamer-2.2.0.jar:na]
+	at com.fincore.JournalService.Service.JournalBulkValidationService.processValidationAsync(JournalBulkValidationService.java:114) ~[classes/:na]
+	at com.fincore.JournalService.Service.JournalBulkValidationService.initiateValidation(JournalBulkValidationService.java:90) ~[classes/:na]
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354) ~[spring-aop-6.1.8.jar:6.1.8]
+	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:716) ~[spring-aop-6.1.8.jar:6.1.8]
+	at com.fincore.JournalService.Service.JournalBulkValidationService$$SpringCGLIB$$0.initiateValidation(<generated>) ~[classes/:na]
+	at com.fincore.JournalService.Controllers.JournalRequestController.initiateValidation(JournalRequestController.java:161) ~[classes/:na]
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103) ~[na:na]
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580) ~[na:na]
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:255) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:188) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:926) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:831) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1014) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:914) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:590) ~[tomcat-embed-core-10.1.24.jar:6.0]
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:658) ~[tomcat-embed-core-10.1.24.jar:6.0]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51) ~[tomcat-embed-websocket-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:108) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy.lambda$doFilterInternal$3(FilterChainProxy.java:231) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:365) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.access.intercept.AuthorizationFilter.doFilter(AuthorizationFilter.java:100) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:126) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:120) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:131) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:85) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.authentication.AnonymousAuthenticationFilter.doFilter(AnonymousAuthenticationFilter.java:100) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter.doFilter(SecurityContextHolderAwareRequestFilter.java:179) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.savedrequest.RequestCacheAwareFilter.doFilter(RequestCacheAwareFilter.java:63) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at com.fincore.commonutilities.security.ContextRbacFilter.doFilterInternal(ContextRbacFilter.java:145) ~[classes/:na]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:107) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:93) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.CorsFilter.doFilterInternal(CorsFilter.java:91) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.header.HeaderWriterFilter.doHeadersAfter(HeaderWriterFilter.java:90) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.header.HeaderWriterFilter.doFilterInternal(HeaderWriterFilter.java:75) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:82) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:69) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter.doFilterInternal(WebAsyncManagerIntegrationFilter.java:62) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.session.DisableEncodeUrlFilter.doFilterInternal(DisableEncodeUrlFilter.java:42) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.web.FilterChainProxy$VirtualFilterChain.doFilter(FilterChainProxy.java:374) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy.doFilterInternal(FilterChainProxy.java:233) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.security.web.FilterChainProxy.doFilter(FilterChainProxy.java:191) ~[spring-security-web-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.servlet.handler.HandlerMappingIntrospector.lambda$createCacheFilter$3(HandlerMappingIntrospector.java:195) ~[spring-webmvc-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.CompositeFilter.doFilter(CompositeFilter.java:74) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.security.config.annotation.web.configuration.WebMvcSecurityConfiguration$CompositeFilterChainProxy.doFilter(WebMvcSecurityConfiguration.java:230) ~[spring-security-config-6.3.0.jar:6.3.0]
+	at org.springframework.web.filter.DelegatingFilterProxy.invokeDelegate(DelegatingFilterProxy.java:352) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.DelegatingFilterProxy.doFilter(DelegatingFilterProxy.java:268) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116) ~[spring-web-6.1.8.jar:6.1.8]
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:389) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:896) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1741) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:63) ~[tomcat-embed-core-10.1.24.jar:10.1.24]
+	at java.base/java.lang.Thread.run(Thread.java:1570) ~[na:na]
+Caused by: java.util.zip.ZipException: Unexpected record signature: 0x302c3130
+	at org.apache.commons.compress.archivers.zip.ZipArchiveInputStream.getNextZipEntry(ZipArchiveInputStream.java:770) ~[commons-compress-1.25.0.jar:1.25.0]
+	at org.apache.poi.openxml4j.util.ZipArchiveThresholdInputStream.getNextEntry(ZipArchiveThresholdInputStream.java:150) ~[poi-ooxml-5.2.5.jar:5.2.5]
+	... 116 common frames omitted
 
