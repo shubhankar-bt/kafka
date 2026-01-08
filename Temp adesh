@@ -376,3 +376,65 @@ public class JournalRequestServiceImpl implements JournalRequestService {
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- 1. Fix Creation Speed (The most important command)
+-- Increases memory cache so threads don't fight for locks. 
+-- NO RISK: If DB restarts, you just lose skipping numbers, which is fine for IDs.
+ALTER SEQUENCE JOURNAL_REQUEST_SEQ CACHE 10000;
+
+-- 2. Fix Delete Speed
+-- Recompile the procedure to delete 50,000 rows per commit instead of 10,000.
+CREATE OR REPLACE PROCEDURE PURGE_JOURNAL_BATCH(
+    p_batch_id IN VARCHAR2,
+    p_user_id IN VARCHAR2
+) AS
+    v_status VARCHAR2(20);
+BEGIN
+    -- Security Check
+    BEGIN
+        SELECT BATCH_STATUS INTO v_status
+        FROM JOURNAL_BATCH_MASTER
+        WHERE BATCH_ID = p_batch_id AND CREATOR_ID = p_user_id;
+
+        IF v_status <> 'PENDING' THEN
+            RAISE_APPLICATION_ERROR(-20002, 'Cannot delete batch. Status is ' || v_status);
+        END IF;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20003, 'Batch not found or access denied.');
+    END;
+
+    -- Chunked Delete (Increased to 50k for speed)
+    LOOP
+        DELETE FROM JOURNAL_REQUEST
+        WHERE BATCH_ID = p_batch_id
+          AND REQ_STATUS = 'P' 
+          AND ROWNUM <= 50000; -- Optimization: Bigger chunks = Fewer commits
+
+        EXIT WHEN SQL%ROWCOUNT = 0;
+        COMMIT; 
+    END LOOP;
+
+    DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = p_batch_id;
+    COMMIT;
+END;
+/
+
+
