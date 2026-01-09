@@ -1,3 +1,68 @@
+# Redis Configuration for Notifications
+spring.data.redis.host=10.177.103.195
+spring.data.redis.port=6379
+# spring.data.redis.password= (If needed)
+
+# Topic for Progress Updates
+notification.progress.topic=notifications:progress
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.config;
+
+import com.fincore.ReportService.dto.TaskProgressDto;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+/**
+ * Configuration for the RedisTemplate used to publish TaskProgressDto.
+ * Uses JSON serialization for values so the Notification Service can read them.
+ */
+@Configuration
+public class TaskRedisConfig {
+
+    @Bean(name = "progressRedisTemplate")
+    public RedisTemplate<String, TaskProgressDto> progressRedisTemplate(RedisConnectionFactory connectionFactory) {
+        RedisTemplate<String, TaskProgressDto> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // Keys are Strings (the topic name)
+        template.setKeySerializer(new StringRedisSerializer());
+
+        // Values are JSON (the DTO)
+        Jackson2JsonRedisSerializer<TaskProgressDto> serializer = new Jackson2JsonRedisSerializer<>(TaskProgressDto.class);
+        template.setValueSerializer(serializer);
+
+        return template;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.ReportService.service;
 
 import com.fincore.ReportService.dto.ReportStreamResponse;
@@ -28,7 +93,6 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
@@ -43,13 +107,13 @@ public class ReportServiceImpl implements ReportService {
     private final NotificationWriterService notificationWriterService;
     private final FileSystem hdfsFileSystem;
     
-    @Qualifier("progressRedisTemplate")
+    // Redis Template for Progress Notifications
     private final RedisTemplate<String, TaskProgressDto> redisTemplate;
     
     @Value("${notification.progress.topic}")
     private String progressTopic;
 
-    // 32KB Buffer: Optimal for high-throughput streaming
+    // Buffer size: 32KB is optimal for high throughput
     private static final int BUFFER_SIZE = 32 * 1024; 
 
     private static final Set<String> ALREADY_COMPRESSED_EXTS = Set.of(
@@ -58,7 +122,7 @@ public class ReportServiceImpl implements ReportService {
 
     public ReportServiceImpl(ReportTypeRepository reportTypeRepository,
                              @Value("${glif.reports.base-path}") String basePath,
-                             AppConfigRepository appConfigRepository, // kept if you use start date logic elsewhere
+                             AppConfigRepository appConfigRepository,
                              NotificationWriterService notificationWriterService,
                              FileSystem hdfsFileSystem,
                              @Qualifier("progressRedisTemplate") RedisTemplate<String, TaskProgressDto> redisTemplate) {
@@ -107,12 +171,13 @@ public class ReportServiceImpl implements ReportService {
                 throw new ResourceNotFoundException("No report files found matching: " + fileNamePrefix);
             }
 
-            // --- Generate Task ID for Progress Tracking ---
-            String taskId = "dl_" + UUID.randomUUID().toString();
+            // --- Generate Task ID Internally (as per guide convention) ---
+            // Format: "download_" + timestamp + "_" + random
+            String taskId = "download_" + System.currentTimeMillis();
             log.info("Starting Download Task ID: {} for User: {}", taskId, userId);
 
-            // 3. Construct Streaming Logic (Lambda)
-            long finalTotalSize = totalSizeBytes; 
+            // 3. Construct Streaming Logic
+            long finalTotalSize = totalSizeBytes;
 
             StreamingResponseBody streamBody = outputStream -> {
                 try {
@@ -135,8 +200,9 @@ public class ReportServiceImpl implements ReportService {
                                      "/glif-reports", fileName + "_" + date);
 
                 } catch (ClientAbortException | java.net.SocketException e) {
-                    // STOP Redis updates immediately
+                    // STOP Redis updates immediately if user disconnects
                     log.warn("Download aborted by client. User: {}, Task: {}", userId, taskId);
+                    // Do not send FAILED status here as it's a user cancellation
                 } catch (IOException e) {
                     log.error("Streaming Error for Task {}: {}", taskId, e.getMessage());
                     sendProgress(taskId, userId, 0, "Download Failed", "FAILED");
@@ -151,8 +217,8 @@ public class ReportServiceImpl implements ReportService {
                     ? fileName + "_" + formattedDate + ".zip" 
                     : matchingFiles.get(0).getPath().getName();
             
-            // Return DTO with TaskID so Controller can return it in headers
-            return new ReportStreamResponse(downloadName, streamBody, totalSizeBytes, matchingFiles.size() > 1, taskId);
+            // Return DTO (No TaskID sent to frontend manually)
+            return new ReportStreamResponse(downloadName, streamBody, totalSizeBytes, matchingFiles.size() > 1);
 
         } catch (IOException e) {
             log.error("HDFS Metadata Error: {}", e.getMessage());
@@ -200,7 +266,7 @@ public class ReportServiceImpl implements ReportService {
     private void copyWithProgress(InputStream in, OutputStream out, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
         int bytesRead;
-        long lastPercent = -1;
+        int lastPercent = 0;
 
         while ((bytesRead = in.read(buffer)) != -1) {
             out.write(buffer, 0, bytesRead);
@@ -253,12 +319,96 @@ public class ReportServiceImpl implements ReportService {
         }
     }
     
-    // ... (Keep getReportTypes logic unchanged) ...
+    // ... Stub for interface method
     @Override
     public List<com.fincore.ReportService.dto.ReportTypeDto> getReportTypes(int roleId) {
-         // ... existing implementation ...
-         return new ArrayList<>(); // Stub for compilation context
+         return new ArrayList<>(); 
     }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+import com.fincore.ReportService.dto.ReportDownloadRequest;
+import com.fincore.ReportService.dto.ReportStreamResponse;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.service.ReportService;
+
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/reports") 
+public class ReportController {
+
+    private final ReportService reportService;
+    private final JwtUtil jwtUtil;
+    
+    public ReportController(ReportService reportService, JwtUtil jwtUtil) {
+        this.reportService = reportService;
+        this.jwtUtil = jwtUtil;
+    }
+
+    @PostMapping("/types")
+    public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
+        return reportService.getReportTypes(jwtUtil.getUserRoleFromToken(token));
+    }
+
+    @PostMapping("/download")
+    public ResponseEntity<StreamingResponseBody> downloadReport(
+           @RequestHeader("Authorization") String token,
+           @RequestBody ReportDownloadRequest request) {
+            
+       log.info("Download Request: {}", request);
+       
+       ReportStreamResponse response = reportService.downloadReportStream(
+               request.getFileName(),
+               request.getDate(),
+               jwtUtil.getUserRoleFromToken(token),
+               jwtUtil.getUserIdFromToken(token)
+       );
+
+       ResponseEntity.BodyBuilder builder = ResponseEntity.ok()
+               .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + response.getDownloadFileName() + "\"")
+               .contentType(MediaType.APPLICATION_OCTET_STREAM);
+
+       // Logic for "Standard Browser" progress bar (if single file)
+       // We do NOT send X-Task-Id here as requested
+       if (!response.isZip() && response.getFileSize() != null) {
+           builder.contentLength(response.getFileSize());
+       } else if (response.getFileSize() != null) {
+           builder.header("X-Total-Input-Size", String.valueOf(response.getFileSize()));
+       }
+
+       return builder.body(response.getStreamBody());
+   }
 }
 
 
