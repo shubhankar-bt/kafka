@@ -412,3 +412,284 @@ public class ReportController {
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+------------------
+
+
+
+package com.fincore.ReportService.service;
+
+import com.fincore.ReportService.dto.ReportStreamResponse;
+import com.fincore.ReportService.dto.TaskProgressDto;
+import com.fincore.ReportService.exception.ResourceNotFoundException;
+import com.fincore.ReportService.model.ReportType;
+import com.fincore.ReportService.repository.AppConfigRepository;
+import com.fincore.ReportService.repository.ReportTypeRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.catalina.connector.ClientAbortException;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+@Service
+@Slf4j
+public class ReportServiceImpl implements ReportService {
+
+    private final ReportTypeRepository reportTypeRepository;
+    private final String reportsBasePath;
+    private final NotificationWriterService notificationWriterService;
+    private final FileSystem hdfsFileSystem;
+    
+    // Redis Template for Progress Notifications
+    private final RedisTemplate<String, TaskProgressDto> redisTemplate;
+    
+    @Value("${notification.progress.topic}")
+    private String progressTopic;
+
+    // Buffer size: 32KB is optimal for high throughput
+    private static final int BUFFER_SIZE = 32 * 1024; 
+
+    private static final Set<String> ALREADY_COMPRESSED_EXTS = Set.of(
+        "pdf", "xlsx", "xls", "zip", "gz", "png", "jpg", "jpeg", "docx", "pptx"
+    );
+
+    public ReportServiceImpl(ReportTypeRepository reportTypeRepository,
+                             @Value("${glif.reports.base-path}") String basePath,
+                             AppConfigRepository appConfigRepository,
+                             NotificationWriterService notificationWriterService,
+                             FileSystem hdfsFileSystem,
+                             @Qualifier("progressRedisTemplate") RedisTemplate<String, TaskProgressDto> redisTemplate) {
+        this.reportTypeRepository = reportTypeRepository;
+        this.reportsBasePath = basePath;
+        this.notificationWriterService = notificationWriterService;
+        this.hdfsFileSystem = hdfsFileSystem;
+        this.redisTemplate = redisTemplate;
+    }
+
+    @Transactional(readOnly = true)
+    @Override
+    public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
+        
+        // 1. Authorization
+        ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
+                .orElseThrow(() -> {
+                     log.warn("SECURITY ALERT: User {} attempted unauthorized access to report {}", userId, fileName);
+                     return new AccessDeniedException("Access Denied for report: " + fileName);
+                });
+
+        String reportDisplayName = reportType.getReportName();
+        String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE);
+        
+        // 2. HDFS Location Resolution
+        Path searchDirectory = new Path(reportsBasePath, formattedDate);
+        String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+
+        try {
+            if (!hdfsFileSystem.exists(searchDirectory)) {
+                throw new ResourceNotFoundException("Report not generated for date: " + formattedDate);
+            }
+
+            FileStatus[] allFiles = hdfsFileSystem.listStatus(searchDirectory);
+            List<FileStatus> matchingFiles = new ArrayList<>();
+            long totalSizeBytes = 0;
+
+            for (FileStatus status : allFiles) {
+                if (status.isFile() && status.getPath().getName().startsWith(fileNamePrefix)) {
+                    matchingFiles.add(status);
+                    totalSizeBytes += status.getLen();
+                }
+            }
+
+            if (matchingFiles.isEmpty()) {
+                throw new ResourceNotFoundException("No report files found matching: " + fileNamePrefix);
+            }
+
+            // --- Generate Task ID Internally (as per guide convention) ---
+            // Format: "download_" + timestamp + "_" + random
+            String taskId = "download_" + System.currentTimeMillis();
+            log.info("Starting Download Task ID: {} for User: {}", taskId, userId);
+
+            // 3. Construct Streaming Logic
+            long finalTotalSize = totalSizeBytes;
+
+            StreamingResponseBody streamBody = outputStream -> {
+                try {
+                    // Send 0% Started
+                    sendProgress(taskId, userId, 0, "Starting download...", "PROCESSING");
+                    
+                    AtomicLong globalBytesRead = new AtomicLong(0);
+
+                    if (matchingFiles.size() == 1) {
+                         streamSingleFile(matchingFiles.get(0), outputStream, finalTotalSize, globalBytesRead, taskId, userId);
+                    } else {
+                         streamZipBundle(matchingFiles, outputStream, finalTotalSize, globalBytesRead, taskId, userId);
+                    }
+
+                    // Send 100% Completed
+                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
+
+                    // Persistent Notification (DB) - Success
+                    sendNotification(userId, String.format("Report '%s' downloaded successfully.", reportDisplayName), 
+                                     "/glif-reports", fileName + "_" + date);
+
+                } catch (ClientAbortException | java.net.SocketException e) {
+                    // STOP Redis updates immediately if user disconnects
+                    log.warn("Download aborted by client. User: {}, Task: {}", userId, taskId);
+                    // Do not send FAILED status here as it's a user cancellation
+                } catch (IOException e) {
+                    log.error("Streaming Error for Task {}: {}", taskId, e.getMessage());
+                    sendProgress(taskId, userId, 0, "Download Failed", "FAILED");
+                    
+                    // Persistent Notification (DB) - Failure
+                    sendNotification(userId, "Download failed due to server error.", 
+                                     "/glif-reports", fileName + "_" + date);
+                }
+            };
+
+            String downloadName = matchingFiles.size() > 1 
+                    ? fileName + "_" + formattedDate + ".zip" 
+                    : matchingFiles.get(0).getPath().getName();
+            
+            // Return DTO (No TaskID sent to frontend manually)
+            return new ReportStreamResponse(downloadName, streamBody, totalSizeBytes, matchingFiles.size() > 1);
+
+        } catch (IOException e) {
+            log.error("HDFS Metadata Error: {}", e.getMessage());
+            throw new RuntimeException("Storage unavailable", e);
+        }
+    }
+
+    // --- Streaming Logic ---
+
+    private void streamSingleFile(FileStatus file, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        try (FSDataInputStream hdfsStream = hdfsFileSystem.open(file.getPath(), BUFFER_SIZE)) {
+            copyWithProgress(hdfsStream, outputStream, totalSize, globalBytesRead, taskId, userId);
+        }
+    }
+
+    private void streamZipBundle(List<FileStatus> files, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
+            
+            for (FileStatus status : files) {
+                String currentFileName = status.getPath().getName();
+                ZipEntry zipEntry = new ZipEntry(currentFileName);
+                
+                // Smart Compression: Don't re-compress PDF/XLSX
+                if (isAlreadyCompressed(currentFileName)) {
+                    zipOut.setLevel(Deflater.NO_COMPRESSION);
+                } else {
+                    zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
+                }
+                
+                zipOut.putNextEntry(zipEntry);
+                
+                try (FSDataInputStream hdfsStream = hdfsFileSystem.open(status.getPath(), BUFFER_SIZE)) {
+                    // Note: We write to ZipOut, but we measure bytes read from HDFS
+                    copyWithProgress(hdfsStream, zipOut, totalSize, globalBytesRead, taskId, userId);
+                }
+                
+                zipOut.closeEntry();
+            }
+        }
+    }
+
+    /**
+     * Efficient Copy with Progress Hooks
+     */
+    private void copyWithProgress(InputStream in, OutputStream out, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int bytesRead;
+        int lastPercent = 0;
+
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+            
+            long currentTotal = globalBytesRead.addAndGet(bytesRead);
+            
+            // Safe percentage calculation
+            int percent = (int) ((currentTotal * 100) / totalSize);
+            
+            // Cap at 99% inside the loop so 100% is only sent on completion
+            percent = Math.min(percent, 99);
+
+            // Throttle: Update only on 5% increments
+            if (percent >= lastPercent + 5) {
+                sendProgress(taskId, userId, percent, "Downloading... " + percent + "%", "PROCESSING");
+                lastPercent = percent;
+            }
+        }
+        out.flush(); // Ensure bytes are pushed to the network
+    }
+
+    private void sendProgress(String taskId, String userId, int percent, String msg, String status) {
+        try {
+            TaskProgressDto dto = TaskProgressDto.builder()
+                    .taskId(taskId)
+                    .userId(userId)
+                    .percentage(percent)
+                    .message(msg)
+                    .status(status)
+                    .build();
+            redisTemplate.convertAndSend(progressTopic, dto);
+        } catch (Exception e) {
+            // Redis failure should NOT fail the download
+            log.warn("Redis progress update failed: {}", e.getMessage());
+        }
+    }
+    
+    private boolean isAlreadyCompressed(String fileName) {
+        int dotIndex = fileName.lastIndexOf('.');
+        if (dotIndex == -1) return false;
+        String extension = fileName.substring(dotIndex + 1).toLowerCase();
+        return ALREADY_COMPRESSED_EXTS.contains(extension);
+    }
+
+    private void sendNotification(String userId, String message, String url, String aggregateId) {
+        try {
+            notificationWriterService.createNotification(userId, null, message, url, aggregateId, "ReportService");
+        } catch (Exception e) {
+            log.warn("Persistent DB notification failed: {}", e.getMessage());
+        }
+    }
+    
+    // ... Stub for interface method
+    @Override
+    public List<com.fincore.ReportService.dto.ReportTypeDto> getReportTypes(int roleId) {
+         return new ArrayList<>(); 
+    }
+}
+
+
+
