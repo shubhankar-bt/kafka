@@ -1,387 +1,77 @@
-package com.fincore.NotificationService.dto;
+package com.fincore.NotificationService.controller;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class TaskProgressDto {
-    private String taskId;      // Unique ID for the specific download/job
-    private String userId;      // Who to notify
-    private int percentage;     // 0-100
-    private String status;      // "PROCESSING", "COMPLETED", "FAILED"
-    private String message;     // "Compressing file 1 of 5..."
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.NotificationService.config;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.fincore.NotificationService.service.RedisMessageListener;
-import com.fincore.NotificationService.service.RedisProgressMessageListener; // Import the new listener
-import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.EnableCaching;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.cache.RedisCacheConfiguration;
-import org.springframework.data.redis.cache.RedisCacheManager;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
+import com.fincore.NotificationService.dto.TaskProgressDto;
+import com.fincore.NotificationService.config.RedisConfig;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.listener.ChannelTopic;
-import org.springframework.data.redis.listener.RedisMessageListenerContainer;
-import org.springframework.data.redis.listener.adapter.MessageListenerAdapter;
-import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.RedisSerializationContext;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.web.bind.annotation.*;
 
-import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 
+@RestController
+@RequestMapping("/simulate")
+@Slf4j
+public class SimulationController {
 
-@Configuration
-@EnableCaching
-public class RedisConfig {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
 
-    // Existing Topic for persistent notifications
-    public static final String NOTIFICATION_TOPIC = "notifications:push";
-    
-    // NEW Topic for ephemeral progress updates
-    public static final String PROGRESS_TOPIC = "notifications:progress";
+    /**
+     * Trigger a dummy task that runs for 'durationSeconds'.
+     * Updates are sent every 5% increment.
+     */
+    @PostMapping("/task")
+    public String triggerTask(
+            @RequestParam String userId,
+            @RequestParam String taskId,
+            @RequestParam(defaultValue = "300") int durationSeconds // Default 5 mins (300s)
+    ) {
+        log.info("Starting simulation for Task: {} User: {} Duration: {}s", taskId, userId, durationSeconds);
+        
+        // Run asynchronously so the HTTP request returns immediately
+        runHeavyTask(userId, taskId, durationSeconds);
+        
+        return "Task " + taskId + " started. Check SSE stream.";
+    }
 
-    @Bean
-    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
-        ObjectMapper redisObjectMapper = new ObjectMapper();
-        redisObjectMapper.registerModule(new JavaTimeModule());
-        redisObjectMapper.activateDefaultTyping(
-                BasicPolymorphicTypeValidator.builder()
-                        .allowIfBaseType(Object.class)
-                        .build(),
-                ObjectMapper.DefaultTyping.NON_FINAL
-        );
-        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer(redisObjectMapper);
-        RedisCacheConfiguration cacheConfig = RedisCacheConfiguration.defaultCacheConfig()
-                .entryTtl(Duration.ofHours(24))
-                .disableCachingNullValues()
-                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
-                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(serializer));
-        return RedisCacheManager.builder(connectionFactory)
-                .cacheDefaults(cacheConfig)
+    @Async
+    public void runHeavyTask(String userId, String taskId, int durationSeconds) {
+        try {
+            long totalSteps = 20; // 0%, 5%, 10% ... 100% (20 steps)
+            long sleepPerStep = (durationSeconds * 1000L) / totalSteps;
+
+            // Send 0%
+            sendUpdate(taskId, userId, 0, "Task Started", "PROCESSING");
+
+            for (int i = 1; i < totalSteps; i++) {
+                Thread.sleep(sleepPerStep);
+                int percent = i * 5;
+                sendUpdate(taskId, userId, percent, "Processing chunk " + i + "...", "PROCESSING");
+            }
+
+            Thread.sleep(sleepPerStep);
+            
+            // Send 100%
+            sendUpdate(taskId, userId, 100, "Task Completed", "COMPLETED");
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void sendUpdate(String taskId, String userId, int percent, String msg, String status) {
+        TaskProgressDto dto = TaskProgressDto.builder()
+                .taskId(taskId)
+                .userId(userId)
+                .percentage(percent)
+                .message(msg)
+                .status(status)
                 .build();
-    }
 
-    @Bean
-    public ObjectMapper objectMapper() {
-        ObjectMapper mapper = new ObjectMapper();
-        mapper.registerModule(new JavaTimeModule());
-        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        return mapper;
-    }
-
-    @Bean
-    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory, ObjectMapper objectMapper) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
-        template.setConnectionFactory(connectionFactory);
-
-        Jackson2JsonRedisSerializer<Object> serializer =
-                new Jackson2JsonRedisSerializer<>(objectMapper, Object.class);
-
-        template.setValueSerializer(serializer);
-        template.setKeySerializer(new StringRedisSerializer());
-
-        return template;
-    }
-
-    // Listener Adapter for Standard Notifications
-    @Bean
-    public MessageListenerAdapter messageListenerAdapter(RedisMessageListener listener) {
-        return new MessageListenerAdapter(listener, "onMessage");
-    }
-
-    // NEW: Listener Adapter for Progress Updates
-    @Bean
-    public MessageListenerAdapter progressListenerAdapter(RedisProgressMessageListener listener) {
-        return new MessageListenerAdapter(listener, "onMessage");
-    }
-
-    // Main Container - Registers BOTH listeners
-    @Bean
-    public RedisMessageListenerContainer redisMessageListenerContainer(
-            RedisConnectionFactory connectionFactory, 
-            MessageListenerAdapter messageListenerAdapter,
-            MessageListenerAdapter progressListenerAdapter) {
-        
-        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
-        container.setConnectionFactory(connectionFactory);
-        
-        // Subscribe to Notifications
-        container.addMessageListener(messageListenerAdapter, new ChannelTopic(NOTIFICATION_TOPIC));
-        
-        // Subscribe to Progress
-        container.addMessageListener(progressListenerAdapter, new ChannelTopic(PROGRESS_TOPIC));
-        
-        return container;
+        log.info("Simulating Progress: {} - {}%", taskId, percent);
+        redisTemplate.convertAndSend(RedisConfig.PROGRESS_TOPIC, dto);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.NotificationService.service;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.NotificationService.dto.TaskProgressDto;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.connection.Message;
-import org.springframework.data.redis.connection.MessageListener;
-import org.springframework.stereotype.Service;
-
-@Service
-@Slf4j
-public class RedisProgressMessageListener implements MessageListener {
-
-    @Autowired
-    private SsePushService ssePushService;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Override
-    public void onMessage(Message message, byte[] pattern) {
-        try {
-            // Deserialize the message body into TaskProgressDto
-            TaskProgressDto progress = objectMapper.readValue(message.getBody(), TaskProgressDto.class);
-            
-            log.debug("Received progress update from Redis: Task={}, User={}, {}%", 
-                      progress.getTaskId(), progress.getUserId(), progress.getPercentage());
-
-            // Push directly to SSE
-            ssePushService.pushProgressToLocalEmitter(progress);
-            
-        } catch (Exception e) {
-            log.error("Error processing progress message from Redis", e);
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.NotificationService.service;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.NotificationService.dto.TaskProgressDto;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.connection.Message;
-import org.springframework.data.redis.connection.MessageListener;
-import org.springframework.stereotype.Service;
-
-@Service
-@Slf4j
-public class RedisProgressMessageListener implements MessageListener {
-
-    @Autowired
-    private SsePushService ssePushService;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Override
-    public void onMessage(Message message, byte[] pattern) {
-        try {
-            // Deserialize the message body into TaskProgressDto
-            TaskProgressDto progress = objectMapper.readValue(message.getBody(), TaskProgressDto.class);
-            
-            log.debug("Received progress update from Redis: Task={}, User={}, {}%", 
-                      progress.getTaskId(), progress.getUserId(), progress.getPercentage());
-
-            // Push directly to SSE
-            ssePushService.pushProgressToLocalEmitter(progress);
-            
-        } catch (Exception e) {
-            log.error("Error processing progress message from Redis", e);
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.NotificationService.service;
-
-import com.fincore.NotificationService.dto.TaskProgressDto; // Import DTO
-import com.fincore.NotificationService.model.Notification;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Service;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-@Service
-public class SsePushService {
-
-    private static final Logger log = LoggerFactory.getLogger(SsePushService.class);
-
-    // This map ONLY stores connections for users connected to THIS specific instance.
-    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
-
-    /**
-     * Called by the Controller when a new user connects to THIS instance.
-     */
-    public SseEmitter subscribe(String userId) {
-        // Create an emitter that never times out
-        SseEmitter emitter = new SseEmitter(0L);
-
-        // Store this emitter so we can send messages to it later
-        this.emitters.put(userId, emitter);
-        log.info("New local SSE connection established for user: {}. Total local connections: {}", userId, emitters.size());
-
-        // Set up handlers for when the connection breaks or times out
-        emitter.onCompletion(() -> {
-            log.info("SSE connection completed for user: {}. Removing emitter.", userId);
-            this.emitters.remove(userId);
-        });
-        emitter.onTimeout(() -> {
-            log.info("SSE connection timed out for user: {}. Removing emitter.", userId);
-            this.emitters.remove(userId);
-        });
-        emitter.onError((e) -> {
-            log.error("SSE error for user: {}. Removing emitter.", userId, e);
-            this.emitters.remove(userId);
-        });
-
-        // Send a "hello" message to confirm the connection
-        try {
-            emitter.send(SseEmitter.event().name("connected").data("Connection established"));
-        } catch (IOException e) {
-            log.error("Could not send initial 'connected' event to user: {}", userId, e);
-            this.emitters.remove(userId);
-        }
-
-        return emitter;
-    }
-
-    /**
-     * This method is called by the RedisMessageListener.
-     * It pushes a notification ONLY if this specific instance is
-     * managing the connection for that user.
-     */
-    public void pushNotificationToLocalEmitter(Notification notification) {
-        String userId = notification.getUserId();
-        SseEmitter emitter = this.emitters.get(userId);
-
-        // Check if this user is connected to THIS server instance
-        if (emitter != null) {
-            try {
-                log.info("Found local emitter for user {}. Pushing notification {}.", userId, notification.getId());
-                // Send an event named "new_notification" with the Notification object as JSON
-                emitter.send(SseEmitter.event().name("new_notification").data(notification));
-            } catch (IOException e) {
-                // This means the client's connection is broken (e.g., they closed their laptop)
-                log.error("Failed to push notification to user: {}. Removing emitter.", userId, e);
-                this.emitters.remove(userId);
-            }
-        } else {
-            // This is a NORMAL log message.
-            // It just means this user is connected to a different server instance, not this one.
-            log.debug("No local emitter for user {}. This is normal.", userId);
-        }
-    }
-
-    /**
-     * NEW METHOD: Pushes ephemeral progress updates.
-     * Unlike notifications, we don't need persistent logging here, just speed.
-     */
-    public void pushProgressToLocalEmitter(TaskProgressDto progress) {
-        String userId = progress.getUserId();
-        SseEmitter emitter = this.emitters.get(userId);
-
-        if (emitter != null) {
-            try {
-                // Send a distinct event name: "task_progress"
-                // The frontend will listen to this specific event type
-                emitter.send(SseEmitter.event().name("task_progress").data(progress));
-            } catch (IOException e) {
-                // If connection is broken, just remove it.
-                // We don't need to log heavily for progress updates as they happen frequently.
-                this.emitters.remove(userId);
-            }
-        }
-    }
-}
-
-
-
 
