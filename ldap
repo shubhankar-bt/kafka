@@ -1,31 +1,3 @@
-<!-- Add these dependencies to your pom.xml -->
-
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-data-ldap</artifactId>
-</dependency>
-
-<!-- Required for legacy SSL handling if needed, though standard JDK usually suffices -->
-<dependency>
-    <groupId>com.sun.xml.messaging.saaj</groupId>
-    <artifactId>saaj-impl</artifactId>
-    <version>1.5.1</version>
-</dependency>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.gateway.Config;
 
 import lombok.extern.slf4j.Slf4j;
@@ -38,60 +10,45 @@ import org.springframework.ldap.core.support.LdapContextSource;
 import java.util.HashMap;
 import java.util.Map;
 
-/**
- * Configuration for Secure LDAP (LDAPS) connectivity.
- * * Pre-requisites:
- * 1. The AD Certificate provided must be imported into the JVM Truststore 
- * OR configured via system properties.
- * 2. Connectivity to 10.189.42.83 on port 636 must be open.
- */
 @Slf4j
 @Configuration
 public class LdapConfig {
 
+    // Default to the UAT IP provided in your requirement
     @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
     private String ldapUrl;
 
+    // The base path in the directory (DC=UATAD,DC=SBI)
     @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
     private String ldapBaseDn;
 
-    // Optional: If you need a technical user to search the directory first (Service Account)
-    @Value("${spring.ldap.username:}") 
-    private String ldapManagerDn;
-
-    @Value("${spring.ldap.password:}")
-    private String ldapManagerPassword;
+    // Domain name to append to username (e.g., user@UATAD.SBI)
+    @Value("${spring.ldap.domain:UATAD.SBI}")
+    private String ldapDomain;
 
     @Bean
     public LdapContextSource contextSource() {
-        log.info("Configuring LDAP Context Source with URL: {}", ldapUrl);
+        log.info("Configuring Secure LDAP Context Source. URL: {} | Base: {}", ldapUrl, ldapBaseDn);
         LdapContextSource contextSource = new LdapContextSource();
         contextSource.setUrl(ldapUrl);
         contextSource.setBase(ldapBaseDn);
         
-        // If your AD requires authentication to perform searches (Bind DN), set it here.
-        // For simple authentication (binding as the user), these might be empty.
-        if (ldapManagerDn != null && !ldapManagerDn.isBlank()) {
-            contextSource.setUserDn(ldapManagerDn);
-            contextSource.setPassword(ldapManagerPassword);
-        }
-
-        // --- SSL CONFIGURATION NOTE ---
-        // To make this work with your specific certificate, you have two options:
-        // 1. Import cert to JVM: keytool -import -alias ad_uat -keystore $JAVA_HOME/lib/security/cacerts -file ad_cert.cer
-        // 2. Or set these properties if using a custom truststore:
-        // System.setProperty("javax.net.ssl.trustStore", "/path/to/your/truststore.jks");
-        // System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+        // We use "Simple Authentication" which passes the username/password directly
+        // We do NOT set a userDn/password here because we are dynamically binding as the USER logging in.
         
-        // Setting connection timeout properties
         Map<String, Object> baseEnv = new HashMap<>();
-        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); // 5 seconds
-        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    // 5 seconds
-        // Ensure we are using SSL
+        // SSL Protocol is mandatory for port 636
         baseEnv.put("java.naming.security.protocol", "ssl");
         
-        contextSource.setBaseEnvironmentProperties(baseEnv);
+        // Timeouts are CRITICAL. If AD is down, we don't want the app to hang forever.
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); // 5 Seconds max to connect
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    // 5 Seconds max to read
+
+        // SECURITY NOTE: 
+        // Ensure your JVM trusts the AD certificate.
+        // Run: keytool -import -alias ad_uat -keystore $JAVA_HOME/lib/security/cacerts -file <your_cert>.cer
         
+        contextSource.setBaseEnvironmentProperties(baseEnv);
         return contextSource;
     }
 
@@ -114,19 +71,21 @@ public class LdapConfig {
 
 
 
+
+
+
+
+
+
+
 package com.fincore.gateway.Service;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.ldap.core.LdapTemplate;
-import org.springframework.ldap.filter.EqualsFilter;
 import org.springframework.stereotype.Service;
 
-/**
- * Service responsible for interacting with Active Directory.
- * Handles the "Bind" operation to verify credentials.
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -138,49 +97,47 @@ public class AdAuthenticationService {
     private String adDomain;
 
     /**
-     * Authenticates a user against Active Directory.
-     * * Strategy:
-     * We attempt to "bind" (login) to the directory using the user's specific DN 
-     * or Principal Name. AD often supports "sAMAccountName@domain" or "DOMAIN\sAMAccountName".
-     *
-     * @param username The User ID (sAMAccountName)
+     * Authenticate against Active Directory by attempting a Bind.
+     * * @param username The sAMAccountName (e.g., "7378051")
      * @param password The raw password
-     * @return true if bind succeeds, false otherwise
+     * @return true if credentials are valid, false otherwise.
      */
     public boolean authenticate(String username, String password) {
-        if (username == null || password == null || password.isBlank()) {
+        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+            log.warn("LDAP Auth failed: Empty username or password");
             return false;
         }
 
         try {
-            // Construct the Principal Name for AD (e.g., user@UATAD.SBI)
-            // This is often more robust than constructing a full DN (CN=User,OU=...) 
-            // because users might be in different OUs.
+            // AD usually requires "user@domain.com" or "DOMAIN\user" for binding.
+            // Using the UPN (User Principal Name) format is standard.
+            // Logic: username + "@" + "UATAD.SBI"
             String principalName = username + "@" + adDomain;
             
             log.info("Attempting LDAP Bind for principal: {}", principalName);
 
-            // Attempt to authenticate (Bind)
-            // The authenticate method checks if the credentials are valid.
-            // We use the Empty filter because we are binding directly.
+            // The authenticate method handles the opening of connection and binding.
+            // Filter: (sAMAccountName=username) checks if the user exists.
+            // Password: The credential to verify.
             boolean authenticated = ldapTemplate.authenticate(
-                "",                 // Base DN (empty if handled by ContextSource or absolute)
-                "(sAMAccountName=" + username + ")", // Filter to find the entry
-                password
+                "",                                  // Base DN is already set in config
+                "(sAMAccountName=" + username + ")", // Filter to locate the user
+                password                             // Password to verify
             );
 
             if (authenticated) {
-                log.info("LDAP Bind Successful for user: {}", username);
+                log.info("LDAP Authentication SUCCESS for user: {}", username);
                 return true;
             } else {
-                log.warn("LDAP Bind Failed for user: {} (Invalid Credentials)", username);
+                log.warn("LDAP Authentication FAILED for user: {} (Invalid Credentials)", username);
                 return false;
             }
 
         } catch (Exception e) {
-            log.error("LDAP Connection/Authentication Error for user: {}", username, e);
-            // In a production scenario, you might want to differentiate between 
-            // "Wrong Password" and "Server Down" to handle failover logic.
+            // CRITICAL: Handle Server Down or Network issues
+            log.error("LDAP System Error during auth for user: {}. Error: {}", username, e.getMessage());
+            // In a production app, you might want to throw a specific custom exception 
+            // if you want to differentiate between "Wrong Password" and "Server Down".
             return false;
         }
     }
@@ -202,45 +159,73 @@ public class AdAuthenticationService {
 
 
 
-package com.fincore.gateway.utility;
+package com.fincore.gateway.Service;
 
-public class Constants {
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.stereotype.Service;
 
-    public static final String STATUS = "status";
-    public static final String MESSAGE = "message";
-    public static final String ACCEPTED = "ACCEPTED";
-    public static final String REJECTED = "REJECTED";
-    public static final String SUCCESS = "SUCCESS";
-    public static final String ERROR = "ERROR";
-    public static final String LOCK = "LOCK";
-    public static final String UNLOCK = "UNLOCK";
-    public static final String ACTIVE = "ACTIVE";
-    public static final String INACTIVE = "INACTIVE";
-    public static final String CREATE = "CREATE";
-    public static final String MODIFY = "MODIFY";
-    public static final String DELETE = "DELETE";
-    public static final String BLOCK = "BLOCK";
-    public static final String UNBLOCK = "UNBLOCK";
-    public static final String ACCEPT = "ACCEPT";
-    public static final String REJECT = "REJECT";
-    public static final String PENDING = "PENDING";
-    public static final String LOCKED = "LOCKED";
-    
-    // Login Modes
-    public static final String PASSWORD_BASED_LOGIN = "PASS";
-    public static final String SSO_BASED_LOGIN = "SSO";
-    public static final String LDAP_BASED_LOGIN = "LDAP"; // New Constant
-    
-    public static final String INVALID = "INVALID";
-    
-    public static final char PASSWORD = 'P';
-    public static final char SSO = 'S';
-    public static final char LDAP = 'L'; // New Mode Character
-    public static final char HYBRID = 'A'; // Auto-switch mode
-    
-    public static final String ACTIVE_USER = "Active User";
-    public static final String HMAC = "hmac";
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AdAuthenticationService {
+
+    private final LdapTemplate ldapTemplate;
+
+    @Value("${spring.ldap.domain:UATAD.SBI}")
+    private String adDomain;
+
+    /**
+     * Authenticate against Active Directory by attempting a Bind.
+     * * @param username The sAMAccountName (e.g., "7378051")
+     * @param password The raw password
+     * @return true if credentials are valid, false otherwise.
+     */
+    public boolean authenticate(String username, String password) {
+        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+            log.warn("LDAP Auth failed: Empty username or password");
+            return false;
+        }
+
+        try {
+            // AD usually requires "user@domain.com" or "DOMAIN\user" for binding.
+            // Using the UPN (User Principal Name) format is standard.
+            // Logic: username + "@" + "UATAD.SBI"
+            String principalName = username + "@" + adDomain;
+            
+            log.info("Attempting LDAP Bind for principal: {}", principalName);
+
+            // The authenticate method handles the opening of connection and binding.
+            // Filter: (sAMAccountName=username) checks if the user exists.
+            // Password: The credential to verify.
+            boolean authenticated = ldapTemplate.authenticate(
+                "",                                  // Base DN is already set in config
+                "(sAMAccountName=" + username + ")", // Filter to locate the user
+                password                             // Password to verify
+            );
+
+            if (authenticated) {
+                log.info("LDAP Authentication SUCCESS for user: {}", username);
+                return true;
+            } else {
+                log.warn("LDAP Authentication FAILED for user: {} (Invalid Credentials)", username);
+                return false;
+            }
+
+        } catch (Exception e) {
+            // CRITICAL: Handle Server Down or Network issues
+            log.error("LDAP System Error during auth for user: {}. Error: {}", username, e.getMessage());
+            // In a production app, you might want to throw a specific custom exception 
+            // if you want to differentiate between "Wrong Password" and "Server Down".
+            return false;
+        }
+    }
 }
+
+
+
 
 
 
@@ -287,12 +272,10 @@ import java.util.Map;
 /**
  * Service implementation handling user login/verification, menu resolution, and password updates.
  *
- * <p><strong>Responsibilities</strong>
+ * <p><strong>Updated for LDAP Integration</strong>
  * <ul>
- * <li>Validate credentials (Password, SSO, or LDAP)</li>
- * <li>Issue HS256 JWTs and embed limited user/role claims</li>
- * <li>Transform role permissions into menu responses</li>
- * <li>Track login attempts and enforce wrong password limits</li>
+ * <li>Supports 'L' mode for Active Directory Authentication.</li>
+ * <li>Maintains local Authorization (User/Role check) regardless of Auth mode.</li>
  * </ul>
  */
 @Slf4j
@@ -312,7 +295,7 @@ public class LoginServiceImpl implements LoginService {
     private final MenuService menuService;
     private final ObjectMapper mapper;
     
-    // Injected AD Service for LDAP authentication
+    // NEW: LDAP Service
     private final AdAuthenticationService adAuthenticationService;
 
     @Value("${security.jwt.hmac-base64-secret:}")
@@ -329,9 +312,7 @@ public class LoginServiceImpl implements LoginService {
         log.info("Fetching role-wise data for userId: {}", userId);
         try {
             List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
-
             if (rows == null || rows.isEmpty()) {
-                log.info("No permissions found for userId: {}", userId);
                 return new MenuResponse(Collections.emptyList());
             }
             return menuService.transformFromProjection(rows);
@@ -349,21 +330,22 @@ public class LoginServiceImpl implements LoginService {
         final String rawPassword = userCredentials.getPassword();
 
         UserDto result = new UserDto();
-        // 1. Fetch Local User (Authorization Step)
-        // Even if we use LDAP for auth, user MUST exist in local DB for Roles/Branch info.
+        
+        // 1. AUTHORIZATION CHECK (Must exist in Local DB)
         User user = userRepository.findByUserId(userId);
-
         if (user == null) {
             result.setValidCredentials(false);
             result.setUserStatus(Constants.INVALID);
-            log.info("Login attempt for invalid userId: {}", userId);
+            log.warn("Login blocked: User {} not found in local DB.", userId);
             return result;
         }
 
         LoginParam loginParam = loginParamRepository.getLoginParam();
         char activeMode = loginParam.getActiveLoginMode();
         
+        // Prepare Audit Log
         LoginAttempt attempt = new LoginAttempt();
+        attempt.setLoginMethod(determineMethodString(activeMode));
         attempt.setSuccess("N");
         attempt.setIpAddress(clientIp);
         attempt.setUserId(userId);
@@ -373,7 +355,7 @@ public class LoginServiceImpl implements LoginService {
 
         UserRoles userRole = userRepository.getUserRole(userId);
 
-        // Status checks: role & user
+        // 2. STATUS CHECKS
         result.setRoleStatus(userRole.getRoleStatus());
         result.setUserStatus(user.getAccountStatus());
         result.setPasswordLoginStatus(user.getPasswordLogin());
@@ -392,50 +374,39 @@ public class LoginServiceImpl implements LoginService {
             return result;
         }
 
-        // =========================================================================
-        // ROUTING LOGIC BASED ON LOGIN PARAM
-        // =========================================================================
-        
-        attempt.setLoginMethod(determineMethodString(activeMode));
-
+        // 3. AUTHENTICATION LOGIC BASED ON MODE
         if (activeMode == Constants.LDAP) {
-            // --- LDAP MODE ---
+            // --- MODE: LDAP ---
+            log.info("Processing LDAP Login for user: {}", userId);
             boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+            
             if (ldapSuccess) {
+                // LDAP Success -> Treat as valid login
                 handleSuccess(attempt, result, user, userRole);
             } else {
+                // LDAP Failure -> Handle as wrong credentials
+                // Note: We intentionally map LDAP failure to "Password Based Login" failure logic 
+                // to reuse the lockout mechanism/audit logs if desired.
                 handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
             }
-        } 
-        else if (activeMode == Constants.PASSWORD) {
-            // --- PASSWORD MODE ---
+
+        } else if (activeMode == Constants.PASSWORD) {
+            // --- MODE: LOCAL PASSWORD ---
+            // Check if Password Login is explicitly disabled for this specific user
             if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
                 passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
             } else {
-                result.setValidCredentials(false);
-                attempt.setFailureReason("Password login is disabled for this user.");
+                // Account is Locked or Disabled
+                handleAccountLocked(attempt, result, user);
             }
-        } 
-        else if (activeMode == Constants.HYBRID) { 
-            // --- HYBRID / AUTO SWITCH MODE ---
-            // Try LDAP first, if connection fails, fallback to Password? 
-            // OR Try LDAP, if Invalid Creds, return Invalid.
-            // For now, implementing: LDAP Primary.
-            boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
-            if (ldapSuccess) {
-                handleSuccess(attempt, result, user, userRole);
-            } else {
-                // If LDAP failed, we could check if it was a connection error or creds error in the service.
-                // Assuming stricter security: LDAP fail = Login fail.
-                handleFailure(attempt, result, user, loginParam, "LDAP Hybrid Auth Failed");
-            }
-        }
-        else {
-            // --- SSO MODE (Existing logic) ---
+
+        } else {
+            // --- MODE: SSO (Existing Logic) ---
             attempt.setSuccess("Y");
             attempt.setFailureReason("SUCCESS");
             result.setValidCredentials(true);
-            // If password-login was disabled, re-enable it on successful SSO
+            
+            // Re-enable password login if it was locked, upon successful SSO
             if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
                 user.setPasswordLogin(Constants.ACTIVE);
                 userRepository.save(user);
@@ -447,23 +418,36 @@ public class LoginServiceImpl implements LoginService {
         log.debug("verifyUserCredentials result={}", result);
         return result;
     }
+    
+    // --- Helper Methods to keep code clean ---
 
     private String determineMethodString(char mode) {
-        if (mode == Constants.LDAP) return Constants.LDAP_BASED_LOGIN;
+        if (mode == Constants.LDAP) return "LDAP";
         if (mode == Constants.PASSWORD) return Constants.PASSWORD_BASED_LOGIN;
         return Constants.SSO_BASED_LOGIN;
     }
 
-    /**
-     * Centralized Success Handler to generate tokens and update DB
-     */
+    private void handleAccountLocked(LoginAttempt attempt, UserDto result, User user) {
+        result.setValidCredentials(false);
+        result.setPasswordLoginStatus(user.getPasswordLogin()); 
+        result.setMessage("Your account is locked due to multiple failed attempts.");
+        
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            result.setAttemptsLeft(0);
+            attempt.setFailureReason("Account Locked (Pre-check)");
+        } else {
+            result.setMessage("Password login is disabled.");
+            attempt.setFailureReason("Password login disabled");
+        }
+    }
+
     private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
         attempt.setSuccess("Y");
         attempt.setFailureReason("Success");
         result.setValidCredentials(true);
         result.setMessage("Login Successful");
 
-        // Reset wrong password count on successful login (even LDAP)
+        // Reset wrong password count on successful login
         if (user.getUserWrongPasswordCount() > 0) {
             user.setUserWrongPasswordCount(0);
             userRepository.save(user);
@@ -487,10 +471,7 @@ public class LoginServiceImpl implements LoginService {
         result.setAccessToken(accessToken);
         result.setUser(tokenData);
     }
-
-    /**
-     * Centralized Failure Handler to update attempts and lock if necessary
-     */
+    
     private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
         log.warn("Login failed for user {}: {}", user.getUserId(), reason);
         attempt.setSuccess("N");
@@ -504,7 +485,7 @@ public class LoginServiceImpl implements LoginService {
 
         if (newFailedCount >= maxAllowed) {
             user.setPasswordLogin(Constants.INACTIVE);
-            user.setAccountStatus(Constants.LOCKED);
+            // user.setAccountStatus(Constants.LOCKED); // Optional: Depending on business rule
             attempt.setFailureReason(reason + " -> Account Locked");
             userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
             userInfo.setPasswordLoginStatus(Constants.INACTIVE);
@@ -512,18 +493,29 @@ public class LoginServiceImpl implements LoginService {
         } else {
             int remaining = maxAllowed - newFailedCount;
             attempt.setFailureReason(reason);
-            userInfo.setMessage("Incorrect credentials. " + remaining + " attempts remaining.");
+            if (remaining > 1) {
+                userInfo.setMessage("Incorrect credentials. Please check and try again.");
+            } else {
+                userInfo.setMessage("Incorrect credentials. ⚠️ Final attempt before lock.");
+            }
             userInfo.setAttemptsLeft(remaining);
         }
         userRepository.save(user);
     }
 
+    /**
+     * Password-based authentication logic
+     */
     @Transactional
     @Override
     public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
         log.info("Password-based login for userId={}", user.getUserId());
-        
-        // Use the centralized handlers
+
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            handleAccountLocked(loginAttempt, userInfo, user);
+            return;
+        }
+
         if (encoder.matches(password, user.getPasswordHash())) {
             UserRoles userRole = userRepository.getUserRole(user.getUserId());
             handleSuccess(loginAttempt, userInfo, user, userRole);
@@ -556,21 +548,25 @@ public class LoginServiceImpl implements LoginService {
         if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
             Timestamp setAt = user.getTempPasswordSetAt();
             boolean isPasswordValid = false;
-            // Only check local password validity if strictly in Password mode
+            
+            // Validate password expiration only for Password Mode
             if (loginParam.getActiveLoginMode() == Constants.PASSWORD && setAt != null) {
-                 LocalDateTime lastUpdate = setAt.toLocalDateTime();
-                 isPasswordValid = LocalDateTime.now().isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+                LocalDateTime lastUpdate = setAt.toLocalDateTime();
+                isPasswordValid = LocalDateTime.now()
+                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
             } else {
-                // For LDAP/SSO, local password validity is less relevant, assume valid
-                isPasswordValid = true; 
+                // For LDAP/SSO, we rely on their policies, so treat local validity as true
+                isPasswordValid = true;
             }
 
             UserRoles userRole = userRepository.getUserRole(userId);
             out.setRoleStatus(userRole.getRoleStatus());
-            // If LDAP, we generally don't ask users to update password in our app
-            boolean forceUpdate = (loginParam.getActiveLoginMode() == Constants.PASSWORD) && (user.getPasswordHash() == null || !isPasswordValid);
-            out.setUpdatePassword(forceUpdate);
             
+            // Logic: Update Password only needed if Mode is Password AND (Password is null OR Expired)
+            boolean updateNeeded = (loginParam.getActiveLoginMode() == Constants.PASSWORD) 
+                                   && (user.getPasswordHash() == null || !isPasswordValid);
+                                   
+            out.setUpdatePassword(updateNeeded);
             out.setUserStatus(Constants.ACTIVE);
             out.setMessage(Constants.ACTIVE_USER);
             out.setPasswordLoginStatus(user.getPasswordLogin());
@@ -579,10 +575,11 @@ public class LoginServiceImpl implements LoginService {
             out.setUserCheck(true);
             out.setUserStatus(accountStatus);
             out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please reset password or contact admin."
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact admin."
                             : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
             );
         }
+
         return out;
     }
 
@@ -590,6 +587,7 @@ public class LoginServiceImpl implements LoginService {
     public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
         String userId = userCredentials.getUserId();
         String password = userCredentials.getPassword();
+
         userCredentials.setUpdateFlag(false);
         userCredentials.setPassword("");
         userCredentials.setOtp("");
@@ -646,6 +644,14 @@ public class LoginServiceImpl implements LoginService {
         return userDto;
     }
 }
+
+
+
+
+
+
+
+
 
 
 
