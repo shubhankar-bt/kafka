@@ -1,356 +1,120 @@
-# Redis Configuration for Notifications
-spring.data.redis.host=10.177.103.195
-spring.data.redis.port=6379
-# spring.data.redis.password= (If needed)
+import dayjs from "dayjs";
+import { useEffect, useState } from "react";
+import { fetchEventSource } from "@microsoft/fetch-event-source";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import ProcessDetailsDialog from "./components/ProcessDetailsDialog";
+import ProcessStatusTable from "./components/ProcessStatusTable";
+import { resolveConfig } from "../../config/EnvironmentConfig";
+import { useSelector } from "react-redux";
 
-# Topic for Progress Updates
-notification.progress.topic=notifications:progress
+/* ------------------ Data Transformer ------------------ */
+const processResponseData = (data) => {
+  const processes = data?.map((process) => ({
+    ...process,
+    stageDetails: process.stageDetails.map((stageDetail) => ({
+      ...stageDetail,
+      START_TIME:
+        stageDetail?.START_TIME != null
+          ? dayjs.unix(stageDetail.START_TIME / 1000)
+          : null,
+      END_TIME:
+        stageDetail?.END_TIME != null
+          ? dayjs.unix(stageDetail.END_TIME / 1000)
+          : null,
+    })),
+  }));
 
+  const empty = processes
+    ?.map((p) => p.stageDetails)
+    ?.every((sd) => sd.length === 0);
 
+  return empty ? [] : processes;
+};
 
+/* ------------------ Component ------------------ */
+const ProcessStatusPage = () => {
+  const [processes, setProcesses] = useState([]);
+  const [process, setProcess] = useState(null);
 
-package com.fincore.ReportService.dto;
+  const snackbar = useCustomSnackbar();
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+  const url = "/processes";
+  const service = resolveConfig("/PS");
+  const finalURL = service + url;
+  const token = useSelector((state) => state.auth.token);
 
-import java.io.Serializable;
+  useEffect(() => {
+    const controller = new AbortController();
 
-/**
- * Standard DTO for sending progress updates to the Notification Service via Redis.
- * Matches the structure required by the Notification Platform.
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class TaskProgressDto implements Serializable {
-    private String taskId;      // Unique Job ID (e.g., "download_123_456")
-    private String userId;      // The User ID to notify
-    private int percentage;     // 0 to 100
-    private String status;      // "PROCESSING", "COMPLETED", "FAILED"
-    private String message;     // User-facing text
-}
+    fetchEventSource(finalURL, {
+      method: "GET",
+      signal: controller.signal,
 
+      /* HEADERS SUPPORTED */
+      headers: {
+        Authorization: `Bearer ${token}`,
+        // Accept: "text/event-stream",
+      },
 
+      /* Called when connection opens */
+      onopen(response) {
+        if (!response.ok) {
+          throw new Error(
+            `SSE connection failed for process status: ${response.status}`
+          );
+        }
+      },
 
-
-
-
-
-
-
-package com.fincore.ReportService.config;
-
-import com.fincore.ReportService.dto.TaskProgressDto;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
-
-/**
- * Configuration for the RedisTemplate used to publish TaskProgressDto.
- * Uses JSON serialization for values so the Notification Service can read them.
- */
-@Configuration
-public class TaskRedisConfig {
-
-    @Bean(name = "progressRedisTemplate")
-    public RedisTemplate<String, TaskProgressDto> progressRedisTemplate(RedisConnectionFactory connectionFactory) {
-        RedisTemplate<String, TaskProgressDto> template = new RedisTemplate<>();
-        template.setConnectionFactory(connectionFactory);
-
-        // Keys are Strings (the topic name)
-        template.setKeySerializer(new StringRedisSerializer());
-
-        // Values are JSON (the DTO)
-        Jackson2JsonRedisSerializer<TaskProgressDto> serializer = new Jackson2JsonRedisSerializer<>(TaskProgressDto.class);
-        template.setValueSerializer(serializer);
-
-        return template;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.ReportService.service;
-
-import com.fincore.ReportService.dto.ReportStreamResponse;
-import com.fincore.ReportService.dto.TaskProgressDto;
-import com.fincore.ReportService.exception.ResourceNotFoundException;
-import com.fincore.ReportService.model.ReportType;
-import com.fincore.ReportService.repository.AppConfigRepository;
-import com.fincore.ReportService.repository.ReportTypeRepository;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.catalina.connector.ClientAbortException;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.zip.Deflater;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
-
-@Service
-@Slf4j
-public class ReportServiceImpl implements ReportService {
-
-    private final ReportTypeRepository reportTypeRepository;
-    private final String reportsBasePath;
-    private final NotificationWriterService notificationWriterService;
-    private final FileSystem hdfsFileSystem;
-    
-    // Redis Template for Progress Notifications
-    private final RedisTemplate<String, TaskProgressDto> redisTemplate;
-    
-    @Value("${notification.progress.topic}")
-    private String progressTopic;
-
-    // Buffer size: 32KB is optimal for high throughput
-    private static final int BUFFER_SIZE = 32 * 1024; 
-
-    private static final Set<String> ALREADY_COMPRESSED_EXTS = Set.of(
-        "pdf", "xlsx", "xls", "zip", "gz", "png", "jpg", "jpeg", "docx", "pptx"
-    );
-
-    public ReportServiceImpl(ReportTypeRepository reportTypeRepository,
-                             @Value("${glif.reports.base-path}") String basePath,
-                             AppConfigRepository appConfigRepository,
-                             NotificationWriterService notificationWriterService,
-                             FileSystem hdfsFileSystem,
-                             @Qualifier("progressRedisTemplate") RedisTemplate<String, TaskProgressDto> redisTemplate) {
-        this.reportTypeRepository = reportTypeRepository;
-        this.reportsBasePath = basePath;
-        this.notificationWriterService = notificationWriterService;
-        this.hdfsFileSystem = hdfsFileSystem;
-        this.redisTemplate = redisTemplate;
-    }
-
-    @Transactional(readOnly = true)
-    @Override
-    public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
-        
-        // 1. Authorization
-        ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
-                .orElseThrow(() -> {
-                     log.warn("SECURITY ALERT: User {} attempted unauthorized access to report {}", userId, fileName);
-                     return new AccessDeniedException("Access Denied for report: " + fileName);
-                });
-
-        String reportDisplayName = reportType.getReportName();
-        String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE);
-        
-        // 2. HDFS Location Resolution
-        Path searchDirectory = new Path(reportsBasePath, formattedDate);
-        String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
-
+      /* Called on each SSE message */
+      onmessage(event) {
         try {
-            if (!hdfsFileSystem.exists(searchDirectory)) {
-                throw new ResourceNotFoundException("Report not generated for date: " + formattedDate);
-            }
-
-            FileStatus[] allFiles = hdfsFileSystem.listStatus(searchDirectory);
-            List<FileStatus> matchingFiles = new ArrayList<>();
-            long totalSizeBytes = 0;
-
-            for (FileStatus status : allFiles) {
-                if (status.isFile() && status.getPath().getName().startsWith(fileNamePrefix)) {
-                    matchingFiles.add(status);
-                    totalSizeBytes += status.getLen();
-                }
-            }
-
-            if (matchingFiles.isEmpty()) {
-                throw new ResourceNotFoundException("No report files found matching: " + fileNamePrefix);
-            }
-
-            // --- Generate Task ID Internally (as per guide convention) ---
-            // Format: "download_" + timestamp + "_" + random
-            String taskId = "download_" + System.currentTimeMillis();
-            log.info("Starting Download Task ID: {} for User: {}", taskId, userId);
-
-            // 3. Construct Streaming Logic
-            long finalTotalSize = totalSizeBytes;
-
-            StreamingResponseBody streamBody = outputStream -> {
-                try {
-                    // Send 0% Started
-                    sendProgress(taskId, userId, 0, "Starting download...", "PROCESSING");
-                    
-                    AtomicLong globalBytesRead = new AtomicLong(0);
-
-                    if (matchingFiles.size() == 1) {
-                         streamSingleFile(matchingFiles.get(0), outputStream, finalTotalSize, globalBytesRead, taskId, userId);
-                    } else {
-                         streamZipBundle(matchingFiles, outputStream, finalTotalSize, globalBytesRead, taskId, userId);
-                    }
-
-                    // Send 100% Completed
-                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
-
-                    // Persistent Notification (DB) - Success
-                    sendNotification(userId, String.format("Report '%s' downloaded successfully.", reportDisplayName), 
-                                     "/glif-reports", fileName + "_" + date);
-
-                } catch (ClientAbortException | java.net.SocketException e) {
-                    // STOP Redis updates immediately if user disconnects
-                    log.warn("Download aborted by client. User: {}, Task: {}", userId, taskId);
-                    // Do not send FAILED status here as it's a user cancellation
-                } catch (IOException e) {
-                    log.error("Streaming Error for Task {}: {}", taskId, e.getMessage());
-                    sendProgress(taskId, userId, 0, "Download Failed", "FAILED");
-                    
-                    // Persistent Notification (DB) - Failure
-                    sendNotification(userId, "Download failed due to server error.", 
-                                     "/glif-reports", fileName + "_" + date);
-                }
-            };
-
-            String downloadName = matchingFiles.size() > 1 
-                    ? fileName + "_" + formattedDate + ".zip" 
-                    : matchingFiles.get(0).getPath().getName();
-            
-            // Return DTO (No TaskID sent to frontend manually)
-            return new ReportStreamResponse(downloadName, streamBody, totalSizeBytes, matchingFiles.size() > 1);
-
-        } catch (IOException e) {
-            log.error("HDFS Metadata Error: {}", e.getMessage());
-            throw new RuntimeException("Storage unavailable", e);
+          const response = JSON.parse(event.data);
+          if (Array.isArray(response) && response.length > 0) {
+            setProcesses(processResponseData(response));
+          }
+        } catch (e) {
+          console.error("Error parsing SSE data for process status", e);
         }
-    }
+      },
 
-    // --- Streaming Logic ---
+      /* Called on server-side errors */
+      onerror(err) {
+        console.error("SSE error:", err);
+        snackbar("Error fetching the processes!");
+        throw err; // triggers retry
+      },
 
-    private void streamSingleFile(FileStatus file, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        try (FSDataInputStream hdfsStream = hdfsFileSystem.open(file.getPath(), BUFFER_SIZE)) {
-            copyWithProgress(hdfsStream, outputStream, totalSize, globalBytesRead, taskId, userId);
-        }
-    }
+      /* Retry logic */
+      retryDelay(attempt) {
+        return Math.min(1000 * 2 ** attempt, 15000);
+      },
+    });
 
-    private void streamZipBundle(List<FileStatus> files, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
-            
-            for (FileStatus status : files) {
-                String currentFileName = status.getPath().getName();
-                ZipEntry zipEntry = new ZipEntry(currentFileName);
-                
-                // Smart Compression: Don't re-compress PDF/XLSX
-                if (isAlreadyCompressed(currentFileName)) {
-                    zipOut.setLevel(Deflater.NO_COMPRESSION);
-                } else {
-                    zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
-                }
-                
-                zipOut.putNextEntry(zipEntry);
-                
-                try (FSDataInputStream hdfsStream = hdfsFileSystem.open(status.getPath(), BUFFER_SIZE)) {
-                    // Note: We write to ZipOut, but we measure bytes read from HDFS
-                    copyWithProgress(hdfsStream, zipOut, totalSize, globalBytesRead, taskId, userId);
-                }
-                
-                zipOut.closeEntry();
-            }
-        }
-    }
+    return () => {
+      controller.abort(); // clean close
+    };
+  }, [snackbar]);
 
-    /**
-     * Efficient Copy with Progress Hooks
-     */
-    private void copyWithProgress(InputStream in, OutputStream out, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        byte[] buffer = new byte[BUFFER_SIZE];
-        int bytesRead;
-        int lastPercent = 0;
+  return (
+    <>
+      <ProcessDetailsDialog
+        process={process}
+        onClose={() => setProcess(null)}
+      />
 
-        while ((bytesRead = in.read(buffer)) != -1) {
-            out.write(buffer, 0, bytesRead);
-            
-            long currentTotal = globalBytesRead.addAndGet(bytesRead);
-            
-            // Safe percentage calculation
-            int percent = (int) ((currentTotal * 100) / totalSize);
-            
-            // Cap at 99% inside the loop so 100% is only sent on completion
-            percent = Math.min(percent, 99);
+      <ProcessStatusTable
+        processes={processes}
+        actions={{
+          onStop: () => {},
+          onRestart: () => {},
+          onView: (process) => setProcess(process),
+        }}
+      />
+    </>
+  );
+};
 
-            // Throttle: Update only on 5% increments
-            if (percent >= lastPercent + 5) {
-                sendProgress(taskId, userId, percent, "Downloading... " + percent + "%", "PROCESSING");
-                lastPercent = percent;
-            }
-        }
-        out.flush(); // Ensure bytes are pushed to the network
-    }
-
-    private void sendProgress(String taskId, String userId, int percent, String msg, String status) {
-        try {
-            TaskProgressDto dto = TaskProgressDto.builder()
-                    .taskId(taskId)
-                    .userId(userId)
-                    .percentage(percent)
-                    .message(msg)
-                    .status(status)
-                    .build();
-            redisTemplate.convertAndSend(progressTopic, dto);
-        } catch (Exception e) {
-            // Redis failure should NOT fail the download
-            log.warn("Redis progress update failed: {}", e.getMessage());
-        }
-    }
-    
-    private boolean isAlreadyCompressed(String fileName) {
-        int dotIndex = fileName.lastIndexOf('.');
-        if (dotIndex == -1) return false;
-        String extension = fileName.substring(dotIndex + 1).toLowerCase();
-        return ALREADY_COMPRESSED_EXTS.contains(extension);
-    }
-
-    private void sendNotification(String userId, String message, String url, String aggregateId) {
-        try {
-            notificationWriterService.createNotification(userId, null, message, url, aggregateId, "ReportService");
-        } catch (Exception e) {
-            log.warn("Persistent DB notification failed: {}", e.getMessage());
-        }
-    }
-    
-    // ... Stub for interface method
-    @Override
-    public List<com.fincore.ReportService.dto.ReportTypeDto> getReportTypes(int roleId) {
-         return new ArrayList<>(); 
-    }
-}
+export default ProcessStatusPage;
 
 
 
@@ -372,69 +136,62 @@ public class ReportServiceImpl implements ReportService {
 
 
 
-package com.fincore.ReportService.controller;
 
-import com.fincore.commonutilities.jwt.JwtUtil;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpHeaders;
+
+
+be :
+
+package com.fincore.process_status_service.controller;
+
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import com.fincore.ReportService.dto.ReportDownloadRequest;
-import com.fincore.ReportService.dto.ReportStreamResponse;
-import com.fincore.ReportService.dto.ReportTypeDto;
-import com.fincore.ReportService.service.ReportService;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.InsertDTO;
+import com.fincore.process_status_service.dto.UpdateDTO;
+import com.fincore.process_status_service.model.ProcessStatus;
+import com.fincore.process_status_service.service.ProcessStatusService;
 
-import java.util.List;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
+@RequiredArgsConstructor
 @RestController
-@RequestMapping("/reports") 
-public class ReportController {
+@RequestMapping("/api")
+public class ProcessStatusController {
 
-    private final ReportService reportService;
-    private final JwtUtil jwtUtil;
-    
-    public ReportController(ReportService reportService, JwtUtil jwtUtil) {
-        this.reportService = reportService;
-        this.jwtUtil = jwtUtil;
-    }
+	private final ProcessStatusService processStatusService;
 
-    @PostMapping("/types")
-    public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
-        return reportService.getReportTypes(jwtUtil.getUserRoleFromToken(token));
-    }
+	@PostMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> insert(
+			@Valid @RequestBody InsertDTO insertDTO
+	) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.insert(insertDTO);
+		return responseEntity;
+	}
 
-    @PostMapping("/download")
-    public ResponseEntity<StreamingResponseBody> downloadReport(
-           @RequestHeader("Authorization") String token,
-           @RequestBody ReportDownloadRequest request) {
-            
-       log.info("Download Request: {}", request);
-       
-       ReportStreamResponse response = reportService.downloadReportStream(
-               request.getFileName(),
-               request.getDate(),
-               jwtUtil.getUserRoleFromToken(token),
-               jwtUtil.getUserIdFromToken(token)
-       );
+	@PatchMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> update(@Valid @RequestBody UpdateDTO updateDTO) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.update(updateDTO);
+		return responseEntity;
+	}
 
-       ResponseEntity.BodyBuilder builder = ResponseEntity.ok()
-               .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + response.getDownloadFileName() + "\"")
-               .contentType(MediaType.APPLICATION_OCTET_STREAM);
-
-       // Logic for "Standard Browser" progress bar (if single file)
-       // We do NOT send X-Task-Id here as requested
-       if (!response.isZip() && response.getFileSize() != null) {
-           builder.contentLength(response.getFileSize());
-       } else if (response.getFileSize() != null) {
-           builder.header("X-Total-Input-Size", String.valueOf(response.getFileSize()));
-       }
-
-       return builder.body(response.getStreamBody());
-   }
+	@GetMapping(path = "/processes")
+	public SseEmitter getProcessData() throws JsonProcessingException {
+		return processStatusService.getProcessDataSSE();
+	}
 }
 
 
@@ -444,278 +201,221 @@ public class ReportController {
 
 
 
-
-
-
-
-
-
-------------------
-
-
-
-package com.fincore.ReportService.service;
-
-import com.fincore.ReportService.dto.ReportStreamResponse;
-import com.fincore.ReportService.dto.TaskProgressDto;
-import com.fincore.ReportService.exception.ResourceNotFoundException;
-import com.fincore.ReportService.model.ReportType;
-import com.fincore.ReportService.repository.AppConfigRepository;
-import com.fincore.ReportService.repository.ReportTypeRepository;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.catalina.connector.ClientAbortException;
-import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+package com.fincore.process_status_service.service;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.zip.Deflater;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
 
-@Service
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.InsertDTO;
+import com.fincore.process_status_service.dto.ProcessDTO;
+import com.fincore.process_status_service.dto.StageDTO;
+import com.fincore.process_status_service.dto.UpdateDTO;
+import com.fincore.process_status_service.model.ProcessStages;
+import com.fincore.process_status_service.model.ProcessStatus;
+import com.fincore.process_status_service.repository.ProcessStagesRepository;
+import com.fincore.process_status_service.repository.ProcessStatusRepository;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
 @Slf4j
-public class ReportServiceImpl implements ReportService {
+@RequiredArgsConstructor
+@Service("ProcessStatusService")
+public class ProcessStatusServiceImpl implements ProcessStatusService {
 
-    private final ReportTypeRepository reportTypeRepository;
-    private final String reportsBasePath;
-    private final NotificationWriterService notificationWriterService;
-    private final FileSystem hdfsFileSystem;
-    
-    // Redis Template for Progress Notifications
-    private final RedisTemplate<String, TaskProgressDto> redisTemplate;
-    
-    @Value("${notification.progress.topic}")
-    private String progressTopic;
+	private final ProcessStatusRepository processStatusRepository;
+	private final ProcessStagesRepository processStagesRepository;
 
-    // Buffer size: 32KB is optimal for high throughput
-    private static final int BUFFER_SIZE = 32 * 1024; 
+	private final CopyOnWriteArrayList<SseEmitter> processStatusEmitters = new CopyOnWriteArrayList<>();
 
-    private static final Set<String> ALREADY_COMPRESSED_EXTS = Set.of(
-        "pdf", "xlsx", "xls", "zip", "gz", "png", "jpg", "jpeg", "docx", "pptx"
-    );
+	@Override
+	public ResponseEntity<ResponseVO<ProcessStatus>> insert(InsertDTO insertDTO) {
 
-    public ReportServiceImpl(ReportTypeRepository reportTypeRepository,
-                             @Value("${glif.reports.base-path}") String basePath,
-                             AppConfigRepository appConfigRepository,
-                             NotificationWriterService notificationWriterService,
-                             FileSystem hdfsFileSystem,
-                             @Qualifier("progressRedisTemplate") RedisTemplate<String, TaskProgressDto> redisTemplate) {
-        this.reportTypeRepository = reportTypeRepository;
-        this.reportsBasePath = basePath;
-        this.notificationWriterService = notificationWriterService;
-        this.hdfsFileSystem = hdfsFileSystem;
-        this.redisTemplate = redisTemplate;
-    }
+		ResponseVO<ProcessStatus> responseVo = new ResponseVO<>();
 
-    @Transactional(readOnly = true)
-    @Override
-    public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
-        
-        // 1. Authorization
-        ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
-                .orElseThrow(() -> {
-                     log.warn("SECURITY ALERT: User {} attempted unauthorized access to report {}", userId, fileName);
-                     return new AccessDeniedException("Access Denied for report: " + fileName);
-                });
+		ProcessStatus processStatus = new ProcessStatus();
 
-        String reportDisplayName = reportType.getReportName();
-        String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE);
-        
-        // 2. HDFS Location Resolution
-        Path searchDirectory = new Path(reportsBasePath, formattedDate);
-        String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+		processStatus.setType(insertDTO.getProcessType());
+		processStatus.setProcessStage(insertDTO.getProcessStage());
+		processStatus.setStartTimeStamp(System.currentTimeMillis());
+		processStatus.setStatus(0);
+		processStatus.setTriggeredBy(insertDTO.getTriggeredBy());
 
+		processStatusRepository.save(processStatus);
+
+		responseVo.setMessage("Data inserted successfully");
+		responseVo.setStatus(HttpStatus.valueOf(HttpStatus.OK.value()));
+		responseVo.setData(processStatus);
+		responseVo.setLocalDatetime(LocalDateTime.now());
+
+		sendProcessStatusUpdates();
+
+		return new ResponseEntity<>(responseVo, responseVo.getStatus());
+	}
+
+	@Override
+	public ResponseEntity<ResponseVO<ProcessStatus>> update(UpdateDTO updateDTO) {
+		ResponseVO<ProcessStatus> responseVo = new ResponseVO<>();
+		Long id = updateDTO.getId();
+
+		Optional<ProcessStatus> existingData = processStatusRepository.findById(id);
+		ProcessStatus existingEntity = new ProcessStatus();
+		ProcessStatus savedEntity = new ProcessStatus();
+		if (existingData.isPresent()) {
+			existingEntity = existingData.get();
+			existingEntity.setEndTimeStamp(System.currentTimeMillis());
+			existingEntity.setStatus(updateDTO.getStatus());
+			existingEntity.setRemarks(updateDTO.getRemarks());
+			savedEntity = processStatusRepository.save(existingEntity);
+		} else {
+			throw new IllegalArgumentException();
+		}
+		responseVo.setMessage("Data Updated Successfully");
+		responseVo.setStatus(HttpStatus.valueOf(HttpStatus.OK.value()));
+		responseVo.setData(savedEntity);
+		responseVo.setLocalDatetime(LocalDateTime.now());
+
+		sendProcessStatusUpdates();
+
+		return new ResponseEntity<>(responseVo, responseVo.getStatus());
+	}
+
+	@Override
+	public SseEmitter getProcessDataSSE() throws JsonProcessingException {
+
+		SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+		processStatusEmitters.add(emitter);
+		emitter.onCompletion(() -> {
+			processStatusEmitters.remove(emitter);
+			emitter.complete();
+		});
+		emitter.onError((e) -> {
+			processStatusEmitters.remove(emitter);
+			emitter.completeWithError(e);
+		});
+		emitter.onTimeout(() -> {
+			processStatusEmitters.remove(emitter);
+			emitter.complete();
+		});
+        // Send a "hello" message to confirm the connection
         try {
-            if (!hdfsFileSystem.exists(searchDirectory)) {
-                throw new ResourceNotFoundException("Report not generated for date: " + formattedDate);
-            }
-
-            FileStatus[] allFiles = hdfsFileSystem.listStatus(searchDirectory);
-            List<FileStatus> matchingFiles = new ArrayList<>();
-            long totalSizeBytes = 0;
-
-            for (FileStatus status : allFiles) {
-                if (status.isFile() && status.getPath().getName().startsWith(fileNamePrefix)) {
-                    matchingFiles.add(status);
-                    totalSizeBytes += status.getLen();
-                }
-            }
-
-            if (matchingFiles.isEmpty()) {
-                throw new ResourceNotFoundException("No report files found matching: " + fileNamePrefix);
-            }
-
-            // --- Generate Task ID Internally (as per guide convention) ---
-            // Format: "download_" + timestamp + "_" + random
-            String taskId = "download_" + System.currentTimeMillis();
-            log.info("Starting Download Task ID: {} for User: {}", taskId, userId);
-
-            // 3. Construct Streaming Logic
-            long finalTotalSize = totalSizeBytes;
-
-            StreamingResponseBody streamBody = outputStream -> {
-                try {
-                    // Send 0% Started
-                    sendProgress(taskId, userId, 0, "Starting download...", "PROCESSING");
-                    
-                    AtomicLong globalBytesRead = new AtomicLong(0);
-
-                    if (matchingFiles.size() == 1) {
-                         streamSingleFile(matchingFiles.get(0), outputStream, finalTotalSize, globalBytesRead, taskId, userId);
-                    } else {
-                         streamZipBundle(matchingFiles, outputStream, finalTotalSize, globalBytesRead, taskId, userId);
-                    }
-
-                    // Send 100% Completed
-                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
-
-                    // Persistent Notification (DB) - Success
-                    sendNotification(userId, String.format("Report '%s' downloaded successfully.", reportDisplayName), 
-                                     "/glif-reports", fileName + "_" + date);
-
-                } catch (ClientAbortException | java.net.SocketException e) {
-                    // STOP Redis updates immediately if user disconnects
-                    log.warn("Download aborted by client. User: {}, Task: {}", userId, taskId);
-                    // Do not send FAILED status here as it's a user cancellation
-                } catch (IOException e) {
-                    log.error("Streaming Error for Task {}: {}", taskId, e.getMessage());
-                    sendProgress(taskId, userId, 0, "Download Failed", "FAILED");
-                    
-                    // Persistent Notification (DB) - Failure
-                    sendNotification(userId, "Download failed due to server error.", 
-                                     "/glif-reports", fileName + "_" + date);
-                }
-            };
-
-            String downloadName = matchingFiles.size() > 1 
-                    ? fileName + "_" + formattedDate + ".zip" 
-                    : matchingFiles.get(0).getPath().getName();
-            
-            // Return DTO (No TaskID sent to frontend manually)
-            return new ReportStreamResponse(downloadName, streamBody, totalSizeBytes, matchingFiles.size() > 1);
-
+            emitter.send(SseEmitter.event().name("connected").data("Connection established with Fincore-F1 Ultra SSE services..."));
         } catch (IOException e) {
-            log.error("HDFS Metadata Error: {}", e.getMessage());
-            throw new RuntimeException("Storage unavailable", e);
+//            log.error("Could not send initial 'connected' event to user: {}", userId, e);
+//            this.processStatusEmitters.remove(userId);
         }
-    }
 
-    // --- Streaming Logic ---
+        sendProcessStatusUpdates();
+		return emitter;
+	}
 
-    private void streamSingleFile(FileStatus file, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        try (FSDataInputStream hdfsStream = hdfsFileSystem.open(file.getPath(), BUFFER_SIZE)) {
-            copyWithProgress(hdfsStream, outputStream, totalSize, globalBytesRead, taskId, userId);
-        }
-    }
+	private List<ProcessDTO> getProcessData() {
 
-    private void streamZipBundle(List<FileStatus> files, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
-            
-            for (FileStatus status : files) {
-                String currentFileName = status.getPath().getName();
-                ZipEntry zipEntry = new ZipEntry(currentFileName);
-                
-                // Smart Compression: Don't re-compress PDF/XLSX
-                if (isAlreadyCompressed(currentFileName)) {
-                    zipOut.setLevel(Deflater.NO_COMPRESSION);
-                } else {
-                    zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
-                }
-                
-                zipOut.putNextEntry(zipEntry);
-                
-                try (FSDataInputStream hdfsStream = hdfsFileSystem.open(status.getPath(), BUFFER_SIZE)) {
-                    // Note: We write to ZipOut, but we measure bytes read from HDFS
-                    copyWithProgress(hdfsStream, zipOut, totalSize, globalBytesRead, taskId, userId);
-                }
-                
-                zipOut.closeEntry();
-            }
-        }
-    }
+		List<Map<String, Object>> processStatus = processStatusRepository.getData();
+		List<Map<String, Object>> modifiableResults = processStatus.stream().map(HashMap::new)
+				.collect(Collectors.toList());
 
-    /**
-     * Efficient Copy with Progress Hooks
-     */
-    private void copyWithProgress(InputStream in, OutputStream out, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
-        byte[] buffer = new byte[BUFFER_SIZE];
-        int bytesRead;
-        int lastPercent = 0;
+		List<Map<String, Object>> stageDetailsGlifs = new ArrayList<>();
+		List<Map<String, Object>> stageDetailsBancs = new ArrayList<>();
 
-        while ((bytesRead = in.read(buffer)) != -1) {
-            out.write(buffer, 0, bytesRead);
-            
-            long currentTotal = globalBytesRead.addAndGet(bytesRead);
-            
-            // Safe percentage calculation
-            int percent = (int) ((currentTotal * 100) / totalSize);
-            
-            // Cap at 99% inside the loop so 100% is only sent on completion
-            percent = Math.min(percent, 99);
+		for (Map<String, Object> eachObj : modifiableResults) {
+			String type = (String) eachObj.get("PROCESS_TYPE");
+			if (type.equalsIgnoreCase("BANCS")) {
+				String stage = String.valueOf(eachObj.get("PROCESS_STAGE"));
 
-            // Throttle: Update only on 5% increments
-            if (percent >= lastPercent + 5) {
-                sendProgress(taskId, userId, percent, "Downloading... " + percent + "%", "PROCESSING");
-                lastPercent = percent;
-            }
-        }
-        out.flush(); // Ensure bytes are pushed to the network
-    }
+				eachObj.remove("id");
+				eachObj.remove("processId");
+				eachObj.remove("type");
 
-    private void sendProgress(String taskId, String userId, int percent, String msg, String status) {
-        try {
-            TaskProgressDto dto = TaskProgressDto.builder()
-                    .taskId(taskId)
-                    .userId(userId)
-                    .percentage(percent)
-                    .message(msg)
-                    .status(status)
-                    .build();
-            redisTemplate.convertAndSend(progressTopic, dto);
-        } catch (Exception e) {
-            // Redis failure should NOT fail the download
-            log.warn("Redis progress update failed: {}", e.getMessage());
-        }
-    }
-    
-    private boolean isAlreadyCompressed(String fileName) {
-        int dotIndex = fileName.lastIndexOf('.');
-        if (dotIndex == -1) return false;
-        String extension = fileName.substring(dotIndex + 1).toLowerCase();
-        return ALREADY_COMPRESSED_EXTS.contains(extension);
-    }
+				Optional<ProcessStages> existingStageData = processStagesRepository.findById(Long.parseLong(stage));
+				if (existingStageData.isPresent()) {
+					ProcessStages stageData = existingStageData.get();
+					StageDTO stageDTO = new StageDTO();
+					stageDTO.setTitle(stageData.getTitle());
+					stageDTO.setIcon(stageData.getIcon());
 
-    private void sendNotification(String userId, String message, String url, String aggregateId) {
-        try {
-            notificationWriterService.createNotification(userId, null, message, url, aggregateId, "ReportService");
-        } catch (Exception e) {
-            log.warn("Persistent DB notification failed: {}", e.getMessage());
-        }
-    }
-    
-    // ... Stub for interface method
-    @Override
-    public List<com.fincore.ReportService.dto.ReportTypeDto> getReportTypes(int roleId) {
-         return new ArrayList<>(); 
-    }
+					eachObj.put("stage", stageDTO);
+
+					stageDetailsBancs.add(eachObj);
+				}
+			} else if (type.equalsIgnoreCase("GLIFS")) {
+
+				String stage = String.valueOf(eachObj.get("PROCESS_STAGE"));
+
+				eachObj.remove("id");
+				eachObj.remove("processId");
+				eachObj.remove("type");
+
+				Optional<ProcessStages> existingStageData = processStagesRepository.findById(Long.parseLong(stage));
+				if (existingStageData.isPresent()) {
+					ProcessStages stageData = existingStageData.get();
+
+					StageDTO stageDTO = new StageDTO();
+					stageDTO.setTitle(stageData.getTitle());
+					stageDTO.setIcon(stageData.getIcon());
+
+					eachObj.put("stage", stageDTO);
+
+					stageDetailsGlifs.add(eachObj);
+				}
+			}
+		}
+
+		ProcessDTO processDTO1 = new ProcessDTO();
+		processDTO1.setType("BANCS");
+		processDTO1.setStageDetails(stageDetailsBancs);
+
+		ProcessDTO processDTO2 = new ProcessDTO();
+		processDTO2.setType("GLIFS");
+		processDTO2.setStageDetails(stageDetailsGlifs);
+
+		List<ProcessDTO> finalProcessedData = new ArrayList<>();
+
+		finalProcessedData.add(processDTO1);
+		finalProcessedData.add(processDTO2);
+
+		return finalProcessedData;
+	}
+
+	private void sendProcessStatusUpdates() {
+
+		Iterator<SseEmitter> emitters = processStatusEmitters.iterator();
+		List<ProcessDTO> data = getProcessData();
+		while (emitters.hasNext()) {
+
+			SseEmitter emitter = emitters.next();
+			try {
+
+				if (emitter != null) {
+
+					emitter.send(SseEmitter.event().data(data).build());
+				}
+			} catch (IOException e) {
+				e.printStackTrace();
+				emitter.completeWithError(e);
+			}
+		}
+	}
 }
 
 
 
+
+
+getting error :
+2026-01-12T15:30:58.800+05:30  WARN 28244 --- [ProcessStatusService] [nio-3000-exec-1] .m.m.a.ExceptionHandlerExceptionResolver : Resolved [org.springframework.web.HttpMediaTypeNotAcceptableException: No acceptable representation]
