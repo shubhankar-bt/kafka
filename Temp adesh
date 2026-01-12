@@ -1,3 +1,74 @@
+package com.fincore.process_status_service.controller;
+
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.InsertDTO;
+import com.fincore.process_status_service.dto.UpdateDTO;
+import com.fincore.process_status_service.model.ProcessStatus;
+import com.fincore.process_status_service.service.ProcessStatusService;
+
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@RequiredArgsConstructor
+@RestController
+@RequestMapping("/api")
+public class ProcessStatusController {
+
+	private final ProcessStatusService processStatusService;
+
+	@PostMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> insert(
+			@Valid @RequestBody InsertDTO insertDTO
+	) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.insert(insertDTO);
+		return responseEntity;
+	}
+
+	@PatchMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> update(@Valid @RequestBody UpdateDTO updateDTO) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.update(updateDTO);
+		return responseEntity;
+	}
+
+    // FIX: Added produces = MediaType.TEXT_EVENT_STREAM_VALUE
+	@GetMapping(path = "/processes", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+	public SseEmitter getProcessData() throws JsonProcessingException {
+		return processStatusService.getProcessDataSSE();
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 import dayjs from "dayjs";
 import { useEffect, useState } from "react";
 import { fetchEventSource } from "@microsoft/fetch-event-source";
@@ -53,12 +124,16 @@ const ProcessStatusPage = () => {
       /* HEADERS SUPPORTED */
       headers: {
         Authorization: `Bearer ${token}`,
-        // Accept: "text/event-stream",
+        // FIX: Explicitly request text/event-stream to avoid 406 Not Acceptable
+        Accept: "text/event-stream", 
       },
 
       /* Called when connection opens */
       onopen(response) {
-        if (!response.ok) {
+        if (
+          !response.ok &&
+          response.headers.get("content-type") !== "text/event-stream"
+        ) {
           throw new Error(
             `SSE connection failed for process status: ${response.status}`
           );
@@ -67,6 +142,13 @@ const ProcessStatusPage = () => {
 
       /* Called on each SSE message */
       onmessage(event) {
+        // Ignore the initial "connected" message if it's just a string, 
+        // or ensure your JSON parser handles it gracefully.
+        if (event.event === 'connected') {
+             console.log("SSE Connected: ", event.data);
+             return;
+        }
+
         try {
           const response = JSON.parse(event.data);
           if (Array.isArray(response) && response.length > 0) {
@@ -79,8 +161,10 @@ const ProcessStatusPage = () => {
 
       /* Called on server-side errors */
       onerror(err) {
-        console.error("SSE error:", err);
-        snackbar("Error fetching the processes!");
+        // console.error("SSE error:", err);
+        // snackbar("Error fetching the processes!"); 
+        // Note: fetchEventSource retries automatically on error. 
+        // Showing a snackbar on every retry attempt might be spammy.
         throw err; // triggers retry
       },
 
@@ -93,7 +177,7 @@ const ProcessStatusPage = () => {
     return () => {
       controller.abort(); // clean close
     };
-  }, [snackbar]);
+  }, [snackbar, finalURL, token]); // Added dependencies for safety
 
   return (
     <>
@@ -116,306 +200,3 @@ const ProcessStatusPage = () => {
 
 export default ProcessStatusPage;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-be :
-
-package com.fincore.process_status_service.controller;
-
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PatchMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.process_status_service.ResponseVO;
-import com.fincore.process_status_service.dto.InsertDTO;
-import com.fincore.process_status_service.dto.UpdateDTO;
-import com.fincore.process_status_service.model.ProcessStatus;
-import com.fincore.process_status_service.service.ProcessStatusService;
-
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-@RequiredArgsConstructor
-@RestController
-@RequestMapping("/api")
-public class ProcessStatusController {
-
-	private final ProcessStatusService processStatusService;
-
-	@PostMapping("/processes")
-	public ResponseEntity<ResponseVO<ProcessStatus>> insert(
-			@Valid @RequestBody InsertDTO insertDTO
-	) {
-		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.insert(insertDTO);
-		return responseEntity;
-	}
-
-	@PatchMapping("/processes")
-	public ResponseEntity<ResponseVO<ProcessStatus>> update(@Valid @RequestBody UpdateDTO updateDTO) {
-		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.update(updateDTO);
-		return responseEntity;
-	}
-
-	@GetMapping(path = "/processes")
-	public SseEmitter getProcessData() throws JsonProcessingException {
-		return processStatusService.getProcessDataSSE();
-	}
-}
-
-
-
-
-
-
-
-
-package com.fincore.process_status_service.service;
-
-import java.io.IOException;
-import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
-
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.stereotype.Service;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.process_status_service.ResponseVO;
-import com.fincore.process_status_service.dto.InsertDTO;
-import com.fincore.process_status_service.dto.ProcessDTO;
-import com.fincore.process_status_service.dto.StageDTO;
-import com.fincore.process_status_service.dto.UpdateDTO;
-import com.fincore.process_status_service.model.ProcessStages;
-import com.fincore.process_status_service.model.ProcessStatus;
-import com.fincore.process_status_service.repository.ProcessStagesRepository;
-import com.fincore.process_status_service.repository.ProcessStatusRepository;
-
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-@RequiredArgsConstructor
-@Service("ProcessStatusService")
-public class ProcessStatusServiceImpl implements ProcessStatusService {
-
-	private final ProcessStatusRepository processStatusRepository;
-	private final ProcessStagesRepository processStagesRepository;
-
-	private final CopyOnWriteArrayList<SseEmitter> processStatusEmitters = new CopyOnWriteArrayList<>();
-
-	@Override
-	public ResponseEntity<ResponseVO<ProcessStatus>> insert(InsertDTO insertDTO) {
-
-		ResponseVO<ProcessStatus> responseVo = new ResponseVO<>();
-
-		ProcessStatus processStatus = new ProcessStatus();
-
-		processStatus.setType(insertDTO.getProcessType());
-		processStatus.setProcessStage(insertDTO.getProcessStage());
-		processStatus.setStartTimeStamp(System.currentTimeMillis());
-		processStatus.setStatus(0);
-		processStatus.setTriggeredBy(insertDTO.getTriggeredBy());
-
-		processStatusRepository.save(processStatus);
-
-		responseVo.setMessage("Data inserted successfully");
-		responseVo.setStatus(HttpStatus.valueOf(HttpStatus.OK.value()));
-		responseVo.setData(processStatus);
-		responseVo.setLocalDatetime(LocalDateTime.now());
-
-		sendProcessStatusUpdates();
-
-		return new ResponseEntity<>(responseVo, responseVo.getStatus());
-	}
-
-	@Override
-	public ResponseEntity<ResponseVO<ProcessStatus>> update(UpdateDTO updateDTO) {
-		ResponseVO<ProcessStatus> responseVo = new ResponseVO<>();
-		Long id = updateDTO.getId();
-
-		Optional<ProcessStatus> existingData = processStatusRepository.findById(id);
-		ProcessStatus existingEntity = new ProcessStatus();
-		ProcessStatus savedEntity = new ProcessStatus();
-		if (existingData.isPresent()) {
-			existingEntity = existingData.get();
-			existingEntity.setEndTimeStamp(System.currentTimeMillis());
-			existingEntity.setStatus(updateDTO.getStatus());
-			existingEntity.setRemarks(updateDTO.getRemarks());
-			savedEntity = processStatusRepository.save(existingEntity);
-		} else {
-			throw new IllegalArgumentException();
-		}
-		responseVo.setMessage("Data Updated Successfully");
-		responseVo.setStatus(HttpStatus.valueOf(HttpStatus.OK.value()));
-		responseVo.setData(savedEntity);
-		responseVo.setLocalDatetime(LocalDateTime.now());
-
-		sendProcessStatusUpdates();
-
-		return new ResponseEntity<>(responseVo, responseVo.getStatus());
-	}
-
-	@Override
-	public SseEmitter getProcessDataSSE() throws JsonProcessingException {
-
-		SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
-		processStatusEmitters.add(emitter);
-		emitter.onCompletion(() -> {
-			processStatusEmitters.remove(emitter);
-			emitter.complete();
-		});
-		emitter.onError((e) -> {
-			processStatusEmitters.remove(emitter);
-			emitter.completeWithError(e);
-		});
-		emitter.onTimeout(() -> {
-			processStatusEmitters.remove(emitter);
-			emitter.complete();
-		});
-        // Send a "hello" message to confirm the connection
-        try {
-            emitter.send(SseEmitter.event().name("connected").data("Connection established with Fincore-F1 Ultra SSE services..."));
-        } catch (IOException e) {
-//            log.error("Could not send initial 'connected' event to user: {}", userId, e);
-//            this.processStatusEmitters.remove(userId);
-        }
-
-        sendProcessStatusUpdates();
-		return emitter;
-	}
-
-	private List<ProcessDTO> getProcessData() {
-
-		List<Map<String, Object>> processStatus = processStatusRepository.getData();
-		List<Map<String, Object>> modifiableResults = processStatus.stream().map(HashMap::new)
-				.collect(Collectors.toList());
-
-		List<Map<String, Object>> stageDetailsGlifs = new ArrayList<>();
-		List<Map<String, Object>> stageDetailsBancs = new ArrayList<>();
-
-		for (Map<String, Object> eachObj : modifiableResults) {
-			String type = (String) eachObj.get("PROCESS_TYPE");
-			if (type.equalsIgnoreCase("BANCS")) {
-				String stage = String.valueOf(eachObj.get("PROCESS_STAGE"));
-
-				eachObj.remove("id");
-				eachObj.remove("processId");
-				eachObj.remove("type");
-
-				Optional<ProcessStages> existingStageData = processStagesRepository.findById(Long.parseLong(stage));
-				if (existingStageData.isPresent()) {
-					ProcessStages stageData = existingStageData.get();
-					StageDTO stageDTO = new StageDTO();
-					stageDTO.setTitle(stageData.getTitle());
-					stageDTO.setIcon(stageData.getIcon());
-
-					eachObj.put("stage", stageDTO);
-
-					stageDetailsBancs.add(eachObj);
-				}
-			} else if (type.equalsIgnoreCase("GLIFS")) {
-
-				String stage = String.valueOf(eachObj.get("PROCESS_STAGE"));
-
-				eachObj.remove("id");
-				eachObj.remove("processId");
-				eachObj.remove("type");
-
-				Optional<ProcessStages> existingStageData = processStagesRepository.findById(Long.parseLong(stage));
-				if (existingStageData.isPresent()) {
-					ProcessStages stageData = existingStageData.get();
-
-					StageDTO stageDTO = new StageDTO();
-					stageDTO.setTitle(stageData.getTitle());
-					stageDTO.setIcon(stageData.getIcon());
-
-					eachObj.put("stage", stageDTO);
-
-					stageDetailsGlifs.add(eachObj);
-				}
-			}
-		}
-
-		ProcessDTO processDTO1 = new ProcessDTO();
-		processDTO1.setType("BANCS");
-		processDTO1.setStageDetails(stageDetailsBancs);
-
-		ProcessDTO processDTO2 = new ProcessDTO();
-		processDTO2.setType("GLIFS");
-		processDTO2.setStageDetails(stageDetailsGlifs);
-
-		List<ProcessDTO> finalProcessedData = new ArrayList<>();
-
-		finalProcessedData.add(processDTO1);
-		finalProcessedData.add(processDTO2);
-
-		return finalProcessedData;
-	}
-
-	private void sendProcessStatusUpdates() {
-
-		Iterator<SseEmitter> emitters = processStatusEmitters.iterator();
-		List<ProcessDTO> data = getProcessData();
-		while (emitters.hasNext()) {
-
-			SseEmitter emitter = emitters.next();
-			try {
-
-				if (emitter != null) {
-
-					emitter.send(SseEmitter.event().data(data).build());
-				}
-			} catch (IOException e) {
-				e.printStackTrace();
-				emitter.completeWithError(e);
-			}
-		}
-	}
-}
-
-
-
-
-
-getting error :
-2026-01-12T15:30:58.800+05:30  WARN 28244 --- [ProcessStatusService] [nio-3000-exec-1] .m.m.a.ExceptionHandlerExceptionResolver : Resolved [org.springframework.web.HttpMediaTypeNotAcceptableException: No acceptable representation]
