@@ -1,25 +1,655 @@
-We suggest you to please test the LDAP integration of the application with AD UAT environment :
+<!-- Add these dependencies to your pom.xml -->
 
-ADS LDAP integration should be done by respective Application Owner by creating their own code 
-(PHP, JAVA etc.) depending upon application platform. ADS team will provide AD related 
-Information. AD provides authentication, authorization needs to be happened in application.
-AO need to provide Application background & flow of application with ADS team. AO should first 
-integrate application with UAT AD environment. Post that AD integration can be done for Production 
-AD environment.
-Please find below necessary information related to UAT AD Environment.
-Pre-requisites:
-AO should raise a FAR for connectivity with UAT ADS servers to open the required ports. For e.g. for 
-secure LDAP port 636 needs to be opened. Once FAR is implemented connectivity can be tested by 
-below Telnet command.
-Telnet 10.189.42.83 636
-Note - 10.189.42.83 is IP address of UAT AD server
-UAT Servers Details:
-FQDN for AD UAT server Domain Name IP Address
-UATROOTDC1.UATAD.SBI UATAD.SBI 10.189.42.83
-UATAHMDC1.ahm.UATAD.SBI AHM.UATAD.SBI 10.189.42.84
-UATMUMDC1.MUM.UATAD.SBI MUM.UATAD.SBI 10.189.42.85
-Note - Depending upon Application flow, ports need to be opened for root server or child server & 
-respective certificate will be required for secure connection.
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-ldap</artifactId>
+</dependency>
 
-I am insteucted to movw with ldap, i have one cerificate. 
-Kindly go through with current login service and discuss the new implmentation with proper secure and optimised way. 
+<!-- Required for legacy SSL handling if needed, though standard JDK usually suffices -->
+<dependency>
+    <groupId>com.sun.xml.messaging.saaj</groupId>
+    <artifactId>saaj-impl</artifactId>
+    <version>1.5.1</version>
+</dependency>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Configuration for Secure LDAP (LDAPS) connectivity.
+ * * Pre-requisites:
+ * 1. The AD Certificate provided must be imported into the JVM Truststore 
+ * OR configured via system properties.
+ * 2. Connectivity to 10.189.42.83 on port 636 must be open.
+ */
+@Slf4j
+@Configuration
+public class LdapConfig {
+
+    @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
+    private String ldapUrl;
+
+    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
+    private String ldapBaseDn;
+
+    // Optional: If you need a technical user to search the directory first (Service Account)
+    @Value("${spring.ldap.username:}") 
+    private String ldapManagerDn;
+
+    @Value("${spring.ldap.password:}")
+    private String ldapManagerPassword;
+
+    @Bean
+    public LdapContextSource contextSource() {
+        log.info("Configuring LDAP Context Source with URL: {}", ldapUrl);
+        LdapContextSource contextSource = new LdapContextSource();
+        contextSource.setUrl(ldapUrl);
+        contextSource.setBase(ldapBaseDn);
+        
+        // If your AD requires authentication to perform searches (Bind DN), set it here.
+        // For simple authentication (binding as the user), these might be empty.
+        if (ldapManagerDn != null && !ldapManagerDn.isBlank()) {
+            contextSource.setUserDn(ldapManagerDn);
+            contextSource.setPassword(ldapManagerPassword);
+        }
+
+        // --- SSL CONFIGURATION NOTE ---
+        // To make this work with your specific certificate, you have two options:
+        // 1. Import cert to JVM: keytool -import -alias ad_uat -keystore $JAVA_HOME/lib/security/cacerts -file ad_cert.cer
+        // 2. Or set these properties if using a custom truststore:
+        // System.setProperty("javax.net.ssl.trustStore", "/path/to/your/truststore.jks");
+        // System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+        
+        // Setting connection timeout properties
+        Map<String, Object> baseEnv = new HashMap<>();
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); // 5 seconds
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    // 5 seconds
+        // Ensure we are using SSL
+        baseEnv.put("java.naming.security.protocol", "ssl");
+        
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+        
+        return contextSource;
+    }
+
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        return new LdapTemplate(contextSource());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.filter.EqualsFilter;
+import org.springframework.stereotype.Service;
+
+/**
+ * Service responsible for interacting with Active Directory.
+ * Handles the "Bind" operation to verify credentials.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AdAuthenticationService {
+
+    private final LdapTemplate ldapTemplate;
+
+    @Value("${spring.ldap.domain:UATAD.SBI}")
+    private String adDomain;
+
+    /**
+     * Authenticates a user against Active Directory.
+     * * Strategy:
+     * We attempt to "bind" (login) to the directory using the user's specific DN 
+     * or Principal Name. AD often supports "sAMAccountName@domain" or "DOMAIN\sAMAccountName".
+     *
+     * @param username The User ID (sAMAccountName)
+     * @param password The raw password
+     * @return true if bind succeeds, false otherwise
+     */
+    public boolean authenticate(String username, String password) {
+        if (username == null || password == null || password.isBlank()) {
+            return false;
+        }
+
+        try {
+            // Construct the Principal Name for AD (e.g., user@UATAD.SBI)
+            // This is often more robust than constructing a full DN (CN=User,OU=...) 
+            // because users might be in different OUs.
+            String principalName = username + "@" + adDomain;
+            
+            log.info("Attempting LDAP Bind for principal: {}", principalName);
+
+            // Attempt to authenticate (Bind)
+            // The authenticate method checks if the credentials are valid.
+            // We use the Empty filter because we are binding directly.
+            boolean authenticated = ldapTemplate.authenticate(
+                "",                 // Base DN (empty if handled by ContextSource or absolute)
+                "(sAMAccountName=" + username + ")", // Filter to find the entry
+                password
+            );
+
+            if (authenticated) {
+                log.info("LDAP Bind Successful for user: {}", username);
+                return true;
+            } else {
+                log.warn("LDAP Bind Failed for user: {} (Invalid Credentials)", username);
+                return false;
+            }
+
+        } catch (Exception e) {
+            log.error("LDAP Connection/Authentication Error for user: {}", username, e);
+            // In a production scenario, you might want to differentiate between 
+            // "Wrong Password" and "Server Down" to handle failover logic.
+            return false;
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.utility;
+
+public class Constants {
+
+    public static final String STATUS = "status";
+    public static final String MESSAGE = "message";
+    public static final String ACCEPTED = "ACCEPTED";
+    public static final String REJECTED = "REJECTED";
+    public static final String SUCCESS = "SUCCESS";
+    public static final String ERROR = "ERROR";
+    public static final String LOCK = "LOCK";
+    public static final String UNLOCK = "UNLOCK";
+    public static final String ACTIVE = "ACTIVE";
+    public static final String INACTIVE = "INACTIVE";
+    public static final String CREATE = "CREATE";
+    public static final String MODIFY = "MODIFY";
+    public static final String DELETE = "DELETE";
+    public static final String BLOCK = "BLOCK";
+    public static final String UNBLOCK = "UNBLOCK";
+    public static final String ACCEPT = "ACCEPT";
+    public static final String REJECT = "REJECT";
+    public static final String PENDING = "PENDING";
+    public static final String LOCKED = "LOCKED";
+    
+    // Login Modes
+    public static final String PASSWORD_BASED_LOGIN = "PASS";
+    public static final String SSO_BASED_LOGIN = "SSO";
+    public static final String LDAP_BASED_LOGIN = "LDAP"; // New Constant
+    
+    public static final String INVALID = "INVALID";
+    
+    public static final char PASSWORD = 'P';
+    public static final char SSO = 'S';
+    public static final char LDAP = 'L'; // New Mode Character
+    public static final char HYBRID = 'A'; // Auto-switch mode
+    
+    public static final String ACTIVE_USER = "Active User";
+    public static final String HMAC = "hmac";
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.model.LoginAttempt;
+import com.fincore.gateway.model.LoginParam;
+import com.fincore.gateway.model.User;
+import com.fincore.gateway.model.UserRoles;
+import com.fincore.gateway.repository.LoginAttemptRepository;
+import com.fincore.gateway.repository.LoginParamRepository;
+import com.fincore.gateway.repository.RolePermissionsRepository;
+import com.fincore.gateway.repository.UserRepository;
+import com.fincore.gateway.utility.Constants;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Service implementation handling user login/verification, menu resolution, and password updates.
+ *
+ * <p><strong>Responsibilities</strong>
+ * <ul>
+ * <li>Validate credentials (Password, SSO, or LDAP)</li>
+ * <li>Issue HS256 JWTs and embed limited user/role claims</li>
+ * <li>Transform role permissions into menu responses</li>
+ * <li>Track login attempts and enforce wrong password limits</li>
+ * </ul>
+ */
+@Slf4j
+@Service("LoginService")
+@RequiredArgsConstructor
+public class LoginServiceImpl implements LoginService {
+
+    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+
+    // ======= Config =======
+    private final UserRepository userRepository;
+    private final LoginAttemptRepository loginAttemptRepository;
+
+    // ======= Dependencies =======
+    private final LoginParamRepository loginParamRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final MenuService menuService;
+    private final ObjectMapper mapper;
+    
+    // Injected AD Service for LDAP authentication
+    private final AdAuthenticationService adAuthenticationService;
+
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+    
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long ttlSeconds;
+
+    // ======= Public API =======
+
+    @Transactional(readOnly = true)
+    @Override
+    public MenuResponse fetchRoleWiseData(String userId) {
+        log.info("Fetching role-wise data for userId: {}", userId);
+        try {
+            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
+
+            if (rows == null || rows.isEmpty()) {
+                log.info("No permissions found for userId: {}", userId);
+                return new MenuResponse(Collections.emptyList());
+            }
+            return menuService.transformFromProjection(rows);
+        } catch (Exception e) {
+            log.error("Error fetching permissions for userId: {}", userId, e);
+            return new MenuResponse(Collections.emptyList());
+        }
+    }
+
+    @Transactional
+    @Override
+    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
+
+        final String userId = userCredentials.getUserId();
+        final String rawPassword = userCredentials.getPassword();
+
+        UserDto result = new UserDto();
+        // 1. Fetch Local User (Authorization Step)
+        // Even if we use LDAP for auth, user MUST exist in local DB for Roles/Branch info.
+        User user = userRepository.findByUserId(userId);
+
+        if (user == null) {
+            result.setValidCredentials(false);
+            result.setUserStatus(Constants.INVALID);
+            log.info("Login attempt for invalid userId: {}", userId);
+            return result;
+        }
+
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        char activeMode = loginParam.getActiveLoginMode();
+        
+        LoginAttempt attempt = new LoginAttempt();
+        attempt.setSuccess("N");
+        attempt.setIpAddress(clientIp);
+        attempt.setUserId(userId);
+
+        result.setLoginMethod(activeMode);
+        result.setUserId(user.getUserId());
+
+        UserRoles userRole = userRepository.getUserRole(userId);
+
+        // Status checks: role & user
+        result.setRoleStatus(userRole.getRoleStatus());
+        result.setUserStatus(user.getAccountStatus());
+        result.setPasswordLoginStatus(user.getPasswordLogin());
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
+            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        // =========================================================================
+        // ROUTING LOGIC BASED ON LOGIN PARAM
+        // =========================================================================
+        
+        attempt.setLoginMethod(determineMethodString(activeMode));
+
+        if (activeMode == Constants.LDAP) {
+            // --- LDAP MODE ---
+            boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+            if (ldapSuccess) {
+                handleSuccess(attempt, result, user, userRole);
+            } else {
+                handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
+            }
+        } 
+        else if (activeMode == Constants.PASSWORD) {
+            // --- PASSWORD MODE ---
+            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
+            } else {
+                result.setValidCredentials(false);
+                attempt.setFailureReason("Password login is disabled for this user.");
+            }
+        } 
+        else if (activeMode == Constants.HYBRID) { 
+            // --- HYBRID / AUTO SWITCH MODE ---
+            // Try LDAP first, if connection fails, fallback to Password? 
+            // OR Try LDAP, if Invalid Creds, return Invalid.
+            // For now, implementing: LDAP Primary.
+            boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+            if (ldapSuccess) {
+                handleSuccess(attempt, result, user, userRole);
+            } else {
+                // If LDAP failed, we could check if it was a connection error or creds error in the service.
+                // Assuming stricter security: LDAP fail = Login fail.
+                handleFailure(attempt, result, user, loginParam, "LDAP Hybrid Auth Failed");
+            }
+        }
+        else {
+            // --- SSO MODE (Existing logic) ---
+            attempt.setSuccess("Y");
+            attempt.setFailureReason("SUCCESS");
+            result.setValidCredentials(true);
+            // If password-login was disabled, re-enable it on successful SSO
+            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                user.setPasswordLogin(Constants.ACTIVE);
+                userRepository.save(user);
+            }
+            handleSuccess(attempt, result, user, userRole);
+        }
+
+        loginAttemptRepository.save(attempt);
+        log.debug("verifyUserCredentials result={}", result);
+        return result;
+    }
+
+    private String determineMethodString(char mode) {
+        if (mode == Constants.LDAP) return Constants.LDAP_BASED_LOGIN;
+        if (mode == Constants.PASSWORD) return Constants.PASSWORD_BASED_LOGIN;
+        return Constants.SSO_BASED_LOGIN;
+    }
+
+    /**
+     * Centralized Success Handler to generate tokens and update DB
+     */
+    private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
+        attempt.setSuccess("Y");
+        attempt.setFailureReason("Success");
+        result.setValidCredentials(true);
+        result.setMessage("Login Successful");
+
+        // Reset wrong password count on successful login (even LDAP)
+        if (user.getUserWrongPasswordCount() > 0) {
+            user.setUserWrongPasswordCount(0);
+            userRepository.save(user);
+        }
+
+        // Generate Token
+        log.info("Credentials validated. Issuing token for userId={}", user.getUserId());
+        UserDto safeClaims = new UserDto();
+        safeClaims.setUserId(user.getUserId());
+        safeClaims.setUserrole(userRole.getRole());
+
+        @SuppressWarnings("unchecked")
+        String accessToken = HmacJwtUtil.generate(
+                hmacSecret,
+                user.getUserId(),
+                ttlSeconds,
+                mapper.convertValue(safeClaims, Map.class)
+        );
+
+        UserTokenDataDto tokenData = initializeTokenData(user, userRole);
+        result.setAccessToken(accessToken);
+        result.setUser(tokenData);
+    }
+
+    /**
+     * Centralized Failure Handler to update attempts and lock if necessary
+     */
+    private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
+        log.warn("Login failed for user {}: {}", user.getUserId(), reason);
+        attempt.setSuccess("N");
+        
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
+        int newFailedCount = currentFailedCount + 1;
+        
+        user.setUserWrongPasswordCount(newFailedCount);
+        userInfo.setValidCredentials(false);
+
+        if (newFailedCount >= maxAllowed) {
+            user.setPasswordLogin(Constants.INACTIVE);
+            user.setAccountStatus(Constants.LOCKED);
+            attempt.setFailureReason(reason + " -> Account Locked");
+            userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
+        } else {
+            int remaining = maxAllowed - newFailedCount;
+            attempt.setFailureReason(reason);
+            userInfo.setMessage("Incorrect credentials. " + remaining + " attempts remaining.");
+            userInfo.setAttemptsLeft(remaining);
+        }
+        userRepository.save(user);
+    }
+
+    @Transactional
+    @Override
+    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
+        log.info("Password-based login for userId={}", user.getUserId());
+        
+        // Use the centralized handlers
+        if (encoder.matches(password, user.getPasswordHash())) {
+            UserRoles userRole = userRepository.getUserRole(user.getUserId());
+            handleSuccess(loginAttempt, userInfo, user, userRole);
+        } else {
+            handleFailure(loginAttempt, userInfo, user, loginParam, "Wrong Password");
+        }
+    }
+
+    @Override
+    public String generateStatusMessage(String status, String type) {
+        return String.format("Trying to login with a %s %s", status, type);
+    }
+
+    @Transactional(readOnly = true)
+    public VerifyUserDTO checkUser(String userId) {
+        VerifyUserDTO out = new VerifyUserDTO();
+        out.setUserId(userId);
+
+        User user = userRepository.findByUserId(userId);
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        out.setLoginMethod(loginParam.getActiveLoginMode());
+
+        if (user == null) {
+            out.setUserCheck(false);
+            out.setUserStatus(Constants.INVALID);
+            out.setMessage("Invalid User");
+            return out;
+        }
+
+        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            Timestamp setAt = user.getTempPasswordSetAt();
+            boolean isPasswordValid = false;
+            // Only check local password validity if strictly in Password mode
+            if (loginParam.getActiveLoginMode() == Constants.PASSWORD && setAt != null) {
+                 LocalDateTime lastUpdate = setAt.toLocalDateTime();
+                 isPasswordValid = LocalDateTime.now().isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+            } else {
+                // For LDAP/SSO, local password validity is less relevant, assume valid
+                isPasswordValid = true; 
+            }
+
+            UserRoles userRole = userRepository.getUserRole(userId);
+            out.setRoleStatus(userRole.getRoleStatus());
+            // If LDAP, we generally don't ask users to update password in our app
+            boolean forceUpdate = (loginParam.getActiveLoginMode() == Constants.PASSWORD) && (user.getPasswordHash() == null || !isPasswordValid);
+            out.setUpdatePassword(forceUpdate);
+            
+            out.setUserStatus(Constants.ACTIVE);
+            out.setMessage(Constants.ACTIVE_USER);
+            out.setPasswordLoginStatus(user.getPasswordLogin());
+        } else {
+            String accountStatus = user.getAccountStatus();
+            out.setUserCheck(true);
+            out.setUserStatus(accountStatus);
+            out.setMessage(
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please reset password or contact admin."
+                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
+            );
+        }
+        return out;
+    }
+
+    @Transactional
+    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
+        String userId = userCredentials.getUserId();
+        String password = userCredentials.getPassword();
+        userCredentials.setUpdateFlag(false);
+        userCredentials.setPassword("");
+        userCredentials.setOtp("");
+
+        try {
+            User user = userRepository.findByUserId(userId);
+            if (user == null) {
+                userCredentials.setMessage("Invalid user id");
+                return userCredentials;
+            }
+
+            String passwordHash = encoder.encode(password);
+            user.setPasswordHash(passwordHash);
+            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
+            userRepository.save(user);
+
+            userCredentials.setMessage("User password successfully updated");
+            userCredentials.setUpdateFlag(true);
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Data integrity violation while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Failed to change password, please try again");
+        } catch (Exception e) {
+            log.error("Unexpected error while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Unexpected error while changing password");
+        }
+        return userCredentials;
+    }
+
+    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
+        UserTokenDataDto tokenData = new UserTokenDataDto();
+        tokenData.setFirstName(user.getFirstName());
+        tokenData.setLastName(user.getLastName());
+        tokenData.setPhoneNumber(user.getPhoneNumber());
+        tokenData.setUserId(user.getUserId());
+        tokenData.setBranch(user.getBranch());
+        tokenData.setEmail(user.getEmail());
+        tokenData.setRole(userRole.getRole());
+        tokenData.setRoleName(userRole.getRoleName());
+        return tokenData;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public UserDto getUserProfile(String userId) {
+        User user = userRepository.findByUserId(userId);
+        UserRoles userRole = userRepository.getUserRole(userId);
+        if (user == null) return null;
+        
+        UserDto userDto = new UserDto();
+        userDto.setUserId(user.getUserId());
+        userDto.setUserStatus(user.getPasswordLogin());
+        userDto.setPasswordLoginStatus(user.getPasswordLogin());
+        userDto.setUser(initializeTokenData(user, userRole));
+        return userDto;
+    }
+}
+
+
+
+
+
+
+
