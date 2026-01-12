@@ -1,19 +1,76 @@
-2026-01-12 :: 15:43:28.478 || INFO :: SecurityConfig.java: | 86 | :: RedisValidationFilter invoked for path=/api/auth/check-user
-2026-01-12 :: 15:43:28.479 || INFO :: LoginUtility.java: | 12 | :: X-Forwarded-For ip : ::1
-2026-01-12 :: 15:43:28.479 || INFO :: AuthController.java: | 137 | :: Check-User info user id: 1015698 , ip : 
-2026-01-12 :: 15:43:29.258 || INFO :: SecurityConfig.java: | 86 | :: RedisValidationFilter invoked for path=/api/auth/login
-2026-01-12 :: 15:43:29.259 || INFO :: LoginUtility.java: | 12 | :: X-Forwarded-For ip : ::1
-2026-01-12 :: 15:43:29.260 || INFO :: AuthController.java: | 169 | :: Login request for user: 1015698 from IP: 
-2026-01-12 :: 15:43:29.350 || INFO :: LoginServiceImpl.java: | 170 | :: Processing LDAP Login for user: 1015698
-2026-01-12 :: 15:43:29.351 || INFO :: AdAuthenticationService.java: | 42 | :: Attempting LDAP Bind for principal: 1015698@UATAD.SBI
-2026-01-12 :: 15:43:29.361 || ERROR:: AdAuthenticationService.java: | 63 | :: LDAP System Error during auth for user: 1015698. Error: 10.189.42.83:636
-2026-01-12 :: 15:43:29.362 || WARN :: LoginServiceImpl.java: | 266 | :: Login failed for user 1015698: LDAP Authentication Failed
-2026-01-12 :: 15:43:29.451 || WARN :: AuthController.java: | 185 | :: Login Failed for user: 1015698. Reason: Incorrect credentials. Please check and try again.
-2026-01-12 :: 15:43:34.976 || INFO :: SecurityConfig.java: | 86 | :: RedisValidationFilter invoked for path=/api/auth/login
-2026-01-12 :: 15:43:34.977 || INFO :: LoginUtility.java: | 12 | :: X-Forwarded-For ip : ::1
-2026-01-12 :: 15:43:34.979 || INFO :: AuthController.java: | 169 | :: Login request for user: 1015698 from IP: 
-2026-01-12 :: 15:43:35.068 || INFO :: LoginServiceImpl.java: | 170 | :: Processing LDAP Login for user: 1015698
-2026-01-12 :: 15:43:35.068 || INFO :: AdAuthenticationService.java: | 42 | :: Attempting LDAP Bind for principal: 1015698@UATAD.SBI
-2026-01-12 :: 15:43:35.078 || ERROR:: AdAuthenticationService.java: | 63 | :: LDAP System Error during auth for user: 1015698. Error: 10.189.42.83:636
-2026-01-12 :: 15:43:35.079 || WARN :: LoginServiceImpl.java: | 266 | :: Login failed for user 1015698: LDAP Authentication Failed
-2026-01-12 :: 15:43:35.167 || WARN :: AuthController.java: | 185 | :: Login Failed for user: 1015698. Reason: Incorrect credentials. Please check and try again.
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Configuration
+public class LdapConfig {
+
+    @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
+    private String ldapUrl;
+
+    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
+    private String ldapBaseDn;
+
+    // We will inject the ResourceLoader to find the file
+    private final ResourceLoader resourceLoader;
+
+    public LdapConfig(ResourceLoader resourceLoader) {
+        this.resourceLoader = resourceLoader;
+    }
+
+    @Bean
+    public LdapContextSource contextSource() {
+        log.info("Configuring LDAP Context Source. URL: {}", ldapUrl);
+
+        // =========================================================================
+        // DYNAMIC TRUSTSTORE LOADING
+        // This allows us to keep the cert in the application resources
+        // =========================================================================
+        try {
+            Resource trustStore = resourceLoader.getResource("classpath:ad-truststore.jks");
+            if (trustStore.exists()) {
+                String trustStorePath = trustStore.getFile().getAbsolutePath();
+                log.info("Setting custom truststore from: {}", trustStorePath);
+                
+                System.setProperty("javax.net.ssl.trustStore", trustStorePath);
+                System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+            } else {
+                log.warn("ad-truststore.jks NOT FOUND in classpath. Falling back to system truststore.");
+            }
+        } catch (IOException e) {
+            log.error("Could not load custom truststore", e);
+        }
+
+        LdapContextSource contextSource = new LdapContextSource();
+        contextSource.setUrl(ldapUrl);
+        contextSource.setBase(ldapBaseDn);
+        
+        // Timeout Configuration
+        Map<String, Object> baseEnv = new HashMap<>();
+        baseEnv.put("java.naming.security.protocol", "ssl");
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); 
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    
+        
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+        return contextSource;
+    }
+
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        return new LdapTemplate(contextSource());
+    }
+}
+
+
