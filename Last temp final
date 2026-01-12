@@ -1,1072 +1,463 @@
-package com.fincore.JournalService.Controllers;
+package com.fincore.gateway.Service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Service.JournalBulkValidationService;
-import com.fincore.JournalService.Service.JournalRequestService;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.validation.Valid;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.model.LoginAttempt;
+import com.fincore.gateway.model.LoginParam;
+import com.fincore.gateway.model.User;
+import com.fincore.gateway.model.UserRoles;
+import com.fincore.gateway.repository.LoginAttemptRepository;
+import com.fincore.gateway.repository.LoginParamRepository;
+import com.fincore.gateway.repository.RolePermissionsRepository;
+import com.fincore.gateway.repository.UserRepository;
+import com.fincore.gateway.utility.Constants;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.core.io.Resource;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.io.IOException;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Controller for Journal Request Management.
- * Implements High-Performance Async Endpoints for Bulk Operations.
+ * Service implementation handling user login/verification, menu resolution, and password updates.
+ *
+ * <p><strong>Responsibilities</strong>
+ * <ul>
+ *   <li>Validate credentials (password-based and SSO-based)</li>
+ *   <li>Issue HS256 JWTs and embed limited user/role claims</li>
+ *   <li>Transform role permissions into menu responses</li>
+ *   <li>Track login attempts and enforce wrong password limits</li>
+ * </ul>
+ *
+ * <p><strong>Notes</strong>
+ * <ul>
+ *   <li>JWT generation uses an HMAC Base64 secret; ensure it is configured for the environment.</li>
+ *   <li>{@code BCryptPasswordEncoder} is created locally for convenience; consider injecting a singleton bean instead.</li>
+ *   <li>Write operations are wrapped in {@link Transactional} where appropriate.</li>
+ * </ul>
  */
-@RestController
-@RequestMapping("/api/journals")
-@RequiredArgsConstructor
 @Slf4j
-public class JournalRequestController {
-
-    private final JournalRequestService journalRequestService;
-    private final JournalBulkValidationService journalBulkValidationService;
-    private final JwtUtil jwtUtil;
-
-    // ==================================================================================
-    // 1. ASYNC BULK OPERATIONS (Fire-and-Forget)
-    // ==================================================================================
-
-    @PostMapping("/create-batch-from-cache")
-    public ResponseEntity<Map<String, Object>> createBatchFromCache(
-            @RequestBody Map<String, String> payload,
-            @RequestHeader("Authorization") String token) {
-
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-            String batchId = journalRequestService.createBatchFromCacheAsync(
-                    payload.get("requestId"),
-                    payload.get("commonBatchRemarks"),
-                    userId,
-                    userRole
-            );
-
-            return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                    "status", "PROCESSING",
-                    "message", "Batch creation initiated in background.",
-                    "batchId", batchId
-            ));
-
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("status", "ERROR", "message", e.getMessage()));
-        } catch (Exception e) {
-            log.error("Batch Init Error", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "System error: " + e.getMessage()));
-        }
-    }
-
-    @PostMapping("/process-bulk")
-    public ResponseEntity<?> processBulkRequests(
-            @RequestHeader("Authorization") String token,
-            @Valid @RequestBody BulkProcessJournalRequestDto dto) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            Integer userRole = jwtUtil.getUserRoleFromToken(token);
-
-            journalRequestService.processBulkRequestsAsync(dto, userId, userRole);
-
-            return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                    "status", "PROCESSING",
-                    "message", "Approval process started. Notifications will be sent upon completion."
-            ));
-        } catch (Exception e) {
-            log.error("Process Error", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Processing failed."));
-        }
-    }
-
-    @DeleteMapping("/my-requests/by-batch/{batchId}")
-    public ResponseEntity<?> cancelMyRequestsByBatch(
-            @RequestHeader("Authorization") String token,
-            @PathVariable String batchId) {
-        try {
-            String userId = jwtUtil.getUserIdFromToken(token);
-            journalRequestService.cancelMyRequestsByBatchIdAsync(batchId, userId);
-
-            return ResponseEntity.status(HttpStatus.ACCEPTED).body(Map.of(
-                    "status", "DELETING",
-                    "message", "Batch deletion queued. Status will update shortly."
-            ));
-        } catch (Exception e) {
-            log.error("Delete Batch Error", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("status", "ERROR", "message", "Cancel failed: " + e.getMessage()));
-        }
-    }
-
-    // ==================================================================================
-    // 2. SAFEGUARDED FETCH API
-    // ==================================================================================
-
-    @GetMapping("/by-batch/{batchId}")
-    public ResponseEntity<?> getRequestsByBatchId(@PathVariable String batchId) {
-        long count = journalRequestService.getRequestCountByBatchId(batchId);
-
-        if (count > 2000) {
-            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
-                    "error", "Batch too large (" + count + " rows). Please use Paginated API.",
-                    "suggestion", "/api/journals/by-batch-paginated/" + batchId
-            ));
-        }
-        return ResponseEntity.ok(journalRequestService.getRequestsByBatchId(batchId));
-    }
-
-    // ==================================================================================
-    // 3. VALIDATION & STATUS (UPDATED FOR PROGRESS)
-    // ==================================================================================
-
-    @PostMapping(value = "/bulk-validate-init", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> initiateValidation(
-            @RequestHeader("Authorization") String token, // ADDED: To capture User ID for notifications
-            @RequestParam("file") MultipartFile file,
-            @RequestParam("postingDate") String date,
-            HttpServletRequest request) {
-        try {
-            if (file == null || file.isEmpty())
-                return ResponseEntity.badRequest().body(Map.of("error", "File is missing"));
-
-            String userId = jwtUtil.getUserIdFromToken(token); // Capture User ID
-
-            String reqId = journalBulkValidationService.initiateValidation(
-                    file.getBytes(),
-                    file.getOriginalFilename(),
-                    LocalDate.parse(date),
-                    userId // Pass to Service
-            );
-            return ResponseEntity.ok(Map.of("status", "QUEUED", "requestId", reqId));
-        } catch (Exception e) {
-            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
-        }
-    }
-
-    @GetMapping("/bulk-status/{requestId}")
-    public ResponseEntity<BulkUploadStateDto> checkStatus(@PathVariable String requestId) {
-        BulkUploadStateDto state = journalBulkValidationService.getState(requestId);
-        return state != null ? ResponseEntity.ok(state) : ResponseEntity.notFound().build();
-    }
-
-    // ==================================================================================
-    // 4. UTILS & LEGACY SUPPORT
-    // ==================================================================================
-
-    @GetMapping("/current-posting-date")
-    public String getCurrentPostingDate() {
-        return journalRequestService.getCurrentPostingDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
-    }
-
-    @GetMapping("/pending-requests-summary")
-    public ResponseEntity<?> getPendingBatchSummaries() {
-        return ResponseEntity.ok(journalRequestService.getPendingBatchSummaries());
-    }
-
-    @GetMapping("/all-requests-summary")
-    public ResponseEntity<?> getAllBatchSummaries() {
-        return ResponseEntity.ok(journalRequestService.getAllBatchSummaries());
-    }
-
-    @GetMapping("/by-batch-paginated/{batchId}")
-    public ResponseEntity<?> getRequestsByBatchIdPaginated(
-            @PathVariable String batchId,
-            @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "10") int size) {
-        return ResponseEntity.ok(journalRequestService.getRequestsByBatchIdPaginated(batchId, PageRequest.of(page, size)));
-    }
-
-    @GetMapping("/download-bulk-file/{requestId}")
-    public ResponseEntity<Resource> downloadFile(@PathVariable String requestId, @RequestParam String type) {
-        byte[] data = journalBulkValidationService.getFileBytes(requestId, type);
-        if (data == null) return ResponseEntity.notFound().build();
-
-        String filename = type.equalsIgnoreCase("ERROR") ? "Error_Report.xlsx" : "Success.csv";
-        MediaType mediaType = type.equalsIgnoreCase("ERROR")
-                ? MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                : MediaType.TEXT_PLAIN;
-
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
-                .contentType(mediaType)
-                .body(new ByteArrayResource(data));
-    }
-
-    @GetMapping("/download-template")
-    public ResponseEntity<Resource> downloadTemplate() throws IOException {
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"Journal_Template.xlsx\"")
-                .body(new ByteArrayResource(journalBulkValidationService.generateTemplateBytes()));
-    }
-
-    // --- Manual/Small Batch Endpoints ---
-    @PostMapping("/create-batch")
-    public ResponseEntity<?> createBatchRequest(@Valid @RequestBody BatchRequestDto batchDto, @RequestHeader("Authorization") String token) throws JsonProcessingException {
-        return ResponseEntity.status(HttpStatus.CREATED).body(journalRequestService.createBatchRequest(batchDto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)));
-    }
-
-    @GetMapping("/my-requests")
-    public List<JournalRequest> getMyRequests(@RequestHeader("Authorization") String token) {
-        return journalRequestService.getMyRequests(jwtUtil.getUserIdFromToken(token));
-    }
-
-    @GetMapping("/pending-requests")
-    public List<JournalRequest> getPendingRequests(@RequestHeader("Authorization") String token) {
-        return journalRequestService.getPendingRequests(jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token));
-    }
-
-    @PatchMapping("/update-request")
-    public JournalRequest updateRequestStatus(@RequestHeader("Authorization") String token, @RequestBody ProcessJournalRequestDto dto) throws JsonProcessingException {
-        return journalRequestService.updateRequestStatus(dto, jwtUtil.getUserIdFromToken(token), jwtUtil.getUserRoleFromToken(token)).get();
-    }
-
-    @DeleteMapping("/my-request/{requestId}")
-    public ResponseEntity<Void> cancelMyRequest(@RequestHeader("Authorization") String token, @PathVariable Long requestId) {
-        journalRequestService.cancelMyRequest(requestId, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.noContent().build();
-    }
-
-    @DeleteMapping("/my-requests/by-journal-list")
-    public ResponseEntity<?> cancelMyRequestsByJournalPrefixes(@RequestHeader("Authorization") String token, @RequestBody List<String> list) {
-        journalRequestService.cancelMyRequestsByJournalPrefixes(list, jwtUtil.getUserIdFromToken(token));
-        return ResponseEntity.ok(Map.of("status", "SUCCESS"));
-    }
-
-    @GetMapping("/status")
-    public ResponseEntity<List<JournalRequestStatusDto>> getJournalStatusList() {
-        return ResponseEntity.ok(journalRequestService.getJournalRequestStatusList());
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.JournalService.Service;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fincore.JournalService.Dto.*;
-import com.fincore.JournalService.Models.JournalLog;
-import com.fincore.JournalService.Models.JournalRequest;
-import com.fincore.JournalService.Models.enums.RequestStatus;
-import com.fincore.JournalService.Repository.JournalLogRepository;
-import com.fincore.JournalService.Repository.JournalRequestRepository;
-import com.fincore.JournalService.Service.JournalBulkValidationService.ExcelRowData;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.jdbc.core.CallableStatementCallback;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import javax.sql.DataSource;
-import java.io.IOException;
-import java.math.BigDecimal;
-import java.sql.*;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
-
-@Service
+@Service("LoginService")
 @RequiredArgsConstructor
-@Slf4j
-public class JournalRequestServiceImpl implements JournalRequestService {
+public class LoginServiceImpl implements LoginService {
 
-    private final JournalRequestRepository journalRequestRepository;
-    private final JournalLogRepository journalLogRepository;
-    private final SequenceService sequenceService;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    private final JournalBulkValidationService journalBulkValidationService;
-    // private final HdfsSyncService hdfsSyncService; // Disable locally to avoid errors
-    private final ProgressService progressService; // NEW: Injected
+    /**
+     * Prefer injecting a singleton bean; retained local instance for compatibility.
+     */
+    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
 
-    @Autowired
-    @Lazy
-    private JournalRequestService self;
 
-    @Autowired
-    @Qualifier("oracleJdbcTemplate")
-    private JdbcTemplate jdbcTemplate;
+    // ======= Config =======
+    private final UserRepository userRepository;
+    private final LoginAttemptRepository loginAttemptRepository;
 
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
+    // ======= Dependencies =======
+    private final LoginParamRepository loginParamRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final MenuService menuService;
+    private final ObjectMapper mapper;
+    /**
+     * Base64-encoded HMAC secret used to sign HS256 JWTs.
+     */
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+    /**
+     * Token time-to-live in seconds.
+     */
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long ttlSeconds;
 
-    @Autowired
-    @Qualifier("bulkExecutor")
-    private Executor bulkExecutor;
+    // ======= Public API =======
 
-    // Direct DataSource access for Raw JDBC performance (CRITICAL FOR SPEED)
-    @Autowired
-    @Qualifier("oracleDataSource")
-    private DataSource dataSource;
-
-    // ==================================================================================
-    // 1. ASYNC BATCH CREATION (Raw JDBC + Progress)
-    // ==================================================================================
-
+    /**
+     * Fetches role-wise permissions for the given user and transforms them into a menu response.
+     *
+     * @param userId ID of the user
+     * @return {@link MenuResponse} built from ordered permissions; empty if none or on error
+     */
+    @Transactional(readOnly = true)
     @Override
-    @Transactional
-    public String createBatchFromCacheAsync(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException {
-        String lockKey = "LOCK_REQ_" + requestId;
-        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, new byte[0], 5, TimeUnit.MINUTES);
-
-        if (Boolean.FALSE.equals(acquired)) {
-            log.warn("Duplicate creation attempt blocked for ReqID: {}", requestId);
-            throw new IllegalStateException("Batch creation is already in progress.");
-        }
-
+    public MenuResponse fetchRoleWiseData(String userId) {
+        log.info("Fetching role-wise data for userId: {}", userId);
         try {
-            String batchId = sequenceService.getNextBatchId();
-            // 1. Start Progress Notification
-            progressService.sendProgress(batchId, creatorId, 0, "PROCESSING", "Initializing Batch Creation...");
-            self.executeAsyncBatchCreation(batchId, requestId, commonRemarks, creatorId, creatorRole);
-            return batchId;
+            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
+
+            if (rows == null || rows.isEmpty()) {
+                log.info("No permissions found for userId: {}", userId);
+                return new MenuResponse(Collections.emptyList());
+            }
+            return menuService.transformFromProjection(rows);
         } catch (Exception e) {
-            redisTemplate.delete(lockKey);
-            throw e;
+            log.error("Error fetching permissions for userId: {}", userId, e);
+            return new MenuResponse(Collections.emptyList());
         }
     }
 
-    @Override
-    @Async("bulkExecutor")
+    /**
+     * Verifies user credentials and, on success, builds {@link UserDto} populated with an access token and token data.
+     * <p>Also records the login attempt and enforces password attempt limits.</p>
+     *
+     * @param userCredentials payload containing {@code userId} and (for password mode) {@code password}
+     * @param clientIp        caller's IP address for audit
+     * @return {@link UserDto} with validity flags, statuses, and (if valid) a signed access token
+     */
     @Transactional
-    public void executeAsyncBatchCreation(String batchId, String requestId, String commonRemarks, String creatorId, Integer creatorRole) {
-        log.info("ASYNC CREATE: Starting Batch {} (Source: {})", batchId, requestId);
-        long start = System.currentTimeMillis();
+    @Override
+    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
 
-        try {
-            progressService.sendProgress(batchId, creatorId, 5, "PROCESSING", "Preparing Data...");
+        final String userId = userCredentials.getUserId();
+        final String rawPassword = userCredentials.getPassword();
 
-            // 1. Fetch from Redis
-            List<ExcelRowData> cachedRows = journalBulkValidationService.getValidRowsFromCache(requestId);
-            if (cachedRows == null || cachedRows.isEmpty()) {
-                logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", "Cache Expired for " + batchId);
-                progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Data cache expired or empty.");
-                return;
-            }
+        UserDto result = new UserDto();
+        User user = userRepository.findByUserId(userId);
 
-            // 2. Prepare Parallel Execution
-            int totalRows = cachedRows.size();
-            int batchSize = 5000; // Optimal for Oracle
-
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            LongAdder totalDebit = new LongAdder();
-            LongAdder totalCredit = new LongAdder();
-
-            AtomicInteger completedChunks = new AtomicInteger(0);
-            int totalChunks = (int) Math.ceil((double) totalRows / batchSize);
-
-            // 3. Submit Chunks (Using Raw JDBC for Speed)
-            for (int i = 0; i < totalRows; i += batchSize) {
-                final int startIdx = i;
-                final int endIdx = Math.min(i + batchSize, totalRows);
-                final List<ExcelRowData> chunk = cachedRows.subList(startIdx, endIdx);
-
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() ->
-                                processChunkRaw(chunk, batchId, commonRemarks, creatorId, creatorRole, startIdx, totalDebit, totalCredit), bulkExecutor)
-                        .thenRun(() -> {
-                            // Update Progress
-                            int done = completedChunks.incrementAndGet();
-                            int percent = 5 + (done * 90 / totalChunks); // Map 5% -> 95%
-                            progressService.sendProgress(batchId, creatorId, percent, "PROCESSING",
-                                    String.format("Created %d/%d records...", (done * batchSize), totalRows));
-                        });
-                futures.add(future);
-            }
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-            // 4. Insert Master Record
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-            jdbcTemplate.update(sumSql, batchId, creatorId, ts, commonRemarks, totalRows,
-                    BigDecimal.valueOf(totalDebit.sum()), BigDecimal.valueOf(totalCredit.sum()), "PENDING");
-
-            // 5. Clean & Log
-            redisTemplate.delete("DATA_" + requestId);
-            redisTemplate.delete("LOCK_REQ_" + requestId);
-            logAudit(creatorId, "CREATE_SUCCESS", "BATCH_ASYNC", "Created Batch " + batchId);
-
-            // 6. FINAL NOTIFICATIONS
-            // A. Progress Bar Complete
-            progressService.sendProgress(batchId, creatorId, 100, "COMPLETED", "Batch Created Successfully");
-
-            // B. Persistent Notification to CREATOR (Success)
-            sendNotification(creatorId, null, "Batch " + batchId + " created successfully.", batchId);
-
-            // C. Persistent Notification to EXECUTORS (Action Required)
-            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
-            if (config != null) {
-                String msg = String.format("New Batch %s by %s requires approval.", batchId, creatorId);
-                sendNotification(creatorId, config.getTargetRoles(), msg, batchId);
-            }
-
-            log.info("✅ Batch {} Created. Rows: {}. Time: {}ms", batchId, totalRows, System.currentTimeMillis() - start);
-
-        } catch (Exception e) {
-            log.error("Async Create Failed", e);
-            logAudit(creatorId, "CREATE_FAIL", "BATCH_ASYNC", e.getMessage());
-            redisTemplate.delete("LOCK_REQ_" + requestId);
-            cleanupFailedBatch(batchId);
-            progressService.sendProgress(batchId, creatorId, 0, "FAILED", "Creation Error: " + e.getMessage());
+        if (user == null) {
+            result.setValidCredentials(false);
+            result.setUserStatus(Constants.INVALID);
+            log.info("Login attempt for invalid userId: {}", userId);
+            return result;
         }
-    }
 
-    // --- CRITICAL RAW JDBC INSERT METHOD ---
-    private void processChunkRaw(List<ExcelRowData> chunk, String batchId, String commonRemarks, String creatorId, Integer creatorRole, int globalOffset, LongAdder debit, LongAdder credit) {
-        String sql = "INSERT INTO JOURNAL_REQUEST (REQ_ID, REQ_STATUS, CHANGE_TYPE, REQ_DATE, CREATOR_ID, CREATOR_ROLE, BATCH_ID, JOURNAL_ID, COMMON_BATCH_REMARKS, PAYLOAD, REQ_BRANCH_CODE, REQ_CURRENCY, REQ_CGL, REQ_AMOUNT, REQ_CSV_DATE, REQ_NARRATION, REQ_PRODUCT) VALUES (JOURNAL_REQUEST_SEQ.nextval, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        LoginAttempt attempt = new LoginAttempt();
+        attempt.setLoginMethod(loginParam.getActiveLoginMode() == 'P'
+                ? Constants.PASSWORD_BASED_LOGIN
+                : Constants.SSO_BASED_LOGIN);
+        attempt.setSuccess("N");
+        attempt.setIpAddress(clientIp);
+        attempt.setUserId(userId);
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+        result.setLoginMethod(loginParam.getActiveLoginMode());
+        result.setUserId(user.getUserId());
 
-            // CRITICAL: Force manual commit to ensure driver sends batch packet efficiently
-            conn.setAutoCommit(false);
+        UserRoles userRole = userRepository.getUserRole(userId);
 
-            Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
-            final DateTimeFormatter jsonFmt = DateTimeFormatter.ISO_DATE;
+        // Status checks: role & user
+        result.setRoleStatus(userRole.getRoleStatus());
+        result.setUserStatus(user.getAccountStatus());
+        result.setPasswordLoginStatus(user.getPasswordLogin());
 
-            for (int i = 0; i < chunk.size(); i++) {
-                ExcelRowData r = chunk.get(i);
-                int globalIdx = globalOffset + i + 1;
-                String jId = batchId + "-" + globalIdx;
+        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
+            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
 
-                BigDecimal absAmt = (r.amount != null) ? r.amount.abs() : BigDecimal.ZERO;
-                boolean isCredit = "Credit".equalsIgnoreCase(r.txnType) || "Cr".equalsIgnoreCase(r.txnType);
-                BigDecimal signedAmt = isCredit ? absAmt.negate() : absAmt;
+        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
 
-                if (isCredit) credit.add(absAmt.longValue());
-                else debit.add(absAmt.longValue());
-
-                LocalDate rDate = LocalDate.now();
-                if (r.isSystemFormat && r.sysDate != null && r.sysDate.length() == 8) {
-                    try { rDate = LocalDate.parse(r.sysDate, DateTimeFormatter.ofPattern("ddMMyyyy")); } catch (Exception e) {}
+        // Proceed by login mode
+        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
+            // CHECK 1: Is Password Login Allowed? (Handles Attempt 6+)
+            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
+            } else {
+                // This block executes for the 6th attempt onwards (Already Locked)
+                result.setValidCredentials(false);
+                result.setPasswordLoginStatus(user.getPasswordLogin()); // Status is INACTIVE
+                result.setMessage("Your account is locked due to multiple failed attempts.");
+                // Specific check to return "Out of Attempts" style message
+                if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                    result.setMessage("Your account is locked due to multiple failed attempts.");
+                    result.setAttemptsLeft(0); // Explicitly send 0
+                    attempt.setFailureReason("Account Locked (Pre-check)");
+                } else {
+                    result.setMessage("Password login is disabled.");
+                    attempt.setFailureReason("Password login disabled");
                 }
-
-                ps.setString(1, "P");
-                ps.setString(2, "ADD");
-                ps.setTimestamp(3, ts);
-                ps.setString(4, creatorId);
-                ps.setInt(5, creatorRole != null ? creatorRole : 0);
-                ps.setString(6, batchId);
-                ps.setString(7, jId);
-                ps.setString(8, commonRemarks);
-                ps.setString(9, buildJsonPayloadFast(r, signedAmt, rDate, batchId, jId, commonRemarks, globalIdx, jsonFmt));
-                ps.setString(10, r.branch);
-                ps.setString(11, r.currency);
-                ps.setString(12, r.cgl);
-                ps.setBigDecimal(13, signedAmt);
-                ps.setDate(14, java.sql.Date.valueOf(rDate));
-                ps.setString(15, r.remarks);
-                ps.setString(16, r.productCode);
-
-                ps.addBatch();
             }
+        } else {
+            // SSO-based login
+            attempt.setSuccess("Y");
+            attempt.setFailureReason("SUCCESS");
+            result.setValidCredentials(true);
 
-            ps.executeBatch();
-            conn.commit(); 
-
-        } catch (SQLException e) {
-            log.error("Raw JDBC Batch Insert Failed", e);
-            throw new RuntimeException("DB Error", e);
+            // If password-login was disabled, re-enable it on successful SSO per your original logic
+            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                user.setPasswordLogin(Constants.ACTIVE);
+                userRepository.save(user);
+            }
         }
+
+        // On success, mint token and populate token data
+        if (result.isValidCredentials()) {
+            log.info("Credentials validated. Issuing token for userId={}", userId);
+
+            UserDto safeClaims = new UserDto();
+            safeClaims.setUserId(user.getUserId());
+            safeClaims.setUserrole(userRole.getRole());
+
+            @SuppressWarnings("unchecked")
+            String accessToken = HmacJwtUtil.generate(
+                    hmacSecret,
+                    user.getUserId(),
+                    ttlSeconds,
+                    mapper.convertValue(safeClaims, Map.class)
+            );
+
+            UserTokenDataDto tokenData = initializeTokenData(user, userRole);
+            result.setAccessToken(accessToken);
+            result.setUser(tokenData);
+        }
+
+        loginAttemptRepository.save(attempt);
+        log.debug("verifyUserCredentials result={}", result);
+        return result;
     }
 
-    private void cleanupFailedBatch(String batchId) {
-        try {
-            jdbcTemplate.update("DELETE FROM JOURNAL_REQUEST WHERE BATCH_ID = ?", batchId);
-            jdbcTemplate.update("DELETE FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", batchId);
-        } catch (Exception e) {
-            log.warn("Cleanup failed", e);
-        }
-    }
-
-    // ==================================================================================
-    // 2. ASYNC APPROVAL (Progress + Executor & Creator Notification)
-    // ==================================================================================
-
+    /**
+     * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
+     * 1. Increments count on failure.
+     * 2. Calculates remaining attempts.
+     * 3. Locks account immediately if limit reached.
+     *
+     * @param password     raw password from the request
+     * @param loginAttempt login attempt entity to be updated with success/failure
+     * @param userInfo     output DTO updated with validity and attempts left
+     * @param user         the user entity being authenticated
+     * @param loginParam   login parameter configuration (e.g., permitted attempts)
+     */
+    @Transactional
     @Override
-    @Transactional
-    public void processBulkRequestsAsync(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) {
-        // Synchronous Lock
-        int updated = jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS = 'PENDING'", dto.getBatchId());
+    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
+        log.info("Password-based login for userId={}", user.getUserId());
 
-        if (updated == 0) {
-            log.warn("Race Condition detected! Batch {} is already being processed.", dto.getBatchId());
-            throw new IllegalStateException("Batch " + dto.getBatchId() + " is already queued or processed by another user.");
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
+
+        // 1. Check if ALREADY locked (Double safety, though verifyUserCredentials checks status earlier)
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            loginAttempt.setFailureReason("Account Locked");
+            userInfo.setValidCredentials(false);
+            userInfo.setMessage("Your account is locked. Please reset password or contact admin.");
+            userInfo.setAttemptsLeft(0);
+            return;
         }
-        
-        progressService.sendProgress(dto.getBatchId(), executorId, 0, "PROCESSING", "Approval Queued...");
-        self.executeAsyncBatchProcessing(dto, executorId);
-    }
 
-    @Async("bulkExecutor")
-    @Transactional
-    public void executeAsyncBatchProcessing(BulkProcessJournalRequestDto dto, String executorId) {
-        String batchId = dto.getBatchId();
-        
-        try {
-            // Fetch Creator ID
-            String creatorId = jdbcTemplate.queryForObject("SELECT CREATOR_ID FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", String.class, batchId);
+        // 2. Validate Password
+        if (encoder.matches(password, user.getPasswordHash())) {
+            // --- SUCCESS CASE ---
+            loginAttempt.setSuccess("Y");
+            loginAttempt.setFailureReason("Success");
+            userInfo.setValidCredentials(true);
+            userInfo.setMessage("Login Successful");
 
-            progressService.sendProgress(batchId, executorId, 20, "PROCESSING", "Processing on Database...");
+            // Reset count on success
+            user.setUserWrongPasswordCount(0);
+            userRepository.save(user);
+            return;
+        }
 
-            if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+        // --- FAILURE CASE ---
+        log.warn("Password mismatch for user {}", user.getUserId());
 
-                log.info("Calling Oracle Procedure for Batch {}", batchId);
-                // PL/SQL Call
-                jdbcTemplate.execute(
-                        "{call PROCESS_JOURNAL_BATCH(?, ?, ?, ?, ?)}",
-                        (CallableStatementCallback<Object>) cs -> {
-                            cs.setString(1, batchId);
-                            cs.setString(2, executorId);
-                            cs.setString(3, dto.getRemarks());
-                            cs.setString(4, "A");
-                            cs.registerOutParameter(5, -10);
-                            cs.execute();
-                            return null;
-                        }
+        // Increment the count immediately
+        int newFailedCount = currentFailedCount + 1;
+        user.setUserWrongPasswordCount(newFailedCount);
+        loginAttempt.setSuccess("N");
+
+        // Mark credentials invalid
+        userInfo.setValidCredentials(false);
+
+        // If max attempts reached → LOCK ACCOUNT
+        if (newFailedCount >= maxAllowed) {
+            user.setPasswordLogin(Constants.INACTIVE);
+//            user.setAccountStatus(Constants.LOCKED);
+            loginAttempt.setFailureReason("Account Locked: Maximum Login Attempts Reached");
+            userInfo.setMessage(
+                    "Your account has been locked due to multiple unsuccessful login attempts. "
+                            + "Please contact support."
+            );
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
+        } else {
+            int remaining = maxAllowed - newFailedCount;
+            loginAttempt.setFailureReason("Wrong Password");
+            // Conditional professional messages
+            if (remaining > 1) {
+                // First & second wrong attempt
+                userInfo.setMessage(
+                        "Incorrect password. Please check your credentials and try again."
                 );
-
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ACCEPTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                        executorId, dto.getRemarks(), batchId);
-
-                // --- NOTIFICATIONS ---
-                // 1. Progress Done
-                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Approved Successfully");
-
-                // 2. Notify Executor (Task Done)
-                sendNotification(executorId, null, "You approved Batch " + batchId, batchId);
-
-                // 3. Notify Creator (Outcome)
-                if (creatorId != null && !creatorId.equals(executorId)) {
-                    sendNotification(creatorId, null, "Your Batch " + batchId + " has been ACCEPTED.", batchId);
-                }
-
-                logAudit(executorId, "APPROVE_SUCCESS", "BATCH_ASYNC", "Approved Batch " + batchId);
-                log.info("✅ Batch {} Processed & ACCEPTED", batchId);
-
-            } else if (RequestStatus.REJECTED.equals(dto.getStatus())) {
-                jdbcTemplate.update("UPDATE JOURNAL_REQUEST SET REQ_STATUS = 'R', EXECUTOR_ID = ?, EXECUTOR_REMARKS = ?, EXECUTION_DATE = SYSDATE WHERE BATCH_ID = ? AND REQ_STATUS = 'P'",
-                        executorId, dto.getRemarks(), batchId);
-
-                jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'REJECTED', EXECUTOR_ID = ?, EXECUTION_DATE = SYSTIMESTAMP, EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?",
-                        executorId, dto.getRemarks(), batchId);
-
-                logAudit(executorId, "REJECT_OK", "BATCH_ASYNC", "Rejected Batch " + batchId);
-
-                // --- NOTIFICATIONS ---
-                progressService.sendProgress(batchId, executorId, 100, "COMPLETED", "Batch Rejected");
-                sendNotification(executorId, null, "You rejected Batch " + batchId, batchId);
-                if (creatorId != null && !creatorId.equals(executorId)) {
-                    sendNotification(creatorId, null, "Your Batch " + batchId + " was REJECTED.", batchId);
-                }
+            } else {
+                // Last attempt warning
+                userInfo.setMessage(
+                        "Incorrect password. ⚠️ This is your final attempt. "
+                                + "One more failed login will lock your account."
+                );
             }
-        } catch (Exception e) {
-            log.error("Async Process Failed for Batch {}", batchId, e);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "System Error: " + e.getMessage(), batchId);
-            progressService.sendProgress(batchId, executorId, 0, "FAILED", "Error: " + e.getMessage());
-        }
-    }
-
-    // ==================================================================================
-    // 3. ASYNC DELETION (Progress + Notification)
-    // ==================================================================================
-
-    @Override
-    @Transactional
-    public void cancelMyRequestsByBatchIdAsync(String batchId, String userId) {
-        int updated = jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'QUEUED' WHERE BATCH_ID = ? AND BATCH_STATUS IN ('PENDING', 'ERROR')", batchId);
-
-        if (updated == 0) {
-            throw new IllegalStateException("Batch is already being processed or deleted.");
+            userInfo.setAttemptsLeft(remaining);
         }
 
-        progressService.sendProgress(batchId, userId, 0, "PROCESSING", "Deleting Batch...");
-        self.executeAsyncBatchCancellation(batchId, userId);
+        // Persist user state
+        userRepository.save(user);
     }
 
+    /**
+     * Produces a human-readable message describing a blocked login due to {@code status} of a given {@code type}.
+     *
+     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
+     * @param type   subject type (e.g., "user", "role")
+     * @return formatted message
+     */
     @Override
-    @Async("bulkExecutor")
-    public void executeAsyncBatchCancellation(String batchId, String userId) {
-        long start = System.currentTimeMillis();
-        try {
-            progressService.sendProgress(batchId, userId, 20, "PROCESSING", "Purging Data...");
-            
-            jdbcTemplate.execute(
-                    "{call PURGE_JOURNAL_BATCH(?, ?)}",
-                    (CallableStatementCallback<Object>) cs -> {
-                        cs.setString(1, batchId);
-                        cs.setString(2, userId);
-                        cs.execute();
-                        return null;
-                    }
+    public String generateStatusMessage(String status, String type) {
+        return String.format("Trying to login with a %s %s", status, type);
+    }
+
+
+    /**
+     * Checks the status and requirements for a user attempting to log in (without performing login).
+     *
+     * @param userId the user identifier
+     * @return {@link VerifyUserDTO} describing status, password update requirements, and messages
+     */
+    @Transactional(readOnly = true)
+    public VerifyUserDTO checkUser(String userId) {
+        VerifyUserDTO out = new VerifyUserDTO();
+        out.setUserId(userId);
+
+        User user = userRepository.findByUserId(userId);
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        out.setLoginMethod(loginParam.getActiveLoginMode());
+
+        if (user == null) {
+            // Invalid user
+            out.setUserCheck(false);
+            out.setUserStatus(Constants.INVALID);
+            out.setMessage("Invalid User");
+            return out;
+        }
+
+        // Existing user
+        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            // Password validity window based on tempPasswordSetAt (guard nulls)
+            Timestamp setAt = user.getTempPasswordSetAt();
+            boolean isPasswordValid = false;
+            if (setAt != null) {
+                LocalDateTime lastUpdate = setAt.toLocalDateTime();
+                isPasswordValid = LocalDateTime.now()
+                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+            }
+
+            UserRoles userRole = userRepository.getUserRole(userId);
+            out.setRoleStatus(userRole.getRoleStatus());
+            out.setUpdatePassword(user.getPasswordHash() == null || !isPasswordValid);
+            out.setUserStatus(Constants.ACTIVE);
+            out.setMessage(Constants.ACTIVE_USER);
+            out.setPasswordLoginStatus(user.getPasswordLogin());
+        } else {
+            // Inactive, Locked, Pending_Verification
+            String accountStatus = user.getAccountStatus();
+            out.setUserCheck(true);
+            out.setUserStatus(accountStatus);
+//            out.setPasswordLoginStatus(user.getPasswordLogin());
+            out.setMessage(
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact admin."
+                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
             );
-
-            logAudit(userId, "CANCEL_SUCCESS", "BATCH_ASYNC", "Deleted " + batchId);
-
-            // Final Notifications
-            progressService.sendProgress(batchId, userId, 100, "COMPLETED", "Batch Deleted");
-            sendNotification(userId, null, "Batch " + batchId + " deleted successfully.", batchId);
-
-            log.info("✅ Batch {} DELETED in {}ms", batchId, System.currentTimeMillis() - start);
-
-        } catch (Exception e) {
-            log.error("Delete Failed", e);
-            jdbcTemplate.update("UPDATE JOURNAL_BATCH_MASTER SET BATCH_STATUS = 'ERROR', EXECUTOR_REMARKS = ? WHERE BATCH_ID = ?", "Delete Failed: " + e.getMessage(), batchId);
-            progressService.sendProgress(batchId, userId, 0, "FAILED", "Delete Failed: " + e.getMessage());
         }
+
+        return out;
     }
 
-    // ==================================================================================
-    // 4. UTILS & SUMMARY
-    // ==================================================================================
+    /**
+     * Updates the user's password hash and resets the temporary password timestamp.
+     * <p><strong>TODO:</strong> Integrate OTP validation before update.</p>
+     *
+     * @param userCredentials input DTO with {@code userId} and new raw {@code password}
+     * @return {@link UpdatePasswordDTO} indicating success and message; sensitive fields are cleared
+     */
+    @Transactional
+    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
+        String userId = userCredentials.getUserId();
+        String password = userCredentials.getPassword();
 
-    @Override
-    public List<Map<String, Object>> getPendingBatchSummaries() {
-        String sql = """
-            SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_REMARKS
-            FROM JOURNAL_BATCH_MASTER 
-            WHERE BATCH_STATUS IN ('PENDING', 'ERROR') 
-            ORDER BY REQ_DATE DESC
-        """;
+        // Always sanitize outbound fields
+        userCredentials.setUpdateFlag(false);
+        userCredentials.setPassword("");
+        userCredentials.setOtp("");
 
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS"));
-            if ("ERROR".equals(rs.getString("BATCH_STATUS"))) {
-                map.put("errorMessage", rs.getString("EXECUTOR_REMARKS"));
-            }
-            return map;
-        });
-    }
-
-    private void sendNotification(String userId, String roles, String message, String batchId) {
         try {
-            String url = "/journal-view/" + batchId; 
-            notificationWriterService.createNotification(userId, roles, message, url, batchId, "JournalService");
+            User user = userRepository.findByUserId(userId);
+            if (user == null) {
+                userCredentials.setMessage("Invalid user id");
+                return userCredentials;
+            }
+
+            String passwordHash = encoder.encode(password);
+            user.setPasswordHash(passwordHash);
+            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
+            userRepository.save(user);
+
+            userCredentials.setMessage("User password successfully updated");
+            userCredentials.setUpdateFlag(true);
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Data integrity violation while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Failed to change password, please try again");
         } catch (Exception e) {
-            log.warn("Failed to send persistent notification", e);
+            log.error("Unexpected error while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Unexpected error while changing password");
         }
+
+        return userCredentials;
     }
 
-    // ... [Other Helper Methods like logAudit, buildJsonPayloadFast remain unchanged] ...
-    
-    // Copy the rest of the existing methods (getAllBatchSummaries, etc.) from your uploaded file
+    // ======= Helpers =======
+
+    /**
+     * Initializes the token-visible user data embedded/returned alongside the JWT.
+     *
+     * @param user     the user entity
+     * @param userRole the role mapping for the user
+     * @return user token DTO with non-sensitive fields
+     */
+    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
+        UserTokenDataDto tokenData = new UserTokenDataDto();
+        tokenData.setFirstName(user.getFirstName());
+        tokenData.setLastName(user.getLastName());
+        tokenData.setPhoneNumber(user.getPhoneNumber());
+        tokenData.setUserId(user.getUserId());
+        tokenData.setBranch(user.getBranch());
+        tokenData.setEmail(user.getEmail());
+        tokenData.setRole(userRole.getRole());
+        tokenData.setRoleName(userRole.getRoleName());
+        return tokenData;
+    }
+
+
+    /**
+     * Retrieves the full user profile for Token Refresh.
+     * Uses the exact same structure as verifyUserCredentials to ensure token claims are identical.
+     */
     @Override
-    public List<Map<String, Object>> getAllBatchSummaries() {
-        String sql = "SELECT BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS, EXECUTOR_ID, EXECUTOR_REMARKS FROM JOURNAL_BATCH_MASTER ORDER BY REQ_DATE DESC FETCH FIRST 100 ROWS ONLY";
-        return jdbcTemplate.query(sql, (rs, rowNum) -> {
-            Map<String, Object> map = new HashMap<>();
-            map.put("batchId", rs.getString("BATCH_ID"));
-            map.put("creatorId", rs.getString("CREATOR_ID"));
-            map.put("requestDate", rs.getTimestamp("REQ_DATE"));
-            map.put("commonBatchRemarks", rs.getString("BATCH_REMARKS"));
-            map.put("requestCount", rs.getLong("TOTAL_ROWS"));
-            map.put("totalDebit", rs.getBigDecimal("TOTAL_DEBIT"));
-            map.put("totalCredit", rs.getBigDecimal("TOTAL_CREDIT"));
-            map.put("requestStatus", rs.getString("BATCH_STATUS"));
-            map.put("executorId", rs.getString("EXECUTOR_ID"));
-            map.put("executorRemarks", rs.getString("EXECUTOR_REMARKS"));
-            return map;
-        });
-    }
-    
-    // ... [Include standard override methods from your uploaded file] ...
-    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-        return "{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"" + pDate.format(fmt) + "\"," +
-                "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
-                "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
-                "\"productType\":\"" + (row.productCode == null ? "" : row.productCode) + "\"," +
-                "\"remarks\":\"" + (row.remarks == null ? "" : escapeJson(row.remarks)) + "\"," +
-                "\"arFlag\":\"A\",\"acClassification\":\"A\",\"batchId\":\"" + batchId + "\"," +
-                "\"journalId\":\"" + jId + "\",\"commonBatchRemarks\":\"" + escapeJson(rem) + "\"," +
-                "\"transactionCount\":" + count + "}";
-    }
-    private String escapeJson(String s) { return s == null ? "" : s.replace("\"", "\\\"").replace("\\", "\\\\"); }
-    
-    @Override public long getRequestCountByBatchId(String batchId) { try { return jdbcTemplate.queryForObject("SELECT TOTAL_ROWS FROM JOURNAL_BATCH_MASTER WHERE BATCH_ID = ?", Long.class, batchId); } catch (Exception e) { return 0; } }
-    @Override public LocalDate getCurrentPostingDate() { return LocalDate.now(); }
-    @Override public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException { return new ArrayList<>(); }
-    @Override public String createBulkBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException { return ""; }
-    @Override public String createBatchFromCache(String requestId, String commonRemarks, String creatorId, Integer creatorRole) throws IOException { return createBatchFromCacheAsync(requestId, commonRemarks, creatorId, creatorRole); }
-    @Override public List<JournalRequest> processBulkRequests(BulkProcessJournalRequestDto dto, String executorId, Integer executorRole) { processBulkRequestsAsync(dto, executorId, executorRole); return new ArrayList<>(); }
-    @Override public Optional<JournalRequest> updateRequestStatus(ProcessJournalRequestDto dto, String executorId, Integer executorRole) throws JsonProcessingException { return Optional.empty(); }
-    @Override public List<JournalRequest> getMyRequests(String userId) { return new ArrayList<>(); }
-    @Override public List<JournalRequest> getPendingRequests(String userId, Integer userRole) { return new ArrayList<>(); }
-    @Override public List<JournalRequest> getRequestsByBatchId(String batchId) { return new ArrayList<>(); }
-    @Override public Page<JournalRequest> getRequestsByBatchIdPaginated(String batchId, Pageable pageable) { return null; }
-    @Override public List<JournalRequestStatusDto> getJournalRequestStatusList() { return new ArrayList<>(); }
-    @Override public void cancelMyRequest(Long requestId, String userId) {}
-    @Override public void cancelMyRequestsByBatchId(String batchId, String userId) {}
-    @Override public void cancelMyRequestsByJournalPrefixes(List<String> journalIdPrefixes, String userId) {}
-    @Override public void cancelMyRequestsByJournalPrefix(String journalIdPrefix, String userId) {}
-    @Override public int deleteBatchChunk(String batchId, String userId) { return 0; }
-}
+    @Transactional(readOnly = true)
+    public UserDto getUserProfile(String userId) {
+        User user = userRepository.findByUserId(userId);
+        UserRoles userRole = userRepository.getUserRole(userId);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.JournalService.Service;
-
-import com.fasterxml.jackson.annotation.JsonFormat;
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.annotation.JsonPropertyOrder;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.JournalService.Dto.BulkUploadStateDto;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.streaming.SXSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-
-import java.io.*;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class JournalBulkValidationService {
-
-    private static final Pattern CLEAN_AMOUNT_REGEX = Pattern.compile("[^0-9.]");
-    private static final Pattern PRODUCT_CODE_REGEX = Pattern.compile("^\\d{8}$");
-    private static final Pattern CGL_FORMAT_REGEX = Pattern.compile("^\\d{10}$");
-    private static final DateTimeFormatter SYSTEM_DATE_FMT = DateTimeFormatter.ofPattern("ddMMyyyy");
-
-    private final ValidationMasterService validationMasterService;
-    private final ObjectMapper objectMapper;
-    private final ProgressService progressService;
-
-    @Autowired
-    @Qualifier("byteArrayRedisTemplate")
-    private RedisTemplate<String, byte[]> redisTemplate;
-
-    private final Map<String, BulkUploadStateDto> statusCache = new ConcurrentHashMap<>();
-
-    @Autowired
-    @Lazy
-    private JournalBulkValidationService self;
-
-    public BulkUploadStateDto getState(String reqId) {
-        return statusCache.get(reqId);
-    }
-
-    public byte[] getFileBytes(String reqId, String type) {
-        return redisTemplate.opsForValue().get("FILE_" + reqId + "_" + type);
-    }
-
-    public List<ExcelRowData> getValidRowsFromCache(String requestId) {
-        long start = System.currentTimeMillis();
-        byte[] compressed = redisTemplate.opsForValue().get("DATA_" + requestId);
-        if (compressed == null) return Collections.emptyList();
-
-        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
-            List<ExcelRowData> rows = objectMapper.readValue(gis, new TypeReference<List<ExcelRowData>>() {});
-            log.info("Decompressed {} rows from Redis in {}ms", rows.size(), System.currentTimeMillis() - start);
-            return rows;
-        } catch (IOException e) {
-            log.error("Failed to decompress rows from Redis", e);
-            return Collections.emptyList();
+        // Return null if user doesn't exist, caller handles the error
+        if (user == null) {
+            return null;
         }
-    }
-
-    private void saveRowsToRedis(String requestId, List<ExcelRowData> rows) {
-        long start = System.currentTimeMillis();
-        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             GZIPOutputStream gos = new GZIPOutputStream(baos)) {
-            objectMapper.writeValue(gos, rows);
-            gos.finish();
-            byte[] compressed = baos.toByteArray();
-            redisTemplate.opsForValue().set("DATA_" + requestId, compressed, 1, TimeUnit.HOURS);
-            log.info("Compressed and saved {} rows to Redis in {}ms (Size: {} bytes)", rows.size(), System.currentTimeMillis() - start, compressed.length);
-        } catch (IOException e) {
-            log.error("Failed to save rows to Redis", e);
-        }
-    }
-
-    // Updated Signature: Requires userId
-    public String initiateValidation(byte[] fileBytes, String filename, LocalDate postingDate, String userId) throws IOException {
-        String requestId = UUID.randomUUID().toString();
-        BulkUploadStateDto state = new BulkUploadStateDto();
-        state.setRequestId(requestId);
-        state.setStatus("PROCESSING");
-        state.setCurrentStage(1);
-        state.setMessage("Initializing Upload...");
-        state.setTotalRows(0);
-        statusCache.put(requestId, state);
-
-        self.processAsync(requestId, fileBytes, filename, postingDate, userId);
-        return requestId;
-    }
-
-    @Async("bulkExecutor")
-    public void processAsync(String requestId, byte[] fileBytes, String filename, LocalDate postingDate, String userId) {
-        log.info("Starting Async Validation for ReqID: {}", requestId);
-        progressService.sendProgress(requestId, userId, 0, "PROCESSING", "Starting Validation...");
-        
-        try {
-            updateState(requestId, s -> s.setMessage("Parsing File..."));
-            progressService.sendProgress(requestId, userId, 5, "PROCESSING", "Parsing File...");
-            
-            List<ExcelRowData> parsedRows;
-            boolean isCsv = filename != null && (filename.toLowerCase().endsWith(".csv") || filename.toLowerCase().endsWith(".txt"));
-
-            if (isCsv) parsedRows = parseCsvBytes(fileBytes, postingDate);
-            else parsedRows = parseExcelBytes(fileBytes, postingDate);
-
-            updateState(requestId, s -> {
-                s.setTotalRows(parsedRows.size());
-                s.setMessage("Validating Formats...");
-            });
-
-            // Format Check (20-40%)
-            progressService.sendProgress(requestId, userId, 20, "PROCESSING", "Checking Formats...");
-            if (runFormatCheck(parsedRows, requestId, userId)) {
-                failRequest(requestId, parsedRows, "Format Validation Failed", 1, userId);
-                return;
-            }
-
-            updateState(requestId, s -> {
-                s.setCurrentStage(2);
-                s.setMessage("Checking Database...");
-            });
-
-            // DB Check (40-70%)
-            progressService.sendProgress(requestId, userId, 40, "PROCESSING", "Validating Data...");
-            if (runDbCheck(parsedRows, requestId, userId)) {
-                failRequest(requestId, parsedRows, "Database Validation Failed", 2, userId);
-                return;
-            }
-
-            updateState(requestId, s -> {
-                s.setCurrentStage(3);
-                s.setMessage("Checking Balances...");
-            });
-
-            // Balance Check
-            progressService.sendProgress(requestId, userId, 70, "PROCESSING", "Checking Balances...");
-            if (runBalanceCheck(parsedRows)) {
-                failRequest(requestId, parsedRows, "Debit/Credit Balance Mismatch", 3, userId);
-                return;
-            }
-
-            progressService.sendProgress(requestId, userId, 90, "PROCESSING", "Generating Report...");
-            completeRequest(requestId, parsedRows, postingDate, isCsv, userId);
-
-        } catch (Exception e) {
-            log.error("Async Validation Error", e);
-            updateState(requestId, s -> {
-                s.setStatus("ERROR");
-                s.setMessage("System Error: " + e.getMessage());
-                s.setHasErrorFile(false);
-            });
-            progressService.sendProgress(requestId, userId, 0, "FAILED", "Error: " + e.getMessage());
-        }
-    }
-
-    private boolean runDbCheck(List<ExcelRowData> rows, String reqId, String userId) {
-        Set<String> validBranches = validationMasterService.getAllActiveBranches();
-        Set<String> validCurrs = validationMasterService.getAllActiveCurrencies();
-        Set<String> validCgls = validationMasterService.getAllActiveCgls();
-
-        AtomicInteger counter = new AtomicInteger(0);
-        int total = rows.size();
-        int chunkSize = Math.max(1, total / 20);
-
-        rows.parallelStream().forEach(d -> {
-            if (!validBranches.contains(d.branch)) d.dbErrors.add("Branch Not Found/Inactive: " + d.branch);
-            if (!validCurrs.contains(d.currency)) d.dbErrors.add("Currency Not Found/Inactive: " + d.currency);
-            if (!validCgls.contains(d.cgl)) d.dbErrors.add("CGL Not Found/Inactive: " + d.cgl);
-            
-            int c = counter.incrementAndGet();
-            if (c % chunkSize == 0) {
-                int p = 40 + (c * 30 / total); 
-                progressService.sendProgress(reqId, userId, p, "PROCESSING", "Validating: " + c + "/" + total);
-            }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-    
-    private boolean runFormatCheck(List<ExcelRowData> rows, String reqId, String userId) {
-        AtomicInteger counter = new AtomicInteger(0);
-        int total = rows.size();
-        int chunkSize = Math.max(1, total / 10); 
-
-        rows.parallelStream().forEach(d -> {
-             if (d.amount == null || d.amount.compareTo(BigDecimal.ZERO) == 0) d.formatErrors.add("Amount cannot be Zero or Null");
-             if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches()) d.formatErrors.add("Product Code Invalid");
-             if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks Mandatory");
-             if (d.currency == null || d.currency.length() != 3) d.formatErrors.add("Currency Invalid");
-             if (d.cgl == null || !CGL_FORMAT_REGEX.matcher(d.cgl).matches()) d.formatErrors.add("CGL Invalid");
-             if (d.branch == null || d.branch.trim().isEmpty()) d.formatErrors.add("Branch Mandatory");
-
-             int c = counter.incrementAndGet();
-             if (c % chunkSize == 0) {
-                 int p = 20 + (c * 20 / total); 
-                 progressService.sendProgress(reqId, userId, p, "PROCESSING", "Formatting: " + c + "/" + total);
-             }
-        });
-        return rows.stream().anyMatch(ExcelRowData::hasErrors);
-    }
-
-    private void failRequest(String reqId, List<ExcelRowData> rows, String msg, int stage, String userId) throws IOException {
-        byte[] excel = new JournalBulkValidationHelper().generateErrorExcelFast(rows);
-        redisTemplate.opsForValue().set("FILE_" + reqId + "_ERROR", excel, 30, TimeUnit.MINUTES);
-        updateState(reqId, s -> { s.setStatus("ERROR"); s.setMessage(msg); s.setCurrentStage(stage); s.setErrorCount(rows.stream().filter(ExcelRowData::hasErrors).count()); s.setHasErrorFile(true); });
-        progressService.sendProgress(reqId, userId, 100, "FAILED", msg);
-    }
-
-    private void completeRequest(String reqId, List<ExcelRowData> rows, LocalDate pDate, boolean isCsv, String userId) throws IOException {
-        saveRowsToRedis(reqId, rows);
-        if (!isCsv) {
-            byte[] csv = new JournalBulkValidationHelper().generateSuccessCsv(rows, pDate);
-            redisTemplate.opsForValue().set("FILE_" + reqId + "_SUCCESS", csv, 30, TimeUnit.MINUTES);
-        }
-        List<Map<String, Object>> preview = rows.stream().limit(100).map(this::mapToPreview).collect(Collectors.toList());
-        updateState(reqId, s -> { s.setCurrentStage(4); s.setStatus("SUCCESS"); s.setMessage("Validation Successful"); s.setHasSuccessFile(!isCsv); try { s.setPreviewDataJson(objectMapper.writeValueAsString(preview)); } catch (Exception e) {} });
-        progressService.sendProgress(reqId, userId, 100, "COMPLETED", "Validation Successful");
-    }
-
-    private void updateState(String requestId, java.util.function.Consumer<BulkUploadStateDto> updater) {
-        BulkUploadStateDto state = statusCache.getOrDefault(requestId, new BulkUploadStateDto());
-        updater.accept(state);
-        statusCache.put(requestId, state);
-    }
-    
-    private List<ExcelRowData> parseCsvBytes(byte[] bytes, LocalDate postingDate) throws IOException {
-         return new ArrayList<>(new JournalBulkValidationHelper().parseCsvBytes(bytes, postingDate));
-    }
-    private List<ExcelRowData> parseExcelBytes(byte[] bytes, LocalDate postingDate) throws IOException {
-         return new ArrayList<>(new JournalBulkValidationHelper().parseExcelBytes(bytes, postingDate));
-    }
-    private boolean runBalanceCheck(List<ExcelRowData> rows) { return new JournalBulkValidationHelper().runBalanceCheck(rows); }
-    
-    private Map<String, Object> mapToPreview(ExcelRowData r) {
-        Map<String, Object> m = new HashMap<>(); m.put("id", r.rowIndex); m.put("branch", r.branch); m.put("currency", r.currency); m.put("cgl", r.cgl); m.put("amount", r.amount); m.put("txnType", r.txnType); m.put("remarks", r.remarks); return m;
-    }
-    public byte[] generateTemplateBytes() throws IOException { return new byte[0]; }
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    @JsonFormat(shape = JsonFormat.Shape.ARRAY)
-    @JsonPropertyOrder({ "rowIndex", "branch", "currency", "cgl", "txnType", "remarks", "productCode", "amount", "isSystemFormat", "sysSite", "sysDate", "sysYear", "sysPeriod", "formatErrors", "dbErrors", "balErrors" })
-    public static class ExcelRowData {
-        public ExcelRowData() {}
-        public int rowIndex;
-        public String branch="", currency="", cgl="", txnType="", remarks="", productCode="";
-        public BigDecimal amount;
-        public boolean isSystemFormat=false;
-        public String sysSite="", sysDate="", sysYear="", sysPeriod="";
-        public List<String> formatErrors = Collections.synchronizedList(new ArrayList<>());
-        public List<String> dbErrors = Collections.synchronizedList(new ArrayList<>());
-        public List<String> balErrors = Collections.synchronizedList(new ArrayList<>());
-        public boolean hasErrors() { return !formatErrors.isEmpty() || !dbErrors.isEmpty() || !balErrors.isEmpty(); }
-        @JsonIgnore
-        public String getAllErrors() { List<String> all = new ArrayList<>(formatErrors); all.addAll(dbErrors); all.addAll(balErrors); return String.join("; ", all); }
-    }
-    
-    // Helper to keep class clean
-    private static class JournalBulkValidationHelper {
-        public List<ExcelRowData> parseCsvBytes(byte[] bytes, LocalDate d) { return new ArrayList<>(); }
-        public List<ExcelRowData> parseExcelBytes(byte[] bytes, LocalDate d) { return new ArrayList<>(); }
-        public boolean runBalanceCheck(List<ExcelRowData> l) { return false; }
-        public byte[] generateErrorExcelFast(List<ExcelRowData> l) { return new byte[0]; }
-        public byte[] generateSuccessCsv(List<ExcelRowData> l, LocalDate d) { return new byte[0]; }
+        UserDto userDto = new UserDto();
+        userDto.setUserId(user.getUserId());
+        userDto.setUserStatus(user.getPasswordLogin());
+        userDto.setPasswordLoginStatus(user.getPasswordLogin());
+        userDto.setUser(initializeTokenData(user, userRole));
+        return userDto;
     }
 }
-
-
-
