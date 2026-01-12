@@ -74,3 +74,120 @@ public class LdapConfig {
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.ldap.CommunicationException;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AdAuthenticationService {
+
+    private final LdapTemplate ldapTemplate;
+
+    @Value("${spring.ldap.domain:UATAD.SBI}")
+    private String adDomain;
+
+    /**
+     * @return true if success, false if invalid credentials.
+     * @throws RuntimeException if the server is unreachable (so we don't lock the user account).
+     */
+    public boolean authenticate(String username, String password) {
+        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+            return false;
+        }
+
+        try {
+            String principalName = username + "@" + adDomain;
+            log.info("Attempting LDAP Bind for principal: {}", principalName);
+
+            boolean authenticated = ldapTemplate.authenticate(
+                "", 
+                "(sAMAccountName=" + username + ")", 
+                password
+            );
+
+            if (authenticated) {
+                log.info("LDAP Success: {}", username);
+                return true;
+            } else {
+                log.warn("LDAP Invalid Credentials: {}", username);
+                return false;
+            }
+
+        } catch (CommunicationException e) {
+            // Server is down or SSL failed.
+            log.error("LDAP CONNECTION ERROR: {}", e.getMessage());
+            // Throwing exception allows LoginService to know it wasn't a wrong password
+            throw new RuntimeException("LDAP Server Down"); 
+        } catch (Exception e) {
+            log.error("LDAP Generic Error", e);
+            return false;
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Inside LoginServiceImpl.java -> verifyUserCredentials
+
+if (activeMode == Constants.LDAP) {
+    try {
+        boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+        if (ldapSuccess) {
+            handleSuccess(attempt, result, user, userRole);
+        } else {
+            handleFailure(attempt, result, user, loginParam, "LDAP Invalid Credentials");
+        }
+    } catch (RuntimeException e) {
+        // Server Down - Do NOT increment wrong password count
+        log.error("Skipping Login Failure logic due to LDAP System Error");
+        result.setValidCredentials(false);
+        result.setMessage("System Error: Unable to verify credentials. Please contact support.");
+        // We do NOT save a failed attempt here
+        return result;
+    }
+}
+
+**Summary of what to do now:**
+1.  **Generate `ad-truststore.jks`** using the command in Step 2.
+2.  **Replace `LdapConfig.java`** with the one provided above.
+3.  **Run the app.** The SSL error will vanish, and you will either get "Login Successful" or "Invalid Credentials" (depending on if your password is actually correct).
+
