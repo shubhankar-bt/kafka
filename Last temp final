@@ -1,934 +1,491 @@
-package com.fincore.gateway.Service;
+package com.fincore.ReportService.controller;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.LoginAttempt;
-import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.model.User;
-import com.fincore.gateway.model.UserRoles;
-import com.fincore.gateway.repository.LoginAttemptRepository;
-import com.fincore.gateway.repository.LoginParamRepository;
-import com.fincore.gateway.repository.RolePermissionsRepository;
-import com.fincore.gateway.repository.UserRepository;
-import com.fincore.gateway.utility.Constants;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Service implementation handling user login/verification, menu resolution, and password updates.
- *
- * <p><strong>Responsibilities</strong>
- * <ul>
- *   <li>Validate credentials (password-based and SSO-based)</li>
- *   <li>Issue HS256 JWTs and embed limited user/role claims</li>
- *   <li>Transform role permissions into menu responses</li>
- *   <li>Track login attempts and enforce wrong password limits</li>
- * </ul>
- *
- * <p><strong>Notes</strong>
- * <ul>
- *   <li>JWT generation uses an HMAC Base64 secret; ensure it is configured for the environment.</li>
- *   <li>{@code BCryptPasswordEncoder} is created locally for convenience; consider injecting a singleton bean instead.</li>
- *   <li>Write operations are wrapped in {@link Transactional} where appropriate.</li>
- * </ul>
- */
-@Slf4j
-@Service("LoginService")
-@RequiredArgsConstructor
-public class LoginServiceImpl implements LoginService {
-
-    /**
-     * Prefer injecting a singleton bean; retained local instance for compatibility.
-     */
-    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
-
-
-    // ======= Config =======
-    private final UserRepository userRepository;
-    private final LoginAttemptRepository loginAttemptRepository;
-
-    // ======= Dependencies =======
-    private final LoginParamRepository loginParamRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final MenuService menuService;
-    private final ObjectMapper mapper;
-    /**
-     * Base64-encoded HMAC secret used to sign HS256 JWTs.
-     */
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-    /**
-     * Token time-to-live in seconds.
-     */
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long ttlSeconds;
-
-    // ======= Public API =======
-
-    /**
-     * Fetches role-wise permissions for the given user and transforms them into a menu response.
-     *
-     * @param userId ID of the user
-     * @return {@link MenuResponse} built from ordered permissions; empty if none or on error
-     */
-    @Transactional(readOnly = true)
-    @Override
-    public MenuResponse fetchRoleWiseData(String userId) {
-        log.info("Fetching role-wise data for userId: {}", userId);
-        try {
-            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
-
-            if (rows == null || rows.isEmpty()) {
-                log.info("No permissions found for userId: {}", userId);
-                return new MenuResponse(Collections.emptyList());
-            }
-            return menuService.transformFromProjection(rows);
-        } catch (Exception e) {
-            log.error("Error fetching permissions for userId: {}", userId, e);
-            return new MenuResponse(Collections.emptyList());
-        }
-    }
-
-    /**
-     * Verifies user credentials and, on success, builds {@link UserDto} populated with an access token and token data.
-     * <p>Also records the login attempt and enforces password attempt limits.</p>
-     *
-     * @param userCredentials payload containing {@code userId} and (for password mode) {@code password}
-     * @param clientIp        caller's IP address for audit
-     * @return {@link UserDto} with validity flags, statuses, and (if valid) a signed access token
-     */
-    @Transactional
-    @Override
-    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
-
-        final String userId = userCredentials.getUserId();
-        final String rawPassword = userCredentials.getPassword();
-
-        UserDto result = new UserDto();
-        User user = userRepository.findByUserId(userId);
-
-        if (user == null) {
-            result.setValidCredentials(false);
-            result.setUserStatus(Constants.INVALID);
-            log.info("Login attempt for invalid userId: {}", userId);
-            return result;
-        }
-
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        LoginAttempt attempt = new LoginAttempt();
-        attempt.setLoginMethod(loginParam.getActiveLoginMode() == 'P'
-                ? Constants.PASSWORD_BASED_LOGIN
-                : Constants.SSO_BASED_LOGIN);
-        attempt.setSuccess("N");
-        attempt.setIpAddress(clientIp);
-        attempt.setUserId(userId);
-
-        result.setLoginMethod(loginParam.getActiveLoginMode());
-        result.setUserId(user.getUserId());
-
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        // Status checks: role & user
-        result.setRoleStatus(userRole.getRoleStatus());
-        result.setUserStatus(user.getAccountStatus());
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
-            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        // Proceed by login mode
-        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
-            // CHECK 1: Is Password Login Allowed? (Handles Attempt 6+)
-            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-            } else {
-                // This block executes for the 6th attempt onwards (Already Locked)
-                result.setValidCredentials(false);
-                result.setPasswordLoginStatus(user.getPasswordLogin()); // Status is INACTIVE
-                result.setMessage("Your account is locked due to multiple failed attempts.");
-                // Specific check to return "Out of Attempts" style message
-                if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                    result.setMessage("Your account is locked due to multiple failed attempts.");
-                    result.setAttemptsLeft(0); // Explicitly send 0
-                    attempt.setFailureReason("Account Locked (Pre-check)");
-                } else {
-                    result.setMessage("Password login is disabled.");
-                    attempt.setFailureReason("Password login disabled");
-                }
-            }
-        } else {
-            // SSO-based login
-            attempt.setSuccess("Y");
-            attempt.setFailureReason("SUCCESS");
-            result.setValidCredentials(true);
-
-            // If password-login was disabled, re-enable it on successful SSO per your original logic
-            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                user.setPasswordLogin(Constants.ACTIVE);
-                userRepository.save(user);
-            }
-        }
-
-        // On success, mint token and populate token data
-        if (result.isValidCredentials()) {
-            log.info("Credentials validated. Issuing token for userId={}", userId);
-
-            UserDto safeClaims = new UserDto();
-            safeClaims.setUserId(user.getUserId());
-            safeClaims.setUserrole(userRole.getRole());
-
-            @SuppressWarnings("unchecked")
-            String accessToken = HmacJwtUtil.generate(
-                    hmacSecret,
-                    user.getUserId(),
-                    ttlSeconds,
-                    mapper.convertValue(safeClaims, Map.class)
-            );
-
-            UserTokenDataDto tokenData = initializeTokenData(user, userRole);
-            result.setAccessToken(accessToken);
-            result.setUser(tokenData);
-        }
-
-        loginAttemptRepository.save(attempt);
-        log.debug("verifyUserCredentials result={}", result);
-        return result;
-    }
-
-    /**
-     * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
-     * 1. Increments count on failure.
-     * 2. Calculates remaining attempts.
-     * 3. Locks account immediately if limit reached.
-     *
-     * @param password     raw password from the request
-     * @param loginAttempt login attempt entity to be updated with success/failure
-     * @param userInfo     output DTO updated with validity and attempts left
-     * @param user         the user entity being authenticated
-     * @param loginParam   login parameter configuration (e.g., permitted attempts)
-     */
-    @Transactional
-    @Override
-    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
-        log.info("Password-based login for userId={}", user.getUserId());
-
-        int currentFailedCount = user.getUserWrongPasswordCount();
-        int maxAllowed = loginParam.getWrongPasswordAttempts();
-
-        // 1. Check if ALREADY locked (Double safety, though verifyUserCredentials checks status earlier)
-        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            loginAttempt.setFailureReason("Account Locked");
-            userInfo.setValidCredentials(false);
-            userInfo.setMessage("Your account is locked. Please reset password or contact admin.");
-            userInfo.setAttemptsLeft(0);
-            return;
-        }
-
-        // 2. Validate Password
-        if (encoder.matches(password, user.getPasswordHash())) {
-            // --- SUCCESS CASE ---
-            loginAttempt.setSuccess("Y");
-            loginAttempt.setFailureReason("Success");
-            userInfo.setValidCredentials(true);
-            userInfo.setMessage("Login Successful");
-
-            // Reset count on success
-            user.setUserWrongPasswordCount(0);
-            userRepository.save(user);
-            return;
-        }
-
-        // --- FAILURE CASE ---
-        log.warn("Password mismatch for user {}", user.getUserId());
-
-        // Increment the count immediately
-        int newFailedCount = currentFailedCount + 1;
-        user.setUserWrongPasswordCount(newFailedCount);
-        loginAttempt.setSuccess("N");
-
-        // Mark credentials invalid
-        userInfo.setValidCredentials(false);
-
-        // If max attempts reached → LOCK ACCOUNT
-        if (newFailedCount >= maxAllowed) {
-            user.setPasswordLogin(Constants.INACTIVE);
-//            user.setAccountStatus(Constants.LOCKED);
-            loginAttempt.setFailureReason("Account Locked: Maximum Login Attempts Reached");
-            userInfo.setMessage(
-                    "Your account has been locked due to multiple unsuccessful login attempts. "
-                            + "Please contact support."
-            );
-            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
-            userInfo.setAttemptsLeft(0);
-        } else {
-            int remaining = maxAllowed - newFailedCount;
-            loginAttempt.setFailureReason("Wrong Password");
-            // Conditional professional messages
-            if (remaining > 1) {
-                // First & second wrong attempt
-                userInfo.setMessage(
-                        "Incorrect password. Please check your credentials and try again."
-                );
-            } else {
-                // Last attempt warning
-                userInfo.setMessage(
-                        "Incorrect password. ⚠️ This is your final attempt. "
-                                + "One more failed login will lock your account."
-                );
-            }
-            userInfo.setAttemptsLeft(remaining);
-        }
-
-        // Persist user state
-        userRepository.save(user);
-    }
-
-    /**
-     * Produces a human-readable message describing a blocked login due to {@code status} of a given {@code type}.
-     *
-     * @param status status string (e.g., ACTIVE/INACTIVE/LOCKED)
-     * @param type   subject type (e.g., "user", "role")
-     * @return formatted message
-     */
-    @Override
-    public String generateStatusMessage(String status, String type) {
-        return String.format("Trying to login with a %s %s", status, type);
-    }
-
-
-    /**
-     * Checks the status and requirements for a user attempting to log in (without performing login).
-     *
-     * @param userId the user identifier
-     * @return {@link VerifyUserDTO} describing status, password update requirements, and messages
-     */
-    @Transactional(readOnly = true)
-    public VerifyUserDTO checkUser(String userId) {
-        VerifyUserDTO out = new VerifyUserDTO();
-        out.setUserId(userId);
-
-        User user = userRepository.findByUserId(userId);
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        out.setLoginMethod(loginParam.getActiveLoginMode());
-
-        if (user == null) {
-            // Invalid user
-            out.setUserCheck(false);
-            out.setUserStatus(Constants.INVALID);
-            out.setMessage("Invalid User");
-            return out;
-        }
-
-        // Existing user
-        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            // Password validity window based on tempPasswordSetAt (guard nulls)
-            Timestamp setAt = user.getTempPasswordSetAt();
-            boolean isPasswordValid = false;
-            if (setAt != null) {
-                LocalDateTime lastUpdate = setAt.toLocalDateTime();
-                isPasswordValid = LocalDateTime.now()
-                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
-            }
-
-            UserRoles userRole = userRepository.getUserRole(userId);
-            out.setRoleStatus(userRole.getRoleStatus());
-            out.setUpdatePassword(user.getPasswordHash() == null || !isPasswordValid);
-            out.setUserStatus(Constants.ACTIVE);
-            out.setMessage(Constants.ACTIVE_USER);
-            out.setPasswordLoginStatus(user.getPasswordLogin());
-        } else {
-            // Inactive, Locked, Pending_Verification
-            String accountStatus = user.getAccountStatus();
-            out.setUserCheck(true);
-            out.setUserStatus(accountStatus);
-//            out.setPasswordLoginStatus(user.getPasswordLogin());
-            out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact admin."
-                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
-            );
-        }
-
-        return out;
-    }
-
-    /**
-     * Updates the user's password hash and resets the temporary password timestamp.
-     * <p><strong>TODO:</strong> Integrate OTP validation before update.</p>
-     *
-     * @param userCredentials input DTO with {@code userId} and new raw {@code password}
-     * @return {@link UpdatePasswordDTO} indicating success and message; sensitive fields are cleared
-     */
-    @Transactional
-    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
-        String userId = userCredentials.getUserId();
-        String password = userCredentials.getPassword();
-
-        // Always sanitize outbound fields
-        userCredentials.setUpdateFlag(false);
-        userCredentials.setPassword("");
-        userCredentials.setOtp("");
-
-        try {
-            User user = userRepository.findByUserId(userId);
-            if (user == null) {
-                userCredentials.setMessage("Invalid user id");
-                return userCredentials;
-            }
-
-            String passwordHash = encoder.encode(password);
-            user.setPasswordHash(passwordHash);
-            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
-            userRepository.save(user);
-
-            userCredentials.setMessage("User password successfully updated");
-            userCredentials.setUpdateFlag(true);
-        } catch (DataIntegrityViolationException e) {
-            log.warn("Data integrity violation while updating password for userId={}", userId, e);
-            userCredentials.setMessage("Failed to change password, please try again");
-        } catch (Exception e) {
-            log.error("Unexpected error while updating password for userId={}", userId, e);
-            userCredentials.setMessage("Unexpected error while changing password");
-        }
-
-        return userCredentials;
-    }
-
-    // ======= Helpers =======
-
-    /**
-     * Initializes the token-visible user data embedded/returned alongside the JWT.
-     *
-     * @param user     the user entity
-     * @param userRole the role mapping for the user
-     * @return user token DTO with non-sensitive fields
-     */
-    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
-        UserTokenDataDto tokenData = new UserTokenDataDto();
-        tokenData.setFirstName(user.getFirstName());
-        tokenData.setLastName(user.getLastName());
-        tokenData.setPhoneNumber(user.getPhoneNumber());
-        tokenData.setUserId(user.getUserId());
-        tokenData.setBranch(user.getBranch());
-        tokenData.setEmail(user.getEmail());
-        tokenData.setRole(userRole.getRole());
-        tokenData.setRoleName(userRole.getRoleName());
-        return tokenData;
-    }
-
-
-    /**
-     * Retrieves the full user profile for Token Refresh.
-     * Uses the exact same structure as verifyUserCredentials to ensure token claims are identical.
-     */
-    @Override
-    @Transactional(readOnly = true)
-    public UserDto getUserProfile(String userId) {
-        User user = userRepository.findByUserId(userId);
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        // Return null if user doesn't exist, caller handles the error
-        if (user == null) {
-            return null;
-        }
-        UserDto userDto = new UserDto();
-        userDto.setUserId(user.getUserId());
-        userDto.setUserStatus(user.getPasswordLogin());
-        userDto.setPasswordLoginStatus(user.getPasswordLogin());
-        userDto.setUser(initializeTokenData(user, userRole));
-        return userDto;
-    }
-}
-
-
-
-
-
-
-
-
-controller :
-
-
-
-
-package com.fincore.gateway.Controller;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.utility.Constants;
-import com.fincore.gateway.utility.LoginUtility;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
+import com.fincore.ReportService.dto.ReportCreationDto;
+import com.fincore.commonutilities.jwt.JwtUtil;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseCookie;
+
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.Base64;
-import java.util.List;
-import java.util.Map;
+import com.fincore.ReportService.dto.ReportDownloadRequest;
+import com.fincore.ReportService.dto.ReportStreamResponse;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.service.ReportService;
 
-/**
- * Authentication Controller (Reactive).
- * Handles Login, Logout, Check-User, and Token Refresh.
- * Wraps responses in ApiResponse for standard structure.
- */
 @Slf4j
 @RestController
-@RequestMapping("/api/auth")
-@RequiredArgsConstructor
-public class AuthController {
+@RequestMapping("/api/reports") 
+public class ReportController {
 
-    private static final String USER_PREFIX = "USR:";
-
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
-
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long accessTokenTtl;
-
-    @Value("${security.jwt.refresh-ttl-seconds:43200}")
-    private long refreshTokenTtl;
-
-    @Value("${security.login.blocked-ips:}")
-    private String blockedIpsConfig;
-
-    // =================================================================================================
-    //                                              HELPERS
-    // =================================================================================================
-
-    private String sanitizeIp(String rawIp) {
-        if (rawIp == null) return "";
-        String ip = rawIp;
-        if (ip.startsWith("/")) ip = ip.substring(1);
-        int colonIndex = ip.indexOf(':');
-        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
-        return ip;
+    private final ReportService reportService;
+    private final JwtUtil jwtUtil;
+    
+    public ReportController(ReportService reportService, JwtUtil jwtUtil) {
+        this.reportService = reportService;
+        this.jwtUtil = jwtUtil;
     }
 
-    private boolean isIpBlocked(String rawClientIp) {
-        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
-        String cleanIp = sanitizeIp(rawClientIp);
-        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
-        boolean blocked = blockedIps.contains(cleanIp);
-        if (blocked) log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", rawClientIp, cleanIp);
-        return blocked;
+    @PostMapping("/types")
+    public List<ReportTypeDto> getReportTypes(@RequestHeader("Authorization") String token) {
+        return reportService.getReportTypes(jwtUtil.getUserRoleFromToken(token));
     }
 
-    /**
-     * Creates a secure HttpOnly cookie for the refresh token.
-     * Prevents XSS attacks as JavaScript cannot read this cookie.
-     * <p>
-     * CONFIG NOTE:
-     * - secure(false): Allows HTTP (Localhost). Set to true in PROD with HTTPS.
-     * - sameSite("Lax"): Allows cross-origin navigation in Localhost dev.
-     * - path("/"): Ensures cookie is sent to all auth endpoints.
-     */
-    private ResponseCookie createRefreshTokenCookie(String token) {
-        return ResponseCookie.from("refresh_token", token)
-                .httpOnly(true)
-                .secure(true) // Set to true in PROD
-                .path("/")
-                .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Lax")
-                .build();
+    @PostMapping("/download")
+    public ResponseEntity<StreamingResponseBody> downloadReport(
+           @RequestHeader("Authorization") String token,
+           @RequestBody ReportDownloadRequest request) {
+            
+       ReportStreamResponse response = reportService.downloadReportStream(
+               request.getFileName(),
+               request.getDate(),
+               jwtUtil.getUserRoleFromToken(token),
+               jwtUtil.getUserIdFromToken(token)
+       );
+
+       return ResponseEntity.ok()
+               .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + response.getDownloadFileName() + "\"")
+               .contentType(MediaType.APPLICATION_OCTET_STREAM)
+               .body(response.getStreamBody());
     }
 
-    /**
-     * Creates an empty cookie to clear the refresh token on logout.
-     */
-    private ResponseCookie createEmptyCookie() {
-        return ResponseCookie.from("refresh_token", "")
-                .httpOnly(true)
-                .path("/")
-                .maxAge(0)
-                .build();
-    }
-
-    private Claims extractClaims(String token) {
-        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
-        return Jwts.parser()
-                .verifyWith(Keys.hmacShaKeyFor(secretBytes))
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    // =================================================================================================
-    //                                           ENDPOINTS
-    // =================================================================================================
-
-    @PostMapping(value = "/check-user")
-    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
-    {
-        final String rawClientIp = LoginUtility.getClientIp(request);
-        log.info("Check-User info user id: {} , ip : {}", body.get("userId"), rawClientIp);
-
-        // 1. IP BLOCK CHECK
-        if (isIpBlocked(rawClientIp)) {
-            log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
-            VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
-                    .userId(body.get("userId"))
-                    .message("Access denied: Your IP address is blocked.")
-                    .userStatus(Constants.RESTRICTED)
-                    .build();
-            // Returning success=true structure, but with restricted status as per existing logic
-            return Mono.just(ApiResponse.success(blockedResponse, "Access Restricted"));
-        }
-
-        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId")))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(dto -> ApiResponse.success(dto, "User check completed"));
-    }
-
-
-    /**
-     * LOGIN ENDPOINT
-     * 1. Validates credentials (Blocking DB call on Elastic Scheduler).
-     * 2. Generates Access Token & Refresh Token.
-     * 3. Stores Access Token JTI in Redis (Session Start).
-     * 4. Returns Access Token in Body, Refresh Token in HttpOnly Cookie.
-     */
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(
-            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload)
-    {
-        final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
-
-        // 1. IP BLOCK CHECK
-        if (isIpBlocked(clientIp)) {
-            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
-        }
-
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(user -> {
-
-                    // =========================================================
-                    // CASE 1: INVALID CREDENTIALS (Wrong Password / Locked)
-                    // =========================================================
-                    if (!user.isValidCredentials()) {
-                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
-
-                        // Build response to show Attempts Left
-                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .userStatus(user.getUserStatus())
-                                .passwordLoginStatus(user.getPasswordLoginStatus())
-                                .attemptsLeft(user.getAttemptsLeft()) // <--- PASS COUNT TO FRONTEND
-                                .error(user.getMessage())
-                                .build();
-
-                        // decide Status Code:
-                        // If attempts are 0 OR status is INACTIVE -> 403 Forbidden (Locked)
-                        // Otherwise -> 401 Unauthorized (Try again)
-                        HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
-                                ? HttpStatus.FORBIDDEN
-                                : HttpStatus.UNAUTHORIZED;
-
-                        return Mono.just(ResponseEntity.status(status)
-                                .body(ApiResponse.success(errorResponse, user.getMessage())));
-                    }
-
-                    // =========================================================
-                    // CASE 2: CONFIG ERROR
-                    // =========================================================
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
-                    }
-
-                    // =========================================================
-                    // CASE 3: SUCCESS
-                    // =========================================================
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
-
-                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-
-                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
-
-                    String jti = extractClaims(accessToken).getId();
-
-                    response.addCookie(createRefreshTokenCookie(refreshToken));
-
-                    return validator.registerUserSession(user.getUserId(), jti)
-                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                    .subscribeOn(Schedulers.boundedElastic())))
-                            .map(roleData -> {
-                                LoginResponseDTO loginResponse = LoginResponseDTO.builder()
-                                        .userId(user.getUserId())
-                                        .validCredentials(true)
-                                        .accessToken(accessToken)
-                                        .tokenType("Bearer")
-                                        .expiresIn(accessTokenTtl)
-                                        .sub(user.getUserId())
-                                        .jti(jti)
-                                        .roleData(roleData)
-                                        .userStatus(user.getUserStatus())
-                                        .passwordLoginStatus(user.getPasswordLoginStatus())
-                                        .attemptsLeft(null) // No need to show attempts on success
-                                        .build();
-
-                                return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
-                            });
-                });
-    }
-
-
-    /**
-     * REFRESH TOKEN ENDPOINT
-     * 1. Reads Refresh Token from Cookie.
-     * 2. Validates Signature & Expiry.
-     * 3. Checks Redis to ensure User Session is still valid/active.
-     * 4. Rotates Tokens (New Access Token + New Refresh Cookie).
-     */
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response)
-    {
-
-        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
-        String refreshToken = (cookie != null) ? cookie.getValue() : null;
-
-        if (refreshToken == null || refreshToken.isBlank()) {
-            log.warn("Refresh failed: No refresh token cookie.");
-            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing refresh token cookie"));
-        }
-
-        return Mono.fromCallable(() -> {
-                    // Note: Exception handler will catch ExpiredJwtException specifically
-                    return extractClaims(refreshToken);
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String userKey = USER_PREFIX + userId;
-                    log.info("Refreshing Token for User: {}", userId);
-
-                    // Check Session in Redis
-                    return redisTemplate.opsForValue().get(userKey)
-                            .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("Redis returned EMPTY for key: {}. Session expired.", userKey);
-                                return Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Session expired. Please login again."));
-                            }))
-                            .flatMap(currentJti -> {
-                                log.info("Session Active in Redis. Fetching Full Profile.");
-
-                                return Mono.fromCallable(() -> loginService.getUserProfile(userId))
-                                        .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(userDto -> {
-                                            if (userDto == null) {
-                                                return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
-                                            }
-
-                                            return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
-                                                    .subscribeOn(Schedulers.boundedElastic())
-                                                    .flatMap(roleData -> {
-
-                                                        // Generate New Tokens
-                                                        @SuppressWarnings("unchecked")
-                                                        Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
-                                                        String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
-
-                                                        Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                                                        String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
-                                                        String newJti = extractClaims(newAccessToken).getId();
-
-                                                        response.addCookie(createRefreshTokenCookie(newRefreshToken));
-
-                                                        return validator.registerUserSession(userId, newJti)
-                                                                .thenReturn(ApiResponse.success(
-                                                                        LoginResponseDTO.builder()
-                                                                                .accessToken(newAccessToken)
-                                                                                .userId(userId)
-                                                                                .jti(newJti)
-                                                                                .expiresIn(accessTokenTtl)
-                                                                                .validCredentials(true)
-                                                                                .roleData(roleData)
-                                                                                .userStatus(userDto.getUserStatus())
-                                                                                .passwordLoginStatus(userDto.getPasswordLoginStatus())
-                                                                                .sub(userId)
-                                                                                .build(),
-                                                                        "Token refreshed successfully"
-                                                                ));
-                                                    });
-                                        });
-                            });
-                });
-    }
-
-
-    /**
-     * LOGOUT ENDPOINT (ROBUST & VERIFIED)
-     * Handles:
-     * 1. Valid Tokens -> Standard Logout
-     * 2. Expired Tokens -> Manually extracts claims -> Cleans up Redis if JTI matches
-     * 3. Concurrent Logins -> Blacklists current token, but PRESERVES the active session in Redis
-     * 4. Missing/Malformed Tokens -> Clears cookies and returns success (Idempotent)
-     */
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
-            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response)
-    {
-
-        // 1. Always clear the Refresh Token Cookie (Idempotent)
-        response.addCookie(createEmptyCookie());
-
-        String tokenString = null;
-
-        // Strategy A: Valid Context
-        if (jwtAuth != null && jwtAuth.getToken() != null) {
-            tokenString = jwtAuth.getToken().getTokenValue();
-        }
-        // Strategy B: Manual Header Extraction (Expired Tokens)
-        else {
-            String header = request.getHeaders().getFirst("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
-                tokenString = header.substring(7);
-            }
-        }
-
-        // 3. Fast Exit: If no token found anywhere, just return success so frontend can clear state
-        if (tokenString == null || tokenString.isBlank()) {
-            log.warn("Logout called without token. Cleaning up cookies only.");
-            return Mono.just(ResponseEntity.ok(
-                    ApiResponse.<LoginResponseDTO>success(
-                            LoginResponseDTO.builder().userId("anonymous").build(),
-                            "Logged out (No Token)"
-                    )
-            ));
-        }
-
-        final String finalToken = tokenString;
-
-        // 4. Processing Chain
-        return Mono.fromCallable(() -> {
-                    try {
-                        // Try standard parsing
-                        return extractClaims(finalToken);
-                    } catch (ExpiredJwtException e) {
-                        // CRITICAL FIX: If token is expired, we STILL want the claims to perform cleanup
-                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
-                        return e.getClaims();
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
-
-                    if (userId == null || incomingJti == null) {
-                        return Mono.just(ResponseEntity.ok(
-                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
-                        ));
-                    }
-
-                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
-
-                    // 5. Blacklist the Token (Always blacklist the incoming token)
-                    return validator.blacklistToken(incomingJti)
-                            .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
-                            .flatMap(activeJti -> {
-                                // 6. Conditional Redis Cleanup
-                                if (activeJti != null && activeJti.equals(incomingJti)) {
-                                    // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
-                                    // Action: Delete it.
-                                    log.info("Session MATCH. Deleting active session for user: {}", userId);
-                                    return validator.clearUserSession(userId)
-                                            .then(Mono.just(ResponseEntity.ok(
-                                                    ApiResponse.<LoginResponseDTO>success(
-                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
-                                                            "Logged out successfully"
-                                                    )
-                                            )));
-                                } else {
-                                    // SCENARIO: Concurrent Login.
-                                    // The session in Redis belongs to a NEWER token (on another device/tab).
-                                    // Action: Do NOT delete it. Just let the blacklist happen.
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
-                                    return Mono.just(ResponseEntity.ok(
-                                            ApiResponse.<LoginResponseDTO>success(
-                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
-                                                    "Logged out (Concurrent Session Preserved)"
-                                            )
-                                    ));
-                                }
-                            })
-                            // If key is missing in Redis (Already timed out), return success
-                            .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                                    ApiResponse.<LoginResponseDTO>success(
-                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
-                                            "Logged out (Session already expired)"
-                                    )
-                            )));
-                })
-                .onErrorResume(e -> {
-                    // Safety Net: If anything explodes (Redis down, etc), allow frontend to logout
-                    log.error("Logout Unexpected Error", e);
-                    return Mono.just(ResponseEntity.ok(
-                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
-                    ));
-                });
-    }
-
-
-    @PostMapping(value = "/update-password")
-    public Mono<ApiResponse<UpdatePasswordDTO>> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
-        return Mono.fromCallable(() -> loginService.updatePassword(dto))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(result -> ApiResponse.success(result, result.getMessage()));
+    @PostMapping("/create-reports")
+    public Map<String,String> createReports (@RequestHeader("Authorization") String token, 
+                                             @RequestBody ReportCreationDto requestBody) throws Exception {
+           // EXTRACT USER ID FROM TOKEN
+           String userId = jwtUtil.getUserIdFromToken(token);
+           return reportService.createReports(requestBody, userId);
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+import com.fincore.ReportService.dto.ReportCreationDto;
+import com.fincore.ReportService.dto.ReportStreamResponse;
+import com.fincore.ReportService.dto.ReportTypeDto;
+
+public interface ReportService {
+
+    List<ReportTypeDto> getReportTypes(int roleId);
+    
+    ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId);
+
+    // Updated to accept User ID for notifications
+    Map<String,String> createReports(ReportCreationDto parameters, String userId) throws Exception;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.service;
+
+import com.fincore.ReportService.dto.ReportCreationDto;
+import com.fincore.ReportService.dto.ReportStreamResponse;
+import com.fincore.ReportService.dto.ReportTypeDto;
+import com.fincore.ReportService.dto.TaskProgressDto;
+import com.fincore.ReportService.exception.ResourceNotFoundException;
+import com.fincore.ReportService.model.AppConfig;
+import com.fincore.ReportService.model.JasperReports;
+import com.fincore.ReportService.model.ReportType;
+import com.fincore.ReportService.repository.AppConfigRepository;
+import com.fincore.ReportService.repository.JasperReportTypeRepository;
+import com.fincore.ReportService.repository.ReportTypeRepository;
+import lombok.extern.slf4j.Slf4j;
+import net.sf.jasperreports.engine.*;
+import net.sf.jasperreports.engine.export.JRCsvExporter;
+import net.sf.jasperreports.engine.export.ooxml.JRXlsxExporter;
+import net.sf.jasperreports.export.SimpleCsvExporterConfiguration;
+import net.sf.jasperreports.export.SimpleExporterInput;
+import net.sf.jasperreports.export.SimpleOutputStreamExporterOutput;
+import net.sf.jasperreports.export.SimpleWriterExporterOutput;
+import org.apache.catalina.connector.ClientAbortException;
+import org.apache.hadoop.fs.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+import javax.sql.DataSource;
+import java.io.*;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+@Service
+@Slf4j
+public class ReportServiceImpl implements ReportService {
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Value("${directory.jasperFileDir:/jasper}")
+    private String jasperFileDir;
+
+    @Value("${notification.progress.topic}")
+    private String progressTopic;
+
+    private final ReportTypeRepository reportTypeRepository;
+    private final JasperReportTypeRepository jasperReportTypeRepository;
+    private final String reportsBasePath;
+    private final AppConfigRepository appConfigRepository;
+    private final NotificationWriterService notificationWriterService;
+    private final FileSystem hdfsFileSystem;
+    
+    // Redis Template for Progress
+    private final RedisTemplate<String, TaskProgressDto> redisTemplate;
+
+    private final String REPORTS_START_DATE_KEY = "REPORTS_START_DATE";
+    private static final int BUFFER_SIZE = 32 * 1024;
+    private static final Set<String> ALREADY_COMPRESSED_EXTS = Set.of("pdf", "xlsx", "xls", "zip", "gz", "png", "jpg", "jpeg");
+
+    public ReportServiceImpl(ReportTypeRepository reportTypeRepository,
+                             JasperReportTypeRepository jasperReportTypeRepository,
+                             @Value("${glif.reports.base-path}") String basePath,
+                             AppConfigRepository appConfigRepository,
+                             NotificationWriterService notificationWriterService,
+                             FileSystem hdfsFileSystem,
+                             @Qualifier("progressRedisTemplate") RedisTemplate<String, TaskProgressDto> redisTemplate) {
+        this.reportTypeRepository = reportTypeRepository;
+        this.jasperReportTypeRepository = jasperReportTypeRepository;
+        this.reportsBasePath = basePath;
+        this.appConfigRepository = appConfigRepository;
+        this.notificationWriterService = notificationWriterService;
+        this.hdfsFileSystem = hdfsFileSystem;
+        this.redisTemplate = redisTemplate;
+    }
+
+    @Override
+    public List<ReportTypeDto> getReportTypes(int roleId) {
+        if (roleId <= 0) throw new IllegalArgumentException("Payload structure is not correct.");
+        LocalDate startDate = getStartDateFromAppConfig();
+        return reportTypeRepository.findByRoleId(roleId).stream()
+                .map(rt -> new ReportTypeDto(rt.getReportName(), rt.getFileName(), startDate))
+                .collect(Collectors.toList());
+    }
+
+    // ----------------------------------------------------------------------------------
+    // 1. DOWNLOAD STREAM WITH PROGRESS (Optimized)
+    // ----------------------------------------------------------------------------------
+    @Transactional(readOnly = true)
+    @Override
+    public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
+        
+        ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
+                .orElseThrow(() -> {
+                    log.warn("Access Denied: User {} -> Report {}", userId, fileName);
+                    sendNotification(userId, "Access Denied for report: " + fileName, "/glif-reports", fileName + "_" + date);
+                    return new AccessDeniedException("Access Denied for report: " + fileName);
+                });
+
+        String reportDisplayName = reportType.getReportName();
+        String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE);
+        Path searchDirectory = new Path(reportsBasePath, formattedDate);
+        String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+
+        try {
+            if (!hdfsFileSystem.exists(searchDirectory)) {
+                throw new ResourceNotFoundException("Reports directory not found: " + searchDirectory);
+            }
+
+            FileStatus[] fileStatuses = hdfsFileSystem.listStatus(searchDirectory);
+            List<FileStatus> matchingFiles = new ArrayList<>();
+            long totalSizeBytes = 0;
+
+            for (FileStatus status : fileStatuses) {
+                if (status.isFile() && status.getPath().getName().startsWith(fileNamePrefix)) {
+                    matchingFiles.add(status);
+                    totalSizeBytes += status.getLen();
+                }
+            }
+
+            if (matchingFiles.isEmpty()) {
+                throw new ResourceNotFoundException("No report files found matching prefix: " + fileNamePrefix);
+            }
+
+            // Task ID for tracking (Internal Use)
+            String taskId = "dl_" + System.currentTimeMillis();
+            
+            long finalTotalSize = totalSizeBytes;
+            StreamingResponseBody streamingBody = outputStream -> {
+                try {
+                    sendProgress(taskId, userId, 0, "Starting download...", "PROCESSING");
+                    AtomicLong globalBytesRead = new AtomicLong(0);
+
+                    if (matchingFiles.size() == 1) {
+                         streamSingleFile(matchingFiles.get(0), outputStream, finalTotalSize, globalBytesRead, taskId, userId);
+                    } else {
+                         streamZipBundle(matchingFiles, outputStream, finalTotalSize, globalBytesRead, taskId, userId);
+                    }
+
+                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
+                    sendNotification(userId, String.format("%s downloaded successfully.", reportDisplayName), "/glif-reports", fileName + "_" + date);
+
+                } catch (ClientAbortException | java.net.SocketException e) {
+                    log.warn("Download aborted by user: {}", userId);
+                    // No FAILED status on user abort
+                } catch (IOException e) {
+                    log.error("Streaming error: {}", e.getMessage());
+                    sendProgress(taskId, userId, 0, "Download Failed", "FAILED");
+                    sendNotification(userId, "Download failed due to server error.", "/glif-reports", fileName + "_" + date);
+                }
+            };
+
+            String downloadName = matchingFiles.size() > 1 ? fileName + "_" + formattedDate + ".zip" : matchingFiles.get(0).getPath().getName();
+            return new ReportStreamResponse(downloadName, streamingBody);
+
+        } catch (IOException e) {
+            log.error("HDFS Metadata Error: {}", e.getMessage());
+            throw new RuntimeException("Storage unavailable", e);
+        }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // 2. CREATE REPORT WITH PROGRESS (Optimized & Resilient)
+    // ----------------------------------------------------------------------------------
+    @Override
+    public Map<String, String> createReports(ReportCreationDto parameters, String userId) throws Exception {
+        Map<String, String> reportStat = new HashMap<>();
+        String taskId = "gen_" + System.currentTimeMillis();
+
+        LocalDate reportDate = LocalDate.parse(parameters.getDate(), DateTimeFormatter.ofPattern("dd/MM/yyyy"));
+        String formattedDate = reportDate.format(DateTimeFormatter.ISO_LOCAL_DATE);
+        String datePrefix = reportDate.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
+        Path reportDir = new Path(reportsBasePath, formattedDate);
+
+        if (!hdfsFileSystem.exists(reportDir)) {
+            hdfsFileSystem.mkdirs(reportDir);
+        }
+
+        List<JasperReports> reportsDetails = jasperReportTypeRepository.findAll();
+        int totalReports = reportsDetails.size();
+        int processedCount = 0;
+
+        sendProgress(taskId, userId, 0, "Starting report generation...", "PROCESSING");
+
+        String logoPath = null;
+        try {
+            logoPath = new ClassPathResource("images/logo.png").getFile().getAbsolutePath();
+        } catch (Exception e) {
+            log.warn("Logo not found");
+        }
+
+        // Use a single connection for the batch, but handle failures gracefully
+        try (Connection connection = dataSource.getConnection()) {
+            for (JasperReports report : reportsDetails) {
+                processedCount++;
+                String reportName = report.getType();
+                String jasperFileName = report.getFileName();
+                
+                // Calculate base percentage for this report
+                int basePercent = (int) (((double) (processedCount - 1) / totalReports) * 100);
+                sendProgress(taskId, userId, basePercent, "Generating " + reportName + "...", "PROCESSING");
+                
+                StringBuilder status = new StringBuilder();
+
+                try {
+                    java.nio.file.Path jasperPath = Paths.get(jasperFileDir, jasperFileName);
+                    if (!jasperPath.toFile().exists()) {
+                         throw new FileNotFoundException("Jasper file missing: " + jasperFileName);
+                    }
+
+                    try (InputStream jasperStream = new FileInputStream(jasperPath.toString())) {
+                        Map<String, Object> reportParams = new HashMap<>();
+                        reportParams.put("imagePath", logoPath);
+                        reportParams.put("date", parameters.getDate());
+
+                        JasperPrint jasperPrint = JasperFillManager.fillReport(jasperStream, reportParams, connection);
+
+                        // --- PDF ---
+                        Path pdfPath = new Path(reportDir, reportName + "_" + datePrefix + ".pdf");
+                        try (FSDataOutputStream pdfOut = hdfsFileSystem.create(pdfPath, true)) {
+                            JasperExportManager.exportReportToPdfStream(jasperPrint, pdfOut);
+                            status.append("PDF generated");
+                        }
+
+                        // --- EXCEL ---
+                        Path xlsxPath = new Path(reportDir, reportName + "_" + datePrefix + ".xlsx");
+                        try (FSDataOutputStream xlsxOut = hdfsFileSystem.create(xlsxPath, true)) {
+                            JRXlsxExporter xlsxExporter = new JRXlsxExporter();
+                            xlsxExporter.setExporterInput(new SimpleExporterInput(jasperPrint));
+                            xlsxExporter.setExporterOutput(new SimpleOutputStreamExporterOutput(xlsxOut));
+                            xlsxExporter.exportReport();
+                            status.append(", Excel generated");
+                        }
+
+                        // --- PSV ---
+                        Path psvPath = new Path(reportDir, reportName + "_" + datePrefix + ".psv");
+                        try (FSDataOutputStream psvOut = hdfsFileSystem.create(psvPath, true)) {
+                            JRCsvExporter csvExporter = new JRCsvExporter();
+                            csvExporter.setExporterInput(new SimpleExporterInput(jasperPrint));
+                            csvExporter.setExporterOutput(new SimpleWriterExporterOutput(psvOut));
+                            SimpleCsvExporterConfiguration csvConfig = new SimpleCsvExporterConfiguration();
+                            csvConfig.setFieldDelimiter("|");
+                            csvExporter.setConfiguration(csvConfig);
+                            csvExporter.exportReport();
+                            status.append(", PSV generated");
+                        }
+
+                        reportStat.put(reportName, status.toString());
+                    }
+                } catch (Exception e) {
+                    log.error("Error generating {}: {}", reportName, e.getMessage());
+                    reportStat.put(reportName, "Failed: " + e.getMessage());
+                    // Don't stop the loop; try to generate other reports
+                }
+            }
+        }
+        
+        sendProgress(taskId, userId, 100, "All reports generated.", "COMPLETED");
+        return reportStat;
+    }
+
+
+    // ----------------------------------------------------------------------------------
+    // HELPER METHODS (Stream Logic + Redis)
+    // ----------------------------------------------------------------------------------
+
+    private void streamSingleFile(FileStatus file, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        try (FSDataInputStream hdfsStream = hdfsFileSystem.open(file.getPath(), BUFFER_SIZE)) {
+            copyWithProgress(hdfsStream, outputStream, totalSize, globalBytesRead, taskId, userId);
+        }
+    }
+
+    private void streamZipBundle(List<FileStatus> files, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        try (ZipOutputStream zipOut = new ZipOutputStream(outputStream)) {
+            for (FileStatus status : files) {
+                String currentFileName = status.getPath().getName();
+                ZipEntry zipEntry = new ZipEntry(currentFileName);
+                
+                if (isAlreadyCompressed(currentFileName)) {
+                    zipOut.setLevel(Deflater.NO_COMPRESSION);
+                } else {
+                    zipOut.setLevel(Deflater.DEFAULT_COMPRESSION);
+                }
+                
+                zipOut.putNextEntry(zipEntry);
+                try (FSDataInputStream hdfsStream = hdfsFileSystem.open(status.getPath(), BUFFER_SIZE)) {
+                    copyWithProgress(hdfsStream, zipOut, totalSize, globalBytesRead, taskId, userId);
+                }
+                zipOut.closeEntry();
+            }
+        }
+    }
+
+    private void copyWithProgress(InputStream in, OutputStream out, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int bytesRead;
+        int lastPercent = 0;
+
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+            long currentTotal = globalBytesRead.addAndGet(bytesRead);
+            
+            int percent = (int) ((currentTotal * 100) / totalSize);
+            percent = Math.min(percent, 99); 
+
+            if (percent >= lastPercent + 5) {
+                sendProgress(taskId, userId, percent, "Downloading... " + percent + "%", "PROCESSING");
+                lastPercent = percent;
+            }
+        }
+        out.flush();
+    }
+
+    private void sendProgress(String taskId, String userId, int percent, String msg, String status) {
+        try {
+            TaskProgressDto dto = TaskProgressDto.builder()
+                    .taskId(taskId)
+                    .userId(userId)
+                    .percentage(percent)
+                    .message(msg)
+                    .status(status)
+                    .build();
+            redisTemplate.convertAndSend(progressTopic, dto);
+        } catch (Exception e) {
+            log.warn("Redis notification failed: {}", e.getMessage());
+        }
+    }
+
+    private boolean isAlreadyCompressed(String fileName) {
+        int dotIndex = fileName.lastIndexOf('.');
+        if (dotIndex == -1) return false;
+        String extension = fileName.substring(dotIndex + 1).toLowerCase();
+        return ALREADY_COMPRESSED_EXTS.contains(extension);
+    }
+    
+    private void sendNotification(String userId, String message, String url, String aggregateId) {
+        try {
+            notificationWriterService.createNotification(userId, null, message, url, aggregateId, "ReportService");
+        } catch (Exception e) {
+            log.warn("Persistent notification failed: {}", e.getMessage());
+        }
+    }
+
+    private LocalDate getStartDateFromAppConfig() {
+        return appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY)
+                .map(AppConfig::getConfigValue)
+                .map(LocalDate::parse)
+                .orElseThrow(() -> new ResourceNotFoundException("Configuration missing: " + REPORTS_START_DATE_KEY));
+    }
+}
+
+
+
+
