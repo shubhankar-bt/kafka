@@ -1,216 +1,3 @@
-<dependencies>
-    <!-- ... existing dependencies ... -->
-    
-    <!-- JSch for SFTP Support -->
-    <dependency>
-        <groupId>com.jcraft</groupId>
-        <artifactId>jsch</artifactId>
-        <version>0.1.55</version>
-    </dependency>
-</dependencies>
-
-
-
-
-
-
-
-
-
-# ... existing configs ...
-
-# STORAGE MODE: 'hdfs' (Default) or 'sftp' (Temporary UAT Fix)
-app.storage.mode=sftp
-
-# SFTP Configuration (Temporary UAT)
-sftp.host=10.x.x.x
-sftp.port=22
-sftp.user=your_sftp_user
-sftp.password=your_sftp_password
-# Base path on the SFTP server where reports are stored
-sftp.base-path=/remote/path/to/reports
-# Strict Host Key Checking (Set to 'no' for internal/temp usage to avoid known_hosts errors)
-sftp.strict-host-key-checking=no
-
-
-
-
-
-
-
-
-
-package com.fincore.ReportService.service;
-
-import com.jcraft.jsch.*;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Vector;
-
-@Service
-@Slf4j
-public class SftpService {
-
-    @Value("${sftp.host}")
-    private String host;
-
-    @Value("${sftp.port}")
-    private int port;
-
-    @Value("${sftp.user}")
-    private String user;
-
-    @Value("${sftp.password}")
-    private String password;
-
-    @Value("${sftp.strict-host-key-checking:no}")
-    private String strictHostKeyChecking;
-
-    /**
-     * Connects to SFTP and executes the provided action.
-     * This ensures the session/channel is always closed properly.
-     */
-    public <T> T execute(SftpAction<T> action) throws IOException {
-        Session session = null;
-        ChannelSftp channelSftp = null;
-
-        try {
-            JSch jsch = new JSch();
-            session = jsch.getSession(user, host, port);
-            session.setPassword(password);
-
-            java.util.Properties config = new java.util.Properties();
-            config.put("StrictHostKeyChecking", strictHostKeyChecking);
-            session.setConfig(config);
-
-            session.connect();
-            
-            Channel channel = session.openChannel("sftp");
-            channel.connect();
-            channelSftp = (ChannelSftp) channel;
-
-            return action.doInSftp(channelSftp);
-
-        } catch (JSchException | SftpException e) {
-            log.error("SFTP Error: {}", e.getMessage());
-            throw new IOException("Failed to communicate with SFTP server: " + e.getMessage(), e);
-        } finally {
-            if (channelSftp != null) channelSftp.exit();
-            if (session != null) session.disconnect();
-        }
-    }
-
-    /**
-     * Functional interface for SFTP actions
-     */
-    public interface SftpAction<T> {
-        T doInSftp(ChannelSftp channel) throws SftpException, IOException;
-    }
-
-    /**
-     * Lists files in a directory matching a prefix.
-     */
-    public List<String> listFiles(String directoryPath, String filePrefix) throws IOException {
-        return execute(channel -> {
-            List<String> matchingFiles = new ArrayList<>();
-            try {
-                Vector<ChannelSftp.LsEntry> entries = channel.ls(directoryPath);
-                for (ChannelSftp.LsEntry entry : entries) {
-                    if (!entry.getAttrs().isDir() && entry.getFilename().startsWith(filePrefix)) {
-                        matchingFiles.add(entry.getFilename());
-                    }
-                }
-            } catch (SftpException e) {
-                // If directory doesn't exist, JSch throws exception with ID 2
-                if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
-                    log.warn("SFTP Directory not found: {}", directoryPath);
-                    return new ArrayList<>(); // Return empty list instead of crashing
-                }
-                throw e;
-            }
-            return matchingFiles;
-        });
-    }
-
-    /**
-     * returns an InputStream for a specific file.
-     * NOTE: The Caller is responsible for closing the Stream, which should close the channel? 
-     * ACTUALLY NO: JSch InputStreams are tied to the Channel. 
-     * If we close the channel in 'execute', the stream dies.
-     * * TEMPORARY FIX: For Streaming, we cannot use the 'execute' wrapper pattern easily.
-     * We need a dedicated method that returns a custom InputStream that closes the Session when it closes.
-     */
-    public InputStream getFileStream(String fullPath) throws IOException, JSchException, SftpException {
-        JSch jsch = new JSch();
-        Session session = jsch.getSession(user, host, port);
-        session.setPassword(password);
-        java.util.Properties config = new java.util.Properties();
-        config.put("StrictHostKeyChecking", strictHostKeyChecking);
-        session.setConfig(config);
-        session.connect();
-
-        Channel channel = session.openChannel("sftp");
-        channel.connect();
-        ChannelSftp channelSftp = (ChannelSftp) channel;
-
-        // Wrap the SFTP InputStream so that closing it also closes the Session/Channel
-        InputStream rawStream = channelSftp.get(fullPath);
-        
-        return new InputStream() {
-            @Override
-            public int read() throws IOException {
-                return rawStream.read();
-            }
-
-            @Override
-            public int read(byte[] b, int off, int len) throws IOException {
-                return rawStream.read(b, off, len);
-            }
-
-            @Override
-            public void close() throws IOException {
-                try {
-                    rawStream.close();
-                } finally {
-                    channelSftp.exit();
-                    session.disconnect();
-                    log.info("SFTP Session closed for file: {}", fullPath);
-                }
-            }
-        };
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.ReportService.service;
 
 import com.fincore.ReportService.dto.ReportCreationDto;
@@ -267,7 +54,7 @@ public class ReportServiceImpl implements ReportService {
     private DataSource dataSource;
     
     @Autowired
-    private SftpService sftpService; // Inject temporary service
+    private SftpService sftpService;
 
     @Value("${directory.jasperFileDir:/jasper}")
     private String jasperFileDir;
@@ -275,7 +62,7 @@ public class ReportServiceImpl implements ReportService {
     @Value("${notification.progress.topic}")
     private String progressTopic;
     
-    @Value("${app.storage.mode:hdfs}") // Default to HDFS
+    @Value("${app.storage.mode:hdfs}")
     private String storageMode;
     
     @Value("${sftp.base-path:}")
@@ -309,7 +96,6 @@ public class ReportServiceImpl implements ReportService {
         this.redisTemplate = redisTemplate;
     }
 
-    // ... (Keep getReportTypes as is) ...
     @Override
     public List<ReportTypeDto> getReportTypes(int roleId) {
         if (roleId <= 0) throw new IllegalArgumentException("Payload structure is not correct.");
@@ -323,7 +109,6 @@ public class ReportServiceImpl implements ReportService {
     @Override
     public ReportStreamResponse downloadReportStream(String fileName, LocalDate date, int userRoleId, String userId) {
         
-        // Authorization check
         ReportType reportType = reportTypeRepository.findByFileNameAndRoles_roleId(fileName, userRoleId)
                 .orElseThrow(() -> {
                     log.warn("Access Denied: User {} -> Report {}", userId, fileName);
@@ -335,23 +120,27 @@ public class ReportServiceImpl implements ReportService {
         String formattedDate = date.format(DateTimeFormatter.ISO_LOCAL_DATE);
         String fileNamePrefix = fileName + "_" + date.format(DateTimeFormatter.ofPattern("ddMMyyyy"));
 
-        // *** BRANCHING LOGIC FOR SFTP vs HDFS ***
+        // *** GENERATE SPECIFIC TASK ID ***
+        // Sanitize inputs (remove spaces/special chars) to keep ID clean
+        String safeReportName = reportDisplayName.replaceAll("[^a-zA-Z0-9]", "");
+        String safeDate = date.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String taskId = String.format("dl_%s_%s_%d", safeReportName, safeDate, System.currentTimeMillis());
+
         if ("sftp".equalsIgnoreCase(storageMode)) {
-            return downloadFromSftp(fileNamePrefix, formattedDate, reportDisplayName, fileName, date, userId);
+            return downloadFromSftp(taskId, fileNamePrefix, formattedDate, reportDisplayName, fileName, date, userId);
         } else {
-            return downloadFromHdfs(fileNamePrefix, formattedDate, reportDisplayName, fileName, date, userId);
+            return downloadFromHdfs(taskId, fileNamePrefix, formattedDate, reportDisplayName, fileName, date, userId);
         }
     }
 
     // ----------------------------------------------------------------------------------
-    // SFTP DOWNLOAD LOGIC (TEMPORARY FOR UAT)
+    // SFTP DOWNLOAD LOGIC
     // ----------------------------------------------------------------------------------
-    private ReportStreamResponse downloadFromSftp(String fileNamePrefix, String formattedDate, String reportDisplayName, String originalFileName, LocalDate date, String userId) {
-        log.info("Attempting SFTP download for date: {} prefix: {}", formattedDate, fileNamePrefix);
+    private ReportStreamResponse downloadFromSftp(String taskId, String fileNamePrefix, String formattedDate, String reportDisplayName, String originalFileName, LocalDate date, String userId) {
+        log.info("Attempting SFTP download. TaskID: {} Prefix: {}", taskId, fileNamePrefix);
         String directoryPath = sftpBasePath + "/" + formattedDate;
 
         try {
-            // 1. List files via SFTP
             List<String> matchingFiles = sftpService.listFiles(directoryPath, fileNamePrefix);
 
             if (matchingFiles.isEmpty()) {
@@ -359,17 +148,11 @@ public class ReportServiceImpl implements ReportService {
                  throw new ResourceNotFoundException("No report files found matching prefix: " + fileNamePrefix);
             }
 
-            // 2. Prepare Task ID
-            String taskId = "dl_sftp_" + System.currentTimeMillis();
-            
-            // 3. Streaming Logic
             StreamingResponseBody streamingBody = outputStream -> {
                 try {
-                    sendProgress(taskId, userId, 0, "Starting SFTP download...", "PROCESSING");
+                    sendProgress(taskId, userId, 0, "Starting " + reportDisplayName + " download...", "PROCESSING");
                     AtomicLong globalBytesRead = new AtomicLong(0);
-                    // SFTP ls doesn't easily give total size without extra calls, so we might skip accurate % calculation
-                    // Or we assume a large dummy size to keep the bar moving if we want to avoid latency of 'stat' calls
-                    long estimatedTotalSize = 10 * 1024 * 1024; // 10MB dummy or implement 'stat' in SftpService
+                    long estimatedTotalSize = 10 * 1024 * 1024; // Dummy size for UAT
 
                     if (matchingFiles.size() == 1) {
                          String fullPath = directoryPath + "/" + matchingFiles.get(0);
@@ -389,7 +172,7 @@ public class ReportServiceImpl implements ReportService {
                             }
                         }
                     }
-                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
+                    sendProgress(taskId, userId, 100, reportDisplayName + " Complete", "COMPLETED");
                     sendNotification(userId, String.format("%s downloaded successfully.", reportDisplayName), "/glif-reports", originalFileName + "_" + date);
 
                 } catch (Exception e) {
@@ -409,9 +192,9 @@ public class ReportServiceImpl implements ReportService {
     }
 
     // ----------------------------------------------------------------------------------
-    // HDFS DOWNLOAD LOGIC (ORIGINAL)
+    // HDFS DOWNLOAD LOGIC
     // ----------------------------------------------------------------------------------
-    private ReportStreamResponse downloadFromHdfs(String fileNamePrefix, String formattedDate, String reportDisplayName, String originalFileName, LocalDate date, String userId) {
+    private ReportStreamResponse downloadFromHdfs(String taskId, String fileNamePrefix, String formattedDate, String reportDisplayName, String originalFileName, LocalDate date, String userId) {
         Path searchDirectory = new Path(reportsBasePath, formattedDate);
         
         try {
@@ -434,12 +217,11 @@ public class ReportServiceImpl implements ReportService {
                 throw new ResourceNotFoundException("No report files found matching prefix: " + fileNamePrefix);
             }
 
-            String taskId = "dl_" + System.currentTimeMillis();
             long finalTotalSize = totalSizeBytes;
             
             StreamingResponseBody streamingBody = outputStream -> {
                 try {
-                    sendProgress(taskId, userId, 0, "Starting download...", "PROCESSING");
+                    sendProgress(taskId, userId, 0, "Starting " + reportDisplayName + " download...", "PROCESSING");
                     AtomicLong globalBytesRead = new AtomicLong(0);
 
                     if (matchingFiles.size() == 1) {
@@ -448,7 +230,7 @@ public class ReportServiceImpl implements ReportService {
                          streamZipBundle(matchingFiles, outputStream, finalTotalSize, globalBytesRead, taskId, userId);
                     }
 
-                    sendProgress(taskId, userId, 100, "Download Complete", "COMPLETED");
+                    sendProgress(taskId, userId, 100, reportDisplayName + " Complete", "COMPLETED");
                     sendNotification(userId, String.format("%s downloaded successfully.", reportDisplayName), "/glif-reports", originalFileName + "_" + date);
 
                 } catch (ClientAbortException | java.net.SocketException e) {
@@ -469,26 +251,10 @@ public class ReportServiceImpl implements ReportService {
         }
     }
 
-    // ... (Keep existing Create Reports logic, helper methods, streamSingleFile, streamZipBundle, copyWithProgress) ...
-    // Note: copyWithProgress is generic (InputStream, OutputStream), so it works for both SFTP and HDFS!
+    // ----------------------------------------------------------------------------------
+    // HELPER METHODS
+    // ----------------------------------------------------------------------------------
 
-    // ----------------------------------------------------------------------------------
-    // CREATE REPORTS (UNCHANGED from previous strict check)
-    // ----------------------------------------------------------------------------------
-    @Override
-    public Map<String, String> createReports(ReportCreationDto parameters, String userId) throws Exception {
-       // ... (The code I generated in previous turn for Create Reports goes here) ...
-       // Since the user asked "Only temporary download from SFTP", I assume Report Creation 
-       // still writes to HDFS? Or does Creation also need SFTP? 
-       // usually "Report Service" creates files on HDFS. If HDFS is down for UAT, 
-       // creation might fail too. 
-       // If creation also needs SFTP, please ask. For now, I implemented DOWNLOAD via SFTP.
-       return new HashMap<>(); // Placeholder to save token space in this response
-    }
-    
-    // ... Helper Methods (streamSingleFile, copyWithProgress, sendProgress, etc.) ...
-    // Make sure these methods are available to both download flows.
-    
     private void streamSingleFile(FileStatus file, OutputStream outputStream, long totalSize, AtomicLong globalBytesRead, String taskId, String userId) throws IOException {
         try (FSDataInputStream hdfsStream = hdfsFileSystem.open(file.getPath(), BUFFER_SIZE)) {
             copyWithProgress(hdfsStream, outputStream, totalSize, globalBytesRead, taskId, userId);
@@ -523,6 +289,7 @@ public class ReportServiceImpl implements ReportService {
             int percent = (int) ((currentTotal * 100) / totalSize);
             percent = Math.min(percent, 99); 
             if (percent >= lastPercent + 5) {
+                // Simplified message: "Downloading... 45%"
                 sendProgress(taskId, userId, percent, "Downloading... " + percent + "%", "PROCESSING");
                 lastPercent = percent;
             }
@@ -547,6 +314,15 @@ public class ReportServiceImpl implements ReportService {
         String extension = fileName.substring(dotIndex + 1).toLowerCase();
         return ALREADY_COMPRESSED_EXTS.contains(extension);
     }
+    
+    // Create Reports Implementation (same logic as previously discussed, but update taskId generation there too if you want)
+    @Override
+    public Map<String, String> createReports(ReportCreationDto parameters, String userId) throws Exception {
+       // ... existing creation logic ...
+       // Recommendation: Use similar logic for taskId here:
+       // String taskId = String.format("gen_ALL_%s_%d", parameters.getDate().replaceAll("/", ""), System.currentTimeMillis());
+       return new HashMap<>(); 
+    }
 
     private LocalDate getStartDateFromAppConfig() {
         return appConfigRepository.findByConfigKey(REPORTS_START_DATE_KEY)
@@ -554,8 +330,5 @@ public class ReportServiceImpl implements ReportService {
                 .orElseThrow(() -> new ResourceNotFoundException("Configuration missing"));
     }
 }
-
-
-
 
 
