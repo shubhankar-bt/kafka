@@ -2902,7 +2902,7 @@ public class JournalBulkValidationService {
                     d.formatErrors.add("INR Amount > 2 decimal places");
             }
             if (d.productCode != null && !d.productCode.isEmpty() && !d.productCode.equals("A") && !PRODUCT_CODE_REGEX.matcher(d.productCode).matches())
-                d.formatErrors.add("Product Code must be 'A' or 8 digits");
+                d.formatErrors.add("Product Code must be 8 digits or Keep it Blank ");
             if (d.remarks == null || d.remarks.trim().isEmpty()) d.formatErrors.add("Remarks is Mandatory");
             else if (d.remarks.length() > 30) d.formatErrors.add("Remarks length must be <= 30 chars");
             if (d.currency == null || d.currency.length() != 3)
@@ -3152,8 +3152,6 @@ public class JournalBulkValidationService {
     }
 
 }
-
-
 // ---------------
 
 
@@ -3275,9 +3273,11 @@ public interface JournalRequestService {
 package com.fincore.JournalService.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.JournalService.Dto.*;
 import com.fincore.JournalService.Models.JournalLog;
 import com.fincore.JournalService.Models.JournalRequest;
+import com.fincore.JournalService.Models.enums.ChangeType;
 import com.fincore.JournalService.Models.enums.RequestStatus;
 import com.fincore.JournalService.Repository.JournalLogRepository;
 import com.fincore.JournalService.Repository.JournalRequestRepository;
@@ -3327,6 +3327,9 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private final JournalBulkValidationService journalBulkValidationService;
     private final HdfsSyncService hdfsSyncService;
     private final ProgressService progressService;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @Autowired
     @Lazy
@@ -3795,8 +3798,22 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     // 5. HELPERS
     // ==================================================================================
 
+//    private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
+//        return "{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"" + pDate.format(fmt) + "\"," +
+//                "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
+//                "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
+//                "\"productType\":\"" + (row.productCode == null ? "" : row.productCode) + "\"," +
+//                "\"remarks\":\"" + (row.remarks == null ? "" : escapeJson(row.remarks)) + "\"," +
+//                "\"arFlag\":\"A\",\"acClassification\":\"A\",\"batchId\":\"" + batchId + "\"," +
+//                "\"journalId\":\"" + jId + "\",\"commonBatchRemarks\":\"" + escapeJson(rem) + "\"," +
+//                "\"transactionCount\":" + count + "}";
+//    }
+
+    // ---------------------------------------------------------
+    // OPTIMIZED PAYLOAD GENERATION (Bulk)
+    // ---------------------------------------------------------
     private String buildJsonPayloadFast(ExcelRowData row, BigDecimal amount, LocalDate pDate, String batchId, String jId, String rem, int count, DateTimeFormatter fmt) {
-        return "{\"changeType\":\"ADD\",\"masterJournalId\":null,\"csvDate\":\"" + pDate.format(fmt) + "\"," +
+        return "{\"csvDate\":\"" + pDate.format(fmt) + "\"," +
                 "\"branch\":\"" + row.branch + "\",\"currency\":\"" + row.currency + "\"," +
                 "\"cgl\":\"" + row.cgl + "\",\"amount\":" + amount + "," +
                 "\"productType\":\"" + (row.productCode == null ? "" : row.productCode) + "\"," +
@@ -3823,7 +3840,7 @@ public class JournalRequestServiceImpl implements JournalRequestService {
     private void sendNotification(String userId, String roles, String message, String batchId) {
         try {
             // Using a generic URL or null if handled by FE routing
-            String url = "/journal-view/" + batchId; // todo
+            String url = "/journal-view/" + batchId;
             notificationWriterService.createNotification(userId, roles, message, url, batchId, "JournalService");
         } catch (Exception e) {
             log.warn("Failed to send persistent notification for {}: {}", batchId, e.getMessage());
@@ -3913,10 +3930,127 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return Optional.empty();
     }
 
+    // ---------------------------------------------------------
+    // MANUAL BATCH CREATION (ADD ONLY - SIMPLIFIED)
+    // ---------------------------------------------------------
     @Override
-    public List<JournalRequest> createBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException {
-        return new ArrayList<>();
+    @Transactional
+    public List<JournalRequest> createBatchRequest(BatchRequestDto dto, String creatorId, Integer creatorRole) throws JsonProcessingException {
+
+        // 1. Generate New Batch ID
+        String batchId = sequenceService.getNextBatchId();
+        Timestamp ts = Timestamp.valueOf(LocalDateTime.now());
+        ObjectMapper localMapper = new ObjectMapper();
+
+        List<JournalRequest> entities = new ArrayList<>();
+        BigDecimal totalDebit = BigDecimal.ZERO;
+        BigDecimal totalCredit = BigDecimal.ZERO;
+        int rowIndex = 1;
+
+        // 2. Iterate through DTO rows
+        for (BatchRequestDto.JournalRequestRow row : dto.getRows()) {
+            JournalRequest entity = new JournalRequest();
+
+            // --- Metadata ---
+            entity.setRequestStatus(RequestStatus.PENDING);
+            entity.setChangeType(ChangeType.ADD);
+            entity.setRequestDate(LocalDateTime.now());
+            entity.setCreatorId(creatorId);
+            entity.setCreatorRole(creatorRole);
+            entity.setBatchId(batchId);
+            entity.setCommonBatchRemarks(dto.getCommonBatchRemarks());
+
+            // --- ID Generation ---
+            String journalId = batchId + "-" + rowIndex;
+            entity.setJournalId(journalId);
+
+            // --- Optimized Columns ---
+            entity.setBranchCode(row.getBranch());
+            entity.setCurrency(row.getCurrency());
+            entity.setCgl(row.getCgl());
+
+            // Amount Handling
+            BigDecimal amount = row.getAmount();
+            entity.setAmount(amount);
+
+            entity.setCsvDate(row.getCsvDate() != null ? row.getCsvDate() : LocalDate.now());
+            entity.setNarration(row.getRemarks());
+            entity.setProductCode(row.getProductType());
+
+            // --- PAYLOAD GENERATION (Simplified) ---
+            Map<String, Object> payloadMap = new HashMap<>();
+
+            payloadMap.put("csvDate", entity.getCsvDate().toString());
+            payloadMap.put("branch", row.getBranch());
+            payloadMap.put("currency", row.getCurrency());
+            payloadMap.put("cgl", row.getCgl());
+            payloadMap.put("amount", amount);
+            payloadMap.put("productType", row.getProductType());
+            payloadMap.put("remarks", row.getRemarks());
+
+            // Keep strictly necessary static flags if your system expects them defaults
+            payloadMap.put("arFlag", "A");
+            payloadMap.put("acClassification", "A");
+
+            payloadMap.put("batchId", batchId);
+            payloadMap.put("journalId", journalId);
+            payloadMap.put("commonBatchRemarks", dto.getCommonBatchRemarks());
+            payloadMap.put("transactionCount", rowIndex);
+
+            // Generate JSON String (Cleaner now)
+            entity.setPayload(localMapper.writeValueAsString(payloadMap));
+
+            // --- Totals Calculation ---
+            if (amount.compareTo(BigDecimal.ZERO) < 0) {
+                totalCredit = totalCredit.add(amount.abs());
+            } else {
+                totalDebit = totalDebit.add(amount.abs());
+            }
+
+            entities.add(entity);
+            rowIndex++;
+        }
+
+        // 3. Save Details
+        List<JournalRequest> savedEntities = journalRequestRepository.saveAll(entities);
+
+        // 4. Save Summary
+        String sumSql = "INSERT INTO JOURNAL_BATCH_MASTER (BATCH_ID, CREATOR_ID, REQ_DATE, BATCH_REMARKS, TOTAL_ROWS, TOTAL_DEBIT, TOTAL_CREDIT, BATCH_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+        jdbcTemplate.update(sumSql,
+                batchId,
+                creatorId,
+                ts,
+                dto.getCommonBatchRemarks(),
+                entities.size(),
+                totalDebit,
+                totalCredit,
+                "PENDING"
+        );
+
+        // 5. Audit & Notification
+        logAudit(creatorId, "CREATE_SUCCESS", "BATCH_MANUAL", "Created Manual Batch " + batchId);
+
+        try {
+            NotificationConfigDto config = permissionConfigService.getConfig("JOURNAL_AUTH");
+            if (config != null) {
+                String msg = String.format("New Manual Batch %s by %s requires approval.", batchId, creatorId);
+                notificationWriterService.createNotification(
+                        null,
+                        config.getTargetRoles(),
+                        msg,
+                        "/journal-view/" + batchId,
+                        batchId,
+                        "JournalService"
+                );
+            }
+        } catch (Exception e) {
+            log.warn("Notification failed for manual batch {}", batchId, e);
+        }
+
+        return savedEntities;
     }
+
 
     @Override
     public String createBulkBatchRequest(BatchRequestDto d, String u, Integer r) throws JsonProcessingException {
@@ -3934,6 +4068,8 @@ public class JournalRequestServiceImpl implements JournalRequestService {
         return Collections.emptyList();
     }
 }
+
+
 
 
 
