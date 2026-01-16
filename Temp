@@ -33,7 +33,7 @@ public class DashboardServiceImpl implements DashboardService {
 
     private final PermissionRepository permissionRepo;
     private final AnnouncementRepository announcementRepo;
-    private final NotificationRepository notificationRepo; 
+    // NotificationRepo REMOVED as per requirement
     private final UserLogsRepository userLogRepo;
     private final DashboardStatsRepository statsRepo;
     private final CommonReqRepository commonReqRepo;
@@ -44,6 +44,7 @@ public class DashboardServiceImpl implements DashboardService {
     /**
      * OPTIMIZED DASHBOARD LOAD
      * Uses CompletableFuture to execute independent DB calls in PARALLEL.
+     * This significantly reduces total response time.
      */
     @Override
     public DashboardResponse getDashboardData(String token) {
@@ -58,33 +59,40 @@ public class DashboardServiceImpl implements DashboardService {
 
         // 2. FIRE INDEPENDENT TASKS (Async)
         
-        // Task A: Announcements
-        CompletableFuture<List<AnnouncementDto>> announcementsFuture = CompletableFuture.supplyAsync(() -> 
-            fetchAnnouncements(roleIdStr)
-        );
-
-        // Task B: Notifications
-        CompletableFuture<List<NotificationDto>> notificationsFuture = CompletableFuture.supplyAsync(() -> 
-            fetchNotifications(userId, roleIdStr)
-        );
-
-        // Task C: Financial Year
-        CompletableFuture<FinancialYearDto> finYearFuture = CompletableFuture.supplyAsync(() -> 
-            fetchFinancialYearData()
-        );
-
-        // Task D: Frequency Stats (Heavy Query)
-        // We default to 30 days
-        CompletableFuture<FrequencyStatsDto> frequencyFuture = CompletableFuture.supplyAsync(() -> {
-            LocalDateTime end = LocalDateTime.now();
-            LocalDateTime startTime = end.minusDays(30);
-            return calculateFlexibleFrequencyStats(startTime, end);
+        // Task A: Announcements (DB Call 1)
+        CompletableFuture<List<AnnouncementDto>> announcementsFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
+            List<AnnouncementDto> res = fetchAnnouncements(roleIdStr);
+            log.debug("Task A (Announcements) took: {} ms", System.currentTimeMillis() - t1);
+            return res;
         });
 
-        // Task E: Activity Feed (Multiple DB calls internally)
-        CompletableFuture<List<ActivityLogDto>> activityFuture = CompletableFuture.supplyAsync(() -> 
-            fetchUnifiedActivity(userId)
-        );
+        // Task B: Financial Year (DB Call 2)
+        CompletableFuture<FinancialYearDto> finYearFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
+            FinancialYearDto res = fetchFinancialYearData();
+            log.debug("Task B (Financial Year) took: {} ms", System.currentTimeMillis() - t1);
+            return res;
+        });
+
+        // Task C: Frequency Stats (Heavy Query - DB Call 3)
+        // We default to 30 days
+        CompletableFuture<FrequencyStatsDto> frequencyFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
+            LocalDateTime end = LocalDateTime.now();
+            LocalDateTime startTime = end.minusDays(30);
+            FrequencyStatsDto res = calculateFlexibleFrequencyStats(startTime, end);
+            log.debug("Task C (Frequency Stats) took: {} ms", System.currentTimeMillis() - t1);
+            return res;
+        });
+
+        // Task D: Activity Feed (Multiple DB calls internally - DB Calls 4-7)
+        CompletableFuture<List<ActivityLogDto>> activityFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
+            List<ActivityLogDto> res = fetchUnifiedActivity(userId);
+            log.debug("Task D (Activity Feed) took: {} ms", System.currentTimeMillis() - t1);
+            return res;
+        });
 
         // 3. DETERMINE PERMISSIONS (Synchronous - fast and needed for Stats logic)
         // These queries are very light (indexed scan on Permissions table)
@@ -99,8 +107,9 @@ public class DashboardServiceImpl implements DashboardService {
         else if (canCreate) viewType = "MAKER";
         else viewType = "VIEWER";
 
-        // Task F: Stats (Complex Logic)
+        // Task E: Stats (Complex Logic - Multiple DB calls)
         CompletableFuture<StatsDto> statsFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
             StatsDto s = new StatsDto();
             calculateMakerStats(s, userId);
             if (canApprove) {
@@ -108,26 +117,30 @@ public class DashboardServiceImpl implements DashboardService {
                 applyIntelligenceLayer(s, userId, approvalTypes);
             }
             s.calculateTotals();
+            log.debug("Task E (Stats) took: {} ms", System.currentTimeMillis() - t1);
             return s;
         });
 
-        // Task G: Smart Quick Actions
-        CompletableFuture<List<QuickActionDto>> actionsFuture = CompletableFuture.supplyAsync(() -> 
-            generateSmartQuickActions(roleIdInt, userId)
-        );
+        // Task F: Smart Quick Actions (Algorithm - DB Calls)
+        CompletableFuture<List<QuickActionDto>> actionsFuture = CompletableFuture.supplyAsync(() -> {
+            long t1 = System.currentTimeMillis();
+            List<QuickActionDto> res = generateSmartQuickActions(roleIdInt, userId);
+            log.debug("Task F (Quick Actions) took: {} ms", System.currentTimeMillis() - t1);
+            return res;
+        });
 
         // 4. WAIT FOR ALL & ASSEMBLE
         // This will block only as long as the SLOWEST task takes.
         DashboardResponse response = new DashboardResponse();
         try {
             CompletableFuture.allOf(
-                announcementsFuture, notificationsFuture, finYearFuture, 
+                announcementsFuture, finYearFuture, 
                 frequencyFuture, activityFuture, statsFuture, actionsFuture
             ).join();
 
             response.setViewType(viewType);
             response.setAnnouncements(announcementsFuture.get());
-            response.setNotifications(notificationsFuture.get());
+            // No Notifications here as per requirement
             response.setFinancialYear(finYearFuture.get());
             response.setFrequencyStats(frequencyFuture.get());
             response.setRecentActivity(activityFuture.get());
@@ -357,19 +370,7 @@ public class DashboardServiceImpl implements DashboardService {
                 .collect(Collectors.toList());
     }
 
-    private List<NotificationDto> fetchNotifications(String userId, String roleId) {
-        // This query fetches the recent notifications for the user
-        return notificationRepo.findRecentNotifications(userId, roleId).stream()
-                .map(n -> new NotificationDto(
-                        n.getEventId(),
-                        n.getMessage(),
-                        n.getLinkUrl(),
-                        getTimeAgo(n.getEventTimestamp()),
-                        n.getEventSource(),
-                        n.getEventSource().contains("REPORT") ? "INFO" : "ALERT"
-                ))
-                .collect(Collectors.toList());
-    }
+    // REMOVED fetchNotifications method
 
     // --- UTILS ---
 
@@ -482,6 +483,440 @@ public class DashboardServiceImpl implements DashboardService {
     private long toMillis(LocalDateTime ldt) {
         return ldt == null ? 0 : ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
     }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class DashboardResponse {
+
+    // Values: "MAKER", "EXECUTOR", "HYBRID", "VIEWER"
+    private String viewType;
+
+    private StatsDto stats;
+
+    private FrequencyStatsDto frequencyStats;
+
+    private List<QuickActionDto> quickActions;
+
+    private List<AnnouncementDto> announcements;
+    
+    // Populated from CALENDER_CONFIG table
+    private FinancialYearDto financialYear;
+
+    private List<ActivityLogDto> recentActivity;
+    
+    // Note: Notifications are removed as they are handled by a separate service
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.repository;
+
+import com.fincore.DashboardService.model.CommonReq;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+/**
+ * OPTIMIZED REPOSITORY
+ * Uses Native Queries and Projections to perform heavy aggregations at the Database level.
+ */
+@Repository
+public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long> {
+
+    // PROJECTION INTERFACE
+    interface TypeCount {
+        String getType();
+        String getStatus();
+        Long getCount();
+    }
+
+    interface DailyStats {
+        String getDateStr();
+        Long getCreatedCount();
+        Long getExecutedCount();
+    }
+    
+    // NEW: Projection for Intelligence Scheduler
+    interface UserBottleneck {
+        String getUserId();
+        Integer getOverdueCount();
+    }
+
+    // ==================================================================================
+    // 1. STATS AGGREGATION (MAKER & EXECUTOR)
+    // ==================================================================================
+
+    @Query(value = "SELECT REQ_TYPE as type, REQ_STATUS as status, COUNT(*) as count " +
+            "FROM COMMON_REQ WHERE CREATOR_ID = :userId " +
+            "GROUP BY REQ_TYPE, REQ_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsCrs(@Param("userId") String userId);
+
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count " +
+            "FROM COMMON_REQ " +
+            "WHERE REQ_STATUS = 'P' AND REQ_TYPE IN :types " +
+            "GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getPendingCountsByTypes(@Param("types") List<String> types);
+
+    @Query(value = "SELECT REQ_STATUS as status, COUNT(*) as count " +
+            "FROM JOURNAL_REQUEST WHERE CREATOR_ID = :userId " +
+            "GROUP BY REQ_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsJournal(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE REQ_STATUS = 'P'", nativeQuery = true)
+    int countPendingJournals();
+
+    @Query(value = "SELECT REQUEST_STATUS as status, COUNT(*) as count " +
+            "FROM USER_REQUESTS WHERE REQUESTOR_USER_ID = :userId " +
+            "GROUP BY REQUEST_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsUser(@Param("userId") String userId);
+
+    @Query(value = "SELECT REQUEST_STATUS as status, COUNT(*) as count " +
+            "FROM ROLE_REQUESTS WHERE REQUESTOR_USER_ID = :userId " +
+            "GROUP BY REQUEST_STATUS", nativeQuery = true)
+    List<TypeCount> getMakerStatsRole(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM USER_REQUESTS WHERE REQUEST_STATUS = 'PENDING'", nativeQuery = true)
+    int countPendingUserReqs();
+
+    @Query(value = "SELECT COUNT(*) FROM ROLE_REQUESTS WHERE REQUEST_STATUS = 'PENDING'", nativeQuery = true)
+    int countPendingRoleReqs();
+
+    // ==================================================================================
+    // 2. INTELLIGENCE: BOTTLENECK & ANOMALY DETECTION
+    // ==================================================================================
+
+    /**
+     * BOTTLENECK DETECTION (Single User View):
+     * Counts items pending for more than 48 hours.
+     */
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ " +
+            "WHERE REQ_STATUS = 'P' " +
+            "AND REQ_TYPE IN :types " +
+            "AND REQ_DATE < (SYSDATE - 2)", nativeQuery = true)
+    int countOverdueItems(@Param("types") List<String> types);
+
+    /**
+     * ANOMALY DETECTION:
+     * Counts rejections in the last 1 HOUR.
+     */
+    @Query(value = "SELECT COUNT(*) FROM COMMON_REQ " +
+            "WHERE EXECUTOR_ID = :userId " +
+            "AND REQ_STATUS = 'R' " +
+            "AND EXECUTION_DATE > (SYSDATE - (1/24))", nativeQuery = true)
+    int countRecentRejections(@Param("userId") String userId);
+    
+    // --- NEW: INTELLIGENCE SCHEDULER QUERY ---
+    /**
+     * Finds ALL users (executors) who have > 5 items pending for more than 48 hours.
+     * This is used by the Intelligence Scheduler to send proactive notifications.
+     */
+    @Query(value = """
+        SELECT EXECUTOR_ID as userId, COUNT(*) as overdueCount
+        FROM COMMON_REQ
+        WHERE REQ_STATUS = 'P' 
+        AND REQ_DATE < (SYSDATE - 2)
+        -- In some systems, pending items might not have an assigned executor yet.
+        -- Assuming 'EXECUTOR_ID' might be populated if assigned, or we might need 
+        -- logic to map types to roles. Ideally, this finds assigned work.
+        AND EXECUTOR_ID IS NOT NULL 
+        GROUP BY EXECUTOR_ID
+        HAVING COUNT(*) > 5
+    """, nativeQuery = true)
+    List<UserBottleneck> findAllBottleneckUsers();
+
+    // ==================================================================================
+    // 3. INTELLIGENCE: BEHAVIORAL ANALYSIS
+    // ==================================================================================
+
+    @Query(value = "SELECT REQ_TYPE as type, COUNT(*) as count " +
+            "FROM COMMON_REQ WHERE CREATOR_ID = :userId " +
+            "GROUP BY REQ_TYPE", nativeQuery = true)
+    List<TypeCount> getUserCrsUsageFrequency(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM JOURNAL_REQUEST WHERE CREATOR_ID = :userId", nativeQuery = true)
+    int getUserJournalUsageCount(@Param("userId") String userId);
+
+    @Query(value = "SELECT COUNT(*) FROM USER_LOGS " +
+            "WHERE USER_ID = :userId AND ACTION_TYPE LIKE 'USER_%'", nativeQuery = true)
+    int getUserMgmtUsageCount(@Param("userId") String userId);
+
+
+    // ==================================================================================
+    // 3. FREQUENCY AGGREGATION
+    // ==================================================================================
+
+    @Query(value = """
+      SELECT
+          TO_CHAR(TRUNC(req_date), 'YYYY-MM-DD') as dateStr,
+          COUNT(*) as createdCount,
+          SUM(CASE
+               WHEN status IN ('A', 'R', 'ACCEPTED', 'REJECTED', 'APPROVED', 'SUCCESS', 'CANCELED', 'CANCELLED') THEN 1
+               ELSE 0
+          END) as executedCount
+      FROM (
+          SELECT REQ_DATE as req_date, REQ_STATUS as status FROM COMMON_REQ WHERE REQ_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          SELECT REQ_DATE as req_date, REQ_STATUS as status FROM JOURNAL_REQUEST WHERE REQ_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status FROM USER_REQUESTS WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status FROM ROLE_REQUESTS WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+      ) all_requests
+      GROUP BY TRUNC(req_date)
+      ORDER BY dateStr ASC
+  """, nativeQuery = true)
+    List<DailyStats> getFrequencyStatsByRange(@Param("startDate") LocalDateTime startDate,
+                                              @Param("endDate") LocalDateTime endDate);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.Instant;
+
+/**
+ * Maps to the shared NOTIFICATIONS table (Oracle).
+ * Acts as the "Outbox" for the Dashboard Service Intelligence Scheduler.
+ */
+@Entity
+@Table(name = "NOTIFICATIONS")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class NotificationOutbox {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "EVENT_ID")
+    private String eventId;
+
+    @Column(name = "USER_ID")
+    private String userId;
+
+    @Column(name = "MESSAGE")
+    private String message;
+
+    @Column(name = "LINK_URL")
+    private String linkUrl;
+
+    @Column(name = "EVENT_SOURCE")
+    private String eventSource;
+
+    @Column(name = "AGGREGATE_ID")
+    private String aggregateId;
+
+    @CreationTimestamp
+    @Column(name = "EVENT_TIMESTAMP", updatable = false)
+    private Instant eventTimestamp;
+
+    @Column(name = "TARGET_ROLE")
+    private String targetRole;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.repository;
+
+import com.fincore.DashboardService.model.NotificationOutbox;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+/**
+ * Repository for writing to the Notification Outbox table.
+ * Used by Intelligence Scheduler.
+ */
+@Repository
+public interface NotificationOutboxRepository extends JpaRepository<NotificationOutbox, String> {
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService.service;
+
+import com.fincore.DashboardService.model.NotificationOutbox;
+import com.fincore.DashboardService.repository.DashboardStatsRepository;
+import com.fincore.DashboardService.repository.DashboardStatsRepository.UserBottleneck;
+import com.fincore.DashboardService.repository.NotificationOutboxRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class IntelligenceSchedulerService {
+
+    private final DashboardStatsRepository statsRepo;
+    private final NotificationOutboxRepository outboxRepo;
+
+    /**
+     * Daily Job (9:00 AM): BOTTLENECK DETECTION
+     * Scans for any users who have > 5 items pending for more than 48 hours.
+     * Writes a warning to the Outbox table using our Outbox Pattern.
+     */
+    @Scheduled(cron = "0 0 9 * * ?") // 9 AM Daily
+    @Transactional
+    public void runBottleneckDetection() {
+        log.info("🕵️ Starting Daily Intelligence Scan: Bottleneck Detection...");
+
+        List<UserBottleneck> bottlenecks = statsRepo.findAllBottleneckUsers();
+
+        if (bottlenecks.isEmpty()) {
+            log.info("✅ No bottlenecks detected today.");
+            return;
+        }
+
+        log.warn("⚠️ Detected {} users with critical bottlenecks.", bottlenecks.size());
+
+        for (UserBottleneck user : bottlenecks) {
+            String message = String.format("Action Required: You have %d request(s) pending for over 48 hours. Please clear your queue.", user.getOverdueCount());
+            
+            // Create Notification Event (Outbox Pattern)
+            NotificationOutbox event = NotificationOutbox.builder()
+                    .userId(user.getUserId()) // Send to specific bottlenecked user
+                    .message(message)
+                    .linkUrl("/dashboard") // Direct them to dashboard/pending
+                    .eventSource("DASHBOARD_INTELLIGENCE")
+                    .aggregateId("BOTTLENECK_" + System.currentTimeMillis()) // Unique ID for this run
+                    .build();
+
+            outboxRepo.save(event);
+            log.info(" -> Notification dispatched for User: {}", user.getUserId());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.DashboardService;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling // Required for the Intelligence Scheduler
+public class DashboardServiceApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(DashboardServiceApplication.class, args);
+	}
+
 }
 
 
