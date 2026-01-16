@@ -1,565 +1,3 @@
-package com.fincore.DashboardService.service;
-
-import com.fincore.DashboardService.dto.*;
-import com.fincore.DashboardService.model.*;
-import com.fincore.DashboardService.repository.*;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-// Note: We remove @Transactional from the class/method level to prevent connection pool exhaustion 
-// when using multiple threads. Repositories are inherently transactional.
-
-import java.sql.Timestamp;
-import java.time.Duration;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import com.fincore.DashboardService.repository.DashboardStatsRepository.TypeCount;
-import com.fincore.DashboardService.repository.DashboardStatsRepository.DailyStats;
-
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DashboardServiceImpl implements DashboardService {
-
-    private final PermissionRepository permissionRepo;
-    private final AnnouncementRepository announcementRepo;
-    // NotificationRepo REMOVED as per requirement
-    private final UserLogsRepository userLogRepo;
-    private final DashboardStatsRepository statsRepo;
-    private final CommonReqRepository commonReqRepo;
-    private final JournalRequestRepository journalReqRepo;
-    private final CalenderConfigRepository calendarRepo;
-    private final JwtUtil jwtUtil;
-
-    /**
-     * OPTIMIZED DASHBOARD LOAD
-     * Uses CompletableFuture to execute independent DB calls in PARALLEL.
-     * This significantly reduces total response time.
-     */
-    @Override
-    public DashboardResponse getDashboardData(String token) {
-        long start = System.currentTimeMillis();
-        
-        // 1. EXTRACT CONTEXT (Fast, In-Memory)
-        String userId = jwtUtil.getUserIdFromToken(token);
-        int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-        String roleIdStr = String.valueOf(roleIdInt);
-        
-        log.info("🚀 Starting Parallel Dashboard Load for User: {}", userId);
-
-        // 2. FIRE INDEPENDENT TASKS (Async)
-        
-        // Task A: Announcements (DB Call 1)
-        CompletableFuture<List<AnnouncementDto>> announcementsFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            List<AnnouncementDto> res = fetchAnnouncements(roleIdStr);
-            log.debug("Task A (Announcements) took: {} ms", System.currentTimeMillis() - t1);
-            return res;
-        });
-
-        // Task B: Financial Year (DB Call 2)
-        CompletableFuture<FinancialYearDto> finYearFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            FinancialYearDto res = fetchFinancialYearData();
-            log.debug("Task B (Financial Year) took: {} ms", System.currentTimeMillis() - t1);
-            return res;
-        });
-
-        // Task C: Frequency Stats (Heavy Query - DB Call 3)
-        // We default to 30 days
-        CompletableFuture<FrequencyStatsDto> frequencyFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            LocalDateTime end = LocalDateTime.now();
-            LocalDateTime startTime = end.minusDays(30);
-            FrequencyStatsDto res = calculateFlexibleFrequencyStats(startTime, end);
-            log.debug("Task C (Frequency Stats) took: {} ms", System.currentTimeMillis() - t1);
-            return res;
-        });
-
-        // Task D: Activity Feed (Multiple DB calls internally - DB Calls 4-7)
-        CompletableFuture<List<ActivityLogDto>> activityFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            List<ActivityLogDto> res = fetchUnifiedActivity(userId);
-            log.debug("Task D (Activity Feed) took: {} ms", System.currentTimeMillis() - t1);
-            return res;
-        });
-
-        // 3. DETERMINE PERMISSIONS (Synchronous - fast and needed for Stats logic)
-        // These queries are very light (indexed scan on Permissions table)
-        List<String> approvalTypes = permissionRepo.findApprovalTypesForRole(roleIdInt);
-        int creationPermCount = permissionRepo.countCreationPermissions(roleIdInt);
-        
-        boolean canApprove = !approvalTypes.isEmpty();
-        boolean canCreate = creationPermCount > 0;
-        String viewType;
-        if (canApprove && canCreate) viewType = "HYBRID";
-        else if (canApprove) viewType = "EXECUTOR";
-        else if (canCreate) viewType = "MAKER";
-        else viewType = "VIEWER";
-
-        // Task E: Stats (Complex Logic - Multiple DB calls)
-        CompletableFuture<StatsDto> statsFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            StatsDto s = new StatsDto();
-            calculateMakerStats(s, userId);
-            if (canApprove) {
-                calculateExecutorStats(s, approvalTypes);
-                applyIntelligenceLayer(s, userId, approvalTypes);
-            }
-            s.calculateTotals();
-            log.debug("Task E (Stats) took: {} ms", System.currentTimeMillis() - t1);
-            return s;
-        });
-
-        // Task F: Smart Quick Actions (Algorithm - DB Calls)
-        CompletableFuture<List<QuickActionDto>> actionsFuture = CompletableFuture.supplyAsync(() -> {
-            long t1 = System.currentTimeMillis();
-            List<QuickActionDto> res = generateSmartQuickActions(roleIdInt, userId);
-            log.debug("Task F (Quick Actions) took: {} ms", System.currentTimeMillis() - t1);
-            return res;
-        });
-
-        // 4. WAIT FOR ALL & ASSEMBLE
-        // This will block only as long as the SLOWEST task takes.
-        DashboardResponse response = new DashboardResponse();
-        try {
-            CompletableFuture.allOf(
-                announcementsFuture, finYearFuture, 
-                frequencyFuture, activityFuture, statsFuture, actionsFuture
-            ).join();
-
-            response.setViewType(viewType);
-            response.setAnnouncements(announcementsFuture.get());
-            // No Notifications here as per requirement
-            response.setFinancialYear(finYearFuture.get());
-            response.setFrequencyStats(frequencyFuture.get());
-            response.setRecentActivity(activityFuture.get());
-            response.setStats(statsFuture.get());
-            response.setQuickActions(actionsFuture.get());
-            
-        } catch (Exception e) {
-            log.error("Error during parallel dashboard execution", e);
-            throw new RuntimeException("Failed to load dashboard data", e);
-        }
-
-        long duration = System.currentTimeMillis() - start;
-        log.info("✅ Dashboard Loaded in {} ms (Parallel Execution)", duration);
-        
-        return response;
-    }
-
-
-    /**
-     * Helper extracted for Async execution
-     */
-    private FinancialYearDto fetchFinancialYearData() {
-        Optional<CalenderConfigModel> configOpt = calendarRepo.findByActiveFlag(1); // Assuming 1 = Active
-        if (configOpt.isPresent()) {
-            CalenderConfigModel cfg = configOpt.get();
-            return FinancialYearDto.builder()
-                    .startDate(cfg.getYearStartDate())
-                    .endDate(cfg.getYearEndDate())
-                    .description(cfg.getRemarks())
-                    .status("Active")
-                    .build();
-        }
-        return null;
-    }
-
-
-    /**
-     * Fetches frequency stats based on dates
-     */
-    public FrequencyStatsDto calculateFlexibleFrequencyStats(LocalDateTime start, LocalDateTime end) {
-        // 1. Fetch raw data (aggregated from all tables via UNION)
-        List<DailyStats> rawData = statsRepo.getFrequencyStatsByRange(start, end);
-
-        // 2. Convert to Map for easier lookup
-        Map<String, DailyDataPoint> dataMap = rawData.stream()
-                .collect(Collectors.toMap(
-                        DailyStats::getDateStr,
-                        d -> new DailyDataPoint(d.getDateStr(), d.getCreatedCount().intValue(), d.getExecutedCount().intValue())
-                ));
-
-        // 3. Fill Gaps
-        List<DailyDataPoint> history = new ArrayList<>();
-        int totalCreated = 0;
-        int totalExecuted = 0;
-
-        LocalDate current = start.toLocalDate();
-        LocalDate endDate = end.toLocalDate();
-        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-
-        while (!current.isAfter(endDate)) {
-            String dateKey = current.format(dtf);
-            DailyDataPoint point = dataMap.getOrDefault(dateKey, new DailyDataPoint(dateKey, 0, 0));
-            history.add(point);
-            totalCreated += point.getCreated();
-            totalExecuted += point.getExecuted();
-            current = current.plusDays(1);
-        }
-
-        return FrequencyStatsDto.builder()
-                .totalCreated(totalCreated)
-                .totalExecuted(totalExecuted)
-                .history(history)
-                .build();
-    }
-
-
-    // ==================================================================================
-    // LOGIC HELPERS (Unchanged but running inside Async Threads now)
-    // ==================================================================================
-
-    private void calculateMakerStats(StatsDto stats, String userId) {
-        Map<String, Integer> pMap = new HashMap<>();
-        Map<String, Integer> aMap = new HashMap<>();
-        Map<String, Integer> rMap = new HashMap<>();
-
-        // 1. CRS
-        List<TypeCount> crsStats = statsRepo.getMakerStatsCrs(userId);
-        for (TypeCount row : crsStats) bucketStats(pMap, aMap, rMap, row.getType(), row.getStatus(), row.getCount().intValue());
-
-        // 2. Journal
-        List<TypeCount> journalStats = statsRepo.getMakerStatsJournal(userId);
-        for (TypeCount row : journalStats) bucketStats(pMap, aMap, rMap, "JOURNAL_AUTH", row.getStatus(), row.getCount().intValue());
-
-        // 3. User & Role
-        List<TypeCount> userStats = statsRepo.getMakerStatsUser(userId);
-        for (TypeCount row : userStats) bucketStats(pMap, aMap, rMap, "USER_MANAGEMENT", row.getStatus(), row.getCount().intValue());
-
-        List<TypeCount> roleStats = statsRepo.getMakerStatsRole(userId);
-        for (TypeCount row : roleStats) bucketStats(pMap, aMap, rMap, "ROLE_MANAGEMENT", row.getStatus(), row.getCount().intValue());
-
-        stats.setMyPending(sumMap(pMap));
-        stats.setMyApproved(sumMap(aMap));
-        stats.setMyRejected(sumMap(rMap));
-        stats.setMyPendingDetails(pMap);
-        stats.setMyApprovedDetails(aMap);
-        stats.setMyRejectedDetails(rMap);
-    }
-
-    private void calculateExecutorStats(StatsDto stats, List<String> allowedTypes) {
-        Map<String, Integer> details = new HashMap<>();
-
-        if(!allowedTypes.isEmpty()) {
-            List<TypeCount> crsPending = statsRepo.getPendingCountsByTypes(allowedTypes);
-            for(TypeCount row : crsPending) details.put(row.getType(), row.getCount().intValue());
-        }
-
-        if(allowedTypes.contains("USER_MANAGEMENT")) addIfPositive(details, "USER_MANAGEMENT", statsRepo.countPendingUserReqs());
-        if(allowedTypes.contains("ROLE_MANAGEMENT")) addIfPositive(details, "ROLE_MANAGEMENT", statsRepo.countPendingRoleReqs());
-        if(allowedTypes.contains("JOURNAL_AUTH")) addIfPositive(details, "JOURNAL_AUTH", statsRepo.countPendingJournals());
-
-        stats.setPendingForMe(sumMap(details));
-        stats.setPendingForMeDetails(details);
-    }
-
-    private void applyIntelligenceLayer(StatsDto stats, String userId, List<String> approvalTypes) {
-        int overdueCount = statsRepo.countOverdueItems(approvalTypes);
-        stats.setOverduePendingCount(overdueCount);
-        stats.setBottleneck(overdueCount > 4);
-
-        int recentRejections = statsRepo.countRecentRejections(userId);
-        if (recentRejections > 20) {
-            stats.setAnomalyDetected(true);
-            stats.setAnomalyMessage("Warning: High volume of rejections detected (" + recentRejections + " in last hour).");
-        }
-    }
-
-    private List<QuickActionDto> generateSmartQuickActions(int roleId, String userId) {
-        List<Permissions> allPerms = permissionRepo.findAllByRoleId(roleId);
-        Map<String, Integer> usageMap = new HashMap<>();
-        
-        List<TypeCount> crsUsage = statsRepo.getUserCrsUsageFrequency(userId);
-        for(TypeCount row : crsUsage) usageMap.put(row.getType(), row.getCount().intValue());
-        
-        int journalUsage = statsRepo.getUserJournalUsageCount(userId);
-        if(journalUsage > 0) usageMap.put("JOURNAL", journalUsage);
-        
-        int userMgmtUsage = statsRepo.getUserMgmtUsageCount(userId);
-        if(userMgmtUsage > 0) usageMap.put("USER_MANAGEMENT", userMgmtUsage);
-
-        List<QuickActionDto> actions = new ArrayList<>();
-        List<QuickActionDto> approvalActions = new ArrayList<>();
-
-        for (Permissions p : allPerms) {
-            String type = getActionType(p.getMenuAction());
-            String reqType = p.getMappedRequestType();
-            
-            if(p.getMenuTitle().matches("Dashboard") || p.getMenuUrl().equals("/dashboard")) continue;
-
-            int score = 0;
-            if (reqType != null && usageMap.containsKey(reqType)) score += (usageMap.get(reqType) * 2);
-            if (p.getMenuUrl().contains("journal") && usageMap.containsKey("JOURNAL")) score += 20;
-            if (p.getMenuUrl().contains("user") && usageMap.containsKey("USER_MANAGEMENT")) score += 20;
-
-            if ("UPLOAD".equals(type)) score += 10;
-            else if ("CREATE".equals(type)) score += 8;
-            else if ("DOWNLOAD".equals(type)) score += 5;
-            else if ("APPROVE".equals(type)) score += 6;
-            else score += 1;
-
-            QuickActionDto action = new QuickActionDto(
-                    p.getMenuId(), deriveLabel(type, p.getMenuTitle()),
-                    p.getMenuUrl(), p.getMenuIcon(), type, p.getMenuDescription(), score
-            );
-
-            if (isApprovalScreen(p)) approvalActions.add(action);
-            else actions.add(action);
-        }
-
-        actions.sort((a, b) -> Integer.compare(b.getScore(), a.getScore()));
-        
-        if (actions.size() < 4) {
-            approvalActions.sort((a, b) -> Integer.compare(b.getScore(), a.getScore()));
-            for (QuickActionDto approval : approvalActions) {
-                if (actions.size() >= 4) break;
-                approval.setLabel("Manage " + approval.getLabel().replace("Requests", "").trim());
-                approval.setIcon("check-square");
-                actions.add(approval);
-            }
-        }
-        if (actions.isEmpty()) {
-            actions.add(new QuickActionDto(0, "View Profile", "/profile", "user", "VIEW", "User Profile", 0));
-        }
-
-        return actions.stream().limit(6).collect(Collectors.toList());
-    }
-
-    private List<ActivityLogDto> fetchUnifiedActivity(String userId) {
-        List<ActivityLogDto> timeline = new ArrayList<>();
-        
-        List<UserLogs> userLogs = userLogRepo.findTop20ByUserIdOrderByActionTimeDesc(userId);
-        for (UserLogs log : userLogs) timeline.add(parseUserLogDetails(log));
-        
-        for (CommonReq r : commonReqRepo.findTop10ByCreatorIdOrderByReqDateDesc(userId)) {
-            String message = String.format("Raised request to %s %s (Target: %s)",
-                    mapChangeType(r.getReqType()), r.getReqType(), r.getTargetId());
-            timeline.add(createLog("Request Raised", toMillis(r.getReqDate()), "COMMON_REQ", message, normalizeStatus(r.getReqStatus()), r.getCreatorId()));
-        }
-        for (CommonReq r : commonReqRepo.findTop10ByExecutorIdOrderByExecutionDateDesc(userId)) {
-            if (r.getExecutionDate() != null) {
-                String status = normalizeStatus(r.getReqStatus());
-                String message = String.format("%s request for %s (Target: %s)", status, r.getReqType(), r.getTargetId());
-                timeline.add(createLog("Request Processed", toMillis(r.getExecutionDate()), "COMMON_REQ", message, status, r.getExecutorId()));
-            }
-        }
-        List<JournalRequest> journals = journalReqRepo.findTop10ByCreatorIdOrderByReqDateDesc(userId);
-        for (JournalRequest j : journals) {
-            timeline.add(createLog("Journal Upload", toMillis(j.getReqDate()), "JOURNAL", "Uploaded Batch " + j.getBatchId(), normalizeStatus(j.getReqStatus()), j.getCreatorId()));
-        }
-
-        Collections.sort(timeline);
-        return timeline.stream().limit(15).collect(Collectors.toList());
-    }
-
-    private List<AnnouncementDto> fetchAnnouncements(String roleId) {
-        return announcementRepo.findActiveAnnouncements(roleId).stream()
-                .map(a -> new AnnouncementDto(a.getId(), a.getTitle(), a.getMessage(), a.getSeverity(), a.getCreatedAt().toString()))
-                .collect(Collectors.toList());
-    }
-
-    // REMOVED fetchNotifications method
-
-    // --- UTILS ---
-
-    private String getTimeAgo(Timestamp time) {
-        if(time == null) return "Unknown";
-        Duration d = Duration.between(time.toLocalDateTime(), LocalDateTime.now());
-        if(d.toMinutes() < 1) return "Just now";
-        if(d.toHours() < 1) return d.toMinutes() + " mins ago";
-        if(d.toDays() < 1) return d.toHours() + " hours ago";
-        return d.toDays() + " days ago";
-    }
-
-    private ActivityLogDto parseUserLogDetails(UserLogs log) {
-        String raw = log.getNewValue();
-        String actionType = log.getActionType() != null ? log.getActionType() : "ACTIVITY";
-        String reqType = extractRegex(raw, "requestType");
-        String target = extractRegex(raw, "targetUserId");
-        String display = actionType.replace("_", " ");
-        String details = log.getChangeType();
-
-        if ("USER_REQUEST".equals(actionType)) {
-            display = "User Management";
-            details = String.format("Raised %s for User %s", reqType, target);
-        } else if (actionType.contains("APPROVAL")) {
-            display = "Approval";
-            details = String.format("Processed %s for %s", reqType != null ? reqType : "Request", target);
-        }
-        return createLog(display, log.getActionTime().getTime(), "USER_LOG", details, "COMPLETED", log.getUserId());
-    }
-
-    private void bucketStats(Map<String, Integer> p, Map<String, Integer> a, Map<String, Integer> r, String type, String rawStatus, int count) {
-        String status = normalizeStatus(rawStatus);
-        if ("PENDING".equals(status)) p.merge(type, count, Integer::sum);
-        else if ("APPROVED".equals(status)) a.merge(type, count, Integer::sum);
-        else if ("REJECTED".equals(status)) r.merge(type, count, Integer::sum);
-    }
-
-    private void addIfPositive(Map<String, Integer> map, String key, int count) {
-        if(count > 0) map.put(key, count);
-    }
-
-    private int sumMap(Map<String, Integer> map) {
-        return map.values().stream().mapToInt(Integer::intValue).sum();
-    }
-
-    private String normalizeStatus(String rawStatus) {
-        if (rawStatus == null) return "UNKNOWN";
-        String s = rawStatus.trim().toUpperCase();
-        return switch (s) {
-            case "P", "PENDING" -> "PENDING";
-            case "A", "ACCEPTED", "APPROVED", "SUCCESS" -> "APPROVED";
-            case "R", "REJECTED", "CANCELLED" -> "REJECTED";
-            case "D", "DELETED" -> "DELETED";
-            case "C", "CANCELED" -> "CANCELED";
-            default -> s;
-        };
-    }
-
-    private String mapChangeType(String type) {
-        if (type == null) return "Modify";
-        if (type.equalsIgnoreCase("A")) return "Create";
-        if (type.equalsIgnoreCase("U")) return "Update";
-        if (type.equalsIgnoreCase("D")) return "Delete";
-        if (type.equalsIgnoreCase("B")) return "Block";
-        if (type.equalsIgnoreCase("UB")) return "Unblock";
-        return "Modify";
-    }
-
-    private String getActionType(String raw) {
-        if(raw == null) return "VIEW";
-        raw = raw.toLowerCase();
-        if(raw.contains("upload")) return "UPLOAD";
-        if(raw.contains("create")) return "CREATE";
-        if(raw.contains("download")) return "DOWNLOAD";
-        if(raw.contains("approve")) return "APPROVE";
-        return "VIEW";
-    }
-
-    private String deriveLabel(String type, String title) {
-        if("VIEW".equals(type)) return title;
-        if("APPROVE".equals(type)) return title;
-        return type.charAt(0) + type.substring(1).toLowerCase() + " " + title;
-    }
-
-    private boolean isApprovalScreen(Permissions p) {
-        return p.getMenuTitle().contains("Requests") ||
-                (p.getMenuAction() != null && p.getMenuAction().toLowerCase().contains("approve"));
-    }
-
-    private String extractRegex(String source, String key) {
-        if (source == null) return "Unknown";
-        Pattern p = Pattern.compile(key + "=([^,}]+)");
-        Matcher m = p.matcher(source);
-        if (m.find()) return m.group(1).trim();
-        return "Unknown";
-    }
-
-    private ActivityLogDto createLog(String action, long time, String source, String details, String status, String user) {
-        ActivityLogDto log = new ActivityLogDto();
-        log.setAction(action);
-        log.setTimestamp(time);
-        log.setDisplayTime(new Timestamp(time).toString());
-        log.setSource(source);
-        log.setDetails(details);
-        log.setStatus(status);
-        log.setUser(user);
-        return log;
-    }
-
-    private long toMillis(LocalDateTime ldt) {
-        return ldt == null ? 0 : ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.util.List;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class DashboardResponse {
-
-    // Values: "MAKER", "EXECUTOR", "HYBRID", "VIEWER"
-    private String viewType;
-
-    private StatsDto stats;
-
-    private FrequencyStatsDto frequencyStats;
-
-    private List<QuickActionDto> quickActions;
-
-    private List<AnnouncementDto> announcements;
-    
-    // Populated from CALENDER_CONFIG table
-    private FinancialYearDto financialYear;
-
-    private List<ActivityLogDto> recentActivity;
-    
-    // Note: Notifications are removed as they are handled by a separate service
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.DashboardService.repository;
 
 import com.fincore.DashboardService.model.CommonReq;
@@ -592,8 +30,9 @@ public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long>
     }
     
     // NEW: Projection for Intelligence Scheduler
-    interface UserBottleneck {
-        String getUserId();
+    // Returns Role ID (String) instead of User ID, as responsibility is Role-based.
+    interface RoleBottleneck {
+        String getRoleId();
         Integer getOverdueCount();
     }
 
@@ -660,24 +99,32 @@ public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long>
             "AND EXECUTION_DATE > (SYSDATE - (1/24))", nativeQuery = true)
     int countRecentRejections(@Param("userId") String userId);
     
-    // --- NEW: INTELLIGENCE SCHEDULER QUERY ---
+    // --- NEW: INTELLIGENCE SCHEDULER QUERY (CORRECTED) ---
     /**
-     * Finds ALL users (executors) who have > 5 items pending for more than 48 hours.
-     * This is used by the Intelligence Scheduler to send proactive notifications.
+     * Finds ALL ROLES that have > 5 items pending for more than 48 hours.
+     * Logic:
+     * 1. Find Pending Requests older than 48 hours.
+     * 2. Join with PERMISSIONS to find which Screen handles this Request Type.
+     * 3. Join with ROLE_PERMISSIONS to find which Roles have access to that Screen.
+     * 4. Filter for Roles that have 'approve' or 'reject' rights.
+     * 5. Group by ROLE_ID to find the bottlenecked teams.
      */
     @Query(value = """
-        SELECT EXECUTOR_ID as userId, COUNT(*) as overdueCount
-        FROM COMMON_REQ
-        WHERE REQ_STATUS = 'P' 
-        AND REQ_DATE < (SYSDATE - 2)
-        -- In some systems, pending items might not have an assigned executor yet.
-        -- Assuming 'EXECUTOR_ID' might be populated if assigned, or we might need 
-        -- logic to map types to roles. Ideally, this finds assigned work.
-        AND EXECUTOR_ID IS NOT NULL 
-        GROUP BY EXECUTOR_ID
-        HAVING COUNT(*) > 5
+        SELECT 
+            TO_CHAR(rp.ROLE_ID) as roleId, 
+            COUNT(c.REQ_ID) as overdueCount
+        FROM COMMON_REQ c
+        JOIN PERMISSIONS p ON c.REQ_TYPE = p.MAPPED_REQUEST_TYPE
+        JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+        JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+        WHERE c.REQ_STATUS = 'P' 
+          AND c.REQ_DATE < (SYSDATE - 2)
+          AND r.ROLE_STATUS = 'ACTIVE'
+          AND (lower(p.MENU_ACTION) LIKE '%approve%' OR lower(p.MENU_ACTION) LIKE '%reject%')
+        GROUP BY rp.ROLE_ID
+        HAVING COUNT(c.REQ_ID) > 5
     """, nativeQuery = true)
-    List<UserBottleneck> findAllBottleneckUsers();
+    List<RoleBottleneck> findAllBottleneckRoles();
 
     // ==================================================================================
     // 3. INTELLIGENCE: BEHAVIORAL ANALYSIS
@@ -742,98 +189,12 @@ public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long>
 
 
 
-package com.fincore.DashboardService.model;
-
-import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import org.hibernate.annotations.CreationTimestamp;
-
-import java.time.Instant;
-
-/**
- * Maps to the shared NOTIFICATIONS table (Oracle).
- * Acts as the "Outbox" for the Dashboard Service Intelligence Scheduler.
- */
-@Entity
-@Table(name = "NOTIFICATIONS")
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class NotificationOutbox {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "EVENT_ID")
-    private String eventId;
-
-    @Column(name = "USER_ID")
-    private String userId;
-
-    @Column(name = "MESSAGE")
-    private String message;
-
-    @Column(name = "LINK_URL")
-    private String linkUrl;
-
-    @Column(name = "EVENT_SOURCE")
-    private String eventSource;
-
-    @Column(name = "AGGREGATE_ID")
-    private String aggregateId;
-
-    @CreationTimestamp
-    @Column(name = "EVENT_TIMESTAMP", updatable = false)
-    private Instant eventTimestamp;
-
-    @Column(name = "TARGET_ROLE")
-    private String targetRole;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService.repository;
-
-import com.fincore.DashboardService.model.NotificationOutbox;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-/**
- * Repository for writing to the Notification Outbox table.
- * Used by Intelligence Scheduler.
- */
-@Repository
-public interface NotificationOutboxRepository extends JpaRepository<NotificationOutbox, String> {
-}
-
-
-
-
-
-
-
-
-
-
 
 package com.fincore.DashboardService.service;
 
 import com.fincore.DashboardService.model.NotificationOutbox;
 import com.fincore.DashboardService.repository.DashboardStatsRepository;
-import com.fincore.DashboardService.repository.DashboardStatsRepository.UserBottleneck;
+import com.fincore.DashboardService.repository.DashboardStatsRepository.RoleBottleneck; // Updated Import
 import com.fincore.DashboardService.repository.NotificationOutboxRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -853,7 +214,7 @@ public class IntelligenceSchedulerService {
 
     /**
      * Daily Job (9:00 AM): BOTTLENECK DETECTION
-     * Scans for any users who have > 5 items pending for more than 48 hours.
+     * Scans for ROLES that have > 5 items pending for more than 48 hours.
      * Writes a warning to the Outbox table using our Outbox Pattern.
      */
     @Scheduled(cron = "0 0 9 * * ?") // 9 AM Daily
@@ -861,62 +222,34 @@ public class IntelligenceSchedulerService {
     public void runBottleneckDetection() {
         log.info("🕵️ Starting Daily Intelligence Scan: Bottleneck Detection...");
 
-        List<UserBottleneck> bottlenecks = statsRepo.findAllBottleneckUsers();
+        List<RoleBottleneck> bottlenecks = statsRepo.findAllBottleneckRoles();
 
         if (bottlenecks.isEmpty()) {
             log.info("✅ No bottlenecks detected today.");
             return;
         }
 
-        log.warn("⚠️ Detected {} users with critical bottlenecks.", bottlenecks.size());
+        log.warn("⚠️ Detected {} roles with critical bottlenecks.", bottlenecks.size());
 
-        for (UserBottleneck user : bottlenecks) {
-            String message = String.format("Action Required: You have %d request(s) pending for over 48 hours. Please clear your queue.", user.getOverdueCount());
+        for (RoleBottleneck role : bottlenecks) {
+            String message = String.format("Team Alert: Your Role has %d overdue request(s) pending for over 48 hours. Please clear the queue.", role.getOverdueCount());
             
             // Create Notification Event (Outbox Pattern)
+            // TARGET: ROLE (1-to-Many)
             NotificationOutbox event = NotificationOutbox.builder()
-                    .userId(user.getUserId()) // Send to specific bottlenecked user
+                    .userId(null) // Not for a specific user
+                    .targetRole(role.getRoleId()) // Send to ALL users with this Role
                     .message(message)
-                    .linkUrl("/dashboard") // Direct them to dashboard/pending
+                    .linkUrl("/dashboard") 
                     .eventSource("DASHBOARD_INTELLIGENCE")
-                    .aggregateId("BOTTLENECK_" + System.currentTimeMillis()) // Unique ID for this run
+                    .aggregateId("BOTTLENECK_" + System.currentTimeMillis()) 
                     .build();
 
             outboxRepo.save(event);
-            log.info(" -> Notification dispatched for User: {}", user.getUserId());
+            log.info(" -> Notification dispatched for Role ID: {}", role.getRoleId());
         }
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.DashboardService;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.scheduling.annotation.EnableScheduling;
-
-@SpringBootApplication
-@EnableScheduling // Required for the Intelligence Scheduler
-public class DashboardServiceApplication {
-
-	public static void main(String[] args) {
-		SpringApplication.run(DashboardServiceApplication.class, args);
-	}
-
-}
 
 
