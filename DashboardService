@@ -930,7 +930,6 @@ public class UserRequest {
 
 
 
-
 package com.fincore.DashboardService.repository;
 
 import com.fincore.DashboardService.model.Announcement;
@@ -962,8 +961,6 @@ public interface AnnouncementRepository extends JpaRepository<Announcement, Long
 
 
 
-
-
 package com.fincore.DashboardService.repository;
 
 import com.fincore.DashboardService.model.CommonReq;
@@ -986,6 +983,8 @@ public interface CommonReqRepository extends JpaRepository<CommonReq, Long> {
     // Fetch top 10 executed by user (Checker Log)
     List<CommonReq> findTop10ByExecutorIdOrderByExecutionDateDesc(String executorId);
 }
+
+
 
 
 
@@ -1140,25 +1139,72 @@ public interface DashboardStatsRepository extends JpaRepository<CommonReq, Long>
     // ==================================================================================
     // 3. FREQUENCY AGGREGATION
     // ==================================================================================
+
     /**
-     * Returns daily counts for a given range in ONE query.
-     * * Logic:
-     * 1. TRUNC(REQ_DATE) groups timestamps into days.
-     * 2. SUM(CASE...) allows counting created vs executed in the same row.
+     * Returns daily counts for a given range by aggregating ALL request tables.
+     * Logic:
+     * 1. UNION ALL combines COMMON_REQ, JOURNAL_REQUEST, USER_REQUESTS, ROLE_REQUESTS
+     * 2. Normalizes column names (REQ_DATE vs REQUEST_DATE)
+     * 3. Groups by Truncated Date
+     */
+    /**
+     * Returns daily counts for a given range by aggregating ALL request tables.
+     * Logic:
+     * 1. UNION ALL combines COMMON_REQ, JOURNAL_REQUEST, USER_REQUESTS, ROLE_REQUESTS
+     * 2. Normalizes column names (REQ_DATE vs REQUEST_DATE)
+     * 3. Groups by Truncated Date
      */
     @Query(value = """
-       SELECT
-           TO_CHAR(TRUNC(REQ_DATE), 'YYYY-MM-DD') as dateStr,
-           COUNT(*) as createdCount,
-           SUM(CASE WHEN REQ_STATUS IN ('A', 'R', 'ACCEPTED', 'REJECTED') THEN 1 ELSE 0 END) as executedCount
-       FROM COMMON_REQ
-       WHERE REQ_DATE BETWEEN :startDate AND :endDate
-       GROUP BY TRUNC(REQ_DATE)
-       ORDER BY dateStr ASC
-   """, nativeQuery = true)
+      SELECT
+          TO_CHAR(TRUNC(req_date), 'YYYY-MM-DD') as dateStr,
+          COUNT(*) as createdCount,
+          SUM(CASE
+               WHEN status IN ('A', 'R', 'ACCEPTED', 'REJECTED', 'APPROVED', 'SUCCESS', 'CANCELED', 'CANCELLED') THEN 1
+               ELSE 0
+          END) as executedCount
+      FROM (
+          -- 1. Common Requests
+          SELECT REQ_DATE as req_date, REQ_STATUS as status
+          FROM COMMON_REQ
+          WHERE REQ_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          -- 2. Journal Requests
+          SELECT REQ_DATE as req_date, REQ_STATUS as status
+          FROM JOURNAL_REQUEST
+          WHERE REQ_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          -- 3. User Management Requests
+          SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status
+          FROM USER_REQUESTS
+          WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+          UNION ALL
+          -- 4. Role Management Requests
+          SELECT REQUEST_DATE as req_date, REQUEST_STATUS as status
+          FROM ROLE_REQUESTS
+          WHERE REQUEST_DATE BETWEEN :startDate AND :endDate
+      ) all_requests
+      GROUP BY TRUNC(req_date)
+      ORDER BY dateStr ASC
+  """, nativeQuery = true)
     List<DailyStats> getFrequencyStatsByRange(@Param("startDate") LocalDateTime startDate,
                                               @Param("endDate") LocalDateTime endDate);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1350,6 +1396,9 @@ public interface DashboardService {
 
 
 
+
+
+
 package com.fincore.DashboardService.service;
 
 import com.fincore.DashboardService.dto.*;
@@ -1372,7 +1421,6 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import com.fincore.DashboardService.repository.DashboardStatsRepository.TypeCount;
 import com.fincore.DashboardService.repository.DashboardStatsRepository.DailyStats;
-
 
 @Service
 @RequiredArgsConstructor
@@ -1403,11 +1451,11 @@ public class DashboardServiceImpl implements DashboardService {
 
         // 1. ANNOUNCEMENTS
         response.setAnnouncements(fetchAnnouncements(roleIdStr));
-        log.info("ℹ️ Announcement Fetched");
+        log.info("-> Announcement Fetched");
 
         // 2. VIEW TYPE DETERMINATION (Logic: Hybrid > Executor > Maker > Viewer)
         List<String> approvalTypes = permissionRepo.findApprovalTypesForRole(roleIdInt);
-        log.info("ℹ️ User has approval rights for: {}", approvalTypes);
+        log.info("-> User has approval rights for: {}", approvalTypes);
 
         int creationPermCount = permissionRepo.countCreationPermissions(roleIdInt);
         boolean canApprove = !approvalTypes.isEmpty();
@@ -1431,37 +1479,36 @@ public class DashboardServiceImpl implements DashboardService {
             calculateExecutorStats(stats, approvalTypes);
             // 3c. Apply Bottleneck & Anomaly Intelligence
             applyIntelligenceLayer(stats, userId, approvalTypes);
-            log.info("ℹ️ Intelligence applied for executor ");
+            log.info("-> Intelligence applied for executor ");
         }
 
         stats.calculateTotals();
         response.setStats(stats);
-        log.info("ℹ️ All Stats Fetched");
+        log.info("-> All Stats Fetched");
 
         // 4. Smart Quick Actions (Behavioral Algorithm)
         response.setQuickActions(generateSmartQuickActions(roleIdInt, userId));
-        log.info("ℹ️ Smart Quick actions Fetched");
+        log.info("-> Smart Quick actions Fetched");
 
         // 5. Frequency Stats (Flexible Range)
         // Default: Load last 30 days
         LocalDateTime end = LocalDateTime.now();
         LocalDateTime start = end.minusDays(30);
         response.setFrequencyStats(calculateFlexibleFrequencyStats(start, end));
-        log.info("ℹ️ Frequency data Fetched");
+        log.info("-> Frequency data Fetched");
 
         // 6. ACTIVITY FEED
         response.setRecentActivity(fetchUnifiedActivity(userId));
-        log.info("ℹ️ Recent Activities Fetched");
+        log.info("-> Recent Activities Fetched");
 
         // financial year
         enrichWithFinancialYear(response);
-        log.info("ℹ️ Financial year Fetched");
+        log.info("-> Financial year Fetched");
 
-        log.info("✅ Dashboard Loaded with all data");
+        log.info("-> Dashboard Loaded with all data");
 
         return response;
     }
-
 
     /**
      * Fetches frequency stats based on dates
@@ -1477,9 +1524,7 @@ public class DashboardServiceImpl implements DashboardService {
                         d -> new DailyDataPoint(
                                 d.getDateStr(),
                                 d.getCreatedCount().intValue(),
-                                d.getExecutedCount().intValue()
-                        )
-                ));
+                                d.getExecutedCount().intValue())));
 
         // 3. Fill Gaps: Iterate from Start to End
         List<DailyDataPoint> history = new ArrayList<>();
@@ -1509,11 +1554,11 @@ public class DashboardServiceImpl implements DashboardService {
     }
 
     /**
-     * Simple fetch for Financial Year from Master Table.
-     * No complex alerts, just the data.
+     *  Fetch Active Financial Year From Master Table.
+     *
      */
     private void enrichWithFinancialYear(DashboardResponse response) {
-        Optional<CalenderConfigModel> configOpt = calendarRepo.findFirstByOrderByIdDesc();
+        Optional<CalenderConfigModel> configOpt = calendarRepo.findByActiveFlag(1);
 
         if (configOpt.isPresent()) {
             CalenderConfigModel cfg = configOpt.get();
@@ -1531,7 +1576,7 @@ public class DashboardServiceImpl implements DashboardService {
     }
 
     // ==================================================================================
-    //  ALGORITHM 1: STATS (SQL AGGREGATION - handled in db level)
+    // ALGORITHM 1: STATS (SQL AGGREGATION - handled in db level)
     // ==================================================================================
 
     // --- MAKER STATS (Using Group By) ---
@@ -1542,18 +1587,22 @@ public class DashboardServiceImpl implements DashboardService {
 
         // 1. CRS
         List<TypeCount> crsStats = statsRepo.getMakerStatsCrs(userId);
-        for (TypeCount row : crsStats) bucketStats(pMap, aMap, rMap, row.getType(), row.getStatus(), row.getCount().intValue());
+        for (TypeCount row : crsStats)
+            bucketStats(pMap, aMap, rMap, row.getType(), row.getStatus(), row.getCount().intValue());
 
         // 2. Journal
         List<TypeCount> journalStats = statsRepo.getMakerStatsJournal(userId);
-        for (TypeCount row : journalStats) bucketStats(pMap, aMap, rMap, "JOURNAL_AUTH", row.getStatus(), row.getCount().intValue());
+        for (TypeCount row : journalStats)
+            bucketStats(pMap, aMap, rMap, "JOURNAL_AUTH", row.getStatus(), row.getCount().intValue());
 
         // 3. User & Role
         List<TypeCount> userStats = statsRepo.getMakerStatsUser(userId);
-        for (TypeCount row : userStats) bucketStats(pMap, aMap, rMap, "USER_MANAGEMENT", row.getStatus(), row.getCount().intValue());
+        for (TypeCount row : userStats)
+            bucketStats(pMap, aMap, rMap, "USER_MANAGEMENT", row.getStatus(), row.getCount().intValue());
 
         List<TypeCount> roleStats = statsRepo.getMakerStatsRole(userId);
-        for (TypeCount row : roleStats) bucketStats(pMap, aMap, rMap, "ROLE_MANAGEMENT", row.getStatus(), row.getCount().intValue());
+        for (TypeCount row : roleStats)
+            bucketStats(pMap, aMap, rMap, "ROLE_MANAGEMENT", row.getStatus(), row.getCount().intValue());
 
         stats.setMyPending(sumMap(pMap));
         stats.setMyApproved(sumMap(aMap));
@@ -1568,28 +1617,28 @@ public class DashboardServiceImpl implements DashboardService {
         Map<String, Integer> details = new HashMap<>();
 
         // 1. CRS Pending (Filtered by allowed types)
-        if(!allowedTypes.isEmpty()) {
+        if (!allowedTypes.isEmpty()) {
             List<TypeCount> crsPending = statsRepo.getPendingCountsByTypes(allowedTypes);
-            for(TypeCount row : crsPending) details.put(row.getType(), row.getCount().intValue());
+            for (TypeCount row : crsPending)
+                details.put(row.getType(), row.getCount().intValue());
         }
 
         // 2. Other Modules (Permission Check)
-        if(allowedTypes.contains("USER_MANAGEMENT"))
+        if (allowedTypes.contains("USER_MANAGEMENT"))
             addIfPositive(details, "USER_MANAGEMENT", statsRepo.countPendingUserReqs());
 
-        if(allowedTypes.contains("ROLE_MANAGEMENT"))
+        if (allowedTypes.contains("ROLE_MANAGEMENT"))
             addIfPositive(details, "ROLE_MANAGEMENT", statsRepo.countPendingRoleReqs());
 
-        if(allowedTypes.contains("JOURNAL_AUTH"))
+        if (allowedTypes.contains("JOURNAL_AUTH"))
             addIfPositive(details, "JOURNAL_AUTH", statsRepo.countPendingJournals());
 
         stats.setPendingForMe(sumMap(details));
         stats.setPendingForMeDetails(details);
     }
 
-
     // ==================================================================================
-    //  ALGORITHM 2: INTELLIGENCE (BOTTLENECK & ANOMALY)
+    // ALGORITHM 2: INTELLIGENCE (BOTTLENECK & ANOMALY)
     // ==================================================================================
 
     private void applyIntelligenceLayer(StatsDto stats, String userId, List<String> approvalTypes) {
@@ -1608,12 +1657,13 @@ public class DashboardServiceImpl implements DashboardService {
         // Threshold: > 15 rejections in 1 hour is suspicious/high
         if (recentRejections > 20) {
             stats.setAnomalyDetected(true);
-            stats.setAnomalyMessage("Warning: High volume of rejections detected (" + recentRejections + " in last hour).");
+            stats.setAnomalyMessage(
+                    "Warning: High volume of rejections detected (" + recentRejections + " in last hour).");
         }
     }
 
     // ==================================================================================
-    //  ALGORITHM 3: SMART QUICK ACTIONS (BEHAVIORAL FREQUENCY)
+    // ALGORITHM 3: SMART QUICK ACTIONS (BEHAVIORAL FREQUENCY)
     // ==================================================================================
 
     private List<QuickActionDto> generateSmartQuickActions(int roleId, String userId) {
@@ -1623,13 +1673,16 @@ public class DashboardServiceImpl implements DashboardService {
         Map<String, Integer> usageMap = new HashMap<>();
         List<TypeCount> crsUsage = statsRepo.getUserCrsUsageFrequency(userId);
 
-        for(TypeCount row : crsUsage) usageMap.put(row.getType(), row.getCount().intValue());
+        for (TypeCount row : crsUsage)
+            usageMap.put(row.getType(), row.getCount().intValue());
 
         int journalUsage = statsRepo.getUserJournalUsageCount(userId);
-        if(journalUsage > 0) usageMap.put("JOURNAL", journalUsage);
+        if (journalUsage > 0)
+            usageMap.put("JOURNAL", journalUsage);
 
         int userMgmtUsage = statsRepo.getUserMgmtUsageCount(userId);
-        if(userMgmtUsage > 0) usageMap.put("USER_MANAGEMENT", userMgmtUsage);
+        if (userMgmtUsage > 0)
+            usageMap.put("USER_MANAGEMENT", userMgmtUsage);
 
         List<QuickActionDto> actions = new ArrayList<>();
         List<QuickActionDto> approvalActions = new ArrayList<>();
@@ -1640,23 +1693,31 @@ public class DashboardServiceImpl implements DashboardService {
             int score = 0;
 
             // Skip the dashboard itself
-            if(p.getMenuTitle().matches("Dashboard") || p.getMenuUrl().equals("/dashboard")) continue;
+            if (p.getMenuTitle().matches("Dashboard") || p.getMenuUrl().equals("/dashboard"))
+                continue;
 
             // Scoring
-            if (reqType != null && usageMap.containsKey(reqType)) score += (usageMap.get(reqType) * 2);
-            if (p.getMenuUrl().contains("journal") && usageMap.containsKey("JOURNAL")) score += 20;
-            if (p.getMenuUrl().contains("user") && usageMap.containsKey("USER_MANAGEMENT")) score += 20;
+            if (reqType != null && usageMap.containsKey(reqType))
+                score += (usageMap.get(reqType) * 2);
+            if (p.getMenuUrl().contains("journal") && usageMap.containsKey("JOURNAL"))
+                score += 20;
+            if (p.getMenuUrl().contains("user") && usageMap.containsKey("USER_MANAGEMENT"))
+                score += 20;
 
-            if ("UPLOAD".equals(type)) score += 10;
-            else if ("CREATE".equals(type)) score += 8;
-            else if ("DOWNLOAD".equals(type)) score += 5;
-            else if ("APPROVE".equals(type)) score += 6;
-            else score += 1;
+            if ("UPLOAD".equals(type))
+                score += 10;
+            else if ("CREATE".equals(type))
+                score += 8;
+            else if ("DOWNLOAD".equals(type))
+                score += 5;
+            else if ("APPROVE".equals(type))
+                score += 6;
+            else
+                score += 1;
 
             QuickActionDto action = new QuickActionDto(
                     p.getMenuId(), deriveLabel(type, p.getMenuTitle()),
-                    p.getMenuUrl(), p.getMenuIcon(), type, p.getMenuDescription(), score
-            );
+                    p.getMenuUrl(), p.getMenuIcon(), type, p.getMenuDescription(), score);
 
             // Split into "Operational" vs "Approval" buckets
             if (isApprovalScreen(p)) {
@@ -1675,7 +1736,8 @@ public class DashboardServiceImpl implements DashboardService {
             approvalActions.sort((a, b) -> Integer.compare(b.getScore(), a.getScore()));
 
             for (QuickActionDto approval : approvalActions) {
-                if (actions.size() >= 4) break; // Stop once we have enough
+                if (actions.size() >= 4)
+                    break; // Stop once we have enough
 
                 // Customize label for approval actions
                 approval.setLabel("Manage " + approval.getLabel().replace("Requests", "").trim());
@@ -1692,9 +1754,8 @@ public class DashboardServiceImpl implements DashboardService {
         return actions.stream().limit(6).collect(Collectors.toList());
     }
 
-
     // ==================================================================================
-    //  UNIFIED ACTIVITY FEED (ROBUST PARSING)
+    // UNIFIED ACTIVITY FEED (ROBUST PARSING)
     // ==================================================================================
 
     private List<ActivityLogDto> fetchUnifiedActivity(String userId) {
@@ -1702,7 +1763,8 @@ public class DashboardServiceImpl implements DashboardService {
 
         // 1. USER LOGS (Parsed carefully)
         List<UserLogs> userLogs = userLogRepo.findTop20ByUserIdOrderByActionTimeDesc(userId);
-        for (UserLogs log : userLogs) timeline.add(parseUserLogDetails(log));
+        for (UserLogs log : userLogs)
+            timeline.add(parseUserLogDetails(log));
 
         // 2. CRS ACTIVITY (Common Requests - CGL, Segment, etc.)
         // Created by Me
@@ -1729,7 +1791,8 @@ public class DashboardServiceImpl implements DashboardService {
         List<JournalRequest> journals = journalReqRepo.findTop10ByCreatorIdOrderByReqDateDesc(userId);
         for (JournalRequest j : journals) {
             String msg = "Uploaded Batch " + j.getBatchId();
-            timeline.add(createLog("Journal Upload", toMillis(j.getReqDate()), "JOURNAL", msg, normalizeStatus(j.getReqStatus()), j.getCreatorId()));
+            timeline.add(createLog("Journal Upload", toMillis(j.getReqDate()), "JOURNAL", msg,
+                    normalizeStatus(j.getReqStatus()), j.getCreatorId()));
         }
 
         Collections.sort(timeline);
@@ -1737,7 +1800,7 @@ public class DashboardServiceImpl implements DashboardService {
     }
 
     // ==================================================================================
-    //  HELPERS
+    // HELPERS
     // ==================================================================================
 
     // --- PARSER FOR USER LOGS ---
@@ -1763,15 +1826,20 @@ public class DashboardServiceImpl implements DashboardService {
         return createLog(display, log.getActionTime().getTime(), "USER_LOG", details, "COMPLETED", log.getUserId());
     }
 
-    private void bucketStats(Map<String, Integer> p, Map<String, Integer> a, Map<String, Integer> r, String type, String rawStatus, int count) {
+    private void bucketStats(Map<String, Integer> p, Map<String, Integer> a, Map<String, Integer> r, String type,
+            String rawStatus, int count) {
         String status = normalizeStatus(rawStatus);
-        if ("PENDING".equals(status)) p.merge(type, count, Integer::sum);
-        else if ("APPROVED".equals(status)) a.merge(type, count, Integer::sum);
-        else if ("REJECTED".equals(status)) r.merge(type, count, Integer::sum);
+        if ("PENDING".equals(status))
+            p.merge(type, count, Integer::sum);
+        else if ("APPROVED".equals(status))
+            a.merge(type, count, Integer::sum);
+        else if ("REJECTED".equals(status))
+            r.merge(type, count, Integer::sum);
     }
 
     private void addIfPositive(Map<String, Integer> map, String key, int count) {
-        if(count > 0) map.put(key, count);
+        if (count > 0)
+            map.put(key, count);
     }
 
     private int sumMap(Map<String, Integer> map) {
@@ -1782,7 +1850,8 @@ public class DashboardServiceImpl implements DashboardService {
      * NORMALIZER: Converts "P", "Pending", "ACCEPTED", "A" -> Standard Set
      */
     private String normalizeStatus(String rawStatus) {
-        if (rawStatus == null) return "UNKNOWN";
+        if (rawStatus == null)
+            return "UNKNOWN";
         String s = rawStatus.trim().toUpperCase();
         return switch (s) {
             case "P", "PENDING" -> "PENDING";
@@ -1798,31 +1867,44 @@ public class DashboardServiceImpl implements DashboardService {
      * Helper to make "A" -> "Add", "U" -> "Update" for messages
      */
     private String mapChangeType(String type) {
-        if (type == null) return "Modify";
+        if (type == null)
+            return "Modify";
 
-        if (type.equalsIgnoreCase("A")) return "Create";
-        if (type.equalsIgnoreCase("U")) return "Update";
-        if (type.equalsIgnoreCase("D")) return "Delete";
-        if (type.equalsIgnoreCase("B")) return "Block";
-        if (type.equalsIgnoreCase("UB")) return "Unblock";
+        if (type.equalsIgnoreCase("A"))
+            return "Create";
+        if (type.equalsIgnoreCase("U"))
+            return "Update";
+        if (type.equalsIgnoreCase("D"))
+            return "Delete";
+        if (type.equalsIgnoreCase("B"))
+            return "Block";
+        if (type.equalsIgnoreCase("UB"))
+            return "Unblock";
 
         return "Modify";
     }
 
     private String getActionType(String raw) {
-        if(raw == null) return "VIEW";
+        if (raw == null)
+            return "VIEW";
         raw = raw.toLowerCase();
-        if(raw.contains("upload")) return "UPLOAD";
-        if(raw.contains("create")) return "CREATE";
-        if(raw.contains("download")) return "DOWNLOAD";
-        if(raw.contains("approve")) return "APPROVE";
+        if (raw.contains("upload"))
+            return "UPLOAD";
+        if (raw.contains("create"))
+            return "CREATE";
+        if (raw.contains("download"))
+            return "DOWNLOAD";
+        if (raw.contains("approve"))
+            return "APPROVE";
 
         return "VIEW";
     }
 
     private String deriveLabel(String type, String title) {
-        if("VIEW".equals(type)) return title;
-        if("APPROVE".equals(type)) return title; // Will be renamed in backfill logic
+        if ("VIEW".equals(type))
+            return title;
+        if ("APPROVE".equals(type))
+            return title; // Will be renamed in backfill logic
         return type.charAt(0) + type.substring(1).toLowerCase() + " " + title;
     }
 
@@ -1831,16 +1913,18 @@ public class DashboardServiceImpl implements DashboardService {
                 (p.getMenuAction() != null && p.getMenuAction().toLowerCase().contains("approve"));
     }
 
-
     private String extractRegex(String source, String key) {
-        if (source == null) return "Unknown";
+        if (source == null)
+            return "Unknown";
         Pattern p = Pattern.compile(key + "=([^,}]+)");
         Matcher m = p.matcher(source);
-        if (m.find()) return m.group(1).trim();
+        if (m.find())
+            return m.group(1).trim();
         return "Unknown";
     }
 
-    private ActivityLogDto createLog(String action, long time, String source, String details, String status, String user) {
+    private ActivityLogDto createLog(String action, long time, String source, String details, String status,
+            String user) {
         ActivityLogDto log = new ActivityLogDto();
         log.setAction(action);
         log.setTimestamp(time);
@@ -1859,11 +1943,18 @@ public class DashboardServiceImpl implements DashboardService {
     // Frequency Stats & Announcements (Unchanged)
     private List<AnnouncementDto> fetchAnnouncements(String roleId) {
         return announcementRepo.findActiveAnnouncements(roleId).stream()
-                .map(a -> new AnnouncementDto(a.getId(), a.getTitle(), a.getMessage(), a.getSeverity(), a.getCreatedAt().toString()))
+                .map(a -> new AnnouncementDto(a.getId(), a.getTitle(), a.getMessage(), a.getSeverity(),
+                        a.getCreatedAt().toString()))
                 .collect(Collectors.toList());
     }
 
 }
+
+
+
+
+
+
 
 
 
@@ -2311,9 +2402,9 @@ import java.util.Optional;
 
 @Repository
 public interface CalenderConfigRepository extends JpaRepository<CalenderConfigModel, Long> {
-    
+
     // Fetches the latest entry (effectively the singleton config)
-    Optional<CalenderConfigModel> findFirstByOrderByIdDesc();
+    Optional<CalenderConfigModel> findByActiveFlag(Integer activeFlag);
 }
 
 
