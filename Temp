@@ -23,32 +23,31 @@ import {
   LooksTwo,
   Looks3,
 } from "@mui/icons-material";
-import useApi from "../../hooks/useApi"; // Ensure this path is correct for your project
+import useApi from "../../hooks/useApi";
 import dayjs from "dayjs";
 import { useSelector } from "react-redux";
-import useCustomSnackbar from "../../utils/useCustomSnackbar"; // Ensure this path is correct
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
 import { useTheme } from "@mui/material/styles";
-import CustomChip from "../../utils/CustomChip"; // Ensure this path is correct
-import GlifReportsStyles from "./GlifReportsStyles"; // Ensure this path is correct
+import CustomChip from "../../utils/CustomChip";
+import GlifReportsStyles from "./GlifReportsStyles";
 
-// Ensure proper locale formatting if needed, though 'format' prop usually suffices
-// import "dayjs/locale/en-gb"; 
+// 1. Ensure strictly 'en-gb' locale logic if specific DD/MM formats are fighting with browser locale
+import "dayjs/locale/en-gb";
 
 export default function GlifReports() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
   const user = useSelector((state) => state.auth.user);
-  
+
   const [dateError, setDateError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [repTypes, setRepTypes] = useState([]);
   const [selectedReport, setReport] = useState(null);
   const [selectedDate, setDate] = useState(null);
-  
-  // Initialize minDate as a dayjs object (default to today or specific date to avoid 'invalid date' states)
-  const [minDate, setMinDate] = useState(dayjs("2020-01-01")); 
 
-  // Streaming progress state
+  // Defaulting to a safe past date initially
+  const [minDate, setMinDate] = useState(dayjs("2020-01-01"));
+
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
 
@@ -60,7 +59,7 @@ export default function GlifReports() {
   const downloadedMB =
     downloadedBytes > 0 ? (downloadedBytes / (1024 * 1024)).toFixed(2) : null;
 
-  // Getting Reports Types list
+  // --- API Fetch ---
   useEffect(() => {
     async function fetchData() {
       setIsLoading(true);
@@ -73,15 +72,14 @@ export default function GlifReports() {
         const types = data.data || [];
         setRepTypes(types);
 
-        // Safely handle minDate initialization
         if (types.length > 0 && types[0].selectedDate) {
-            // Parse the date string immediately into a dayjs object
-            setMinDate(dayjs(types[0].selectedDate));
+          // IMPORTANT: Use .startOf('day') to ensure time is 00:00:00
+          // This fixes the "sometimes enabled/disabled arrow" issue by ensuring strict day comparison
+          setMinDate(dayjs(types[0].selectedDate).startOf("day"));
         } else {
-            // Fallback default
-            setMinDate(dayjs("2025-10-01"));
+          // Fallback
+          setMinDate(dayjs("2025-10-01").startOf("day"));
         }
-
       } catch (error) {
         console.error("Failed to fetch report types:", error);
         showSnackBar("Failed to load report types", "error");
@@ -95,18 +93,13 @@ export default function GlifReports() {
     setReport(report);
   };
 
-  const handleDateChange = (newDate) => {
-    // This function handles both manual typing and picker selection
-    setDate(newDate);
-  };
-
+  // --- Download Logic ---
   const handleFetchReportData = async () => {
     if (!selectedReport?.fileName || !selectedDate) return;
-    
-    // Safety check: Don't allow download if there's a date error
+
     if (dateError) {
-        showSnackBar(getErrorMessage(dateError), "error");
-        return;
+      showSnackBar(getErrorMessage(dateError), "error");
+      return;
     }
 
     setIsLoading(true);
@@ -134,7 +127,7 @@ export default function GlifReports() {
             }
           },
         },
-        false 
+        false
       );
 
       if (response.data && response.data.size > 22) {
@@ -161,10 +154,7 @@ export default function GlifReports() {
         a.click();
         a.remove();
         window.URL.revokeObjectURL(downloadUrl);
-        showSnackBar(
-          `Reports "${filename}" downloaded successfully`,
-          "success"
-        );
+        showSnackBar(`Reports "${filename}" downloaded successfully`, "success");
       } else {
         showSnackBar(
           "No reports found matching your current filter criteria",
@@ -200,18 +190,23 @@ export default function GlifReports() {
     }
   };
 
+  // --- Validation Message Logic ---
   const getErrorMessage = (error) => {
+    const minDateStr = minDate?.isValid()
+      ? minDate.format("DD/MM/YYYY")
+      : "Allowed Min Date";
+
     switch (error) {
       case "maxDate":
-        return "Date cannot be in the future";
+        return "Date cannot be in the future (Today is max)";
       case "minDate":
-        // Dynamically show the min date in the error if available
-        const dateStr = minDate?.isValid() ? minDate.format('DD/MM/YYYY') : 'allowed minimum';
-        return `Date cannot be before ${dateStr}`;
+        return `Date cannot be prior to ${minDateStr}`;
       case "invalidDate":
-        return "Invalid date format (DD/MM/YYYY)";
+        // This covers cases like 31st Feb or 31st April
+        return "Invalid date (Check day for this month)";
       default:
-        return "";
+        // When no error, return instructions
+        return `Allowed Range: ${minDateStr} - Today`;
     }
   };
 
@@ -247,8 +242,8 @@ export default function GlifReports() {
 
               <Box sx={styles.noteContainer}>
                 <Typography variant="body2" sx={styles.noteText}>
-                  Note: The generated reports cannot be viewed on-screen it
-                  can only be downloaded.
+                  Note: The generated reports cannot be viewed on-screen it can
+                  only be downloaded.
                 </Typography>
                 <Stack direction="row" spacing={2} sx={styles.stepsStack}>
                   <CustomChip
@@ -297,26 +292,40 @@ export default function GlifReports() {
 
                   {/* Date Picker */}
                   <FormControl sx={styles.formControl}>
-                    <LocalizationProvider dateAdapter={AdapterDayjs}>
+                    {/* Ensure adapterLocale is set to handle DD/MM logic naturally */}
+                    <LocalizationProvider
+                      dateAdapter={AdapterDayjs}
+                      adapterLocale="en-gb"
+                    >
                       <DatePicker
                         label="Select report date"
-                        // Critical: Enforce DD/MM/YYYY format for masking and display
-                        format="DD/MM/YYYY" 
+                        format="DD/MM/YYYY"
                         views={["year", "month", "day"]}
                         value={selectedDate}
-                        onChange={handleDateChange}
-                        // Use dayjs() for maxDate (today)
-                        maxDate={dayjs()} 
-                        // Use the state object directly
-                        minDate={minDate} 
+                        onChange={(newDate) => setDate(newDate)}
+                        // Explicitly set maxDate to Today
+                        maxDate={dayjs().endOf("day")}
+                        // Explicitly set minDate
+                        minDate={minDate}
                         onError={(newError) => setDateError(newError)}
                         disabled={repTypes.length === 0 || disableInputs}
                         slotProps={{
                           textField: {
-                            helperText: getErrorMessage(dateError),
+                            // Logic: If there is an error, show specific error msg.
+                            // If no error, show the range helper text to guide user.
+                            helperText: dateError
+                              ? getErrorMessage(dateError)
+                              : `Allowed: ${
+                                  minDate?.isValid()
+                                    ? minDate.format("DD/MM/YYYY")
+                                    : "..."
+                                } - Today`,
                             error: !!dateError,
-                            // Ensure placeholder guides the user
                             placeholder: "DD/MM/YYYY",
+                          },
+                          // Enhancement: Show days outside current month but verify they are disabled correctly
+                          day: {
+                            showDaysOutsideCurrentMonth: true,
                           },
                         }}
                       />
@@ -341,7 +350,6 @@ export default function GlifReports() {
                   {isDownloading ? "Downloading..." : "Fetch & Download"}
                 </Button>
 
-                {/* Progress UI */}
                 <Fade in={isDownloading} unmountOnExit>
                   <Box sx={styles.progressContainer}>
                     <Box sx={styles.progressHeader}>
@@ -353,8 +361,8 @@ export default function GlifReports() {
                           Downloading{" "}
                           {selectedReport?.reportName ?? "the selected report"}{" "}
                           for the period{" "}
-                          {selectedDate?.isValid() 
-                            ? selectedDate.format("YYYY-MM-DD") 
+                          {selectedDate?.isValid()
+                            ? selectedDate.format("YYYY-MM-DD")
                             : "an unknown period"}{" "}
                           is in progress.
                         </Typography>
@@ -392,4 +400,5 @@ export default function GlifReports() {
     </Grow>
   );
 }
+
 
