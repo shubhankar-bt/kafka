@@ -1,11 +1,3 @@
-1) Currently when the screen loads, i get the min date in types api call as selectedDate which is already p[resent in the code. But the issue is with thye date picker. In my current code i am allpowing the user to enter the dates and also select dates fropm date picker, in date picker as min date is set to a 
-specific date so in date picker prior dates are invalid but while user enters manually any date before the min date then it allows to type the date, proper error is hsowing in the error text that dates can not be prior to min date, 
-but in that time if i open the date picker then the fdate types in the text input the date pi9cker opened froom then, like if i type 1999 then in date picker 1999 opened although it is not enabled, still open so much old date which is not allowed,
-and also disabled does not make any sense. I want to handle this case very carefully and correctly so that in every cxase it should behavce correctly and no further issues come in it.  
-2) dates in the input are MM/DD/YYYY format, i want DD/MM/YYYY formaty also the backspace and enter new date with momnth and year should be working as how the actual system should work. Iijn all cases see all tthe behaviours as per user perdpsective and see what could be done to achive best practices.
-3) Once check the full code from first tom last and If any other issue you found in the code, please check and do the needful. 
-
-
 import { useEffect, useState } from "react";
 import {
   Box,
@@ -31,30 +23,34 @@ import {
   LooksTwo,
   Looks3,
 } from "@mui/icons-material";
-import useApi from "../../hooks/useApi";
+import useApi from "../../hooks/useApi"; // Ensure this path is correct for your project
 import dayjs from "dayjs";
 import { useSelector } from "react-redux";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import useCustomSnackbar from "../../utils/useCustomSnackbar"; // Ensure this path is correct
 import { useTheme } from "@mui/material/styles";
-import CustomChip from "../../utils/CustomChip";
-import GlifReportsStyles from "./GlifReportsStyles";
-import HybridDatePicker from "./HybridDatePicker";
+import CustomChip from "../../utils/CustomChip"; // Ensure this path is correct
+import GlifReportsStyles from "./GlifReportsStyles"; // Ensure this path is correct
+
+// Ensure proper locale formatting if needed, though 'format' prop usually suffices
+// import "dayjs/locale/en-gb"; 
 
 export default function GlifReports() {
   const { callApi } = useApi();
   const showSnackBar = useCustomSnackbar();
   const user = useSelector((state) => state.auth.user);
+  
   const [dateError, setDateError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [repTypes, setRepTypes] = useState([]);
   const [selectedReport, setReport] = useState(null);
   const [selectedDate, setDate] = useState(null);
-  const [open, setOpen] = useState(null);
+  
+  // Initialize minDate as a dayjs object (default to today or specific date to avoid 'invalid date' states)
+  const [minDate, setMinDate] = useState(dayjs("2020-01-01")); 
 
-  // NEW: streaming progress state
+  // Streaming progress state
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
-  const [minDate, setMinDate] = useState("");
 
   const theme = useTheme();
   const styles = GlifReportsStyles(theme);
@@ -64,7 +60,7 @@ export default function GlifReports() {
   const downloadedMB =
     downloadedBytes > 0 ? (downloadedBytes / (1024 * 1024)).toFixed(2) : null;
 
-  //Getting Reports Types list
+  // Getting Reports Types list
   useEffect(() => {
     async function fetchData() {
       setIsLoading(true);
@@ -74,22 +70,44 @@ export default function GlifReports() {
           { roleId: user.role },
           "POST"
         );
-        setRepTypes(data.data || []);
-        setMinDate(data.data[0]?.selectedDate || "2025-10-01");
+        const types = data.data || [];
+        setRepTypes(types);
+
+        // Safely handle minDate initialization
+        if (types.length > 0 && types[0].selectedDate) {
+            // Parse the date string immediately into a dayjs object
+            setMinDate(dayjs(types[0].selectedDate));
+        } else {
+            // Fallback default
+            setMinDate(dayjs("2025-10-01"));
+        }
+
       } catch (error) {
         console.error("Failed to fetch report types:", error);
+        showSnackBar("Failed to load report types", "error");
       }
       setIsLoading(false);
     }
     fetchData();
-  }, [callApi, user.role]);
+  }, [callApi, user.role, showSnackBar]);
 
   const handleSelect = (report) => {
     setReport(report);
   };
 
+  const handleDateChange = (newDate) => {
+    // This function handles both manual typing and picker selection
+    setDate(newDate);
+  };
+
   const handleFetchReportData = async () => {
     if (!selectedReport?.fileName || !selectedDate) return;
+    
+    // Safety check: Don't allow download if there's a date error
+    if (dateError) {
+        showSnackBar(getErrorMessage(dateError), "error");
+        return;
+    }
 
     setIsLoading(true);
     setIsDownloading(true);
@@ -109,7 +127,6 @@ export default function GlifReports() {
         "blob",
         "application/json",
         {
-          // axios streaming progress (no total because no Content-Length)
           onDownloadProgress: (event) => {
             setIsDownloading(true);
             if (event && typeof event.loaded === "number") {
@@ -117,11 +134,10 @@ export default function GlifReports() {
             }
           },
         },
-        false // get full axios response, not only data
+        false 
       );
 
       if (response.data && response.data.size > 22) {
-        // axios headers is a plain object, not Headers
         const contentDisposition =
           response.headers["content-disposition"] ||
           response.headers["Content-Disposition"];
@@ -158,18 +174,14 @@ export default function GlifReports() {
     } catch (error) {
       console.log("error", error);
 
-      if (error) {
-        // The server sent an error (JSON), but Axios wrapped it in a Blob because of responseType: 'blob'
-        // We must read that Blob as text to see the JSON message.
-        const errorBlob = error;
+      if (error && error instanceof Blob) {
         const reader = new FileReader();
         reader.onload = () => {
           try {
             const errorJson = JSON.parse(reader.result);
             console.error(errorJson.message);
-            // SHOW TOAST / NOTIFICATION HERE
             showSnackBar(
-              "No reports found matching your current filter criteria",
+              errorJson.message || "No reports found matching your criteria",
               "error"
             );
           } catch (e) {
@@ -177,10 +189,9 @@ export default function GlifReports() {
             showSnackBar("Something went wrong, kindly try again.", "error");
           }
         };
-        reader.readAsText(errorBlob);
+        reader.readAsText(error);
       } else {
-        // Network error (Server down, DNS issues)
-        showSnackBar("Network Error: Could not connect to server");
+        showSnackBar("Network Error: Could not connect to server", "error");
       }
     } finally {
       setIsLoading(false);
@@ -194,190 +205,191 @@ export default function GlifReports() {
       case "maxDate":
         return "Date cannot be in the future";
       case "minDate":
-        return "Date is before the allowed minimum";
+        // Dynamically show the min date in the error if available
+        const dateStr = minDate?.isValid() ? minDate.format('DD/MM/YYYY') : 'allowed minimum';
+        return `Date cannot be before ${dateStr}`;
       case "invalidDate":
-        return "Invalid date format";
+        return "Invalid date format (DD/MM/YYYY)";
       default:
         return "";
     }
   };
 
   return (
-    <>
-      <Grow in timeout={500}>
-        <Stack spacing={4}>
-          <Box sx={styles.rootBox} elevation={10}>
-            <Stack
-              spacing={3}
-              direction={"column"}
-              alignItems="center"
-              justifyContent="center"
-            >
-              <Card sx={styles.card}>
-                <Box sx={styles.headerContainer}>
-                  <Box sx={styles.headerIconWrapper}>
-                    <Summarize sx={styles.summaryIcon} />
-                  </Box>
-                  <Box sx={styles.headerTextBox}>
-                    <Typography
-                      variant="h5"
-                      fontWeight="bold"
-                      sx={styles.headerTitle}
-                    >
-                      Reports Generation
-                    </Typography>
-                    <Typography variant="body2" sx={styles.headerSubtitle}>
-                      Choose a specific required report type and date using the
-                      criteria below to download reports
-                      {/* on-demand with streaming delivery. */}
-                    </Typography>
-                  </Box>
+    <Grow in timeout={500}>
+      <Stack spacing={4}>
+        <Box sx={styles.rootBox} elevation={10}>
+          <Stack
+            spacing={3}
+            direction={"column"}
+            alignItems="center"
+            justifyContent="center"
+          >
+            <Card sx={styles.card}>
+              <Box sx={styles.headerContainer}>
+                <Box sx={styles.headerIconWrapper}>
+                  <Summarize sx={styles.summaryIcon} />
                 </Box>
-                {/* Steps description */}
-                <Box sx={styles.noteContainer}>
-                  <Typography variant="body2" sx={styles.noteText}>
-                    Note: The generated reports cannot be viewed on-screen it
-                    can only be downloaded.
-                  </Typography>
-                  <Stack direction="row" spacing={2} sx={styles.stepsStack}>
-                    <CustomChip
-                      label="Select a report"
-                      variant="outlined"
-                      icon={<LooksOne />}
-                      color="info"
-                      // sx={styles.stepChip}
-                    />
-                    <CustomChip
-                      label="Select the report date for which you would like to download"
-                      variant="outlined"
-                      icon={<LooksTwo />}
-                      color="info"
-                      // sx={styles.stepChip}
-                    />
-                    <CustomChip
-                      label="Click Fetch & Download button"
-                      variant="outlined"
-                      icon={<Looks3 />}
-                      color="info"
-                      // sx={styles.stepChip}
-                    />
-                  </Stack>
-                </Box>
-
-                <Box sx={styles.inputOuterBox}>
-                  <Box sx={styles.inputInnerBox}>
-                    {/* Dropdown Menu */}
-                    <FormControl sx={styles.formControl}>
-                      <InputLabel id="menu-select-label">
-                        Select a report
-                      </InputLabel>
-                      <Select
-                        labelId="menu-select-label"
-                        id="menu-select"
-                        value={selectedReport}
-                        label="Select a report"
-                        onChange={(row) => handleSelect(row.target.value)}
-                        disabled={repTypes.length === 0 || disableInputs}
-                      >
-                        {repTypes.map((item) => (
-                          <MenuItem key={item.fileName} value={item}>
-                            {item.reportName}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-
-                    {/* Date Picker */}
-                    <FormControl sx={styles.formControl}>
-                      <LocalizationProvider dateAdapter={AdapterDayjs}>
-                        <DatePicker
-                          label="Select report date"
-                          views={["year", "month", "day"]}
-                          value={selectedDate}
-                          onChange={(newDate) => setDate(newDate)}
-                          maxDate={dayjs()}
-                          minDate={dayjs(minDate)}
-                          onError={(newError) => setDateError(newError)}
-                          disabled={repTypes.length === 0 || disableInputs}
-                          slotProps={{
-                            textField: {
-                              helperText: getErrorMessage(dateError),
-                              error: !!dateError,
-                            },
-                          }}
-                        />
-                      </LocalizationProvider>
-                    </FormControl>
-                  </Box>
-                </Box>
-
-                <Box sx={styles.buttonContainer}>
-                  <Button
-                    sx={styles.downloadButton}
-                    endIcon={<CloudDownloadTwoTone />}
-                    variant="contained"
-                    onClick={handleFetchReportData}
-                    disabled={
-                      disableInputs ||
-                      !selectedReport ||
-                      !selectedDate ||
-                      getErrorMessage(dateError)
-                    }
+                <Box sx={styles.headerTextBox}>
+                  <Typography
+                    variant="h5"
+                    fontWeight="bold"
+                    sx={styles.headerTitle}
                   >
-                    {isDownloading ? "Downloading..." : "Fetch & Download"}
-                  </Button>
-
-                  {/* Customised progress UI */}
-                  <Fade in={isDownloading} unmountOnExit>
-                    <Box sx={styles.progressContainer}>
-                      {/* Status header */}
-                      <Box sx={styles.progressHeader}>
-                        <Box sx={styles.progressIconWrapper}>
-                          <CloudDownloadTwoTone sx={styles.innerDownloadIcon} />
-                        </Box>
-                        <Box sx={styles.progressHeaderTextBox}>
-                          <Typography variant="body2" fontWeight={600}>
-                            Downloading{" "}
-                            {selectedReport?.reportName ??
-                              "the selected report"}{" "}
-                            for the period{" "}
-                            {selectedDate?.format("YYYY-MM-DD") ??
-                              "an unknown period"}{" "}
-                            is in progress.
-                          </Typography>
-
-                          <Typography
-                            variant="caption"
-                            color="text.secondary"
-                            sx={styles.progressCaption}
-                          >
-                            {downloadedMB
-                              ? `Streaming report data… ${downloadedMB} MB received`
-                              : "Preparing your report stream…"}
-                          </Typography>
-                        </Box>
-
-                        {downloadedMB && (
-                          <CustomChip
-                            color="error"
-                            label={`${downloadedMB} MB downloaded`}
-                            variant="filled"
-                          />
-                        )}
-                      </Box>
-                      {/* Fancy progress bar */}
-                      <LinearProgress
-                        variant="indeterminate"
-                        sx={styles.progressBar}
-                      />
-                    </Box>
-                  </Fade>
+                    Reports Generation
+                  </Typography>
+                  <Typography variant="body2" sx={styles.headerSubtitle}>
+                    Choose a specific required report type and date using the
+                    criteria below to download reports
+                  </Typography>
                 </Box>
-              </Card>
-            </Stack>
-          </Box>
-        </Stack>
-      </Grow>
-    </>
+              </Box>
+
+              <Box sx={styles.noteContainer}>
+                <Typography variant="body2" sx={styles.noteText}>
+                  Note: The generated reports cannot be viewed on-screen it
+                  can only be downloaded.
+                </Typography>
+                <Stack direction="row" spacing={2} sx={styles.stepsStack}>
+                  <CustomChip
+                    label="Select a report"
+                    variant="outlined"
+                    icon={<LooksOne />}
+                    color="info"
+                  />
+                  <CustomChip
+                    label="Select the report date"
+                    variant="outlined"
+                    icon={<LooksTwo />}
+                    color="info"
+                  />
+                  <CustomChip
+                    label="Click Fetch & Download button"
+                    variant="outlined"
+                    icon={<Looks3 />}
+                    color="info"
+                  />
+                </Stack>
+              </Box>
+
+              <Box sx={styles.inputOuterBox}>
+                <Box sx={styles.inputInnerBox}>
+                  {/* Dropdown Menu */}
+                  <FormControl sx={styles.formControl}>
+                    <InputLabel id="menu-select-label">
+                      Select a report
+                    </InputLabel>
+                    <Select
+                      labelId="menu-select-label"
+                      id="menu-select"
+                      value={selectedReport || ""}
+                      label="Select a report"
+                      onChange={(e) => handleSelect(e.target.value)}
+                      disabled={repTypes.length === 0 || disableInputs}
+                    >
+                      {repTypes.map((item) => (
+                        <MenuItem key={item.fileName} value={item}>
+                          {item.reportName}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+
+                  {/* Date Picker */}
+                  <FormControl sx={styles.formControl}>
+                    <LocalizationProvider dateAdapter={AdapterDayjs}>
+                      <DatePicker
+                        label="Select report date"
+                        // Critical: Enforce DD/MM/YYYY format for masking and display
+                        format="DD/MM/YYYY" 
+                        views={["year", "month", "day"]}
+                        value={selectedDate}
+                        onChange={handleDateChange}
+                        // Use dayjs() for maxDate (today)
+                        maxDate={dayjs()} 
+                        // Use the state object directly
+                        minDate={minDate} 
+                        onError={(newError) => setDateError(newError)}
+                        disabled={repTypes.length === 0 || disableInputs}
+                        slotProps={{
+                          textField: {
+                            helperText: getErrorMessage(dateError),
+                            error: !!dateError,
+                            // Ensure placeholder guides the user
+                            placeholder: "DD/MM/YYYY",
+                          },
+                        }}
+                      />
+                    </LocalizationProvider>
+                  </FormControl>
+                </Box>
+              </Box>
+
+              <Box sx={styles.buttonContainer}>
+                <Button
+                  sx={styles.downloadButton}
+                  endIcon={<CloudDownloadTwoTone />}
+                  variant="contained"
+                  onClick={handleFetchReportData}
+                  disabled={
+                    disableInputs ||
+                    !selectedReport ||
+                    !selectedDate ||
+                    !!dateError
+                  }
+                >
+                  {isDownloading ? "Downloading..." : "Fetch & Download"}
+                </Button>
+
+                {/* Progress UI */}
+                <Fade in={isDownloading} unmountOnExit>
+                  <Box sx={styles.progressContainer}>
+                    <Box sx={styles.progressHeader}>
+                      <Box sx={styles.progressIconWrapper}>
+                        <CloudDownloadTwoTone sx={styles.innerDownloadIcon} />
+                      </Box>
+                      <Box sx={styles.progressHeaderTextBox}>
+                        <Typography variant="body2" fontWeight={600}>
+                          Downloading{" "}
+                          {selectedReport?.reportName ?? "the selected report"}{" "}
+                          for the period{" "}
+                          {selectedDate?.isValid() 
+                            ? selectedDate.format("YYYY-MM-DD") 
+                            : "an unknown period"}{" "}
+                          is in progress.
+                        </Typography>
+
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={styles.progressCaption}
+                        >
+                          {downloadedMB
+                            ? `Streaming report data… ${downloadedMB} MB received`
+                            : "Preparing your report stream…"}
+                        </Typography>
+                      </Box>
+
+                      {downloadedMB && (
+                        <CustomChip
+                          color="error"
+                          label={`${downloadedMB} MB downloaded`}
+                          variant="filled"
+                        />
+                      )}
+                    </Box>
+                    <LinearProgress
+                      variant="indeterminate"
+                      sx={styles.progressBar}
+                    />
+                  </Box>
+                </Fade>
+              </Box>
+            </Card>
+          </Stack>
+        </Box>
+      </Stack>
+    </Grow>
   );
 }
+
