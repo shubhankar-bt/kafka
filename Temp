@@ -1,74 +1,490 @@
-package com.fincore.DashboardService.service;
+import { useEffect, useMemo, useState } from "react";
+import dayjs from "dayjs";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+import CloseIcon from "@mui/icons-material/Close";
+import useApi from "../../hooks/useApi";
+import useCustomSnackbar from "../../utils/useCustomSnackbar";
+import { getIconComponent } from "../../utils/IconUtils";
+import {
+  Box,
+  Stack,
+  Typography,
+  TextField,
+  Button,
+  Divider,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+} from "@mui/material";
+import {
+  ChipStyle,
+  StyledBox,
+  StyledTableContainer,
+  StyledTable,
+  StyledTableHead,
+  StyledTableCell,
+  StyledTableRow,
+  StyledTableBody,
+  StyledTablePagination,
+  StyledDialogTitle,
+  StyledTypography,
+  StyledCloseButton,
+  StyledDialog,
+} from "./CalendarConfig";
 
-import com.fincore.DashboardService.model.NotificationOutbox;
-import com.fincore.DashboardService.repository.DashboardStatsRepository;
-import com.fincore.DashboardService.repository.DashboardStatsRepository.RoleBottleneck;
-import com.fincore.DashboardService.repository.NotificationOutboxRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+export default function CalendarConfigTab() {
+  const { callApi } = useApi();
+  const showSnackBar = useCustomSnackbar();
+  
+  // State for Data
+  const [currentFY, setCurrentFY] = useState({ start: null, end: null });
+  const [nextFYInfo, setNextFYInfo] = useState({
+    expectedStart: null,
+    lastEnd: null,
+  });
+  const [calendarRows, setCalendarRows] = useState([]);
+  
+  // State for UI/Dialogs
+  const [openApprovedDialog, setOpenApprovedDialog] = useState(false);
+  const [openDialog, setOpenDialog] = useState(false);
+  
+  // State for Forms
+  const [selectedYear, setSelectedYear] = useState(null);
+  const [remarks, setRemarks] = useState("");
+  const [yearError, setYearError] = useState("");
+  const [remarksError, setRemarksError] = useState("");
+  
+  // State for Pagination
+  const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(5);
 
-import java.util.List;
+  const REMARKS_REGEX = /^[A-Za-z0-9 ,.]*$/;
+  // For Active and In-Active Icons inside the table
+  const ActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
+  const InActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
+  
+  const MAX_REMARKS = 150;
+  const MIN_REMARKS = 5;
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class IntelligenceSchedulerService {
+  // The year we expect the user to select (Derived from backend data)
+  const allowedYear = nextFYInfo?.expectedStart?.year();
 
-    private final DashboardStatsRepository statsRepo;
-    private final NotificationOutboxRepository outboxRepo;
+  useEffect(() => {
+    loadCurrentFY();
+    loadTableData();
+  }, []);
 
-    /**
-     * Daily Job (9:00 AM): BOTTLENECK DETECTION
-     * Scans for ROLES that have > 5 items pending for more than 48 hours.
-     * Sends a specific, descriptive alert to each bottlenecked role.
-     */
-    @Scheduled(cron = "0 0 9 * * ?") // 9 AM Daily
-    @Transactional
-    public void runBottleneckDetection() {
-        log.info("🕵️ Starting Daily Intelligence Scan: Bottleneck Detection...");
+  // For data inside approved requests form
+  const tableRows = calendarRows.map((row) => ({
+    id: row.id,
+    yearStartDate: row.yearStartDate,
+    yearEndDate: row.yearEndDate,
+    remarks: row.remarks,
+    activeFlag: row.activeFlag,
+    approvedBy: row.approvedBy,
+    requestedBy: row.requestedBy,
+    status: row.activeFlag === 1 ? "Active" : "Inactive",
+  }));
 
-        List<RoleBottleneck> bottlenecks = statsRepo.findAllBottleneckRoles();
+  // Loading current Financial Year (FY)
+  const loadCurrentFY = async () => {
+    try {
+      const res = await callApi("/CM/common-master/calendar-configuration");
+      if (res?.data?.activeFlag === 1) {
+        setCurrentFY({
+          start: dayjs(res.data.yearStartDate),
+          end: dayjs(res.data.yearEndDate),
+        });
+      }
+    } catch (error) {
+      console.error("Failed to load current FY", error);
+    }
+  };
 
-        if (bottlenecks.isEmpty()) {
-            log.info("✅ No bottlenecks detected today.");
-            return;
-        }
+  // Loading approved FY's into the table & Next FY Info
+  const loadTableData = async () => {
+    try {
+      const res = await callApi("/CM/calendar-config/next-year-info");
+      if (res?.data) {
+        setNextFYInfo({
+          expectedStart: res.data.expectedStartDate
+            ? dayjs(res.data.expectedStartDate)
+            : null,
+          lastEnd: res.data.lastEndDate ? dayjs(res.data.lastEndDate) : null,
+        });
+        const rows = res.data.calenderConfig || [];
+        setCalendarRows(rows);
+      }
+    } catch (error) {
+      console.error("Failed to load table data", error);
+    }
+  };
 
-        log.warn("⚠️ Detected {} roles with critical bottlenecks.", bottlenecks.size());
+  // For "Raise request" button
+  const handleRaiseRequestClick = async () => {
+    resetRaiseRequestForm();
+    await loadTableData();
+    setOpenDialog(true);
+  };
 
-        for (RoleBottleneck role : bottlenecks) {
-            String roleIdStr = role.getRoleId();
-            
-            if (roleIdStr == null || roleIdStr.trim().isEmpty()) {
-                continue;
-            }
+  // To reset the form every time
+  const resetRaiseRequestForm = () => {
+    setSelectedYear(null);
+    setYearError("");
+    setRemarks("");
+    setRemarksError("");
+  };
 
-            // Construct Descriptive Message (Header + Details)
-            String message = String.format(
-                "⚠️ Action Required: Pending Approvals\n" +
-                "Your role has %d request(s) pending for more than 48 hours. " +
-                "Please visit the Dashboard to review and clear your queue.", 
-                role.getOverdueCount()
-            );
-            
-            // Create Notification Event (Outbox Pattern)
-            // Targeted specifically at THIS role so they see THEIR count.
-            NotificationOutbox event = NotificationOutbox.builder()
-                    .userId(null) 
-                    .targetRole(roleIdStr) // "51" -> Notification Service will notify all users with Role 51
-                    .message(message)
-                    .linkUrl("/dashboard") 
-                    .eventSource("DASHBOARD_INTELLIGENCE")
-                    .aggregateId("BOTTLENECK_" + System.currentTimeMillis()) 
-                    .build();
+  // To handle close button in "view approved requests" form
+  const handleCloseDialog = () => {
+    setOpenApprovedDialog(false);
+  };
 
-            outboxRepo.save(event);
-            log.info(" -> Notification dispatched for Role ID: {}", roleIdStr);
+  // Handle Date Selection and Manual Typing Validation
+  const handleYearChange = (val) => {
+    // If input is cleared or invalid date object
+    if (!val || !val.isValid()) {
+        setSelectedYear(null);
+        // We don't set an error immediately on clear, allows user to retype
+        // But if it's invalid date format, DatePicker's onError handles it
+        return;
+    }
+
+    const enteredYear = val.year();
+    setSelectedYear(enteredYear); // Update UI with what they typed
+
+    // Validation Logic
+    if (allowedYear) {
+        if (enteredYear < allowedYear) {
+            setYearError(`Invalid Year. Expected: ${allowedYear}. You cannot raise requests for past years.`);
+        } else if (enteredYear > allowedYear) {
+            setYearError(`Invalid Year. Expected: ${allowedYear}. You cannot skip the upcoming Financial Year.`);
+        } else {
+            // Valid match
+            setYearError("");
         }
     }
-}
+  };
 
+  // Logic for "Submit" button in Raise Request form
+  const handleSubmit = async () => {
+    if (!selectedYear || yearError) return;
+
+    try {
+      const res = await callApi(
+        "/CR/create-request",
+        {
+          requestType: "CALENDER",
+          changeType: "ADD",
+          payload: {
+            yearStartDate: `${selectedYear}-04-01`,
+            yearEndDate: `${selectedYear + 1}-03-31`,
+            remarks,
+          },
+        },
+        "POST"
+      );
+      showSnackBar(
+        "Request raised successfully for upcoming financial year with request id " +
+          res?.data?.id,
+        "success"
+      );
+      setOpenDialog(false);
+      resetRaiseRequestForm();
+      loadTableData();
+    } catch (err) {
+      showSnackBar(
+        err?.message || "Something went wrong. Please try again.",
+        "error"
+      );
+    }
+  };
+
+  return (
+    <Box sx={{ display: "flex", justifyContent: "center" }}>
+      <Box
+        sx={{ display: "flex", width: "100%", p: 4, justifyContent: "center" }}
+      >
+        {/*To show the current Financial Year details*/}
+        <Box
+          sx={{
+            width: { xs: "95%", md: "65%" },
+            p: 5,
+            borderRadius: "20px",
+            background: "rgba(255,255,255,0.12)",
+            backdropFilter: "blur(12px)",
+            border: "1px solid rgba(255,255,255,0.25)",
+          }}
+        >
+          <Typography variant="h6" textAlign="center" mb={2}>
+            Current Financial Year
+          </Typography>
+
+          <Box
+            sx={{
+              display: "flex",
+              justifyContent: "center",
+              gap: 15,
+              p: 2,
+              borderRadius: 2,
+              border: "1px solid rgba(255,255,255,0.3)",
+            }}
+          >
+            <Typography>
+              Financial Year Start Date:{" "}
+              <b>{currentFY.start?.format("DD-MM-YYYY")}</b>
+            </Typography>
+            <Typography>
+              Financial Year End Date:{" "}
+              <b>{currentFY.end?.format("DD-MM-YYYY")}</b>
+            </Typography>
+          </Box>
+
+          <Box textAlign="center" mt={2}>
+            <Typography variant="body2" sx={{ opacity: 0.8 }}>
+              Current Financial Year is Active.
+            </Typography>
+            <Typography variant="body2" sx={{ opacity: 0.8, mb: 2 }}>
+              Requests can be raised only for the next Financial Year.
+            </Typography>
+
+            <Stack direction="row" spacing={2} justifyContent="center" mt={2}>
+              <Button
+                variant="contained"
+                onClick={() => setOpenApprovedDialog(true)}
+              >
+                View Approved Financial Years
+              </Button>
+              <Button variant="contained" onClick={handleRaiseRequestClick}>
+                Raise Request
+              </Button>
+            </Stack>
+          </Box>
+        </Box>
+
+        {/* Dialog to view approved requests*/}
+        <StyledDialog open={openApprovedDialog} fullWidth maxWidth="md">
+          <StyledDialogTitle>
+            <StyledTypography alignItems="center">
+              Approved Financial Year Details
+            </StyledTypography>
+            <StyledCloseButton onClick={handleCloseDialog}>
+              <CloseIcon />
+            </StyledCloseButton>
+          </StyledDialogTitle>
+
+          <Divider />
+
+          <DialogContent>
+            <StyledBox>
+              <StyledTableContainer>
+                <StyledTable stickyHeader>
+                  <StyledTableHead>
+                    <StyledTableRow>
+                      <StyledTableCell>Start Date</StyledTableCell>
+                      <StyledTableCell>End Date</StyledTableCell>
+                      <StyledTableCell>Approved By</StyledTableCell>
+                      <StyledTableCell>Requested By</StyledTableCell>
+                      <StyledTableCell>Status</StyledTableCell>
+                    </StyledTableRow>
+                  </StyledTableHead>
+
+                  <StyledTableBody>
+                    {tableRows
+                      .slice()
+                      .sort(
+                        (a, b) =>
+                          new Date(a.yearStartDate).getTime() -
+                          new Date(b.yearStartDate).getTime()
+                      )
+                      .slice(
+                        page * rowsPerPage,
+                        page * rowsPerPage + rowsPerPage
+                      )
+                      .map((row) => {
+                        if (!row) return null;
+
+                        const isActive = row.status === "Active";
+
+                        return (
+                          <StyledTableRow key={row.id}>
+                            <StyledTableCell>
+                              {row.yearStartDate}
+                            </StyledTableCell>
+                            <StyledTableCell>{row.yearEndDate}</StyledTableCell>
+                            <StyledTableCell>
+                              {row.approvedBy || "-"}
+                            </StyledTableCell>
+                            <StyledTableCell>
+                              {row.requestedBy || "-"}
+                            </StyledTableCell>
+                            <StyledTableCell>
+                              <ChipStyle
+                                row={{ status: isActive ? 1 : 0 }}
+                                size="small"
+                                icon={
+                                  isActive ? <ActiveIcon /> : <InActiveIcon />
+                                }
+                                label={isActive ? "Active" : "In-Active"}
+                                sx={{
+                                  backgroundColor:
+                                    row.activeFlag === 1
+                                      ? "rgba(46, 125, 50, 0.15)" // green bg
+                                      : "rgba(211, 47, 47, 0.15)", // red bg
+                                  color:
+                                    row.activeFlag === 1
+                                      ? "#2e7d32"
+                                      : "#d32f2f",
+                                  fontWeight: 500,
+                                }}
+                              />
+                            </StyledTableCell>
+                          </StyledTableRow>
+                        );
+                      })}
+                  </StyledTableBody>
+                </StyledTable>
+              </StyledTableContainer>
+
+              <StyledTablePagination
+                component="div"
+                count={tableRows.length}
+                page={page}
+                onPageChange={(e, newPage) => setPage(newPage)}
+                rowsPerPage={rowsPerPage}
+                rowsPerPageOptions={[]}
+                labelDisplayedRows={({ page }) => `PAGE ${page + 1}`}
+              />
+            </StyledBox>
+          </DialogContent>
+        </StyledDialog>
+
+        {/* Dialog to raise a new request*/}
+        <Dialog open={openDialog} maxWidth="sm" fullWidth>
+          <DialogTitle textAlign={"center"}>
+            Raise Financial Year Request
+          </DialogTitle>
+          <DialogContent>
+            <LocalizationProvider dateAdapter={AdapterDayjs}>
+              <DatePicker
+                views={["year"]}
+                label="Financial Year*"
+                // Construct dayjs object for value, handle null case carefully
+                value={selectedYear ? dayjs(`${selectedYear}-04-01`) : null}
+                
+                // Keep the calendar dropdown constrained to logical limits (e.g., from current year onwards)
+                // but rely on manual validation for the specific "expected" logic
+                minDate={dayjs("2020-01-01")} 
+                maxDate={dayjs("2099-12-31")}
+                
+                // Disable field if backend info isn't loaded yet
+                disabled={!nextFYInfo?.expectedStart}
+                
+                // This disables clicking invalid years in the popup calendar
+                shouldDisableYear={(year) =>
+                  allowedYear ? year.year() !== allowedYear : true
+                }
+                
+                onChange={handleYearChange}
+                
+                onError={(reason) => {
+                  if (reason) {
+                    setYearError("Invalid year format.");
+                  }
+                }}
+                
+                sx={{ mt: 1 }}
+                slotProps={{
+                  textField: {
+                    size: "small",
+                    fullWidth: true,
+                    error: Boolean(yearError),
+                    // Helper text logic for 3 states: Error, Selected, or Info
+                    helperText: yearError
+                      ? yearError
+                      : selectedYear
+                      ? `Selected Financial Year : ${selectedYear} – ${
+                          selectedYear + 1
+                        } (April to March)`
+                      : allowedYear
+                      ? `Requests are permitted only for Financial Year ${allowedYear}-${
+                          allowedYear + 1
+                        }.`
+                      : "",
+
+                    inputProps: {
+                      maxLength: 4,
+                      inputMode: "numeric",
+                      pattern: "[0-9]*",
+                    },
+
+                    FormHelperTextProps: {
+                      sx: {
+                        mt: 1,
+                        fontSize: "0.85rem",
+                        fontWeight: 500,
+                        color: yearError ? "#d32f2f" : "#6500caff",
+                      },
+                    },
+                  },
+                }}
+              />
+            </LocalizationProvider>
+
+            <TextField
+              label="Remarks*"
+              fullWidth
+              multiline
+              rows={3}
+              sx={{ mt: 2 }}
+              value={remarks}
+              inputProps={{ maxLength: MAX_REMARKS }}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (!REMARKS_REGEX.test(v)) {
+                  setRemarksError("Special characters are not allowed.");
+                  return;
+                }
+                setRemarksError("");
+                setRemarks(v);
+              }}
+              error={
+                Boolean(remarksError) ||
+                (remarks && remarks.length < MIN_REMARKS)
+              }
+              helperText={
+                remarksError ||
+                (remarks.length < MIN_REMARKS
+                  ? `Minimum ${MIN_REMARKS} characters required`
+                  : `${remarks.length}/${MAX_REMARKS}`)
+              }
+            />
+
+            <Stack direction="row" spacing={2} justifyContent="center" mt={3}>
+              <Button
+                variant="contained"
+                // Disable if: Year not selected OR Year has Error OR Remarks too short
+                disabled={!selectedYear || Boolean(yearError) || remarks.length < MIN_REMARKS}
+                onClick={handleSubmit}
+              >
+                Submit Request
+              </Button>
+              <Button
+                variant="outlined"
+                onClick={() => {
+                  resetRaiseRequestForm();
+                  setOpenDialog(false);
+                }}
+              >
+                Cancel
+              </Button>
+            </Stack>
+          </DialogContent>
+        </Dialog>
+      </Box>
+    </Box>
+  );
+}
 
