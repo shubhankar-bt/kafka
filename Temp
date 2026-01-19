@@ -1,490 +1,136 @@
-import { useEffect, useMemo, useState } from "react";
-import dayjs from "dayjs";
-import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
-import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
-import { DatePicker } from "@mui/x-date-pickers/DatePicker";
-import CloseIcon from "@mui/icons-material/Close";
-import useApi from "../../hooks/useApi";
-import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import { getIconComponent } from "../../utils/IconUtils";
-import {
-  Box,
-  Stack,
-  Typography,
-  TextField,
-  Button,
-  Divider,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-} from "@mui/material";
-import {
-  ChipStyle,
-  StyledBox,
-  StyledTableContainer,
-  StyledTable,
-  StyledTableHead,
-  StyledTableCell,
-  StyledTableRow,
-  StyledTableBody,
-  StyledTablePagination,
-  StyledDialogTitle,
-  StyledTypography,
-  StyledCloseButton,
-  StyledDialog,
-} from "./CalendarConfig";
+import React, { useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { LocalizationProvider } from '@mui/x-date-pickers';
+import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
+import { DatePicker } from '@mui/x-date-pickers/DatePicker';
+import { createTheme, ThemeProvider } from '@mui/material/styles';
+import Box from '@mui/material/Box';
+import Typography from '@mui/material/Typography';
+import Card from '@mui/material/Card';
+import CardContent from '@mui/material/CardContent';
+import dayjs from 'dayjs';
 
-export default function CalendarConfigTab() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  
-  // State for Data
-  const [currentFY, setCurrentFY] = useState({ start: null, end: null });
-  const [nextFYInfo, setNextFYInfo] = useState({
-    expectedStart: null,
-    lastEnd: null,
-  });
-  const [calendarRows, setCalendarRows] = useState([]);
-  
-  // State for UI/Dialogs
-  const [openApprovedDialog, setOpenApprovedDialog] = useState(false);
-  const [openDialog, setOpenDialog] = useState(false);
-  
-  // State for Forms
+// --- Theme Setup ---
+const theme = createTheme({
+  palette: {
+    primary: {
+      main: '#6500caff',
+    },
+  },
+});
+
+const App = () => {
+  // --- Mock Data Setup (Simulating your backend/props) ---
+  // In your real app, these come from your props or context
+  const expectedStartDate = "2025-04-01"; 
+  const nextFYInfo = {
+    expectedStart: dayjs(expectedStartDate),
+  };
+
+  // --- State ---
+  // Initialize with null or a default year
   const [selectedYear, setSelectedYear] = useState(null);
-  const [remarks, setRemarks] = useState("");
-  const [yearError, setYearError] = useState("");
-  const [remarksError, setRemarksError] = useState("");
-  
-  // State for Pagination
-  const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(5);
 
-  const REMARKS_REGEX = /^[A-Za-z0-9 ,.]*$/;
-  // For Active and In-Active Icons inside the table
-  const ActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
-  const InActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
-  
-  const MAX_REMARKS = 150;
-  const MIN_REMARKS = 5;
-
-  // The year we expect the user to select (Derived from backend data)
-  const allowedYear = nextFYInfo?.expectedStart?.year();
-
-  useEffect(() => {
-    loadCurrentFY();
-    loadTableData();
-  }, []);
-
-  // For data inside approved requests form
-  const tableRows = calendarRows.map((row) => ({
-    id: row.id,
-    yearStartDate: row.yearStartDate,
-    yearEndDate: row.yearEndDate,
-    remarks: row.remarks,
-    activeFlag: row.activeFlag,
-    approvedBy: row.approvedBy,
-    requestedBy: row.requestedBy,
-    status: row.activeFlag === 1 ? "Active" : "Inactive",
-  }));
-
-  // Loading current Financial Year (FY)
-  const loadCurrentFY = async () => {
-    try {
-      const res = await callApi("/CM/common-master/calendar-configuration");
-      if (res?.data?.activeFlag === 1) {
-        setCurrentFY({
-          start: dayjs(res.data.yearStartDate),
-          end: dayjs(res.data.yearEndDate),
-        });
-      }
-    } catch (error) {
-      console.error("Failed to load current FY", error);
-    }
-  };
-
-  // Loading approved FY's into the table & Next FY Info
-  const loadTableData = async () => {
-    try {
-      const res = await callApi("/CM/calendar-config/next-year-info");
-      if (res?.data) {
-        setNextFYInfo({
-          expectedStart: res.data.expectedStartDate
-            ? dayjs(res.data.expectedStartDate)
-            : null,
-          lastEnd: res.data.lastEndDate ? dayjs(res.data.lastEndDate) : null,
-        });
-        const rows = res.data.calenderConfig || [];
-        setCalendarRows(rows);
-      }
-    } catch (error) {
-      console.error("Failed to load table data", error);
-    }
-  };
-
-  // For "Raise request" button
-  const handleRaiseRequestClick = async () => {
-    resetRaiseRequestForm();
-    await loadTableData();
-    setOpenDialog(true);
-  };
-
-  // To reset the form every time
-  const resetRaiseRequestForm = () => {
-    setSelectedYear(null);
-    setYearError("");
-    setRemarks("");
-    setRemarksError("");
-  };
-
-  // To handle close button in "view approved requests" form
-  const handleCloseDialog = () => {
-    setOpenApprovedDialog(false);
-  };
-
-  // Handle Date Selection and Manual Typing Validation
-  const handleYearChange = (val) => {
-    // If input is cleared or invalid date object
-    if (!val || !val.isValid()) {
-        setSelectedYear(null);
-        // We don't set an error immediately on clear, allows user to retype
-        // But if it's invalid date format, DatePicker's onError handles it
-        return;
-    }
-
-    const enteredYear = val.year();
-    setSelectedYear(enteredYear); // Update UI with what they typed
-
-    // Validation Logic
-    if (allowedYear) {
-        if (enteredYear < allowedYear) {
-            setYearError(`Invalid Year. Expected: ${allowedYear}. You cannot raise requests for past years.`);
-        } else if (enteredYear > allowedYear) {
-            setYearError(`Invalid Year. Expected: ${allowedYear}. You cannot skip the upcoming Financial Year.`);
-        } else {
-            // Valid match
-            setYearError("");
-        }
-    }
-  };
-
-  // Logic for "Submit" button in Raise Request form
-  const handleSubmit = async () => {
-    if (!selectedYear || yearError) return;
-
-    try {
-      const res = await callApi(
-        "/CR/create-request",
-        {
-          requestType: "CALENDER",
-          changeType: "ADD",
-          payload: {
-            yearStartDate: `${selectedYear}-04-01`,
-            yearEndDate: `${selectedYear + 1}-03-31`,
-            remarks,
-          },
-        },
-        "POST"
-      );
-      showSnackBar(
-        "Request raised successfully for upcoming financial year with request id " +
-          res?.data?.id,
-        "success"
-      );
-      setOpenDialog(false);
-      resetRaiseRequestForm();
-      loadTableData();
-    } catch (err) {
-      showSnackBar(
-        err?.message || "Something went wrong. Please try again.",
-        "error"
-      );
-    }
-  };
+  // --- Validation Logic ---
+  // Helper to determine if the selected year matches the expectation
+  const isValidSelection = selectedYear && 
+    nextFYInfo.expectedStart && 
+    selectedYear === nextFYInfo.expectedStart.year();
 
   return (
-    <Box sx={{ display: "flex", justifyContent: "center" }}>
-      <Box
-        sx={{ display: "flex", width: "100%", p: 4, justifyContent: "center" }}
-      >
-        {/*To show the current Financial Year details*/}
-        <Box
-          sx={{
-            width: { xs: "95%", md: "65%" },
-            p: 5,
-            borderRadius: "20px",
-            background: "rgba(255,255,255,0.12)",
-            backdropFilter: "blur(12px)",
-            border: "1px solid rgba(255,255,255,0.25)",
-          }}
-        >
-          <Typography variant="h6" textAlign="center" mb={2}>
-            Current Financial Year
+    <Box className="min-h-screen bg-gray-50 flex items-center justify-center p-4 font-sans">
+      <Card className="w-full max-w-md shadow-lg">
+        <CardContent className="p-6">
+          <Typography variant="h5" component="h2" className="mb-6 font-bold text-gray-800">
+            Financial Year Selector
           </Typography>
 
-          <Box
-            sx={{
-              display: "flex",
-              justifyContent: "center",
-              gap: 15,
-              p: 2,
-              borderRadius: 2,
-              border: "1px solid rgba(255,255,255,0.3)",
-            }}
-          >
-            <Typography>
-              Financial Year Start Date:{" "}
-              <b>{currentFY.start?.format("DD-MM-YYYY")}</b>
-            </Typography>
-            <Typography>
-              Financial Year End Date:{" "}
-              <b>{currentFY.end?.format("DD-MM-YYYY")}</b>
-            </Typography>
-          </Box>
+          <Typography variant="body2" className="mb-4 text-gray-600">
+            <strong>Context:</strong> Expected FY Start is {nextFYInfo.expectedStart.format('MMMM D, YYYY')}.
+            <br />
+            Try typing "2025" (valid) or "2026" (disabled/invalid).
+          </Typography>
 
-          <Box textAlign="center" mt={2}>
-            <Typography variant="body2" sx={{ opacity: 0.8 }}>
-              Current Financial Year is Active.
-            </Typography>
-            <Typography variant="body2" sx={{ opacity: 0.8, mb: 2 }}>
-              Requests can be raised only for the next Financial Year.
-            </Typography>
-
-            <Stack direction="row" spacing={2} justifyContent="center" mt={2}>
-              <Button
-                variant="contained"
-                onClick={() => setOpenApprovedDialog(true)}
-              >
-                View Approved Financial Years
-              </Button>
-              <Button variant="contained" onClick={handleRaiseRequestClick}>
-                Raise Request
-              </Button>
-            </Stack>
-          </Box>
-        </Box>
-
-        {/* Dialog to view approved requests*/}
-        <StyledDialog open={openApprovedDialog} fullWidth maxWidth="md">
-          <StyledDialogTitle>
-            <StyledTypography alignItems="center">
-              Approved Financial Year Details
-            </StyledTypography>
-            <StyledCloseButton onClick={handleCloseDialog}>
-              <CloseIcon />
-            </StyledCloseButton>
-          </StyledDialogTitle>
-
-          <Divider />
-
-          <DialogContent>
-            <StyledBox>
-              <StyledTableContainer>
-                <StyledTable stickyHeader>
-                  <StyledTableHead>
-                    <StyledTableRow>
-                      <StyledTableCell>Start Date</StyledTableCell>
-                      <StyledTableCell>End Date</StyledTableCell>
-                      <StyledTableCell>Approved By</StyledTableCell>
-                      <StyledTableCell>Requested By</StyledTableCell>
-                      <StyledTableCell>Status</StyledTableCell>
-                    </StyledTableRow>
-                  </StyledTableHead>
-
-                  <StyledTableBody>
-                    {tableRows
-                      .slice()
-                      .sort(
-                        (a, b) =>
-                          new Date(a.yearStartDate).getTime() -
-                          new Date(b.yearStartDate).getTime()
-                      )
-                      .slice(
-                        page * rowsPerPage,
-                        page * rowsPerPage + rowsPerPage
-                      )
-                      .map((row) => {
-                        if (!row) return null;
-
-                        const isActive = row.status === "Active";
-
-                        return (
-                          <StyledTableRow key={row.id}>
-                            <StyledTableCell>
-                              {row.yearStartDate}
-                            </StyledTableCell>
-                            <StyledTableCell>{row.yearEndDate}</StyledTableCell>
-                            <StyledTableCell>
-                              {row.approvedBy || "-"}
-                            </StyledTableCell>
-                            <StyledTableCell>
-                              {row.requestedBy || "-"}
-                            </StyledTableCell>
-                            <StyledTableCell>
-                              <ChipStyle
-                                row={{ status: isActive ? 1 : 0 }}
-                                size="small"
-                                icon={
-                                  isActive ? <ActiveIcon /> : <InActiveIcon />
-                                }
-                                label={isActive ? "Active" : "In-Active"}
-                                sx={{
-                                  backgroundColor:
-                                    row.activeFlag === 1
-                                      ? "rgba(46, 125, 50, 0.15)" // green bg
-                                      : "rgba(211, 47, 47, 0.15)", // red bg
-                                  color:
-                                    row.activeFlag === 1
-                                      ? "#2e7d32"
-                                      : "#d32f2f",
-                                  fontWeight: 500,
-                                }}
-                              />
-                            </StyledTableCell>
-                          </StyledTableRow>
-                        );
-                      })}
-                  </StyledTableBody>
-                </StyledTable>
-              </StyledTableContainer>
-
-              <StyledTablePagination
-                component="div"
-                count={tableRows.length}
-                page={page}
-                onPageChange={(e, newPage) => setPage(newPage)}
-                rowsPerPage={rowsPerPage}
-                rowsPerPageOptions={[]}
-                labelDisplayedRows={({ page }) => `PAGE ${page + 1}`}
-              />
-            </StyledBox>
-          </DialogContent>
-        </StyledDialog>
-
-        {/* Dialog to raise a new request*/}
-        <Dialog open={openDialog} maxWidth="sm" fullWidth>
-          <DialogTitle textAlign={"center"}>
-            Raise Financial Year Request
-          </DialogTitle>
-          <DialogContent>
-            <LocalizationProvider dateAdapter={AdapterDayjs}>
-              <DatePicker
-                views={["year"]}
-                label="Financial Year*"
-                // Construct dayjs object for value, handle null case carefully
-                value={selectedYear ? dayjs(`${selectedYear}-04-01`) : null}
-                
-                // Keep the calendar dropdown constrained to logical limits (e.g., from current year onwards)
-                // but rely on manual validation for the specific "expected" logic
-                minDate={dayjs("2020-01-01")} 
-                maxDate={dayjs("2099-12-31")}
-                
-                // Disable field if backend info isn't loaded yet
-                disabled={!nextFYInfo?.expectedStart}
-                
-                // This disables clicking invalid years in the popup calendar
-                shouldDisableYear={(year) =>
-                  allowedYear ? year.year() !== allowedYear : true
+          <LocalizationProvider dateAdapter={AdapterDayjs}>
+            <DatePicker
+              views={["year"]}
+              label="Financial Year*"
+              // Ensure format matches the view so typing works naturally
+              format="YYYY" 
+              
+              // Bind value carefully to avoid invalid dayjs objects
+              value={selectedYear ? dayjs(`${selectedYear}-01-01`) : null}
+              
+              // Validations
+              minDate={dayjs("2025-01-01")}
+              maxDate={nextFYInfo.expectedStart?.endOf("year")}
+              disabled={!nextFYInfo.expectedStart}
+              shouldDisableYear={(year) =>
+                nextFYInfo.expectedStart
+                  ? year.year() !== nextFYInfo.expectedStart.year()
+                  : true
+              }
+              
+              sx={{ mt: 1, width: '100%' }}
+              
+              // Handle Change (Typing + Selection)
+              onChange={(val) => {
+                // If user backspaces/clears, val is null. We must handle this.
+                if (!val || !val.isValid()) {
+                  setSelectedYear(null);
+                  return;
                 }
-                
-                onChange={handleYearChange}
-                
-                onError={(reason) => {
-                  if (reason) {
-                    setYearError("Invalid year format.");
-                  }
-                }}
-                
-                sx={{ mt: 1 }}
-                slotProps={{
-                  textField: {
-                    size: "small",
-                    fullWidth: true,
-                    error: Boolean(yearError),
-                    // Helper text logic for 3 states: Error, Selected, or Info
-                    helperText: yearError
-                      ? yearError
-                      : selectedYear
+                setSelectedYear(val.year());
+              }}
+              
+              slotProps={{
+                textField: {
+                  size: "small",
+                  fullWidth: true,
+                  // REMOVED: InputProps: { readOnly: true } 
+                  // This allows typing.
+                  
+                  // Helper Text Logic (Preserved from your code)
+                  helperText:
+                    selectedYear == expectedStartDate?.split("-")[0]
                       ? `Selected Financial Year : ${selectedYear} – ${
                           selectedYear + 1
                         } (April to March)`
-                      : allowedYear
-                      ? `Requests are permitted only for Financial Year ${allowedYear}-${
-                          allowedYear + 1
-                        }.`
+                      : nextFYInfo.expectedStart
+                      ? `Requests are permitted only for Financial Year ${nextFYInfo.expectedStart.format(
+                          "YYYY"
+                        )}-${nextFYInfo.expectedStart
+                          .add(1, "year")
+                          .format("YYYY")}.`
                       : "",
-
-                    inputProps: {
-                      maxLength: 4,
-                      inputMode: "numeric",
-                      pattern: "[0-9]*",
-                    },
-
-                    FormHelperTextProps: {
-                      sx: {
-                        mt: 1,
-                        fontSize: "0.85rem",
-                        fontWeight: 500,
-                        color: yearError ? "#d32f2f" : "#6500caff",
-                      },
+                  
+                  FormHelperTextProps: {
+                    sx: {
+                      mt: 1,
+                      fontSize: "0.85rem",
+                      fontWeight: 500,
+                      // Change color based on validity for better UX
+                      color: isValidSelection ? "#6500caff" : "#d32f2f",
                     },
                   },
-                }}
-              />
-            </LocalizationProvider>
-
-            <TextField
-              label="Remarks*"
-              fullWidth
-              multiline
-              rows={3}
-              sx={{ mt: 2 }}
-              value={remarks}
-              inputProps={{ maxLength: MAX_REMARKS }}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (!REMARKS_REGEX.test(v)) {
-                  setRemarksError("Special characters are not allowed.");
-                  return;
-                }
-                setRemarksError("");
-                setRemarks(v);
+                },
               }}
-              error={
-                Boolean(remarksError) ||
-                (remarks && remarks.length < MIN_REMARKS)
-              }
-              helperText={
-                remarksError ||
-                (remarks.length < MIN_REMARKS
-                  ? `Minimum ${MIN_REMARKS} characters required`
-                  : `${remarks.length}/${MAX_REMARKS}`)
-              }
             />
+          </LocalizationProvider>
 
-            <Stack direction="row" spacing={2} justifyContent="center" mt={3}>
-              <Button
-                variant="contained"
-                // Disable if: Year not selected OR Year has Error OR Remarks too short
-                disabled={!selectedYear || Boolean(yearError) || remarks.length < MIN_REMARKS}
-                onClick={handleSubmit}
-              >
-                Submit Request
-              </Button>
-              <Button
-                variant="outlined"
-                onClick={() => {
-                  resetRaiseRequestForm();
-                  setOpenDialog(false);
-                }}
-              >
-                Cancel
-              </Button>
-            </Stack>
-          </DialogContent>
-        </Dialog>
-      </Box>
+          <Box className="mt-6 p-4 bg-gray-100 rounded text-sm text-gray-700">
+            <strong>Current State:</strong> {selectedYear || "None"}
+          </Box>
+        </CardContent>
+      </Card>
     </Box>
   );
-}
+};
+
+const root = createRoot(document.getElementById('root'));
+root.render(
+  <ThemeProvider theme={theme}>
+    <App />
+  </ThemeProvider>
+);
 
