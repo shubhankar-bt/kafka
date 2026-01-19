@@ -1,404 +1,1606 @@
-import { useEffect, useState } from "react";
 import {
-  Box,
+  Add as AddIcon,
+  Close as CloseIcon,
+  Edit as EditIcon,
+} from "@mui/icons-material";
+
+import {
+  Autocomplete,
   Typography,
-  FormControl,
-  InputLabel,
-  Select,
+  Box,
+  styled,
+  Button,
+  CircularProgress,
+  debounce,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  IconButton,
   MenuItem,
   Stack,
-  Button,
-  Card,
-  LinearProgress,
-  Grow,
-  Fade,
+  TextField,
+  Tooltip,
 } from "@mui/material";
+
+import { DataGrid } from "@mui/x-data-grid";
 import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
 import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
-import { DatePicker } from "@mui/x-date-pickers/DatePicker";
-import {
-  Summarize,
-  CloudDownloadTwoTone,
-  LooksOne,
-  LooksTwo,
-  Looks3,
-} from "@mui/icons-material";
-import useApi from "../../hooks/useApi";
 import dayjs from "dayjs";
-import { useSelector } from "react-redux";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import useApi from "../../hooks/useApi";
+import { getIconComponent } from "../../utils/IconUtils";
 import useCustomSnackbar from "../../utils/useCustomSnackbar";
-import { useTheme } from "@mui/material/styles";
-import CustomChip from "../../utils/CustomChip";
-import GlifReportsStyles from "./GlifReportsStyles";
+import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 
-// 1. Ensure strictly 'en-gb' locale logic if specific DD/MM formats are fighting with browser locale
-import "dayjs/locale/en-gb";
+import {
+  AddIconStyle,
+  Box1Style,
+  ChipStyle,
+  DatePicker1Style,
+  DatePickerStyle,
+  DialogTitleStyle,
+  FabStyle,
+  IconButtonStyle,
+  StackStyle,
+  TextField1Style,
+  TextFieldStyle,
+} from "./BranchMasterStyle";
+import { validations } from "../../utils/Validations";
+import { date } from "zod";
 
-export default function GlifReports() {
-  const { callApi } = useApi();
-  const showSnackBar = useCustomSnackbar();
-  const user = useSelector((state) => state.auth.user);
+const branchType = [
+  { value: "A", label: "Automated" },
+  { value: "M", label: "Manual" },
+];
 
-  const [dateError, setDateError] = useState(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [repTypes, setRepTypes] = useState([]);
-  const [selectedReport, setReport] = useState(null);
-  const [selectedDate, setDate] = useState(null);
+const reDigits = /^[0-9]*$/;
+const reDesc = /^[a-zA-Z0-9\s/&,-.()]*$/;
 
-  // Defaulting to a safe past date initially
-  const [minDate, setMinDate] = useState(dayjs("2020-01-01"));
+const CustomAutoComplete = ({
+  options,
+  value,
+  onChange,
+  renderOption,
+  uniqueElementKey,
+  inputValue,
+  onInputChange,
+  label,
+  name,
+  disabled,
+  loading,
+  error,
+}) => {
+  const filterOptions = name !== "currency" ? (x) => x : undefined;
 
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadedBytes, setDownloadedBytes] = useState(0);
-
-  const theme = useTheme();
-  const styles = GlifReportsStyles(theme);
-
-  const disableInputs = isLoading || isDownloading;
-
-  const downloadedMB =
-    downloadedBytes > 0 ? (downloadedBytes / (1024 * 1024)).toFixed(2) : null;
-
-  // --- API Fetch ---
-  useEffect(() => {
-    async function fetchData() {
-      setIsLoading(true);
-      try {
-        const data = await callApi(
-          "/RS/reports/types",
-          { roleId: user.role },
-          "POST"
-        );
-        const types = data.data || [];
-        setRepTypes(types);
-
-        if (types.length > 0 && types[0].selectedDate) {
-          // IMPORTANT: Use .startOf('day') to ensure time is 00:00:00
-          // This fixes the "sometimes enabled/disabled arrow" issue by ensuring strict day comparison
-          setMinDate(dayjs(types[0].selectedDate).startOf("day"));
-        } else {
-          // Fallback
-          setMinDate(dayjs("2025-10-01").startOf("day"));
-        }
-      } catch (error) {
-        console.error("Failed to fetch report types:", error);
-        showSnackBar("Failed to load report types", "error");
+  return (
+    <Autocomplete
+      options={options}
+      // defaultValue={value || {}} // resolve 38 no defect
+      value={value ?? null}
+      inputValue={inputValue || ""}
+      onInputChange={onInputChange}
+      disabled={disabled}
+      getOptionLabel={(option) => renderOption(option)}
+      onChange={(_, value) => onChange(value)}
+      filterOptions={filterOptions}
+      isOptionEqualToValue={(option, value) =>
+        option?.[uniqueElementKey] === value?.[uniqueElementKey]
       }
-      setIsLoading(false);
-    }
-    fetchData();
-  }, [callApi, user.role, showSnackBar]);
+      renderOption={(props, option) => (
+        <li {...props} key={option[uniqueElementKey]}>
+          {renderOption(option)}
+        </li>
+      )}
+      //noOptionsText={"Exactly 5 digits"} // resolve 38 no defect
+      noOptionsText={
+        loading
+          ? "Loading..."
+          : inputValue?.length < 3
+            ? "Enter Atleast 3 Characters"
+            : options?.length === 0
+              ? "No Data for given filter"
+              : ""
+      }
+      renderInput={(params) => (
+        <TextField
+          {...params}
+          label={label}
+          name={name}
+          disabled={disabled}
+          inputProps={{
+            ...params.inputProps,
+            readOnly: !!disabled,
+          }}
+          InputProps={{
+            ...params.InputProps,
+            endAdornment: (
+              <>
+                {loading ? <CircularProgress size={20} /> : null}
+                {params.InputProps.endAdornment}
+              </>
+            ),
+          }}
+          error={error}
+          helperText={error}
+          sx={{ width: 300 }}
+        />
+      )}
+    />
+  );
+};
 
-  const handleSelect = (report) => {
-    setReport(report);
+const OverlayBox = styled(Box)(() => ({
+  display: "flex",
+  flexDirection: "column",
+  height: "100%",
+  justifyContent: "center",
+  alignItems: "center",
+}));
+
+const CustomNoRowsOverlay = () => {
+  return (
+    <OverlayBox>
+      <ErrorOutlineIcon fontSize="large" />
+      <Typography variant="h5" fontSize="1.2rem">
+        Data is not available
+      </Typography>
+    </OverlayBox>
+  );
+};
+
+export default function BranchMasterTab() {
+  const [rows, setRows] = useState([]);
+  const [rowCount, setRowCount] = useState(0);
+  const [open, setOpen] = useState(false);
+  const { callApi, cancelAllRequests } = useApi();
+
+  const [originalData, setOriginalData] = useState(null); // New state for original data
+  const [isDataSame, setIsDataSame] = useState(true);
+  const [inputValue, setInputValue] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [checkingCode, setCheckingCode] = useState(false);
+  const eprefix = "sbi.";
+  const emailDomain = "@sbi.co.in";
+  //const [closedateHelper, setclosedateHelper] = useState("");
+  const [branchData, setBranchData] = useState({
+    code: "",
+    name: "",
+    circleCode: "",
+    state: "",
+    city: "",
+    address: "",
+    pinCode: "",
+    phoneNumber: "",
+    emailId: `${eprefix}${emailDomain}`,
+    nmrCode: "",
+    status: "Active",
+    openDate: dayjs(),
+    closeDate: new Date(),
+    mergeDate: new Date(),
+    mergedWithBranch: "",
+    lastChangeDate: new Date(),
+    cpcFlag: false,
+    foodCreditFlag: false,
+    currChestFlag: false,
+    branchType: "A",
+  });
+
+  const [states, setStates] = useState([]);
+  const [errors, setErrors] = useState({});
+  const [circles, setCircles] = useState([]);
+  const [mwb, setMwb] = useState([]);
+  const [mwbLoading, setMwbLoading] = useState(false);
+  const snackbar = useCustomSnackbar();
+
+  const [loading, setLoading] = useState(false);
+  /* ===== SERVER GRID STATE ===== */
+
+  const [paginationModel, setPaginationModel] = useState({
+    page: 0,
+    pageSize: 20,
+  });
+  const [sortModel, setSortModel] = useState([]);
+  const [filterModel, setFilterModel] = useState({ items: [] });
+
+  /* ===== DUPLICATE CALL PREVENTION ===== */
+
+  const lastQueryRef = useRef("");
+  const lastFilterRef = useRef("");
+
+  const ActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
+  const InActiveIcon = useMemo(() => getIconComponent("FiberManualRecord"), []);
+
+  /* ================= FETCH ================= */
+
+  const fetchBranches = useCallback(async () => {
+    const sortField = sortModel[0]?.field;
+    const sortOrder = sortModel[0]?.sort;
+
+    const filters = filterModel.items
+      .filter(
+        (f) =>
+          f.operator &&
+          f.value !== undefined &&
+          f.value !== null &&
+          f.value !== "",
+      )
+      .map((f) => ({
+        field: f.field,
+        operator: f.operator,
+        value: f.value,
+      }));
+
+    const querySignature = JSON.stringify({
+      page: paginationModel.page,
+      size: paginationModel.pageSize,
+      sortField,
+      sortOrder,
+      filters,
+    });
+
+    // PREVENT DUPLICATE API CALL
+    if (lastQueryRef.current === querySignature) return;
+    lastQueryRef.current = querySignature;
+
+    try {
+      setLoading(true);
+
+      const payload = {
+        page: paginationModel.page,
+        size: paginationModel.pageSize,
+        sortField,
+        sortOrder,
+        filters,
+      };
+
+      const resp = await callApi(
+        "/CM/common-master/branches-master",
+        payload,
+        "POST",
+      );
+
+      setRows(resp?.data?.data || []);
+      setRowCount(resp?.data?.totalElements || 0);
+    } catch (err) {
+      snackbar(err?.message || "Failed to load branches", "error");
+      setRows([]);
+      setRowCount(0);
+    } finally {
+      setLoading(false);
+    }
+  }, [callApi, snackbar, paginationModel, sortModel, filterModel]);
+
+  /* ================= EFFECTS ================= */
+
+  useEffect(() => {
+    fetchBranches();
+  }, [fetchBranches]);
+
+  // Reset page ONLY when filter meaningfully changes
+  useEffect(() => {
+    const current = JSON.stringify(filterModel.items || []);
+    if (current === lastFilterRef.current) return;
+
+    lastFilterRef.current = current;
+
+    setPaginationModel((p) => (p.page === 0 ? p : { ...p, page: 0 }));
+  }, [filterModel]);
+
+  // --- throttle snackbar so they don't spam while typing ---
+  const snackGateRef = useRef(true);
+  const notifyOnce = useCallback(
+    (msg, variant = "warning") => {
+      if (!snackGateRef.current) return;
+      snackGateRef.current = false;
+      snackbar(msg, variant);
+      setTimeout(() => (snackGateRef.current = true), 800);
+    },
+    [snackbar],
+  );
+
+  const checkDataEquality = (current, original) => {
+    if (!original) return true; // If no original data, assume they are "same" initially for disable state
+    return (
+      current.name === original.name &&
+      current.circleCode === original.circleCode &&
+      current.state === original.state &&
+      current.city === original.city &&
+      current.address === original.address &&
+      current.pinCode === original.pinCode &&
+      current.phoneNumber === original.phoneNumber &&
+      current.emailId === original.emailId &&
+      current.nmrCode === original.nmrCode &&
+      current.status === original.status &&
+      current.openDate === original.openDate &&
+      current.closeDate === original.closeDate &&
+      current.mergeDate === original.mergeDate &&
+      current.mergedWithBranch === original.mergedWithBranch &&
+      current.cpcFlag === original.cpcFlag &&
+      current.foodCreditFlag === original.foodCreditFlag &&
+      current.currChestFlag === original.currChestFlag &&
+      current.branchType === original.branchType
+    );
   };
 
-  // --- Download Logic ---
-  const handleFetchReportData = async () => {
-    if (!selectedReport?.fileName || !selectedDate) return;
+  const fetchData = useCallback(async () => {
+    const statesResponse = await callApi(
+      "/CM/common-master/states",
+      null,
+      "GET",
+    );
+    setStates(statesResponse?.data ?? []);
+    const circleResponse = await callApi(
+      "/CM/common-master/circle-codes",
+      null,
+      "GET",
+    );
+    setCircles(circleResponse?.data ?? []);
+  }, [callApi]);
 
-    if (dateError) {
-      showSnackBar(getErrorMessage(dateError), "error");
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  useEffect(() => {
+    const change =
+      branchData.status === "InActive" ||
+      !!branchData.closeDate ||
+      !!branchData.mergeDate ||
+      !!branchData.mergedWithBranch;
+    if (editingId && change && branchData.branchType !== "M") {
+      setBranchData((prev) => ({
+        ...prev,
+        branchType: "M",
+      }));
+    }
+    if (!change && branchData.branchType !== "A") {
+      setBranchData((prev) => ({
+        ...prev,
+        branchType: "A",
+      }));
+    }
+  }, [
+    editingId,
+    branchData.status,
+    branchData.closeDate,
+    branchData.mergeDate,
+    branchData.mergedWithBranch,
+    branchData.branchType,
+  ]);
+
+  useEffect(() => {
+    if (!branchData.mergedWithBranch) {
+      setBranchData((prev) => ({
+        ...prev,
+        mergeDate: null,
+      }));
+    }
+  }, [branchData.mergedWithBranch]);
+
+  useEffect(() => {
+    if (
+      editingId &&
+      branchData.mergedWithBranch &&
+      typeof branchData.mergedWithBranch === "string" &&
+      mwb?.length
+    ) {
+      const obj = mwb.find((b) => b.code === branchData.mergedWithBranch);
+      if (obj) {
+        setBranchData((prev) => ({
+          ...prev,
+          mergedWithBranch: obj,
+        }));
+      }
+    }
+  }, [editingId, mwb]);
+
+  useEffect(() => {
+    if (editingId && originalData) {
+      setIsDataSame(checkDataEquality(branchData, originalData));
+    }
+  }, [branchData, originalData, editingId]);
+
+  const handleMergedWithBranchAutoCompleteChange = (value) => {
+    setBranchData((prev) => ({
+      ...prev,
+      mergedWithBranch: value,
+    }));
+    setErrors((prev) => ({
+      ...prev,
+      mergedWithBranch: validateField("mergedWithBranch", value?.code),
+    }));
+  };
+
+  const isAllZeros = (str) => {
+    return /^0+$/.test(str);
+  };
+
+  const validateField = useCallback((name, value) => {
+    switch (name) {
+      case "code":
+        if (!value.trim()) return "Branch Code is required";
+        if (!reDigits.test(value)) return "Only digits allowed";
+        if (value.length !== 5) return "Must be 5 digits";
+        break;
+
+      case "name":
+        if (!value.trim()) return "Branch name is required";
+        if (!reDesc.test(value))
+          return "Only letters, spaces, numbers, / & ( ) - , .";
+        if (value.trim().length < 3)
+          return "Branch Name must be at least 3 characters";
+        break;
+
+      case "circleCode":
+        if (!value.trim()) return "Circle Code is required";
+        if (!reDigits.test(value)) return "Only digits allowed";
+        if (value.length !== 3) return "Must be 3 digits";
+        break;
+
+      case "state":
+        if (!value.trim()) return "state is required";
+        if (!reDesc.test(value)) return "Only letters";
+        break;
+
+      case "city":
+        if (value.trim() && !reDesc.test(value))
+          return "Only letters, digits, spaces, / & . ( ) - ,";
+        if (value.trim().length < 3)
+          return "City name must be at least 3 characters";
+        break;
+
+      case "address":
+        if (value.trim() && !reDesc.test(value))
+          return "Only letters, digits, spaces, / & ( ) - ,";
+
+        if (value.trim().length < 5)
+          return "Address must be at least 5 characters";
+        break;
+
+      case "pinCode":
+        if (value.trim() && !reDigits.test(value)) return "Only digits allowed";
+        if (value.length !== 6) return "Must be 6 digits";
+        break;
+
+      case "phoneNumber":
+        if (!value.trim()) return "Mobile Number is required";
+        if (!reDigits.test(value)) return "Only digits allowed";
+        if (value.length !== 10) return "Must be 10 digits";
+        break;
+
+      case "nmrCode":
+        if (!value.trim()) return "NMR Code is required";
+        if (!reDigits.test(value)) return "Only digits allowed";
+        if (value.length !== 9) return "Must be 9 digits";
+        break;
+
+      case "mergedWithBranch":
+        if (branchData?.code === value)
+          return "Merged with Branch cannot be same as current Branch!";
+        break;
+
+      default:
+        return "";
+    }
+  });
+
+  const isFormValid = useCallback(() => {
+    if (
+      validateField("code", branchData.code) ||
+      validateField("name", branchData.name) ||
+      validateField("circleCode", branchData.circleCode) ||
+      validateField("state", branchData.state) ||
+      validateField("city", branchData.city) ||
+      validateField("address", branchData.address) ||
+      validateField("pinCode", branchData.pinCode) ||
+      validateField("phoneNumber", branchData.phoneNumber) ||
+      validateField("emailId", branchData.emailId) ||
+      validateField("nmrCode", branchData.nmrCode)
+    ) {
+      return false;
+    }
+    if (branchData.status === "InActive" && !branchData.closeDate) {
+      return false;
+    }
+    if (branchData.mergedWithBranch && !branchData.mergeDate) {
+      return false;
+    }
+    return true;
+  }, [branchData, validateField]);
+
+  // --- live validation on change + snackbar for bad keystrokes ---
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+
+    if (name === "code") {
+      if (!reDigits.test(value)) {
+        notifyOnce("branch Code accepts digits only");
+        return;
+      }
+      if (value.length > 5) {
+        notifyOnce("branch Code must be 5 digits");
+        return;
+      }
+      if (value.length === 5 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+      if (value.length === 5) {
+        checkBranchCodeExixts(value);
+      }
+    }
+
+    if (name === "name") {
+      if (value && !/^[A-Za-z0-9]$/.test(value[0])) {
+        notifyOnce("Should not start with special/invalid character");
+        return;
+      }
+      if (value.length == 50 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+      if (value !== "" && !/^[A-Za-z0-9/&(),-. ]*$/.test(value)) {
+        setErrors((prev) => ({
+          ...prev,
+          name: "Invalid special characters used",
+        }));
+        return;
+      }
+    }
+
+    if (name === "city") {
+      if (value && !/^[A-Za-z0-9]$/.test(value[0])) {
+        notifyOnce("Should not start with special character");
+        return;
+      }
+      if (value.length == 30 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+      if (value !== "" && !/^[A-Za-z0-9/&(),-. ]*$/.test(value)) {
+        setErrors((prev) => ({
+          ...prev,
+          city: "Invalid special characters used",
+        }));
+        return;
+      }
+    }
+
+    if (name === "address") {
+      if (value && !/^[A-Za-z0-9]$/.test(value[0])) {
+        notifyOnce("Should not start with special character");
+        return;
+      }
+      if (value.length == 50 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+      if (value !== "" && !/^[A-Za-z0-9/&(),-. ]*$/.test(value)) {
+        setErrors((prev) => ({
+          ...prev,
+          address: "Invalid special characters used",
+        }));
+        return;
+      }
+    }
+
+    if (name === "pinCode") {
+      if (value && !/^[1-9]$/.test(value[0])) {
+        snackbar("Pin Code should not start with zero", "error");
+        return;
+      }
+      if (!reDigits.test(value)) {
+        notifyOnce("Pin Code accepts digits only");
+        return;
+      }
+      if (value.length > 6) {
+        notifyOnce("Pin Code must be 6 digits");
+        return;
+      }
+      if (value.length === 6 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+    }
+
+    if (name === "phoneNumber") {
+      if (value && !/^[1-9]$/.test(value[0])) {
+        snackbar(
+          "Mobile Number should start only with greater than zero",
+          "error",
+        );
+        return;
+      }
+      if (!reDigits.test(value)) {
+        notifyOnce("Mobile Number accepts digits only");
+        return;
+      }
+      if (value.length > 10) {
+        notifyOnce("Mobile Number must be 10 digits");
+        return;
+      }
+    }
+
+    if (name === "nmrCode") {
+      if (!reDigits.test(value)) {
+        notifyOnce("N-M-R Code accepts digits only");
+        return;
+      }
+      if (value.length > 9) {
+        notifyOnce("N-M-R Code must be 9 digits");
+        return;
+      }
+      if (value.length === 9 && isAllZeros(value)) {
+        notifyOnce("All zeros are not Allowed");
+        return;
+      }
+    }
+
+    setBranchData((prev) => ({ ...prev, [name]: value }));
+
+    setBranchData((prev) => {
+      const updated = {
+        ...prev,
+        [name]: value,
+      };
+
+      if (name === "code") {
+        const bc = value || "";
+        updated.emailId = `${eprefix}${bc}${emailDomain}`;
+      }
+      return updated;
+    });
+    setBranchData((prev) => {
+      const updatedDate = {
+        ...prev,
+        [name]: value,
+      };
+      if (name === "status" && value !== "InActive") {
+        updatedDate.closeDate = null;
+      }
+      return updatedDate;
+    });
+
+    setErrors((prev) => ({ ...prev, [name]: "" }));
+
+    // update error for just this field
+    setErrors((prev) => ({
+      ...prev,
+      [name]: validateField(name, value),
+    }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const isEditing = editingId;
+    if (editingId && isDataSame) {
+      snackbar(
+        "No Changes Detected, Kindly modify data before saving",
+        "warning",
+      );
+      return;
+    }
+    if (!isEditing) {
+      try {
+        const url =
+          "/CM/common-master/branches-code-name-only?q=" +
+          encodeURIComponent(branchData.code);
+        const payload = null;
+        const response = await callApi(url, payload, "GET");
+        const data = response.data;
+
+        const branchExists = data.some((row) => row.code === branchData.code);
+        if (branchExists) {
+          snackbar("Branch code already exist", "warning");
+          return;
+        }
+        if (isClosed && !branchData.closeDate) {
+          notifyOnce("Please select Close Date", "error");
+          return;
+        }
+        if (isMerged && !branchData.mergeDate) {
+          notifyOnce("Please select Merge Date", "error");
+          return;
+        }
+      } catch {
+        snackbar("Something went wrong", "warning");
+        return;
+      }
+    }
+
+    if (editingId) {
+      if (
+        !branchData?.code ||
+        !branchData?.name ||
+        !branchData?.circleCode ||
+        !branchData?.state ||
+        !branchData?.city ||
+        !branchData?.pinCode ||
+        !branchData?.address ||
+        !branchData?.phoneNumber ||
+        !branchData?.emailId ||
+        !branchData?.nmrCode ||
+        !branchData?.status ||
+        !branchData?.foodCreditFlag ||
+        !branchData?.currChestFlag ||
+        !branchData?.branchType ||
+        !branchData?.openDate ||
+        !branchData?.cpcFlag
+      ) {
+        snackbar("Kindly Check data before updating", "warning");
+        return;
+      }
+    }
+
+    const allErrors = {
+      code: validateField("code", branchData.code),
+      name: validateField("name", branchData.name),
+      circleCode: validateField("circleCode", branchData.circleCode),
+      state: validateField("state", branchData.state),
+      city: validateField("city", branchData.city),
+      address: validateField("address", branchData.address),
+      pinCode: validateField("pinCode", branchData.pinCode),
+      phoneNumber: validateField("phoneNumber", branchData.phoneNumber),
+      emailId: validateField("emailId", branchData.emailId),
+      nmrCode: validateField("nmrCode", branchData.nmrCode),
+      status: validateField("status", branchData.status),
+      openDate: validateField("openDate", branchData.openDate),
+      branchType: validateField("branchType", branchData.branchType),
+      mergedWithBranch: branchData.mergedWithBranch
+        ? validateField("mergedWithBranch", branchData.mergedWithBranch)
+        : null,
+      closeDate:
+        editingId && branchData.status === "InActive"
+          ? validateField("closeDate", branchData.closeDate)
+          : null,
+      mergeDate:
+        editingId && branchData.mergedWithBranch
+          ? validateField("mergeDate", branchData.mergeDate)
+          : null,
+    };
+    setErrors(allErrors);
+
+    const valid = Object.values(allErrors).every((v) => !v);
+    if (!valid) {
+      notifyOnce("Please fix validation errors", "error");
       return;
     }
 
-    setIsLoading(true);
-    setIsDownloading(true);
-    setDownloadedBytes(0);
+    console.log(branchData);
 
-    const payload = {
-      fileName: selectedReport.fileName,
-      date: selectedDate.format("YYYY-MM-DD"),
-      roleId: user.role,
+    const foundCircle = circles.find(
+      (item) => item.circleCode === branchData.circleCode,
+    );
+
+    const foundState = states.find(
+      (item) => item.stateCode === branchData.state,
+    );
+
+    const payloadData = {
+      requestType: "BRANCH",
+      changeType: editingId ? "UPDATE" : "ADD",
+      targetId: branchData.code,
+      payload: {
+        code: branchData.code.trim(),
+        name: branchData.name.trim(),
+        circleCode: branchData.circleCode.trim(),
+        circleName: foundCircle.circleName.trim(),
+        state: branchData.state.trim(),
+        stateName: foundState.stateName.trim(),
+        city: branchData.city.trim(),
+        address: branchData.address.trim(),
+        pinCode: branchData.pinCode.trim(),
+        phoneNumber: branchData.phoneNumber.trim(),
+        emailId: branchData.emailId.trim(),
+        nmrCode: branchData.nmrCode.trim(),
+        status: branchData.status === "Active",
+        cpcFlag: branchData.cpcFlag,
+        foodCreditFlag: branchData.foodCreditFlag,
+        currChestFlag: branchData.currChestFlag,
+        branchType: branchData.branchType,
+        openDate: editingId
+          ? branchData.openDate
+          : branchData.openDate
+            ? dayjs(branchData.openDate).format("DD/MM/YYYY")
+            : null,
+
+        ...(editingId && {
+          mergedWithBranch: branchData.mergedWithBranch?.code || null,
+          closeDate: branchData.closeDate
+            ? dayjs(branchData.closeDate).format("DD/MM/YYYY")
+            : null,
+          mergeDate: branchData.mergeDate
+            ? dayjs(branchData.mergeDate).format("DD/MM/YYYY")
+            : null,
+        }),
+      },
     };
 
     try {
-      const response = await callApi(
-        "/RS/reports/download",
-        payload,
-        "POST",
-        "blob",
-        "application/json",
-        {
-          onDownloadProgress: (event) => {
-            setIsDownloading(true);
-            if (event && typeof event.loaded === "number") {
-              setDownloadedBytes(event.loaded);
-            }
-          },
-        },
-        false
-      );
-
-      if (response.data && response.data.size > 22) {
-        const contentDisposition =
-          response.headers["content-disposition"] ||
-          response.headers["Content-Disposition"];
-
-        let filename = "report.zip";
-        if (
-          contentDisposition &&
-          contentDisposition.indexOf("attachment") !== -1
-        ) {
-          const filenameMatch = contentDisposition.match(/filename="(.+?)"/);
-          if (filenameMatch && filenameMatch.length > 1) {
-            filename = filenameMatch[1];
-          }
-        }
-
-        const downloadUrl = window.URL.createObjectURL(response.data);
-        const a = document.createElement("a");
-        a.href = downloadUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.URL.revokeObjectURL(downloadUrl);
-        showSnackBar(`Reports "${filename}" downloaded successfully`, "success");
-      } else {
-        showSnackBar(
-          "No reports found matching your current filter criteria",
-          "warning"
+      const response = await callApi("/CR/create-request", payloadData, "POST");
+      if (response) {
+        snackbar(
+          editingId
+            ? "Branch update request submitted successfully with request id " +
+                response?.data?.id
+            : "Branch creation request submitted successfully with request id " +
+                response?.data?.id,
+          "success",
         );
+        handleClose();
+        fetchData();
       }
-    } catch (error) {
-      console.log("error", error);
-
-      if (error && error instanceof Blob) {
-        const reader = new FileReader();
-        reader.onload = () => {
-          try {
-            const errorJson = JSON.parse(reader.result);
-            console.error(errorJson.message);
-            showSnackBar(
-              errorJson.message || "No reports found matching your criteria",
-              "error"
-            );
-          } catch (e) {
-            console.error(e);
-            showSnackBar("Something went wrong, kindly try again.", "error");
-          }
-        };
-        reader.readAsText(error);
-      } else {
-        showSnackBar("Network Error: Could not connect to server", "error");
-      }
-    } finally {
-      setIsLoading(false);
-      setIsDownloading(false);
-      setDownloadedBytes(0);
+    } catch (err) {
+      snackbar(err?.message || "Request failed", "error");
     }
   };
 
-  // --- Validation Message Logic ---
-  const getErrorMessage = (error) => {
-    const minDateStr = minDate?.isValid()
-      ? minDate.format("DD/MM/YYYY")
-      : "Allowed Min Date";
-
-    switch (error) {
-      case "maxDate":
-        return "Date cannot be in the future (Today is max)";
-      case "minDate":
-        return `Date cannot be prior to ${minDateStr}`;
-      case "invalidDate":
-        // This covers cases like 31st Feb or 31st April
-        return "Invalid date (Check day for this month)";
-      default:
-        // When no error, return instructions
-        return `Allowed Range: ${minDateStr} - Today`;
-    }
+  const ns = (status) => {
+    if (status === false) return "InActive";
+    if (status === true) return "Active";
+    return status;
   };
 
-  return (
-    <Grow in timeout={500}>
-      <Stack spacing={4}>
-        <Box sx={styles.rootBox} elevation={10}>
-          <Stack
-            spacing={3}
-            direction={"column"}
+  const handleEdit = useCallback((row) => {
+    const n = ns(row.status);
+    const initialData = {
+      code: String(row.code ?? ""),
+      name: String(row.name ?? ""),
+      circleCode: String(row.circleCode ?? ""),
+      state: String(row.state ?? ""),
+      city: String(row.city ?? ""),
+      address: String(row.address ?? ""),
+      pinCode: String(row.pinCode ?? ""),
+      phoneNumber: String(row.phoneNumber ?? ""),
+      emailId: `${eprefix}${row.code}${emailDomain}`,
+      nmrCode: String(row.nmrCode ?? ""),
+      openDate: row.openDate,
+      status: n,
+      closeDate: row.closeDate ? dayjs(row.closeDate, "DD/MM/YYYY") : null,
+      mergeDate: row.mergeDate ? dayjs(row.mergeDate, "DD/MM/YYYY") : null,
+      mergedWithBranch: row.mergedWithBranch || null,
+      cpcFlag: String(row.cpcFlag ?? ""),
+      currChestFlag: String(row.currChestFlag ?? ""),
+      foodCreditFlag: String(row.foodCreditFlag ?? ""),
+      branchType: String(row.branchType ?? ""),
+    };
+
+    setBranchData(initialData);
+    setOriginalData(initialData); // Store the original data here
+    setEditingId(row.code);
+    setOpen(true);
+    setIsDataSame(true);
+  }, []);
+
+  const columns = useMemo(
+    () => [
+      {
+        field: "code",
+        headerName: "Branch Code",
+        flex: 2,
+        sortable: true,
+      },
+      {
+        field: "name",
+        headerName: "Branch Name",
+        flex: 3,
+        sortable: true,
+      },
+      {
+        field: "status",
+        headerName: "Status",
+        flex: 1,
+        sortable: true,
+
+        type: "singleSelect",
+        valueOptions: [
+          { value: 1, label: "Active" },
+          { value: 0, label: "In-Active" },
+        ],
+        renderCell: (params) => (
+          <Box1Style>
+            <ChipStyle
+              size="small"
+              icon={params.row.status ? <ActiveIcon /> : <InActiveIcon />}
+              label={params.row.status ? "Active" : "In-Active"}
+              color="primary"
+              row={params.row}
+            />
+          </Box1Style>
+        ),
+      },
+      {
+        field: "actions",
+        headerName: "Actions",
+        flex: 1,
+        headerAlign: "center",
+        align: "center",
+        filterable: false,
+        sortable: false,
+        disableColumnMenu: true,
+        renderCell: (params) => (
+          <StackStyle
+            direction="row"
+            spacing={1}
             alignItems="center"
             justifyContent="center"
           >
-            <Card sx={styles.card}>
-              <Box sx={styles.headerContainer}>
-                <Box sx={styles.headerIconWrapper}>
-                  <Summarize sx={styles.summaryIcon} />
-                </Box>
-                <Box sx={styles.headerTextBox}>
-                  <Typography
-                    variant="h5"
-                    fontWeight="bold"
-                    sx={styles.headerTitle}
-                  >
-                    Reports Generation
-                  </Typography>
-                  <Typography variant="body2" sx={styles.headerSubtitle}>
-                    Choose a specific required report type and date using the
-                    criteria below to download reports
-                  </Typography>
-                </Box>
-              </Box>
+            <Tooltip title="Edit">
+              <div>
+                <IconButton
+                  onClick={() => handleEdit(params.row)}
+                  color="primary"
+                >
+                  <EditIcon />
+                </IconButton>
+              </div>
+            </Tooltip>
+          </StackStyle>
+        ),
+      },
+    ],
+    [handleEdit],
+  );
 
-              <Box sx={styles.noteContainer}>
-                <Typography variant="body2" sx={styles.noteText}>
-                  Note: The generated reports cannot be viewed on-screen it can
-                  only be downloaded.
-                </Typography>
-                <Stack direction="row" spacing={2} sx={styles.stepsStack}>
-                  <CustomChip
-                    label="Select a report"
-                    variant="outlined"
-                    icon={<LooksOne />}
-                    color="info"
-                  />
-                  <CustomChip
-                    label="Select the report date"
-                    variant="outlined"
-                    icon={<LooksTwo />}
-                    color="info"
-                  />
-                  <CustomChip
-                    label="Click Fetch & Download button"
-                    variant="outlined"
-                    icon={<Looks3 />}
-                    color="info"
-                  />
-                </Stack>
-              </Box>
+  const resetForm = () => {
+    setBranchData({
+      code: "",
+      name: "",
+      circleCode: "",
+      state: "",
+      city: "",
+      address: "",
+      pinCode: "",
+      phoneNumber: "",
+      emailId: `${eprefix}${emailDomain}`,
+      nmrCode: "",
+      openDate: dayjs(),
+      mergedWithBranch: "",
+      cpcFlag: false,
+      foodCreditFlag: false,
+      currChestFlag: false,
+      branchType: "A",
+      status: "Active",
+    });
+    setErrors({});
+    setEditingId(null);
+    setIsDataSame(true);
+  };
 
-              <Box sx={styles.inputOuterBox}>
-                <Box sx={styles.inputInnerBox}>
-                  {/* Dropdown Menu */}
-                  <FormControl sx={styles.formControl}>
-                    <InputLabel id="menu-select-label">
-                      Select a report
-                    </InputLabel>
-                    <Select
-                      labelId="menu-select-label"
-                      id="menu-select"
-                      value={selectedReport || ""}
-                      label="Select a report"
-                      onChange={(e) => handleSelect(e.target.value)}
-                      disabled={repTypes.length === 0 || disableInputs}
-                    >
-                      {repTypes.map((item) => (
-                        <MenuItem key={item.fileName} value={item}>
-                          {item.reportName}
-                        </MenuItem>
-                      ))}
-                    </Select>
-                  </FormControl>
+  const handleClose = () => {
+    setOpen(false);
+    resetForm();
+  };
 
-                  {/* Date Picker */}
-                  <FormControl sx={styles.formControl}>
-                    {/* Ensure adapterLocale is set to handle DD/MM logic naturally */}
-                    <LocalizationProvider
-                      dateAdapter={AdapterDayjs}
-                      adapterLocale="en-gb"
-                    >
-                      <DatePicker
-                        label="Select report date"
-                        format="DD/MM/YYYY"
-                        views={["year", "month", "day"]}
-                        value={selectedDate}
-                        onChange={(newDate) => setDate(newDate)}
-                        // Explicitly set maxDate to Today
-                        maxDate={dayjs().endOf("day")}
-                        // Explicitly set minDate
-                        minDate={minDate}
-                        onError={(newError) => setDateError(newError)}
-                        disabled={repTypes.length === 0 || disableInputs}
-                        slotProps={{
-                          textField: {
-                            // Logic: If there is an error, show specific error msg.
-                            // If no error, show the range helper text to guide user.
-                            helperText: dateError
-                              ? getErrorMessage(dateError)
-                              : `Allowed: ${
-                                  minDate?.isValid()
-                                    ? minDate.format("DD/MM/YYYY")
-                                    : "..."
-                                } - Today`,
-                            error: !!dateError,
-                            placeholder: "DD/MM/YYYY",
-                          },
-                          // Enhancement: Show days outside current month but verify they are disabled correctly
-                          day: {
-                            showDaysOutsideCurrentMonth: true,
-                          },
+  const fetchAutoCompleteData = useCallback(
+    async (e, value, reason) => {
+      try {
+        if (!reDesc.test(value)) {
+          snackbar("Invalid special characters are not allowed", "error");
+          return;
+        }
+        const query = value?.trim();
+
+        if (reason === "clear" || !query || query === "") {
+          setMwb([]);
+          return;
+        }
+        if (query.length < 3) {
+          return;
+        }
+        setMwbLoading(true);
+
+        const url =
+          "/CM/common-master/branches-code-name-only?q=" +
+          encodeURIComponent(query);
+
+        const payload = null;
+        cancelAllRequests();
+        const response = await callApi(url, payload, "GET");
+
+        if (!response || !response?.data) {
+          setMwb([]);
+          setMwbLoading(false);
+          return;
+        }
+        setMwb(response?.data);
+        setMwbLoading(false);
+      } catch (e) {
+        if (e.code === "ERR_CANCELED") {
+          return;
+        }
+        setMwbLoading(false);
+      }
+    },
+    [callApi, cancelAllRequests],
+  );
+
+  const handleAutoCompleteInputChange = useCallback(
+    (e, value, reason) => {
+      if (!reDesc.test(value)) {
+        snackbar("Invalid special characters are not allowed", "error");
+        return;
+      } else {
+        setInputValue(value);
+        fetchAutoCompleteData(e, value, reason);
+      }
+    },
+    [fetchAutoCompleteData],
+  );
+
+  const checkBranchCodeExixts = async (code) => {
+    if (!code || code.length !== 5) return;
+    if (editingId && editingId === code) return;
+    try {
+      setCheckingCode(true);
+
+      const url =
+        "/CM/common-master/branches-code-name-only?q=" +
+        encodeURIComponent(code);
+      const response = await callApi(url, null, "GET");
+      const data = response?.data || [];
+      const exists = data.some((row) => row.code === code);
+      if (exists) {
+        setErrors((prev) => ({
+          ...prev,
+          code: "Branch code already exists",
+        }));
+        snackbar("Branch code already exists", "error");
+        setBranchData((prev) => ({
+          ...prev,
+          code: "",
+        }));
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setCheckingCode(false);
+    }
+  };
+
+  const debounceQuery = debounce(handleAutoCompleteInputChange, 1);
+  const isClosed =
+    branchData.status === "InActive" || branchData.status === "Closed";
+  const isMerged = branchData.mergedWithBranch;
+  const canEnabledMD = !!branchData?.mergedWithBranch?.code && !isClosed;
+  const startOfCurrentMonth = dayjs().startOf("month");
+  const endOfCurrentMonth = dayjs().endOf("month");
+
+  useEffect(() => {
+    if (branchData.status === "InActive" || branchData.status === "Closed") {
+      setBranchData((prev) => ({
+        ...prev,
+        mergedWithBranch: null,
+        mergeDate: null,
+      }));
+      setErrors((prev) => ({
+        ...prev,
+        mergedWithBranch: "",
+        mergeDate: "",
+      }));
+    }
+  }, [branchData.status]);
+
+  return (
+    <LocalizationProvider dateAdapter={AdapterDayjs}>
+      <Box>
+        <Box>
+          <FabStyle
+            onClick={() => setOpen(true)}
+            color="primary"
+            variant="extended"
+          >
+            <AddIconStyle />
+          </FabStyle>
+        </Box>
+
+        <DataGrid
+          rows={rows}
+          columns={columns}
+          getRowId={(row) => row.code}
+          loading={loading}
+          paginationMode="server"
+          sortingMode="server"
+          filterMode="server"
+          rowCount={rowCount}
+          paginationModel={paginationModel}
+          onPaginationModelChange={setPaginationModel}
+          sortModel={sortModel}
+          onSortModelChange={setSortModel}
+          filterModel={filterModel}
+          onFilterModelChange={setFilterModel}
+          pageSizeOptions={[10, 20, 50, 100]}
+          disableRowSelectionOnClick
+          slots={{ noRowsOverlay: CustomNoRowsOverlay }}
+        />
+
+        {open && (
+          <Dialog
+            open={true}
+            scroll="paper"
+            component="form"
+            autoComplete="off"
+            onSubmit={handleSubmit}
+            maxWidth={"md"}
+          >
+            <DialogTitleStyle id="customized-dialog-title">
+              {editingId ? "Edit Branch" : "Add New Branch"}
+            </DialogTitleStyle>
+            <IconButtonStyle aria-label="close" onClick={handleClose}>
+              <CloseIcon />
+            </IconButtonStyle>
+            <DialogContent dividers>
+              <Stack direction={"column"} spacing={2}>
+                <Stack direction={"row"} spacing={1}>
+                  <TextFieldStyle
+                    fullWidth
+                    label="Branch Code *"
+                    name="code"
+                    value={branchData.code}
+                    onChange={handleChange}
+                    disabled={!!editingId}
+                    error={!!errors.code}
+                    helperText={errors.code || "Exactly 5 digits"}
+                    inputProps={{ maxLength: 5, inputMode: "numeric" }}
+                  />
+
+                  <TextFieldStyle
+                    fullWidth
+                    label="Branch Name *"
+                    name="name"
+                    value={branchData.name}
+                    onChange={handleChange}
+                    error={!!errors.name}
+                    inputProps={{ maxLength: 50 }}
+                    helperText={
+                      errors.name ||
+                      "Allowed 3-50 letters,numbers,spaces,/&()-,."
+                    }
+                  />
+
+                  <Autocomplete
+                    fullWidth
+                    options={circles}
+                    getOptionLabel={(option) =>
+                      `${option.circleCode} - ${option.circleName}`
+                    }
+                    value={
+                      circles.find(
+                        (c) => c.circleCode === branchData.circleCode,
+                      ) || null
+                    }
+                    onChange={(_, value) => {
+                      handleChange({
+                        target: {
+                          name: "circleCode",
+                          value: value?.circleCode || "",
+                        },
+                      });
+                    }}
+                    renderInput={(params) => (
+                      <TextFieldStyle
+                        {...params}
+                        label="Circle Code *"
+                        error={!!errors.circleCode}
+                        helperText={errors.circleCode || ""}
+                        inputProps={{
+                          ...params.inputProps,
+                          maxLength: 50,
                         }}
                       />
-                    </LocalizationProvider>
-                  </FormControl>
-                </Box>
-              </Box>
+                    )}
+                  />
+                </Stack>
 
-              <Box sx={styles.buttonContainer}>
-                <Button
-                  sx={styles.downloadButton}
-                  endIcon={<CloudDownloadTwoTone />}
-                  variant="contained"
-                  onClick={handleFetchReportData}
-                  disabled={
-                    disableInputs ||
-                    !selectedReport ||
-                    !selectedDate ||
-                    !!dateError
-                  }
-                >
-                  {isDownloading ? "Downloading..." : "Fetch & Download"}
-                </Button>
+                <Stack direction={"row"} spacing={1}>
+                  <Autocomplete
+                    fullWidth
+                    options={states}
+                    getOptionLabel={(option) =>
+                      // `${option.stateCode} - ${option.stateName}`
+                      `${option.stateName}`
+                    }
+                    value={
+                      states.find((s) => s.stateCode === branchData.state) ||
+                      null
+                    }
+                    onChange={(_, value) => {
+                      handleChange({
+                        target: {
+                          name: "state",
+                          value: value?.stateCode || "",
+                        },
+                      });
+                    }}
+                    renderInput={(params) => (
+                      <TextFieldStyle
+                        {...params}
+                        label="State *"
+                        error={!!errors.state}
+                        helperText={errors.state}
+                        inputProps={{
+                          ...params.inputProps,
+                          maxLength: 50,
+                        }}
+                      />
+                    )}
+                  />
 
-                <Fade in={isDownloading} unmountOnExit>
-                  <Box sx={styles.progressContainer}>
-                    <Box sx={styles.progressHeader}>
-                      <Box sx={styles.progressIconWrapper}>
-                        <CloudDownloadTwoTone sx={styles.innerDownloadIcon} />
-                      </Box>
-                      <Box sx={styles.progressHeaderTextBox}>
-                        <Typography variant="body2" fontWeight={600}>
-                          Downloading{" "}
-                          {selectedReport?.reportName ?? "the selected report"}{" "}
-                          for the period{" "}
-                          {selectedDate?.isValid()
-                            ? selectedDate.format("YYYY-MM-DD")
-                            : "an unknown period"}{" "}
-                          is in progress.
-                        </Typography>
+                  <TextFieldStyle
+                    fullWidth
+                    label="City *"
+                    name="city"
+                    value={branchData.city}
+                    onChange={handleChange}
+                    error={!!errors.city}
+                    inputProps={{ maxLength: 30 }}
+                    helperText={
+                      errors.city ||
+                      "Allowed 3-30 letters,numbers,spaces,/&()-,."
+                    }
+                  />
 
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          sx={styles.progressCaption}
-                        >
-                          {downloadedMB
-                            ? `Streaming report data… ${downloadedMB} MB received`
-                            : "Preparing your report stream…"}
-                        </Typography>
-                      </Box>
+                  <TextFieldStyle
+                    fullWidth
+                    label="Pin Code *"
+                    name="pinCode"
+                    value={branchData.pinCode}
+                    onChange={handleChange}
+                    error={!!errors.pinCode}
+                    helperText={errors.pinCode || "Exactly 6 digits"}
+                    inputProps={{ maxLength: 6, inputMode: "numeric" }}
+                  />
+                </Stack>
 
-                      {downloadedMB && (
-                        <CustomChip
-                          color="error"
-                          label={`${downloadedMB} MB downloaded`}
-                          variant="filled"
-                        />
-                      )}
-                    </Box>
-                    <LinearProgress
-                      variant="indeterminate"
-                      sx={styles.progressBar}
+                <Stack direction={"row"} spacing={1}>
+                  <TextField
+                    fullWidth
+                    label="Address *"
+                    name="address"
+                    value={branchData.address}
+                    onChange={handleChange}
+                    error={!!errors.address}
+                    inputProps={{ maxLength: 50 }}
+                    helperText={
+                      errors.address ||
+                      "Allowed 5-50 characters (A-Z, 0-9, spaces, /.&,()-)"
+                    }
+                    multiline
+                    maxRows={2}
+                  />
+                </Stack>
+
+                <Stack direction={"row"} spacing={1}>
+                  <TextField1Style
+                    fullWidth
+                    label="Mobile Number *"
+                    name="phoneNumber"
+                    value={branchData.phoneNumber}
+                    onChange={handleChange}
+                    error={!!errors.phoneNumber}
+                    helperText={errors.phoneNumber || "Exactly 10 digits"}
+                    inputProps={{ maxLength: 10, inputMode: "numeric" }}
+                  />
+                  <TextField1Style
+                    fullWidth
+                    name="emailId"
+                    label="Email ID *"
+                    value={branchData.emailId || emailDomain}
+                    onChange={handleChange}
+                    disabled={true}
+                    onClick={(e) => {
+                      const i = e.target;
+                      const p = branchData.emailId.indexOf("@");
+                      i.setSelectionRange(p, p);
+                    }}
+                    onKeyDown={(e) => {
+                      const p = e.target.selectionStart;
+                      const a = branchData.emailId.indexOf("@");
+                      if (e.key === "Delete" && p >= a) {
+                        e.preventDefault();
+                        return;
+                      }
+                      if (p > a) {
+                        e.preventDefault();
+                        e.target.setSelectionRange(a, a);
+                      }
+                    }}
+                    onBlur={handleChange} // Re-validate on blur
+                    error={!!errors.emailId}
+                    helperText="Auto-generated as sbi.<BranchCode>@sbi.co.in"
+                  />
+                </Stack>
+                <Stack direction={"row"} spacing={1}>
+                  <TextFieldStyle
+                    fullWidth
+                    name="nmrCode"
+                    label="N-M-R Code *"
+                    value={branchData.nmrCode}
+                    onChange={handleChange}
+                    onBlur={handleChange} // Re-validate on blur
+                    error={!!errors.nmrCode}
+                    helperText={errors.nmrCode || "Exactly 9 digits"}
+                    inputProps={{ maxLength: 9, inputMode: "numeric" }}
+                  />
+                  <TextFieldStyle
+                    select
+                    fullWidth
+                    disabled={!editingId}
+                    label="Branch Status as per CBS *"
+                    name="status"
+                    value={
+                      !branchData.status || branchData.status === "InActive"
+                        ? "InActive"
+                        : "Active"
+                    }
+                    onChange={handleChange}
+                    error={!!errors.status}
+                    helperText={errors.status}
+                  >
+                    <MenuItem value="">Select Branch Status</MenuItem>
+                    <MenuItem key={"Live"} value={"Active"}>
+                      Live
+                    </MenuItem>
+                    <MenuItem key={"Closed"} value={"InActive"}>
+                      Closed
+                    </MenuItem>
+                  </TextFieldStyle>
+                  <DatePickerStyle
+                    label="Open Date *"
+                    format="DD/MM/YYYY"
+                    name="openDate"
+                    disableFuture
+                    disabled={!!editingId}
+                    value={
+                      branchData.openDate
+                        ? dayjs(branchData.openDate, "DD/MM/YYYY")
+                        : null
+                    }
+                    onChange={(newValue) => {
+                      if (newValue && dayjs(newValue).isAfter(dayjs(), "day")) {
+                        return;
+                      }
+                      handleChange({
+                        target: {
+                          name: "openDate",
+                          value: newValue,
+                        },
+                      });
+                    }}
+                    minDate={!editingId ? startOfCurrentMonth : undefined}
+                    maxDate={!editingId ? endOfCurrentMonth : undefined}
+                    slotProps={{
+                      textField: {
+                        fullWidth: true,
+                        variant: "outlined",
+                        //onKeyDown: (e) => e.preventDefault(),
+                      },
+                    }}
+                  />
+                </Stack>
+
+                <Stack direction={"row"} spacing={1}>
+                  {editingId && (
+                    <DatePicker1Style
+                      label="Close Date"
+                      format="DD/MM/YYYY"
+                      name="closeDate"
+                      disabled={!isClosed}
+                      disableFuture
+                      value={
+                        branchData.closeDate
+                          ? dayjs(branchData.closeDate, "DD/MM/YYYY")
+                          : null
+                      }
+                      onChange={(newValue) => {
+                        if (
+                          newValue &&
+                          dayjs(newValue)
+                            .startOf("day")
+                            .isAfter(dayjs().startOf("day"))
+                        ) {
+                          return;
+                        }
+
+                        if (
+                          newValue &&
+                          branchData.openDate &&
+                          dayjs(newValue).isBefore(
+                            dayjs(branchData.openDate, "DD/MM/YYYY"),
+                            "day",
+                          )
+                        ) {
+                          return;
+                        }
+                        handleChange({
+                          target: {
+                            name: "closeDate",
+                            value: newValue,
+                          },
+                        });
+                      }}
+                      slotProps={{
+                        textField: {
+                          fullWidth: true,
+                          variant: "outlined", // Pass props to the internal TextField
+                          // onKeyDown: (e) => e.preventDefault(),
+                          error:
+                            (isClosed && !branchData.closeDate) ||
+                            (!isClosed && branchData.closeDate),
+                          helperText:
+                            isClosed && !branchData.closeDate
+                              ? "Close Date is required when status is Closed"
+                              : !isClosed && branchData.closeDate
+                                ? "Close Date can be entered only when Branch status is closed"
+                                : "",
+                        },
+                      }}
                     />
-                  </Box>
-                </Fade>
-              </Box>
-            </Card>
-          </Stack>
-        </Box>
-      </Stack>
-    </Grow>
+                  )}
+
+                  {/* Conditionally render closeDate field only if editingId exists */}
+                  {editingId && (
+                    <DatePicker1Style
+                      label="Merge Date"
+                      format="DD/MM/YYYY"
+                      name="mergeDate"
+                      required={isMerged}
+                      //shouldDisableDate={(date) => date.isAfter(dayjs(), "day")}
+                      //disabled={isClosed}
+                      disableFuture
+                      disabled={!canEnabledMD}
+                      value={
+                        branchData.mergeDate
+                          ? dayjs(branchData.mergeDate, "DD/MM/YYYY")
+                          : null
+                      }
+                      onChange={(newValue) => {
+                        if (
+                          newValue &&
+                          dayjs(newValue).isAfter(dayjs(), "day")
+                        ) {
+                          return;
+                        }
+
+                        handleChange({
+                          target: {
+                            name: "mergeDate",
+                            value: newValue,
+                          },
+                        });
+                      }}
+                      slotProps={{
+                        textField: {
+                          fullWidth: true,
+                          variant: "outlined", // Pass props to the internal TextField
+                          // onKeyDown: (e) => e.preventDefault(),
+
+                          error:
+                            (isMerged && !branchData.mergeDate) ||
+                            (!isMerged && branchData.mergeDate),
+                          helperText:
+                            isMerged && !branchData.mergeDate
+                              ? "Merge Date is required when branch is merged"
+                              : !isMerged && branchData.mergeDate
+                                ? "Merge Date can be entered only when Merged With Branch is selected"
+                                : "",
+                        },
+                      }}
+                    />
+                  )}
+
+                  {editingId && (
+                    <CustomAutoComplete
+                      key={isClosed ? "mwb-closed" : "mwb-open"}
+                      options={mwb || []}
+                      loading={mwbLoading}
+                      value={isClosed ? null : branchData.mergedWithBranch}
+                      onChange={handleMergedWithBranchAutoCompleteChange}
+                      inputValue={inputValue}
+                      disabled={isClosed}
+                      onInputChange={debounceQuery}
+                      renderOption={(option) =>
+                        typeof option === "string"
+                          ? option
+                          : !option || !option?.code || !option?.name
+                            ? ""
+                            : `${option.code} (${option.name})`
+                      }
+                      uniqueElementKey={"code"}
+                      label={"Merge with Branch"}
+                      name={"mergedWithBranch"}
+                      error={errors?.mergedWithBranch}
+                    />
+                  )}
+                </Stack>
+
+                <Stack direction={"row"} spacing={1}>
+                  <TextFieldStyle
+                    fullWidth
+                    select
+                    label="CPC Flag *"
+                    name="cpcFlag"
+                    value={branchData.cpcFlag}
+                    onChange={handleChange}
+                    error={!!errors.cpcFlag}
+                    helperText={errors.cpcFlag}
+                  >
+                    <MenuItem key={true} value="true">
+                      Allowed
+                    </MenuItem>
+                    <MenuItem key={false} value="false">
+                      Not Allowed
+                    </MenuItem>
+                  </TextFieldStyle>
+
+                  <TextFieldStyle
+                    fullWidth
+                    select
+                    label="Food Credit Flag *"
+                    name="foodCreditFlag"
+                    value={branchData.foodCreditFlag}
+                    onChange={handleChange}
+                    error={!!errors.foodCreditFlag}
+                    helperText={errors.foodCreditFlag}
+                  >
+                    <MenuItem key={true} value="true">
+                      Allowed
+                    </MenuItem>
+                    <MenuItem key={false} value="false">
+                      Not Allowed
+                    </MenuItem>
+                  </TextFieldStyle>
+
+                  <TextFieldStyle
+                    fullWidth
+                    select
+                    label="Currency Chest Flag *"
+                    name="currChestFlag"
+                    value={branchData.currChestFlag}
+                    onChange={handleChange}
+                    error={!!errors.currChestFlag}
+                    helperText={errors.currChestFlag}
+                  >
+                    <MenuItem key={true} value="true">
+                      Allowed
+                    </MenuItem>
+                    <MenuItem key={false} value="false">
+                      Not Allowed
+                    </MenuItem>
+                  </TextFieldStyle>
+
+                  <TextFieldStyle
+                    select
+                    fullWidth
+                    label="Branch Type *"
+                    name="branchType"
+                    value={branchData.branchType}
+                    onChange={handleChange}
+                    error={!!errors.branchType}
+                    helperText={errors.branchType}
+                  >
+                    {branchType.map((option) => (
+                      <MenuItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuItem>
+                    ))}
+                  </TextFieldStyle>
+                </Stack>
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button
+                type="submit"
+                variant="contained"
+                startIcon={editingId ? <EditIcon /> : <AddIcon />}
+                disabled={!isFormValid()}
+              >
+                {editingId ? "Update" : "Add"}
+              </Button>
+            </DialogActions>
+          </Dialog>
+        )}
+      </Box>
+    </LocalizationProvider>
   );
 }
-
-
