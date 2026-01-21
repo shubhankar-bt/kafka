@@ -1,144 +1,674 @@
--- =============================================================================
--- PROJECT: FIN CORE - HELP SERVICE
--- DBMS:    ORACLE SQL
--- DESC:    Schema definition for Contextual Help, FAQs, and Search Analytics.
--- =============================================================================
+<dependencies>
+    <!-- Core Web -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
 
--- 1. CLEANUP (Optional - Use with caution in Dev)
--- DROP TABLE HELP_SEARCH_ANALYTICS CASCADE CONSTRAINTS;
--- DROP TABLE HELP_PERMISSION_MAPPING CASCADE CONSTRAINTS; -- (If we used mapping table, but we are using Action column strategy)
--- DROP TABLE HELP_QUESTION_MASTER CASCADE CONSTRAINTS;
--- DROP TABLE HELP_SCREEN_MASTER CASCADE CONSTRAINTS;
--- DROP TABLE HELP_FAQ_MASTER CASCADE CONSTRAINTS;
+    <!-- Persistence -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.oracle.database.jdbc</groupId>
+        <artifactId>ojdbc11</artifactId>
+        <scope>runtime</scope>
+    </dependency>
 
--- =============================================================================
--- TABLE 1: HELP_SCREEN_MASTER
--- DESC:    Registry of all Screens/Modules. 
---          MUST match 'MENU_TITLE' from the PERMISSIONS table.
--- =============================================================================
-CREATE TABLE HELP_SCREEN_MASTER (
-    SCREEN_NAME     VARCHAR2(100 CHAR) NOT NULL,
-    SCREEN_LABEL    VARCHAR2(100 CHAR),
-    IS_ACTIVE       CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
-    CREATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
-    UPDATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
+    <!-- Caching (Redis) -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- Tools -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
     
-    CONSTRAINT PK_HELP_SCREEN PRIMARY KEY (SCREEN_NAME),
-    CONSTRAINT CHK_HSM_ACTIVE CHECK (IS_ACTIVE IN ('Y', 'N'))
-);
+    <!-- Importing your Common Lib (Assuming it exists locally or in nexus) -->
+    <!-- 
+    <dependency>
+        <groupId>com.fincore</groupId>
+        <artifactId>common-utilities</artifactId>
+        <version>1.0.0</version>
+    </dependency> 
+    -->
+</dependencies>
 
-COMMENT ON TABLE HELP_SCREEN_MASTER IS 'Registry of application screens. SCREEN_NAME must match Permissions Service MENU_TITLE.';
-COMMENT ON COLUMN HELP_SCREEN_MASTER.SCREEN_LABEL IS 'Friendly display name for the Chat UI dropdown.';
 
--- =============================================================================
--- TABLE 2: HELP_QUESTION_MASTER
--- DESC:    The core content table containing questions, answers, and RBAC rules.
--- =============================================================================
-CREATE TABLE HELP_QUESTION_MASTER (
-    QUESTION_ID     VARCHAR2(50 CHAR) NOT NULL,
-    SCREEN_NAME     VARCHAR2(100 CHAR) NOT NULL,
-    QUESTION_TEXT   VARCHAR2(500 CHAR) NOT NULL,
-    ANSWER_CONTENT  CLOB,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================
+# FIN CORE - HELP SERVICE CONFIGURATION
+# ==============================================================
+spring.application.name=HelpService
+server.port=9099
+
+# --- ORACLE DATABASE ---
+spring.datasource.url=jdbc:oracle:thin:@//10.1.1.1:1521/FINCOREDB
+spring.datasource.username=FIN_HELP_USER
+spring.datasource.password=YourSecurePassword
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+# --- JPA / HIBERNATE ---
+spring.jpa.database-platform=org.hibernate.dialect.OracleDialect
+spring.jpa.show-sql=false
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+
+# --- REDIS CACHE ---
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.cache.type=redis
+# Cache time-to-live (1 Hour) - Refresh help content every hour
+spring.cache.redis.time-to-live=3600000
+
+# --- LOGGING ---
+logging.level.com.fincore.HelpService=INFO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.io.Serializable;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * ENTITY: HELP_SCREEN_MASTER
+ * Represents a functional module in the application (e.g., "CGL Management").
+ */
+@Data
+@Entity
+@Table(name = "HELP_SCREEN_MASTER")
+public class HelpScreenEntity implements Serializable {
     
-    -- Actionable Links
-    ACTION_LINK     VARCHAR2(255 CHAR),
-    ACTION_LABEL    VARCHAR2(50 CHAR),
+    @Id
+    @Column(name = "SCREEN_NAME", length = 100)
+    private String screenName; // Primary Key (Natural Key)
+
+    @Column(name = "SCREEN_LABEL", length = 100)
+    private String screenLabel;
+
+    @Column(name = "IS_ACTIVE", length = 1)
+    private String isActive;
+
+    @CreationTimestamp
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt;
+}
+
+/**
+ * ENTITY: HELP_QUESTION_MASTER
+ * Represents individual help items. 
+ * Includes logic for auto-generating UUIDs if not provided.
+ */
+@Data
+@Entity
+@Table(name = "HELP_QUESTION_MASTER")
+public class HelpQuestionEntity implements Serializable {
+
+    @Id
+    @Column(name = "QUESTION_ID", length = 50)
+    private String questionId;
+
+    @Column(name = "SCREEN_NAME", length = 100, nullable = false)
+    private String screenName;
+
+    @Column(name = "QUESTION_TEXT", length = 500, nullable = false)
+    private String questionText;
+
+    @Lob
+    @Column(name = "ANSWER_CONTENT")
+    private String answerContent;
+
+    @Column(name = "ACTION_LINK")
+    private String actionLink;
+
+    @Column(name = "ACTION_LABEL")
+    private String actionLabel;
+
+    @Column(name = "REQUIRED_ACTION", length = 50)
+    private String requiredAction; // RBAC: 'CREATE', 'APPROVE', etc.
+
+    @Column(name = "KEYWORDS", length = 1000)
+    private String keywords; // Search Optimization
+
+    @Column(name = "DISPLAY_ORDER")
+    private Integer displayOrder;
+
+    @Column(name = "IS_ACTIVE", length = 1)
+    private String isActive;
+
+    // --- ID GENERATION HOOK ---
+    @PrePersist
+    public void prePersist() {
+        if (this.questionId == null || this.questionId.isEmpty()) {
+            this.questionId = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+        }
+    }
+}
+
+/**
+ * ENTITY: HELP_FAQ_MASTER
+ * Global FAQs.
+ */
+@Data
+@Entity
+@Table(name = "HELP_FAQ_MASTER")
+public class HelpFaqEntity implements Serializable {
+
+    @Id
+    @Column(name = "FAQ_ID", length = 50)
+    private String faqId;
+
+    @Column(name = "QUESTION_TEXT", length = 500)
+    private String questionText;
+
+    @Lob
+    @Column(name = "ANSWER_CONTENT")
+    private String answerContent;
+
+    @Column(name = "DISPLAY_ORDER")
+    private Integer displayOrder;
+
+    @Column(name = "IS_ACTIVE")
+    private String isActive;
+
+    @PrePersist
+    public void prePersist() {
+        if (this.faqId == null || this.faqId.isEmpty()) {
+            this.faqId = UUID.randomUUID().toString();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService.repository;
+
+import com.fincore.HelpService.entity.HelpFaqEntity;
+import com.fincore.HelpService.entity.HelpQuestionEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface HelpQuestionRepository extends JpaRepository<HelpQuestionEntity, String> {
+
+    // Fetch active questions for a specific screen (Context Flow)
+    List<HelpQuestionEntity> findByScreenNameAndIsActiveOrderByDisplayOrderAsc(String screenName, String isActive);
+
+    // Fetch ALL active questions (Search Flow - to be cached)
+    List<HelpQuestionEntity> findByIsActive(String isActive);
+}
+
+@Repository
+public interface HelpFaqRepository extends JpaRepository<HelpFaqEntity, String> {
     
-    -- RBAC & Search
-    REQUIRED_ACTION VARCHAR2(50 CHAR), -- e.g. 'CREATE', 'APPROVE'. NULL = Public for that screen.
-    KEYWORDS        VARCHAR2(1000 CHAR), -- Comma separated synonyms for search (e.g. 'add, new, insert')
+    // Fetch Global FAQs
+    List<HelpFaqEntity> findByIsActiveOrderByDisplayOrderAsc(String isActive);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import jakarta.validation.constraints.NotNull;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+import java.util.List;
+
+public class HelpDTOs {
+
+    /**
+     * Request Payload for Contextual Fetch or Search
+     */
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class HelpRequestDTO {
+        // Mode 1: Context Fetch
+        private String screenName; 
+        
+        // Mode 2: Search
+        private String searchQuery; 
+
+        // RBAC: User's Allowed Actions (from Login Token)
+        // e.g., ["VIEW", "CREATE", "APPROVE"]
+        @NotNull(message = "User actions cannot be null")
+        private List<String> userActions;
+
+        private boolean fetchFaqs;
+    }
+
+    /**
+     * Standard Response
+     */
+    @Data
+    @Builder
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public static class HelpResponseDTO {
+        private String context; // Screen Name or "Search Results"
+        private List<HelpItemDTO> results;
+        private List<HelpItemDTO> faqs;
+    }
+
+    /**
+     * Individual Item (Question/Answer)
+     */
+    @Data
+    @Builder
+    public static class HelpItemDTO implements Serializable {
+        private String id;
+        private String text;       // The Question
+        private String answer;     // The Answer (HTML/Text)
+        private String actionLink; // Deep Link
+        private String actionLabel;// Button Text
+        private String type;       // QUESTION, FAQ, SEARCH_RESULT
+        private double searchScore; // Internal use (optional to expose)
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService.service;
+
+import com.fincore.HelpService.dto.HelpDTOs.*;
+import com.fincore.HelpService.entity.HelpFaqEntity;
+import com.fincore.HelpService.entity.HelpQuestionEntity;
+import com.fincore.HelpService.repository.HelpFaqRepository;
+import com.fincore.HelpService.repository.HelpQuestionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpService {
+
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+
+    // Words to ignore in search to improve relevance
+    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on");
+
+    /**
+     * ORCHESTRATOR: Decides whether to Fetch by Screen OR Perform Search
+     */
+    public HelpResponseDTO processRequest(HelpRequestDTO request) {
+        
+        // 1. Normalize User Actions (Upper Case for safety)
+        List<String> userActions = (request.getUserActions() == null) 
+                ? new ArrayList<>() 
+                : request.getUserActions().stream().map(String::toUpperCase).collect(Collectors.toList());
+
+        List<HelpItemDTO> results = new ArrayList<>();
+        String contextLabel = "";
+
+        // 2. SEARCH MODE
+        if (request.getSearchQuery() != null && request.getSearchQuery().length() > 2) {
+            contextLabel = "Search Results";
+            results = performSmartSearch(request.getSearchQuery(), userActions);
+        } 
+        // 3. CONTEXT MODE (Select Module)
+        else if (request.getScreenName() != null) {
+            contextLabel = request.getScreenName();
+            results = fetchContextualHelp(request.getScreenName(), userActions);
+        }
+
+        // 4. Attach FAQs if requested
+        List<HelpItemDTO> faqs = null;
+        if (request.isFetchFaqs()) {
+            faqs = fetchGlobalFaqs();
+        }
+
+        return HelpResponseDTO.builder()
+                .context(contextLabel)
+                .results(results)
+                .faqs(faqs)
+                .build();
+    }
+
+    // =========================================================================
+    // LOGIC 1: CONTEXTUAL FETCH
+    // =========================================================================
     
-    -- Meta
-    DISPLAY_ORDER   NUMBER(5,0) DEFAULT 0,
-    IS_ACTIVE       CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
-    CREATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
-    UPDATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
-    
-    CONSTRAINT PK_HELP_QUESTION PRIMARY KEY (QUESTION_ID),
-    CONSTRAINT FK_HQM_SCREEN FOREIGN KEY (SCREEN_NAME) REFERENCES HELP_SCREEN_MASTER(SCREEN_NAME),
-    CONSTRAINT CHK_HQM_ACTIVE CHECK (IS_ACTIVE IN ('Y', 'N'))
-);
+    private List<HelpItemDTO> fetchContextualHelp(String screenName, List<String> userActions) {
+        // Fetch from Cache/DB
+        List<HelpQuestionEntity> rawQuestions = getQuestionsForScreen(screenName.trim());
 
--- Performance Index: Crucial for fetching all questions for a specific screen (The "Select Module" feature)
-CREATE INDEX IDX_HQM_SCREEN ON HELP_QUESTION_MASTER(SCREEN_NAME);
--- Search Index: Useful if we decide to do DB-level searching later (though we plan In-Memory)
-CREATE INDEX IDX_HQM_ACTION ON HELP_QUESTION_MASTER(REQUIRED_ACTION);
+        // Filter by Action Permissions
+        return rawQuestions.stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> mapToDTO(q, "QUESTION"))
+                .collect(Collectors.toList());
+    }
 
-COMMENT ON TABLE HELP_QUESTION_MASTER IS 'Stores help questions. REQUIRED_ACTION maps to MENU_ACTION verbs.';
-COMMENT ON COLUMN HELP_QUESTION_MASTER.KEYWORDS IS 'Synonyms used by the Java Fuzzy Search logic to improve relevance.';
+    // =========================================================================
+    // LOGIC 2: SMART FUZZY SEARCH
+    // =========================================================================
 
--- =============================================================================
--- TABLE 3: HELP_FAQ_MASTER
--- DESC:    Global FAQs (Password reset, Support contacts) independent of Screens.
--- =============================================================================
-CREATE TABLE HELP_FAQ_MASTER (
-    FAQ_ID          VARCHAR2(50 CHAR) NOT NULL,
-    QUESTION_TEXT   VARCHAR2(500 CHAR) NOT NULL,
-    ANSWER_CONTENT  CLOB,
-    DISPLAY_ORDER   NUMBER(5,0) DEFAULT 0,
-    IS_ACTIVE       CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
-    CREATED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
-    
-    CONSTRAINT PK_HELP_FAQ PRIMARY KEY (FAQ_ID),
-    CONSTRAINT CHK_HFM_ACTIVE CHECK (IS_ACTIVE IN ('Y', 'N'))
-);
+    private List<HelpItemDTO> performSmartSearch(String query, List<String> userActions) {
+        // Fetch ALL questions (Cached)
+        List<HelpQuestionEntity> allQuestions = getAllActiveQuestions();
 
--- =============================================================================
--- TABLE 4: HELP_SEARCH_ANALYTICS
--- DESC:    Audit trail for what users are searching vs. clicking. 
---          Used to improve Keywords and Content.
--- =============================================================================
-CREATE TABLE HELP_SEARCH_ANALYTICS (
-    LOG_ID          VARCHAR2(50 CHAR) NOT NULL,
-    USER_ID         VARCHAR2(50 CHAR), -- Optional, from Token
-    SEARCH_QUERY    VARCHAR2(255 CHAR),
-    SCREEN_CONTEXT  VARCHAR2(100 CHAR),
-    CLICKED_Q_ID    VARCHAR2(50 CHAR), -- Null if user didn't click anything (Failed Search)
-    SEARCH_TIMESTAMP TIMESTAMP DEFAULT SYSTIMESTAMP,
-    
-    CONSTRAINT PK_HELP_ANALYTICS PRIMARY KEY (LOG_ID)
-);
+        // Tokenize Query (e.g., "create cgl" -> ["create", "cgl"])
+        List<String> tokens = Arrays.stream(query.toLowerCase().split("\\s+"))
+                .filter(s -> !STOP_WORDS.contains(s))
+                .collect(Collectors.toList());
 
-COMMENT ON TABLE HELP_SEARCH_ANALYTICS IS 'Logs user search queries and clicks for optimization analysis.';
+        // Score, Filter & Sort
+        return allQuestions.stream()
+                .filter(q -> isActionAllowed(q, userActions)) // RBAC Check
+                .map(q -> new AbstractMap.SimpleEntry<>(q, calculateScore(q, tokens)))
+                .filter(entry -> entry.getValue() > 0) // Remove irrelevant
+                .sorted((e1, e2) -> Integer.compare(e2.getValue(), e1.getValue())) // Sort High to Low
+                .limit(5) // Top 5 Only
+                .map(entry -> mapToDTO(entry.getKey(), "SEARCH_RESULT"))
+                .collect(Collectors.toList());
+    }
 
--- =============================================================================
--- DATA SEEDING (Based on your Permissions_Table.txt)
--- =============================================================================
+    // Custom Scoring Algorithm (No AI needed)
+    private int calculateScore(HelpQuestionEntity q, List<String> tokens) {
+        int score = 0;
+        String text = q.getQuestionText().toLowerCase();
+        String keywords = (q.getKeywords() != null) ? q.getKeywords().toLowerCase() : "";
+        String action = (q.getRequiredAction() != null) ? q.getRequiredAction().toLowerCase() : "";
 
--- 1. Populate Screens (Taken directly from your uploaded file's MENU_TITLE)
-INSERT INTO HELP_SCREEN_MASTER (SCREEN_NAME, SCREEN_LABEL) VALUES ('Circle Management', 'Circle Management');
-INSERT INTO HELP_SCREEN_MASTER (SCREEN_NAME, SCREEN_LABEL) VALUES ('CGL Management', 'CGL Management');
-INSERT INTO HELP_SCREEN_MASTER (SCREEN_NAME, SCREEN_LABEL) VALUES ('Segment Management', 'Segment Management');
-INSERT INTO HELP_SCREEN_MASTER (SCREEN_NAME, SCREEN_LABEL) VALUES ('Branch Management', 'Branch Management');
-INSERT INTO HELP_SCREEN_MASTER (SCREEN_NAME, SCREEN_LABEL) VALUES ('User Management', 'User Management');
+        for (String token : tokens) {
+            // 1. Action Match (Intent) - Huge Boost
+            if (token.equals(action)) score += 50;
+            
+            // 2. Exact Word Match in Text
+            if (text.contains(token)) score += 20;
+            
+            // 3. Keyword Match (Hidden synonyms)
+            if (keywords.contains(token)) score += 15;
 
--- 2. Populate CGL Management Questions
--- Scenario A: General Info (No Action Required)
-INSERT INTO HELP_QUESTION_MASTER (QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, KEYWORDS, DISPLAY_ORDER) 
-VALUES ('Q_CGL_001', 'CGL Management', 'What is a CGL Code?', 'CGL (Central General Ledger) codes are used for financial tracking...', 'definition, meaning, what is', 1);
+            // 4. Fuzzy Match (Typo tolerance)
+            // If token is 'cretae' and text has 'create'
+            if (fuzzyMatch(token, text)) score += 5;
+        }
+        return score;
+    }
 
--- Scenario B: Create Action (Requires 'CREATE' in payload)
-INSERT INTO HELP_QUESTION_MASTER (QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, DISPLAY_ORDER) 
-VALUES ('Q_CGL_002', 'CGL Management', 'How do I create a new CGL?', 'Click the "Add CGL" button in the top right corner.', '/cgl-management/create', 'Go to Create', 'CREATE', 'add, new, insert, make, generate', 2);
+    // Simple Levenshtein check (tolerance of 2 edits for words > 4 chars)
+    private boolean fuzzyMatch(String token, String target) {
+        if (target.contains(token)) return true;
+        // Simplified loop over words in target for performance
+        for(String word : target.split(" ")) {
+            if (calculateDistance(token, word) <= 2 && token.length() > 3) return true;
+        }
+        return false;
+    }
 
--- Scenario C: Approve Action (Requires 'APPROVE' in payload)
-INSERT INTO HELP_QUESTION_MASTER (QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, DISPLAY_ORDER) 
-VALUES ('Q_CGL_003', 'CGL Management', 'How to approve CGL requests?', 'Navigate to the "CGL Requests" tab and select "Approve" on the ballot.', '/cgl-requests', 'View Requests', 'APPROVE', 'authorize, sign off, check, accept', 3);
+    // Standard Edit Distance Algo
+    private int calculateDistance(String x, String y) {
+        int[][] dp = new int[x.length() + 1][y.length() + 1];
+        for (int i = 0; i <= x.length(); i++) {
+            for (int j = 0; j <= y.length(); j++) {
+                if (i == 0) dp[i][j] = j;
+                else if (j == 0) dp[i][j] = i;
+                else {
+                    dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
+                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+                }
+            }
+        }
+        return dp[x.length()][y.length()];
+    }
 
--- Scenario D: Modify Action
-INSERT INTO HELP_QUESTION_MASTER (QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, REQUIRED_ACTION, KEYWORDS, DISPLAY_ORDER) 
-VALUES ('Q_CGL_004', 'CGL Management', 'How to edit a CGL description?', 'Select the CGL from the list and click the Pencil icon.', 'MODIFY', 'edit, update, change, correct', 4);
+    // =========================================================================
+    // CACHING & UTILS
+    // =========================================================================
 
--- 3. Populate Segment Management Questions
-INSERT INTO HELP_QUESTION_MASTER (QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, REQUIRED_ACTION, KEYWORDS) 
-VALUES ('Q_SEG_001', 'Segment Management', 'How to add a new Segment?', 'Use the Segment Master screen to add entries.', 'CREATE', 'add, new, create');
+    @Cacheable(value = "help_questions", key = "#screenName")
+    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
+        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    }
 
--- 4. Global FAQs
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER) 
-VALUES ('FAQ_001', 'I forgot my password', 'Please go to the login screen and click "Forgot Password".', 1);
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() {
+        return questionRepository.findByIsActive("Y");
+    }
 
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER) 
-VALUES ('FAQ_002', 'Who do I contact for support?', 'Email IT Support at helpdesk@fincore.com', 2);
+    public List<HelpItemDTO> fetchGlobalFaqs() {
+        // FAQs can also be cached separately
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
+                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent()).type("FAQ").build())
+                .collect(Collectors.toList());
+    }
 
-COMMIT;
+    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
+        // If question has no restricted action, it's public for that screen
+        if (q.getRequiredAction() == null || q.getRequiredAction().isEmpty()) return true;
+        // Super Admin Bypass
+        if (userActions.contains("ALL") || userActions.contains("*")) return true;
+        // Check List Inclusion
+        return userActions.contains(q.getRequiredAction().toUpperCase());
+    }
+
+    private HelpItemDTO mapToDTO(HelpQuestionEntity q, String type) {
+        return HelpItemDTO.builder()
+                .id(q.getQuestionId())
+                .text(q.getQuestionText())
+                .answer(q.getAnswerContent())
+                .actionLink(q.getActionLink())
+                .actionLabel(q.getActionLabel())
+                .type(type)
+                .build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService.controller;
+
+import com.fincore.HelpService.dto.HelpDTOs.HelpRequestDTO;
+import com.fincore.HelpService.dto.HelpDTOs.HelpResponseDTO;
+import com.fincore.HelpService.service.HelpService;
+import com.fincore.commonutilities.dto.ApiResponse; // From your common lib
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/help")
+@RequiredArgsConstructor
+@Slf4j
+public class HelpController {
+
+    private final HelpService helpService;
+
+    /**
+     * Unified Endpoint for Help.
+     * Handles both "Select Screen" and "Search/Type" flows based on payload.
+     * * @param request Contains screenName OR searchQuery + userActions
+     * @return Filtered list of questions/answers
+     */
+    @PostMapping("/fetch")
+    public ApiResponse<HelpResponseDTO> getHelp(@RequestBody @Valid HelpRequestDTO request) {
+        
+        long startTime = System.currentTimeMillis();
+        try {
+            HelpResponseDTO response = helpService.processRequest(request);
+            
+            log.info("Help processed in {}ms | Context: {} | Results: {}", 
+                    (System.currentTimeMillis() - startTime), 
+                    response.getContext(), 
+                    response.getResults().size());
+
+            return new ApiResponse<>(200, "Success", "Help content retrieved", response);
+
+        } catch (Exception e) {
+            log.error("Error processing help request", e);
+            return new ApiResponse<>(500, "Error", "Internal Server Error", null);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.HelpService;
+
+import com.fincore.commonutilities.config.RedisConfig;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Import;
+
+@SpringBootApplication
+@EnableCaching
+@Import(RedisConfig.class) // Ensures Redis Template is loaded from Common Utils
+public class HelpServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(HelpServiceApplication.class, args);
+    }
+}
+
+
+
+
+
+
+
 
