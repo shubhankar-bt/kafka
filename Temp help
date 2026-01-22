@@ -1,0 +1,285 @@
+package com.fincore.helpservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+/**
+ * Standard API Response Wrapper.
+ * Ensures consistent JSON structure across the entire application.
+ * * Structure:
+ * {
+ * "success": true,
+ * "message": "Operation Successful",
+ * "data": { ... payload ... },
+ * "errorCode": null,
+ * "timestamp": "2023-10-27T10:00:00"
+ * }
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class ApiResponse<T> {
+
+    @Builder.Default
+    private boolean success = true;
+
+    private String message;
+
+    private T data;
+
+    private String errorCode;
+
+    @Builder.Default
+    private LocalDateTime timestamp = LocalDateTime.now();
+
+    // ========================================================================
+    // STATIC FACTORY METHODS (Fluent API)
+    // ========================================================================
+
+    /**
+     * Success response with data and default message.
+     */
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder()
+                .success(true)
+                .message("Request processed successfully")
+                .data(data)
+                .build();
+    }
+
+    /**
+     * Success response with data and custom message.
+     */
+    public static <T> ApiResponse<T> success(T data, String message) {
+        return ApiResponse.<T>builder()
+                .success(true)
+                .message(message)
+                .data(data)
+                .build();
+    }
+
+    /**
+     * Error response with message and code.
+     */
+    public static <T> ApiResponse<T> error(String message, String errorCode) {
+        return ApiResponse.<T>builder()
+                .success(false)
+                .message(message)
+                .errorCode(errorCode)
+                .build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.exception;
+
+import lombok.Getter;
+import org.springframework.http.HttpStatus;
+
+/**
+ * Custom Business Exception for Help Service.
+ * * Usage: throw new HelpServiceException("Screen not found", "SCREEN_INVALID", HttpStatus.BAD_REQUEST);
+ * This ensures we control exactly what status code and error code the user sees.
+ */
+@Getter
+public class HelpServiceException extends RuntimeException {
+
+    private final String errorCode;
+    private final HttpStatus status;
+
+    public HelpServiceException(String message, String errorCode, HttpStatus status) {
+        super(message);
+        this.errorCode = errorCode;
+        this.status = status;
+    }
+
+    public HelpServiceException(String message, String errorCode) {
+        super(message);
+        this.errorCode = errorCode;
+        this.status = HttpStatus.BAD_REQUEST; // Default to 400
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.exception;
+
+import com.fincore.helpservice.dto.ApiResponse;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Centralized Exception Handler.
+ * Intercepts all exceptions thrown by Controllers/Services and converts them 
+ * into the standard ApiResponse format.
+ */
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /**
+     * Handle Custom Business Logic Exceptions.
+     */
+    @ExceptionHandler(HelpServiceException.class)
+    public ResponseEntity<ApiResponse<Void>> handleBusinessException(HelpServiceException ex) {
+        log.warn("Business Exception: [{}] {}", ex.getErrorCode(), ex.getMessage());
+        return ResponseEntity
+                .status(ex.getStatus())
+                .body(ApiResponse.error(ex.getMessage(), ex.getErrorCode()));
+    }
+
+    /**
+     * Handle Validation Errors (@Valid failure).
+     * Returns a map of field errors in the data payload for the frontend to highlight.
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Map<String, String>>> handleValidationException(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        for (FieldError error : ex.getBindingResult().getFieldErrors()) {
+            errors.put(error.getField(), error.getDefaultMessage());
+        }
+        
+        log.warn("Validation Failed: {}", errors);
+
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.<Map<String, String>>builder()
+                        .success(false)
+                        .message("Validation failed for input request")
+                        .errorCode("VALIDATION_ERROR")
+                        .data(errors)
+                        .build());
+    }
+
+    /**
+     * Handle 404 (Resource Not Found) - e.g., Wrong URL.
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handle404(NoResourceFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error("The requested resource was not found", "NOT_FOUND"));
+    }
+
+    /**
+     * Handle unexpected System Errors (Catch-All).
+     * We do NOT expose the raw stack trace message to the client for security.
+     */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleGlobalException(Exception ex, HttpServletRequest request) {
+        log.error("Unhandled Exception at {}: ", request.getRequestURI(), ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("An unexpected internal error occurred. Please contact support.", "INTERNAL_SERVER_ERROR"));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.controller;
+
+import com.fincore.helpservice.dto.ApiResponse;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.service.HelpService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/help")
+@RequiredArgsConstructor
+@Slf4j
+public class HelpController {
+
+    private final HelpService helpService;
+
+    /**
+     * Unified Help Endpoint.
+     * * Architecture Note:
+     * We removed the try-catch block here. If 'helpService.processRequest' fails,
+     * the GlobalExceptionHandler will automatically catch it and return the correct JSON.
+     * This keeps the controller clean and focused on routing.
+     */
+    @PostMapping("/fetch")
+    public ResponseEntity<ApiResponse<HelpResponseDTO>> getHelp(@RequestBody @Valid HelpRequestDTO request) {
+        
+        log.debug("Received Help Request for Mode: {}", 
+                (request.getSearchQuery() != null ? "Search" : "Context"));
+
+        // Delegate business logic to Service
+        HelpResponseDTO result = helpService.processRequest(request);
+
+        // Return clean success response
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+}
+
