@@ -57,7 +57,7 @@ public class CommonSecurityConfig {
 
         // 1. Allowed Origins
         // In PROD: Replace "*" with specific frontend domains (e.g., "https://myapp.com")
-        configuration.setAllowedOrigins(List.of("https://localhost:1000", "https://localhost:4200", "https://fincoreuat.sbi","*"));
+        configuration.setAllowedOrigins(List.of("https://localhost:1000", "https://localhost:4200", "https://fincoreuat.sbi","https://fincorest.sbi", "*"));
 
         // 2. Allowed Methods
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
@@ -69,7 +69,8 @@ public class CommonSecurityConfig {
                 "Content-Type",
                 "X-Request-Type",
                 "X-Forwarded-For",
-                "Accept"
+                "Accept",
+                "X-Correlation-ID"
         ));
 
         // 4. Expose Headers
@@ -83,9 +84,11 @@ public class CommonSecurityConfig {
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);
+
         return source;
     }
 }
+
 
 
 
@@ -563,6 +566,85 @@ public class ControlDateService {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.logging;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.UUID;
+
+@Component
+@RequiredArgsConstructor
+public class MdcLoggingFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+            throws ServletException, IOException {
+
+        try {
+            // 1. Trace ID (Correlation ID)
+            // Use header from Gateway/Ingress if present, else generate one
+            String traceId = request.getHeader("X-Correlation-ID");
+            if (traceId == null) {
+                traceId = UUID.randomUUID().toString();
+            }
+            MDC.put("traceId", traceId);
+            response.setHeader("X-Correlation-ID", traceId); // Return to client
+
+            // 2. Client IP
+            String ip = request.getHeader("X-Forwarded-For");
+            if (ip == null) ip = request.getRemoteAddr();
+            MDC.put("clientIp", ip);
+
+            // 3. User ID (If Token is present)
+            // We do a "soft" check here just for logging.
+            // Validations happen in ContextRbacFilter later.
+            String authHeader = request.getHeader("Authorization");
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                try {
+                    String token = authHeader.substring(7);
+                    String userId = jwtUtil.getUserIdFromToken(token);
+                    MDC.put("userId", userId);
+                } catch (Exception e) {
+                    MDC.put("userId", "anonymous");
+                }
+            } else {
+                MDC.put("userId", "anonymous");
+            }
+
+            // 4. API Path & Method
+            MDC.put("apiPath", request.getRequestURI());
+            MDC.put("method", request.getMethod());
+
+            filterChain.doFilter(request, response);
+
+        } finally {
+            // CRITICAL: Clear MDC to prevent data leaking to other requests on the same thread
+            MDC.clear();
+        }
+    }
+}
 
 
 
