@@ -1,480 +1,84 @@
-package com.fincore.commonutilities.config;
+package com.tcs.fincore.CommonRequestService.config;
 
-
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.core.StringRedisTemplate;
-
-@Configuration
-public class RedisConfig {
-
-    /**
-     * Provides a StringRedisTemplate if the main application hasn't defined one.
-     * This is crucial for the RbacFilter to work out-of-the-box.
-     */
-    @Bean
-    @ConditionalOnMissingBean
-    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
-        return new StringRedisTemplate(connectionFactory);
-    }
-}
-
-
-
-
-
-
-
-package com.fincore.commonutilities.config;
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
-
-import java.util.Arrays;
-import java.util.List;
-
-/**
- * Centralized Security Configuration Bean provider.
- * * Microservices should Import this class or define the beans similar to this
- * to ensure consistent CORS policies across the distributed system.
- */
-@Configuration
-public class CommonSecurityConfig {
-
-    /**
-     * Defines the CORS policy for the entire microservice ecosystem.
-     * Since there is no Gateway, every service must handle CORS individually.
-     * This bean standardizes that logic.
-     */
-    @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
-        CorsConfiguration configuration = new CorsConfiguration();
-
-        // 1. Allowed Origins
-        // In PROD: Replace "*" with specific frontend domains (e.g., "https://myapp.com")
-        configuration.setAllowedOrigins(List.of("https://localhost:1000", "https://localhost:4200", "https://fincoreuat.sbi","https://fincorest.sbi", "*"));
-
-        // 2. Allowed Methods
-        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
-
-        // 3. Allowed Headers
-        // "X-Request-Type" is critical for your RBAC Logic
-        configuration.setAllowedHeaders(Arrays.asList(
-                "Authorization",
-                "Content-Type",
-                "X-Request-Type",
-                "X-Forwarded-For",
-                "Accept",
-                "X-Correlation-ID"
-        ));
-
-        // 4. Expose Headers
-        // Allows frontend to read the Auth header if updated
-        configuration.setExposedHeaders(List.of("Authorization"));
-
-        // 5. Allow Credentials
-        // Set to true if using Cookies. If false, "*" origins are allowed.
-        // If set to true, you CANNOT use "*" for origins.
-        configuration.setAllowCredentials(false);
-
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", configuration);
-
-        return source;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.commonutilities.jwt;
-
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
-import lombok.extern.slf4j.Slf4j;
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.logging.MdcLoggingFilter;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
-
-import javax.crypto.SecretKey;
-import java.util.Date;
-import java.util.function.Function;
-
-/**
- * Utility class for manipulating and validating JSON Web Tokens (JWT).
- * This class is shared across microservices to ensure consistent token parsing logic.
- */
-@Component
-@Slf4j
-public class JwtUtil {
-
-    // Default value provided for dev, override in application.properties
-    @Value("${jwt.secret:bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=}")
-    private String secretKey;
-
-
-    /**
-     * Extracts the User ID (Subject) from the token.
-     *
-     * @param token The Bearer token.
-     * @return The userId string.
-     */
-    public String getUserIdFromToken(String token) {
-        String cleanToken = removeBearerPrefix(token);
-        return extractClaim(cleanToken, Claims::getSubject);
-    }
-
-    /**
-     * Extracts the Role ID from the token claims.
-     *
-     * @param token The Bearer token.
-     * @return The Role ID as an integer.
-     */
-    public int getUserRoleFromToken(String token) {
-        String cleanToken = removeBearerPrefix(token);
-        return extractClaim(cleanToken, claims -> {
-            Object role = claims.get("role");
-            if (role instanceof Number) {
-                return ((Number) role).intValue();
-            }
-            // Fallback for string roles if necessary
-            if (role instanceof String) {
-                try {
-                    return Integer.parseInt((String) role);
-                } catch (NumberFormatException ignored) {
-                }
-            }
-            throw new IllegalArgumentException("Token role claim is not a number");
-        });
-    }
-
-    /**
-     * Validates the cryptographic signature and expiration of the token.
-     *
-     * @param token The Bearer token.
-     * @return true if valid, false if expired or tampered.
-     */
-    public boolean isTokenValid(String token) {
-        String cleanToken = removeBearerPrefix(token);
-        return !isTokenExpired(cleanToken);
-    }
-
-    /**
-     * GENERIC CLAIM EXTRACTOR (Made Public for Filter access).
-     * This is required to extract 'jti' (JWT ID) for session validation.
-     */
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        final Claims claims = extractAllClaims(token);
-        return claimsResolver.apply(claims);
-    }
-
-    // --- Internal Helpers ---
-
-    private String removeBearerPrefix(String token) {
-        if (token != null && token.startsWith("Bearer ")) {
-            return token.substring(7);
-        }
-        return token;
-    }
-
-    private boolean isTokenExpired(String token) {
-        return extractExpiration(token).before(new Date());
-    }
-
-    private Date extractExpiration(String token) {
-        return extractClaim(token, Claims::getExpiration);
-    }
-
-    private Claims extractAllClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    private SecretKey getSigningKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(keyBytes);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.commonutilities.security;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.JwtException;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.lang.NonNull;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.util.AntPathMatcher;
-import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Set;
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class, CommonSecurityConfig.class}) // Don't import Filters here if you define them as Beans below
+public class SecurityConfig {
 
+    @Autowired
+    private StringRedisTemplate redisTemplate;
 
-/**
- * A Blocking (Servlet) Filter that enforces security for microservices.
- * * Responsibilities:
- * 1. Validate JWT Signature.
- * 2. Enforce "One Session Per User" by comparing JWT 'jti' with Redis 'USR:<userId>'.
- * 3. Enforce RBAC (Role Based Access Control) via Redis permissions.
- */
-@Slf4j
-@RequiredArgsConstructor
-public class ContextRbacFilter extends OncePerRequestFilter {
+    @Autowired
+    private JwtUtil jwtUtil;
 
-    private static final String REDIS_USER_PREFIX = "USR:";
-    private static final String REDIS_RBAC_PREFIX = "RBAC::PERMISSIONS::";
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig;
 
-    private static final Set<String> WHITELIST = Set.of(
-            "/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/login",
-            "/auth/login", "/auth/logout", "/auth/check-user"
-    );
+    @Value("${app.security.bypass-secret:}") 
+    private String bypassSecret;
 
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final AntPathMatcher pathMatcher = new AntPathMatcher();
-
-    @Override
-    protected void doFilterInternal(
-            @NonNull HttpServletRequest request,
-            @NonNull HttpServletResponse response,
-            @NonNull FilterChain filterChain
-    ) throws ServletException, IOException {
-
-        String uri = request.getRequestURI();
-
-        // 1. SKIP WHITELIST
-        for (String pattern : WHITELIST) {
-            if (pathMatcher.match(pattern, uri)) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-        }
-
-        // 2. VALIDATE TOKEN
-        String token = request.getHeader("Authorization");
-
-        if (token != null) {
-            try {
-                // A. STANDARD VALIDATION (Signature + Expiry)
-                if (!jwtUtil.isTokenValid(token)) {
-                    throw new JwtException("Invalid Token Signature");
-                }
-
-                // If valid, extract info
-                String userId = jwtUtil.getUserIdFromToken(token);
-                String incomingJti = jwtUtil.extractClaim(removeBearer(token), Claims::getId);
-                int roleIdInt = jwtUtil.getUserRoleFromToken(token);
-
-                // B. ACTIVE SESSION CHECK
-                if (!checkRedisSession(response, userId, incomingJti)) {
-                    return; // Error sent
-                }
-
-                // C. RBAC / CONTEXT SETUP
-                setSecurityContext(userId, roleIdInt);
-
-                if (!checkRbac(request, response, String.valueOf(roleIdInt), userId)) {
-                    return;
-                }
-
-            } catch (ExpiredJwtException e) {
-                // -----------------------------------------------------------------
-                // HANDLE EXPIRED TOKEN: Distinguish between "Time out" vs "Concurrent Login"
-                // -----------------------------------------------------------------
-                try {
-                    Claims claims = e.getClaims();
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
-
-                    // CHECK 1: Missing JTI ---
-                    if (incomingJti == null) {
-                        log.error("Expired Token missing JTI for user {}", userId);
-                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
-                        return;
-                    }
-
-                    String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
-
-                    // CASE 1: Session totally gone from Redis (User idle > 24h)
-                    if (activeJti == null) {
-                        log.warn("Session expired in Redis (found during token expiry check) for user {}", userId);
-                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
-                        return;
-                    }
-
-                    // CASE 2: Concurrent Login (Redis has newer JTI)
-                    if (!activeJti.equals(incomingJti)) {
-                        log.warn("Concurrent Login Detected on Expired Token. User: {}", userId);
-                        sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
-                        return;
-                    }
-
-                    // CASE 3: Normal Expiry (Redis matches) -> Allow Frontend to Refresh
-                } catch (Exception ex) {
-                    log.error("Error checking concurrency on expired token", ex);
-                }
-
-                // Default behavior: Tell frontend token is expired so it can call /refresh-token
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "TOKEN_EXPIRED", "JWT has expired.");
-                return;
-
-            } catch (Exception e) {
-                log.error("Auth Error: {}", e.getMessage());
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "AUTH_ERROR", "Authentication failed.");
-                return;
-            }
-        } else {
-            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "MISSING_TOKEN", "Authorization header missing.");
-            return;
-        }
-
-        filterChain.doFilter(request, response);
+    // --- 1. Define Filters as Beans (Explicitly) ---
+    
+    @Bean
+    public MdcLoggingFilter mdcLoggingFilter() {
+        return new MdcLoggingFilter(jwtUtil);
     }
 
-    private boolean checkRedisSession(HttpServletResponse response, String userId, String incomingJti) throws IOException {
-        if (incomingJti == null) {
-            sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "INVALID_TOKEN", "Token missing JTI");
-            return false;
-        }
-        try {
-            String activeJti = redisTemplate.opsForValue().get(REDIS_USER_PREFIX + userId);
-            if (activeJti == null) {
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "SESSION_EXPIRED", "Session timed out.");
-                return false;
-            }
-            if (!incomingJti.equals(activeJti)) {
-                sendError(response, HttpServletResponse.SC_UNAUTHORIZED, "CONCURRENT_LOGIN", "Logged in on another device.");
-                return false;
-            }
-        } catch (RedisConnectionFailureException e) {
-            sendError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "SYSTEM_ERROR", "Auth Service Unavailable");
-            return false;
-        }
-        return true;
+    @Bean
+    public ContextRbacFilter contextRbacFilter() {
+        return new ContextRbacFilter(redisTemplate, jwtUtil, bypassSecret);
     }
 
-    private void setSecurityContext(String userId, int roleId) {
-        if (SecurityContextHolder.getContext().getAuthentication() == null) {
-            UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                    userId, null, List.of(new SimpleGrantedAuthority("ROLE_" + roleId))
-            );
-            SecurityContextHolder.getContext().setAuthentication(authToken);
-        }
+    // --- 2. Prevent Global Registration (Critical Fix) ---
+    // This stops "The Filter class ... does not have a registered order" error
+    
+    @Bean
+    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
+        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
     }
 
-    /**
-     * Checks if the user's role has permission to access the requested Method + URL + Context.
-     */
-    private boolean checkRbac(HttpServletRequest request, HttpServletResponse response, String roleId, String userId) throws IOException {
-
-        String uri = request.getRequestURI();
-        String method = request.getMethod().toUpperCase();
-
-        // DETERMINE CONTEXT (Header)
-        String contextHeader = request.getHeader("X-Request-Type");
-
-        // If header is missing, treat as "*" (Global Context)
-        String requestContext = (contextHeader != null && !contextHeader.trim().isEmpty()) ? contextHeader : "*";
-
-        // REDIS AUTHORIZATION CHECK
-        String redisKey = REDIS_RBAC_PREFIX + roleId;
-
-        // Fetch permissions set from Redis
-        // Format: "METHOD:URL_PATTERN|CONTEXT" -> e.g., "POST:/user/create|USER_MANAGEMENT"
-        Set<String> permissions = redisTemplate.opsForSet().members(redisKey);
-
-        boolean isAuthorized = false;
-
-        if (permissions != null) {
-            for (String perm : permissions) {
-                // Format: "METHOD:URL_PATTERN|CONTEXT"
-                String[] parts = perm.split("\\|");
-                if (parts.length < 2) continue;
-
-                String methodAndUrl = parts[0];
-                String allowedContext = parts[1];
-
-                // --- A. CONTEXT CHECK ---
-                // 1. Exact Match: Header "SEGMENT_CODE" matches Permission "SEGMENT_CODE"
-                // 2. Wildcard Match: Permission has "*" (e.g. Reports), allows any header (or no header)
-                if (!allowedContext.equals(requestContext) && !allowedContext.equals("*")) {
-                    continue;
-                }
-
-                // --- B. URL & METHOD CHECK ---
-                String[] muParts = methodAndUrl.split(":", 2);
-                if (muParts.length < 2) continue;
-
-                String allowedMethod = muParts[0];
-                String allowedUrlPattern = muParts[1];
-
-                // Method Match AND URL Pattern Match
-                if (allowedMethod.equals(method) && pathMatcher.match(allowedUrlPattern, uri)) {
-                    isAuthorized = true;
-                    break;
-                }
-
-            }
-        }
-
-        if (!isAuthorized) {
-            log.warn("RBAC Deny \uD83D\uDEAB: User {} (Role {}) -> {} {} (Context: {})", userId, roleId, method, uri, requestContext);
-            sendError(response, HttpServletResponse.SC_FORBIDDEN, "ACCESS_DENIED", "Insufficient Permissions for this resource.");
-            return false;
-        }
-        return true;
+    @Bean
+    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
+        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
     }
 
-    private void sendError(HttpServletResponse response, int status, String error, String message) throws IOException {
-        response.setStatus(status);
-        response.setContentType("application/json");
-        response.getWriter().write(String.format("{\"status\": %d, \"error\": \"%s\", \"message\": \"%s\"}", status, error, message));
-    }
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(authz -> authz
+                .requestMatchers("/actuator/**", "/api/auth/**", "/error").permitAll()
+                .anyRequest().authenticated()
+            )
+            // Add Filters using the BEAN references (methods above)
+            .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
+            .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
 
-    private String removeBearer(String token) {
-        if (token != null && token.startsWith("Bearer ")) {
-            return token.substring(7);
-        }
-        return token;
+        return http.build();
     }
 }
 
@@ -484,167 +88,6 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
 
 
-
-
-package com.fincore.commonutilities.buisnessobject;
-
-import java.time.LocalDate;
-import java.util.Date;
-
-public class ControlDatesDto {
-    private LocalDate userDate;
-    private LocalDate etlDate;
-    public ControlDatesDto(LocalDate userDate, LocalDate etlDate) {
-        this.userDate = userDate;
-        this.etlDate = etlDate;
-    }
-    public LocalDate getUserDate() {
-        return userDate;
-    }
-    public LocalDate getEtlDate() {
-        return etlDate;
-    }
-}
-
-
-
-package com.fincore.commonutilities.buisnessobject;
-
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface ControlDatesRepository {
-    @Query(
-            value = """
-               SELECT USER_DATE, ETL_DATE
-               FROM CONTROL_DATES
-               """,
-            nativeQuery = true
-    )
-    Object[] fetchControlDates();
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.commonutilities.buisnessobject;
-
-import jakarta.annotation.PostConstruct;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.sql.Date;
-
-
-@Service
-public class ControlDateService {
-    private final JdbcTemplate jdbcTemplate;
-    public ControlDateService(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
-    }
-    @PostConstruct
-    public void validate() {
-        getControlDates();
-    }
-    public ControlDatesDto getControlDates() {
-        return jdbcTemplate.queryForObject(
-                "SELECT USERS_DATE, ETL_DATE FROM FINCORE_DATE",
-                (rs, rowNum) -> new ControlDatesDto(
-                        rs.getDate("USERS_DATE").toLocalDate(),
-                        rs.getDate("ETL_DATE").toLocalDate()
-                )
-        );
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.commonutilities.logging;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
-import org.slf4j.MDC;
-import org.springframework.stereotype.Component;
-import org.springframework.web.filter.OncePerRequestFilter;
-
-import java.io.IOException;
-import java.util.UUID;
-
-@Component
-@RequiredArgsConstructor
-public class MdcLoggingFilter extends OncePerRequestFilter {
-
-    private final JwtUtil jwtUtil;
-
-    @Override
-    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
-            throws ServletException, IOException {
-
-        try {
-            // 1. Trace ID (Correlation ID)
-            // Use header from Gateway/Ingress if present, else generate one
-            String traceId = request.getHeader("X-Correlation-ID");
-            if (traceId == null) {
-                traceId = UUID.randomUUID().toString();
-            }
-            MDC.put("traceId", traceId);
-            response.setHeader("X-Correlation-ID", traceId); // Return to client
-
-            // 2. Client IP
-            String ip = request.getHeader("X-Forwarded-For");
-            if (ip == null) ip = request.getRemoteAddr();
-            MDC.put("clientIp", ip);
-
-            // 3. User ID (If Token is present)
-            // We do a "soft" check here just for logging.
-            // Validations happen in ContextRbacFilter later.
-            String authHeader = request.getHeader("Authorization");
-            if (authHeader != null && authHeader.startsWith("Bearer ")) {
-                try {
-                    String token = authHeader.substring(7);
-                    String userId = jwtUtil.getUserIdFromToken(token);
-                    MDC.put("userId", userId);
-                } catch (Exception e) {
-                    MDC.put("userId", "anonymous");
-                }
-            } else {
-                MDC.put("userId", "anonymous");
-            }
-
-            // 4. API Path & Method
-            MDC.put("apiPath", request.getRequestURI());
-            MDC.put("method", request.getMethod());
-
-            filterChain.doFilter(request, response);
-
-        } finally {
-            // CRITICAL: Clear MDC to prevent data leaking to other requests on the same thread
-            MDC.clear();
-        }
-    }
-}
 
 
 
@@ -661,76 +104,62 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
 
 
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.0</version>
-        <relativePath />
-    </parent>
-    <groupId>com.fincore</groupId>
-    <artifactId>common-utilities</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>common-utilities</name>
-    <description>Common utilities used across the application.</description>
+<configuration>
 
-    <properties>
-        <java.version>21</java.version>
-        <jjwt.version>0.12.5</jjwt.version>
-    </properties>
+    <!-- 1. CONSOLE: Human Readable (For Dev) -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>
+                %d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [%blue(%t)] %yellow(%C{1.}): %msg %n%throwable
+            </pattern>
+        </encoder>
+    </appender>
 
-    <dependencies>
-        <!-- CORE SPRING BOOT -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-security</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
+    <!-- 2. FILE: JSON Format (For ETL/Splunk) -->
+    <appender name="JSON_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/application.json</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/archived/app-%d{yyyy-MM-dd}.%i.json.gz</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <providers>
+                <timestamp>
+                    <timeZone>UTC</timeZone>
+                </timestamp>
+                <pattern>
+                    <pattern>
+                        {
+                          "timestamp": "%date{ISO8601}",
+                          "level": "%level",
+                          "service": "${spring.application.name:-UnknownService}",
+                          "traceId": "%mdc{traceId}",
+                          "userId": "%mdc{userId}",
+                          "clientIp": "%mdc{clientIp}",
+                          "apiPath": "%mdc{apiPath}",
+                          "thread": "%thread",
+                          "class": "%logger{40}",
+                          "message": "%message",
+                          "stack_trace": "%exception{10}"
+                        }
+                    </pattern>
+                </pattern>
+            </providers>
+        </encoder>
+    </appender>
 
-        <!-- UTILS -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
-        </dependency>
+    <!-- 3. LOG LEVEL: INFO -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="JSON_FILE" />
+    </root>
 
-        <!-- JWT SECURITY (JJWT) -->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>${jjwt.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
-    </dependencies>
-</project>
+</configuration>
+
+
+
+
 
 
 
