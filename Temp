@@ -1,66 +1,94 @@
-package com.fincore.commonutilities.util;
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+    <!-- 1. TEXT CONSOLE (Human Readable - Colors) -->
+    <appender name="CONSOLE_TEXT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>
+                %d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [%blue(%t)] %yellow(%C{1.}): %msg %n%throwable
+            </pattern>
+        </encoder>
+    </appender>
 
-public class MaskingUtil {
+    <!-- 2. JSON CONSOLE (Machine Readable - K8s/Prod) -->
+    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <jsonGeneratorDecorator class="net.logstash.logback.mask.MaskingJsonGeneratorDecorator">
+                <defaultMask>****</defaultMask>
+                <path>password</path> <path>token</path> <path>mobile</path> <path>email</path>
+                <path>pan</path> <path>accountNumber</path>
+            </jsonGeneratorDecorator>
+            <providers>
+                <timestamp><timeZone>UTC</timeZone></timestamp>
+                <pattern>
+                    <pattern>
+                        {
+                          "level": "%level",
+                          "service": "${spring.application.name:-Unknown}",
+                          "traceId": "%mdc{traceId}",
+                          "userId": "%mdc{userId}",
+                          "clientIp": "%mdc{clientIp}",
+                          "message": "%message"
+                        }
+                    </pattern>
+                </pattern>
+                <stackTrace/>
+            </providers>
+        </encoder>
+    </appender>
 
-    private static final ObjectMapper mapper = new ObjectMapper();
+    <!-- 3. JSON FILE (Backup for Local/Dev VMs) -->
+    <appender name="FILE_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/application-json.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/archived/app-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <jsonGeneratorDecorator class="net.logstash.logback.mask.MaskingJsonGeneratorDecorator">
+                <defaultMask>****</defaultMask>
+                <path>password</path> <path>mobile</path> <path>email</path>
+            </jsonGeneratorDecorator>
+            <providers>
+                <timestamp><timeZone>UTC</timeZone></timestamp>
+                <pattern>
+                    <pattern>
+                        {
+                          "level": "%level",
+                          "service": "${spring.application.name:-Unknown}",
+                          "traceId": "%mdc{traceId}",
+                          "userId": "%mdc{userId}",
+                          "message": "%message"
+                        }
+                    </pattern>
+                </pattern>
+            </providers>
+        </encoder>
+    </appender>
 
-    /**
-     * Masks PII fields inside a JSON String.
-     */
-    public static String maskJsonString(String jsonInput) {
-        if (jsonInput == null || jsonInput.isEmpty()) return "{}";
-        try {
-            JsonNode root = mapper.readTree(jsonInput);
-            maskSensitiveFields(root);
-            return root.toString();
-        } catch (JsonProcessingException e) {
-            return "Error parsing JSON payload"; 
-        }
-    }
+    <!-- ====================================================== -->
+    <!-- PROFILE CONFIGURATION -->
+    <!-- ====================================================== -->
 
-    private static void maskSensitiveFields(JsonNode node) {
-        if (node.isObject()) {
-            ObjectNode objectNode = (ObjectNode) node;
-            objectNode.fieldNames().forEachRemaining(fieldName -> {
-                JsonNode value = objectNode.get(fieldName);
-                if (isSensitive(fieldName)) {
-                    objectNode.put(fieldName, "****");
-                } else {
-                    maskSensitiveFields(value); // Recurse
-                }
-            });
-        } else if (node.isArray()) {
-            node.forEach(MaskingUtil::maskSensitiveFields);
-        }
-    }
+    <!-- GROUP 1: LOCAL & DEV -->
+    <!-- Usage: -Dspring.profiles.active=local OR dev -->
+    <springProfile name="default,local,dev">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_TEXT" />
+            <appender-ref ref="FILE_JSON" />
+        </root>
+    </springProfile>
 
-    private static boolean isSensitive(String fieldName) {
-        String lower = fieldName.toLowerCase();
-        return lower.contains("email") || 
-               lower.contains("mobile") || 
-               lower.contains("phone") || 
-               lower.contains("password") || 
-               lower.contains("pan") || 
-               lower.contains("account");
-    }
-}
+    <!-- GROUP 2: ST, UAT, PROD (Kubernetes) -->
+    <!-- Usage: -Dspring.profiles.active=st OR uat OR prod -->
+    <springProfile name="st,uat,prod">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_JSON" />
+        </root>
+    </springProfile>
 
-
-
-
-
-
-
-
-
-
-
-
+</configuration>
 
 
 
@@ -82,28 +110,251 @@ public class MaskingUtil {
 
 
 
-package com.tcs.userservice.dto;
 
-import com.fincore.commonutilities.util.MaskingUtil;
-import lombok.Data; 
-// ... imports
 
-@Data
-public class UserRequestCreateDto {
 
-    private String requestType;
-    private String targetUserId;
-    private String requestPayload; // This contains the JSON string
 
-    // ... other fields ...
 
-    @Override
-    public String toString() {
-        return "UserRequestCreateDto(" +
-                "requestType=" + requestType +
-                ", targetUserId=" + targetUserId +
-                ", requestPayload=" + MaskingUtil.maskJsonString(requestPayload) + 
-                ")";
-    }
-}
 
+
+
+----/------
+
+<!-- This bridge allows Prometheus to read Actuator metrics -->
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 1. Enable the specific Prometheus endpoint
+management.endpoints.web.exposure.include=health, info, prometheus
+
+# 2. Show full health details
+management.endpoint.health.show-details=always
+
+# 3. Add a tag so we know which app is which in the dashboard
+management.metrics.tags.application=${spring.application.name}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Action 3: Restart Your Java Apps
+Stop your Java applications and run them again.
+• Test: Open http://localhost:9010/actuator/prometheus in your browser.
+• Success: You should see a blank screen with a lot of text like jvm_memory_used_bytes 1.234.... If you see this, Step 1 is done.
+Step 2: Create the Prometheus Configuration (The Map)
+Prometheus is a server. It needs a configuration file to know where your Java apps are running.
+Action:
+1. Go to your project root folder (where your docker-compose.yml is).
+2. Create a new folder named monitoring.
+3. Inside monitoring, create a file named prometheus.yml.
+4. Paste this exact content:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+global:
+  scrape_interval: 5s # Check the apps every 5 seconds
+
+scrape_configs:
+  # 1. Scrape Prometheus itself (sanity check)
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 2. Scrape your Java Services
+  - job_name: 'fincore-services'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      # host.docker.internal tells Docker to look at your Windows/Mac/Linux HOST machine
+      # where your Java apps are running (on ports 9010 and 9005).
+      - targets: ['host.docker.internal:9010', 'host.docker.internal:9005']
+        labels:
+          env: 'dev'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Step 3: Update Docker Compose (The Infrastructure)
+Now we need to add Prometheus and Grafana to your existing docker-compose.yml file.
+Action:
+Open your existing docker-compose.yml. Add the prometheus and grafana services to the services: section.
+Here is how your file should look (I have combined your existing Kafka/DB stuff with the new monitoring stuff)
+
+
+
+
+
+
+
+
+
+
+
+
+version: '3.8'
+
+services:
+  # --- YOUR EXISTING SERVICES (Keep these exactly as they are) ---
+  postgres-db:
+    image: bitnami/postgresql:latest
+    # ... (your existing postgres config) ...
+    networks:
+      - kafka-net
+
+  redis:
+    image: bitnami/redis:latest
+    # ... (your existing redis config) ...
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    # ... (your existing kafka config) ...
+    networks:
+      - kafka-net
+
+  connect:
+    image: confluentinc/cp-kafka-connect:latest
+    # ... (your existing connect config) ...
+    networks:
+      - kafka-net
+
+  # --- NEW MONITORING SERVICES (Add these) ---
+
+  # 1. Prometheus: The Collector
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fincore-prometheus
+    volumes:
+      # This links the file you created in Step 2 into the container
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # CRITICAL: Allows access to Java apps running on your laptop
+    networks:
+      - kafka-net
+
+  # 2. Grafana: The Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fincore-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    networks:
+      - kafka-net
+    volumes:
+      - grafana-storage:/var/lib/grafana
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  kafka-data:
+  connect-plugins:
+    driver: local
+  # Add this new volume
+  grafana-storage:
+
+Action:
+Run the following command in your terminal to start the new tools:
+docker-compose up -d
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Step 4: Configure the Dashboard (The Visuals)
+Everything is running. Now we just need to connect the dots in the UI.
+1. Open Grafana: Go to http://localhost:3000 in your browser.
+2. Login: User: admin, Password: admin. (Skip the password change prompt).
+3. Connect Prometheus:
+• Click on "Data Sources" (or the Gear icon -> Data Sources).
+• Click "Add data source".
+• Select Prometheus.
+• HTTP URL: http://prometheus:9090 (We use the container name here).
+• Scroll to the bottom and click "Save & Test".
+• You should see a green checkmark.
+4. Import the Dashboard:
+• Hover over the Plus (+) icon in the left menu.
+• Click Import.
+• In the "Import via grafana.com" box, type the ID: 4701. (This is a famous pre-made dashboard for Spring Boot).
+• Click Load.
+• At the bottom, under "Prometheus", select the Prometheus data source you just added.
+• Click Import.
+✅ Success!
+You should now see a dashboard with:
+• Uptime: How long your apps have been running.
+• CPU Usage: How much CPU NotificationService is using.
+• Memory: How much RAM Java is using.
+To switch between services:
+At the top of the dashboard, there will be a dropdown for application. You can switch between NotificationService and ReportService because we added that tag in application.properties in Step 1.
