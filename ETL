@@ -18,16 +18,9 @@ import org.springframework.stereotype.Component;
 import java.lang.reflect.Method;
 import java.util.function.Supplier;
 
-/**
- * Enterprise Resilience Aspect.
- * * Responsibilities:
- * 1. Wraps ALL @Service methods with Retry & Circuit Breaker logic.
- * 2. Respects @NoRetry annotation for safety.
- * 3. Runs with HIGHEST_PRECEDENCE to ensure retries happen outside the Transaction boundary.
- */
 @Aspect
 @Component
-@Order(Ordered.HIGHEST_PRECEDENCE) // CRITICAL: Run before @Transactional
+@Order(Ordered.HIGHEST_PRECEDENCE) // Run BEFORE Transactional to handle connection issues correctly
 @RequiredArgsConstructor
 @Slf4j
 public class GlobalResilienceAspect {
@@ -35,57 +28,53 @@ public class GlobalResilienceAspect {
     private final RetryRegistry retryRegistry;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
 
-    // Shared config name defined in application.properties
+    // Defined in application.properties
     private static final String SERVICE_NAME = "defaultService";
 
     @Around("within(@org.springframework.stereotype.Service *)")
     public Object applyResilience(ProceedingJoinPoint joinPoint) throws Throwable {
         
-        // 1. SAFETY CHECK: Skip if @NoRetry is present
+        // 1. SAFETY: Skip if @NoRetry is present (Idempotency Check)
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
         Method method = signature.getMethod();
         if (method.isAnnotationPresent(NoRetry.class)) {
             return joinPoint.proceed();
         }
 
-        // 2. Get Resilience Instances
+        // 2. Load Resilience Config
         Retry retry = retryRegistry.retry(SERVICE_NAME);
         CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(SERVICE_NAME);
 
-        // 3. Define the backend call wrapper
+        // 3. Wrap the Service Call
         Supplier<Object> backendCall = () -> {
             try {
                 return joinPoint.proceed();
             } catch (Throwable e) {
-                // Wrap checked exceptions so Supplier can throw them
+                // We must wrap checked exceptions to pass them through the Supplier
                 throw new RuntimeExceptionWrapper(e);
             }
         };
 
-        // 4. Manual Decoration (Standard Approach)
-        // Logic: CircuitBreaker( Retry( Function ) )
-        // Why? If Circuit is Open, we fail FAST. We do NOT want to Retry against an Open circuit.
-        
-        // Inner Layer: Retry
+        // 4. Decorate: CircuitBreaker wraps Retry
+        // If Circuit is Open -> Fails Fast.
+        // If Closed -> Tries Retry Logic.
         Supplier<Object> retryableSupplier = Retry.decorateSupplier(retry, backendCall);
-
-        // Outer Layer: Circuit Breaker
         Supplier<Object> resilientSupplier = CircuitBreaker.decorateSupplier(circuitBreaker, retryableSupplier);
 
         // 5. Execute
         try {
             return resilientSupplier.get();
         } catch (RuntimeExceptionWrapper e) {
-            // Unwrap original exception for the caller
+            // UNWRAP: Throw the original exception (e.g., IllegalArgumentException)
+            // so GlobalExceptionHandler catches the REAL error, not a wrapper.
             throw e.getCause();
         } catch (Exception e) {
-            // Throw other exceptions as is
             throw e;
         }
     }
 
     /**
-     * Internal wrapper to transport checked exceptions through the Supplier lambda.
+     * Helper to transport exceptions through Lambdas.
      */
     private static class RuntimeExceptionWrapper extends RuntimeException {
         public RuntimeExceptionWrapper(Throwable cause) {
@@ -105,17 +94,47 @@ public class GlobalResilienceAspect {
 
 
 
-package com.fincore.commonutilities.config;
 
-import com.fincore.commonutilities.aspect.GlobalResilienceAspect;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.EnableAspectJAutoProxy;
-import org.springframework.context.annotation.Import;
 
-@Configuration
-@EnableAspectJAutoProxy // Ensures AspectJ works
-@Import(GlobalResilienceAspect.class)
-public class ResilienceConfig {
-}
+
+
+
+# ==============================================================
+# RESILIENCE4J CONFIGURATION (Enterprise Grade)
+# ==============================================================
+
+# --- 1. RETRY STRATEGY ---
+resilience4j.retry.instances.defaultService.max-attempts=3
+resilience4j.retry.instances.defaultService.wait-duration=1s
+
+# --- CORRECT EXCEPTION HANDLING ---
+
+# A. RETRY ON THESE (Transient / "Blips")
+# 1. Spring's wrapper for DB Timeouts, Deadlocks, Connection Drops
+resilience4j.retry.instances.defaultService.retry-exceptions[0]=org.springframework.dao.TransientDataAccessException
+# 2. Connection failure at start of transaction
+resilience4j.retry.instances.defaultService.retry-exceptions[1]=org.springframework.transaction.CannotCreateTransactionException
+# 3. DB Resource Failure (DB Down)
+resilience4j.retry.instances.defaultService.retry-exceptions[2]=org.springframework.dao.DataAccessResourceFailureException
+# 4. Network I/O errors (for Feign/RestCalls)
+resilience4j.retry.instances.defaultService.retry-exceptions[3]=java.io.IOException
+resilience4j.retry.instances.defaultService.retry-exceptions[4]=java.net.ConnectException
+resilience4j.retry.instances.defaultService.retry-exceptions[5]=java.net.SocketTimeoutException
+
+# B. DO NOT RETRY ON THESE (Logic / Permanent Errors)
+# Even if these happen, we fail immediately so GlobalExceptionHandler can return 400/409
+resilience4j.retry.instances.defaultService.ignore-exceptions[0]=java.lang.IllegalArgumentException
+resilience4j.retry.instances.defaultService.ignore-exceptions[1]=java.lang.NullPointerException
+resilience4j.retry.instances.defaultService.ignore-exceptions[2]=org.springframework.dao.DataIntegrityViolationException
+resilience4j.retry.instances.defaultService.ignore-exceptions[3]=org.springframework.dao.DuplicateKeyException
+resilience4j.retry.instances.defaultService.ignore-exceptions[4]=org.springframework.web.client.HttpClientErrorException
+
+# --- 2. CIRCUIT BREAKER STRATEGY ---
+resilience4j.circuitbreaker.instances.defaultService.failure-rate-threshold=50
+resilience4j.circuitbreaker.instances.defaultService.minimum-number-of-calls=5
+resilience4j.circuitbreaker.instances.defaultService.automatic-transition-from-open-to-half-open-enabled=true
+resilience4j.circuitbreaker.instances.defaultService.wait-duration-in-open-state=10s
+resilience4j.circuitbreaker.instances.defaultService.permitted-number-of-calls-in-half-open-state=3
+
 
 
