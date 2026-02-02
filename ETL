@@ -1,11 +1,261 @@
-2026-01-23 17:34:54.099 INFO  [http-nio-9000-exec-1] o.a.j.l.DirectJDKLog: Initializing Spring DispatcherServlet 'dispatcherServlet' 
-2026-01-23 17:34:54.100 INFO  [http-nio-9000-exec-1] o.s.w.s.FrameworkServlet: Initializing Servlet 'dispatcherServlet' 
-2026-01-23 17:34:54.101 INFO  [http-nio-9000-exec-1] o.s.w.s.FrameworkServlet: Completed initialization in 1 ms 
-2026-01-23 17:34:54.764 INFO  [http-nio-9000-exec-1] c.t.f.C.c.RequestController: Received request for fetch data for the user: 1015698 and request type: CGL_CODE 
-2026-01-23 17:34:54.765 INFO  [http-nio-9000-exec-1] c.t.f.C.s.RequestServiceImpl: Fetching my requests for user 1015698 with type CGL_CODE 
-2026-01-23 17:35:17.539 INFO  [http-nio-9000-exec-2] c.t.f.C.c.RequestController: Received request creation call from user: 1015698 
-2026-01-23 17:35:17.577 INFO  [http-nio-9000-exec-2] c.t.f.C.s.RequestServiceImpl: Determined targetId for new request as: 1000505022 
-2026-01-23 17:35:17.635 INFO  [http-nio-9000-exec-2] c.t.f.C.s.RequestServiceImpl: Uniqueness check passed for targetId: 1000505022 
-2026-01-23 17:35:17.638 INFO  [http-nio-9000-exec-2] c.t.f.C.s.RequestServiceImpl: Saving new, validated request for targetId 1000505022 
-2026-01-23 17:35:17.680 INFO  [http-nio-9000-exec-2] c.t.f.C.s.RequestServiceImpl: Request Type String to fetch role ids from PERMISSIONS: CGL_CODE 
-2026-01-23 17:35:17.714 INFO  [http-nio-9000-exec-2] c.t.f.C.s.NotificationWriterService: Saved 1-to-many notification event for role: 51,11,10 (AggregateID: 2179) 
+<!-- ... existing dependencies ... -->
+
+        <!-- AOP: To intercept Service calls globally -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!-- RESILIENCE4J: The Industry Standard for Retry/CircuitBreaker -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>2.2.0</version>
+        </dependency>
+        
+        <!-- METRICS: To see Retries in Grafana/Prometheus -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>2.2.0</version>
+        </dependency>
+
+<!-- ... -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.annotation;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+/**
+ * Safety Guardrail:
+ * Mark any Service method with this annotation to BYPASS the global retry logic.
+ * Use this for non-idempotent operations (Sending Emails, Payment Deduction, etc.).
+ */
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface NoRetry {
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.aspect;
+
+import com.fincore.commonutilities.annotation.NoRetry;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.decorators.Decorators;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryRegistry;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Method;
+import java.util.function.Supplier;
+
+/**
+ * Enterprise Resilience Aspect.
+ * * Responsibilities:
+ * 1. Wraps ALL @Service methods with Retry & Circuit Breaker logic.
+ * 2. Respects @NoRetry annotation for safety.
+ * 3. Runs with HIGHEST_PRECEDENCE to ensure retries happen outside the Transaction boundary.
+ * (This ensures a failed transaction is fully rolled back before the next retry starts).
+ */
+@Aspect
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE) // CRITICAL: Run before @Transactional
+@RequiredArgsConstructor
+@Slf4j
+public class GlobalResilienceAspect {
+
+    private final RetryRegistry retryRegistry;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+
+    // We use a shared config named "defaultService" (defined in properties)
+    // accessible to all microservices.
+    private static final String SERVICE_NAME = "defaultService";
+
+    @Around("within(@org.springframework.stereotype.Service *)")
+    public Object applyResilience(ProceedingJoinPoint joinPoint) throws Throwable {
+        
+        // 1. SAFETY CHECK: Skip if @NoRetry is present
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method method = signature.getMethod();
+        if (method.isAnnotationPresent(NoRetry.class)) {
+            return joinPoint.proceed();
+        }
+
+        // 2. Get Resilience Instances from Registry
+        // These look up config from application.properties
+        Retry retry = retryRegistry.retry(SERVICE_NAME);
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(SERVICE_NAME);
+
+        // 3. Define the backend call wrapper
+        // We wrap the AspectJ call in a Supplier to make it compatible with Resilience4j
+        Supplier<Object> backendCall = () -> {
+            try {
+                return joinPoint.proceed();
+            } catch (Throwable e) {
+                // Wrap checked exceptions so Supplier can throw them
+                throw new RuntimeExceptionWrapper(e);
+            }
+        };
+
+        // 4. Decorate the call (Chain: CircuitBreaker -> Retry -> Function)
+        // If Circuit is OPEN, it fails fast. If Closed, it tries Retry logic.
+        Supplier<Object> decoratedSupplier = Decorators.ofSupplier(backendCall)
+                .withCircuitBreaker(circuitBreaker)
+                .withRetry(retry)
+                .decorate();
+
+        // 5. Execute with Resilience
+        try {
+            return decoratedSupplier.get();
+        } catch (RuntimeExceptionWrapper e) {
+            // Unwrap original exception to preserve stack trace for the caller
+            throw e.getCause();
+        } catch (Exception e) {
+            // Throw other exceptions as is
+            throw e;
+        }
+    }
+
+    /**
+     * Internal wrapper to transport checked exceptions through the Supplier lambda.
+     */
+    private static class RuntimeExceptionWrapper extends RuntimeException {
+        public RuntimeExceptionWrapper(Throwable cause) {
+            super(cause);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.config;
+
+import com.fincore.commonutilities.aspect.GlobalResilienceAspect;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
+
+@Configuration
+@EnableAspectJAutoProxy // Enables AOP
+@Import(GlobalResilienceAspect.class) // Loads the Aspect
+public class ResilienceConfig {
+    // This config initializes the Aspect and AOP support.
+    // Services just need to @Import(ResilienceConfig.class)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================
+# RESILIENCE4J CONFIGURATION (Global Rules)
+# ==============================================================
+
+# --- 1. RETRY STRATEGY ---
+# Retry up to 3 times
+resilience4j.retry.instances.defaultService.max-attempts=3
+# Wait 1 second between retries
+resilience4j.retry.instances.defaultService.wait-duration=1s
+# Retry ONLY on these exceptions (Transient / Temporary failures)
+resilience4j.retry.instances.defaultService.retry-exceptions[0]=java.io.IOException
+resilience4j.retry.instances.defaultService.retry-exceptions[1]=java.sql.SQLException
+resilience4j.retry.instances.defaultService.retry-exceptions[2]=org.springframework.dao.TransientDataAccessException
+resilience4j.retry.instances.defaultService.retry-exceptions[3]=java.net.ConnectException
+resilience4j.retry.instances.defaultService.retry-exceptions[4]=java.net.SocketTimeoutException
+# Do NOT retry on business errors (Validation, NullPointer, etc.)
+resilience4j.retry.instances.defaultService.ignore-exceptions[0]=java.lang.IllegalArgumentException
+resilience4j.retry.instances.defaultService.ignore-exceptions[1]=java.lang.NullPointerException
+
+# --- 2. CIRCUIT BREAKER STRATEGY ---
+# If 50% of requests fail, OPEN the circuit (Fail Fast)
+resilience4j.circuitbreaker.instances.defaultService.failure-rate-threshold=50
+# Wait 10 seconds before trying again (Half-Open state)
+resilience4j.circuitbreaker.instances.defaultService.wait-duration-in-open-state=10s
+# Must have at least 5 calls to calculate failure rate
+resilience4j.circuitbreaker.instances.defaultService.minimum-number-of-calls=5
+# When Half-Open, allow 3 test calls to see if backend is up
+resilience4j.circuitbreaker.instances.defaultService.permitted-number-of-calls-in-half-open-state=3
+# Automatically move from Open to Half-Open
+resilience4j.circuitbreaker.instances.defaultService.automatic-transition-from-open-to-half-open-enabled=true
+
+Integration Step
+Finally, ensure your services (like UserService, CommonRequestService) import this new config.
+Example: SecurityConfig.java (in any service)
+@Configuration
+@EnableWebSecurity
+@Import({
+    RedisConfig.class, 
+    JwtUtil.class, 
+    CommonSecurityConfig.class, 
+    MdcLoggingFilter.class,
+    ResilienceConfig.class // <--- ADD THIS LINE
+}) 
+public class SecurityConfig { ... }
+
+
