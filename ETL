@@ -1,87 +1,43 @@
-package com.fincore.commonutilities.aspect;
-
-import com.fincore.commonutilities.annotation.NoRetry;
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
-import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
-import io.github.resilience4j.retry.Retry;
-import io.github.resilience4j.retry.RetryRegistry;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.aspectj.lang.ProceedingJoinPoint;
-import org.aspectj.lang.annotation.Around;
-import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.reflect.MethodSignature;
-import org.springframework.core.Ordered;
-import org.springframework.core.annotation.Order;
-import org.springframework.stereotype.Component;
-
-import java.lang.reflect.Method;
-import java.util.function.Supplier;
-
-@Aspect
-@Component
-@Order(Ordered.HIGHEST_PRECEDENCE) // Run BEFORE Transactional to handle connection issues correctly
-@RequiredArgsConstructor
-@Slf4j
-public class GlobalResilienceAspect {
-
-    private final RetryRegistry retryRegistry;
-    private final CircuitBreakerRegistry circuitBreakerRegistry;
-
-    // Defined in application.properties
-    private static final String SERVICE_NAME = "defaultService";
-
-    @Around("within(@org.springframework.stereotype.Service *)")
-    public Object applyResilience(ProceedingJoinPoint joinPoint) throws Throwable {
-        
-        // 1. SAFETY: Skip if @NoRetry is present (Idempotency Check)
-        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        Method method = signature.getMethod();
-        if (method.isAnnotationPresent(NoRetry.class)) {
-            return joinPoint.proceed();
-        }
-
-        // 2. Load Resilience Config
-        Retry retry = retryRegistry.retry(SERVICE_NAME);
-        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(SERVICE_NAME);
-
-        // 3. Wrap the Service Call
-        Supplier<Object> backendCall = () -> {
-            try {
-                return joinPoint.proceed();
-            } catch (Throwable e) {
-                // We must wrap checked exceptions to pass them through the Supplier
-                throw new RuntimeExceptionWrapper(e);
-            }
-        };
-
-        // 4. Decorate: CircuitBreaker wraps Retry
-        // If Circuit is Open -> Fails Fast.
-        // If Closed -> Tries Retry Logic.
-        Supplier<Object> retryableSupplier = Retry.decorateSupplier(retry, backendCall);
-        Supplier<Object> resilientSupplier = CircuitBreaker.decorateSupplier(circuitBreaker, retryableSupplier);
-
-        // 5. Execute
-        try {
-            return resilientSupplier.get();
-        } catch (RuntimeExceptionWrapper e) {
-            // UNWRAP: Throw the original exception (e.g., IllegalArgumentException)
-            // so GlobalExceptionHandler catches the REAL error, not a wrapper.
-            throw e.getCause();
-        } catch (Exception e) {
-            throw e;
-        }
-    }
-
-    /**
-     * Helper to transport exceptions through Lambdas.
-     */
-    private static class RuntimeExceptionWrapper extends RuntimeException {
-        public RuntimeExceptionWrapper(Throwable cause) {
-            super(cause);
-        }
-    }
-}
+Hi [Client Name/Team],
+Following our discussion on system robustness and security, I would like to present a comprehensive overview of the architectural patterns, security controls, and performance optimizations implemented in the FINCORE application.
+Our architecture leverages a Microservices-based, Event-Driven approach designed for high scalability, banking-grade security, and fault tolerance. Below is the detailed breakdown of our technical stack and design choices:
+1. Advanced Security & Access Control
+• Dual-Token Authentication Strategy:
+• Access Token (9 mins): Short-lived for API access.
+• Refresh Token (12 hours): Stored strictly in HTTP-Only, Secure Cookies to prevent XSS attacks.
+• Zero-Trust RBAC: Implemented a custom ContextRbacFilter that validates every request against Redis-cached permissions. It enforces Context-Aware Security (e.g., Maker vs. Checker roles) via the X-Request-Type header.
+• Internal Service Mesh Security: Service-to-service communication is secured via Custom JWT Validation and Internal Trust Headers (HMAC signatures), ensuring no unauthorized internal access.
+• PII Data Protection:
+• At Rest/Motion: TLS encryption for transport; DB-level encryption for storage.
+• In Logs: Custom Logback Masking Decorators and DTO toString() overrides ensure sensitive data (PAN, Mobile, Passwords) is masked (x****x) before being written to logs.
+2. Design Patterns & Code Quality
+• Strategy Pattern for Validation: We utilize the Strategy Design Pattern for complex server-side validation. This allows us to dynamically switch validation logic (e.g., for different Request Types or User Roles) without creating "Spaghetti Code" with if-else blocks.
+• Strict DTO Contracts: We enforce strict Input/Output structures using Data Transfer Objects (DTOs), ensuring internal domain entities are never exposed directly to the API consumers.
+• AOP (Aspect-Oriented Programming): utilized for Cross-Cutting Concerns like Logging and Retry logic. This keeps our business logic clean and focused purely on functionality.  
+• Global Exception Handling: A centralized @ControllerAdvice catches all exceptions, translating them into standardized, secure JSON error responses (hiding stack traces from clients).  
+3. Resilience & Fault Tolerance
+• Resilience4j Integration: We implemented a centralized Circuit Breaker and Retry Mechanism.
+• Transient Failures: Automatically retried (DB blips, Network timeouts).
+• Circuit Breaking: Fails fast during outages to prevent cascading system failures.
+• Outbox Pattern: For critical notifications, we use the Transactional Outbox Pattern. Events are saved to the DB in the same transaction as the data, ensuring no notification is ever lost even if the Message Broker is down.
+4. High-Performance Data Processing
+• HDFS Direct Streaming: For large file downloads/reports, we implemented StreamingResponseBody. Data is streamed directly from HDFS to the Client through the backend without loading the file into Java Heap memory, preventing Out-Of-Memory (OOM) errors.  
+• Asynchronous Processing: Heavy tasks (Journal Uploads, Bulk Executions) are offloaded to @Async thread pools.
+• Real-Time Progress Tracking: We utilize Redis Pub/Sub to push real-time progress updates (e.g., "File Processing: 45%") to the frontend via SSE, enhancing user experience during long-running tasks.  
+5. Event-Driven & Real-Time Data
+• Kafka & Debezium: We use Change Data Capture (CDC) via Debezium to stream database changes to Kafka. This powers our real-time RBAC permission updates—when an Admin changes a permission, it reflects instantly across all services without restarts.  
+• Redis Caching: Frequently accessed, non-volatile data (Master Data, Currencies) is cached in Redis to reduce Database load and improve API response times.
+6. Observability & Monitoring
+• Structured Logging: All logs are output in JSON format with correlation IDs (TraceId), User IDs, and Client IPs automatically injected via MDC, making them ETL-ready for Splunk/ELK.
+• Metrics: Spring Actuator and Micrometer expose JVM and API metrics (Latency, Error Rates, Heap Usage) to Prometheus and Grafana for real-time health monitoring.  
+• Spring Profiling: Environment-specific configurations (dev, uat, prod) ensure appropriate logging levels and security settings for Kubernetes deployments.
+Attachments / Evidence:
+To validate these implementations, please refer to the attached screenshots:
+1. Validation Logic: Screenshot of the ValidationStrategy interface and a concrete implementation (e.g., CreateRequestValidator).
+2. Streaming: Screenshot of the Controller method using StreamingResponseBody for HDFS.
+3. Resilience: Screenshot of GlobalResilienceAspect.java and application.properties showing Retry/CircuitBreaker rules.
+4. Security: Screenshot of ContextRbacFilter and the HTTP-Only Cookie logic in AuthController.
+5. Observability: Screenshot of a JSON log entry containing traceId and masked PII.
 
 
 
@@ -99,42 +55,45 @@ public class GlobalResilienceAspect {
 
 
 
-# ==============================================================
-# RESILIENCE4J CONFIGURATION (Enterprise Grade)
-# ==============================================================
-
-# --- 1. RETRY STRATEGY ---
-resilience4j.retry.instances.defaultService.max-attempts=3
-resilience4j.retry.instances.defaultService.wait-duration=1s
-
-# --- CORRECT EXCEPTION HANDLING ---
-
-# A. RETRY ON THESE (Transient / "Blips")
-# 1. Spring's wrapper for DB Timeouts, Deadlocks, Connection Drops
-resilience4j.retry.instances.defaultService.retry-exceptions[0]=org.springframework.dao.TransientDataAccessException
-# 2. Connection failure at start of transaction
-resilience4j.retry.instances.defaultService.retry-exceptions[1]=org.springframework.transaction.CannotCreateTransactionException
-# 3. DB Resource Failure (DB Down)
-resilience4j.retry.instances.defaultService.retry-exceptions[2]=org.springframework.dao.DataAccessResourceFailureException
-# 4. Network I/O errors (for Feign/RestCalls)
-resilience4j.retry.instances.defaultService.retry-exceptions[3]=java.io.IOException
-resilience4j.retry.instances.defaultService.retry-exceptions[4]=java.net.ConnectException
-resilience4j.retry.instances.defaultService.retry-exceptions[5]=java.net.SocketTimeoutException
-
-# B. DO NOT RETRY ON THESE (Logic / Permanent Errors)
-# Even if these happen, we fail immediately so GlobalExceptionHandler can return 400/409
-resilience4j.retry.instances.defaultService.ignore-exceptions[0]=java.lang.IllegalArgumentException
-resilience4j.retry.instances.defaultService.ignore-exceptions[1]=java.lang.NullPointerException
-resilience4j.retry.instances.defaultService.ignore-exceptions[2]=org.springframework.dao.DataIntegrityViolationException
-resilience4j.retry.instances.defaultService.ignore-exceptions[3]=org.springframework.dao.DuplicateKeyException
-resilience4j.retry.instances.defaultService.ignore-exceptions[4]=org.springframework.web.client.HttpClientErrorException
-
-# --- 2. CIRCUIT BREAKER STRATEGY ---
-resilience4j.circuitbreaker.instances.defaultService.failure-rate-threshold=50
-resilience4j.circuitbreaker.instances.defaultService.minimum-number-of-calls=5
-resilience4j.circuitbreaker.instances.defaultService.automatic-transition-from-open-to-half-open-enabled=true
-resilience4j.circuitbreaker.instances.defaultService.wait-duration-in-open-state=10s
-resilience4j.circuitbreaker.instances.defaultService.permitted-number-of-calls-in-half-open-state=3
 
 
 
+
+
+
+
+
+
+
+
+Subject: Compliance with Secure Coding Practices
+Our application enforces a Defense-in-Depth security strategy, adhering to OWASP guidelines. Below are the specific secure coding practices implemented in the Login Service and Gateway:
+1. Credential Security & Storage (OWASP A02: Cryptographic Failures)
+• Adaptive Hashing: We do not store plain-text passwords. All passwords are hashed using BCrypt (BCryptPasswordEncoder), which includes automatic salting to prevent Rainbow Table attacks.
+• No Sensitive Data Logging: The application is configured to strictly avoid logging sensitive fields (passwords, tokens, OTPs). The LoginServiceImpl logs only non-sensitive metadata (User ID, IP).
+2. Advanced Authentication Architecture (OWASP A07: Identification Failures)
+• Hybrid Token Security (XSS & CSRF Protection): We utilize a dual-token strategy to mitigate client-side attacks:
+• Refresh Tokens are stored in HttpOnly, Secure Cookies. This makes them inaccessible to JavaScript, preventing XSS (Cross-Site Scripting) attacks from stealing the long-term session.
+• Access Tokens are passed via Headers. This prevents CSRF (Cross-Site Request Forgery) because headers are not automatically sent by the browser.
+• Stateful Validation (Kill Switch): Unlike standard stateless JWTs, we validate every token against a Redis Session Store (TokenSessionValidator). This allows us to instantly revoke compromised tokens or logout users remotely.
+3. Brute Force & Abuse Protection
+• Account Locking Policy: The system enforces a strict limit (configurable, e.g., 5 attempts) on failed logins.
+• After 5 failed attempts, the account is logically locked (PASSWORD_LOGIN set to INACTIVE) in the database.
+• Subsequent attempts are rejected at the pre-check level without hitting the password hasher to save CPU resources.
+• IP Blacklisting: The AuthController includes logic to check client IPs against a blocked configuration list before processing requests.
+4. Session Management (OWASP A01: Broken Access Control)
+• Concurrent Session Control: The system tracks the unique JWT ID (JTI) in Redis. If a user logs in from a new device, the system detects the concurrency and manages the session accordingly.
+• Secure Logout: The logout endpoint performs a "hard" cleanup:
+1. Invalidates the session in Redis.
+2. Adds the token to a Blacklist.
+3. Clears the HttpOnly cookie from the browser.
+5. Authorization & RBAC
+• Context-Aware RBAC: Downstream services use a ContextRbacFilter that validates permissions dynamically from Redis based on:
+• User Role.
+• HTTP Method & Endpoint.
+• Context Header (X-Request-Type).
+• Deny-by-Default: The SecurityConfig follows the "Least Privilege" principle. All endpoints are blocked (.anyExchange().authenticated()) unless explicitly whitelisted (e.g., login, health checks).
+6. Error Handling & Input Validation
+• Information Leakage Prevention: The GlobalExceptionHandler catches internal exceptions (like SQL errors or NullPointers) and returns generic error messages to the client ("System Error") to prevent exposing stack traces or database structures.
+• Strict Input Validation: We use Java Bean Validation (@Valid) on incoming DTOs to ensure data integrity before processing.
+• Input Sanitization: Utility methods (e.g., sanitizeIp) are used to clean input data before using it in logic or logs.
