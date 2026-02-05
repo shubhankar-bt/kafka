@@ -1,116 +1,71 @@
-package com.fincore.ReportService.config;
-
-import lombok.extern.slf4j.Slf4j;
-import org.apache.hadoop.fs.FileSystem;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
-
-@Configuration
-@Slf4j
-public class HadoopConfig {
-
-    @Value("${hadoop.fs.nameservice}")
-    private String nameservice;
-
-    @Value("${hadoop.fs.user}")
-    private String hadoopUser;
-
-    @Value("${hadoop.fs.ha.namenodes}")
-    private String nnIds;
-
-    @Value("${hadoop.fs.ha.nn1.rpc}")
-    private String nn1Rpc;
-
-    @Value("${hadoop.fs.ha.nn2.rpc}")
-    private String nn2Rpc;
-
-    @Value("${hadoop.fs.ha.nn3.rpc}")
-    private String nn3Rpc;
-
-    @Bean
-    public org.apache.hadoop.conf.Configuration hadoopConfiguration() {
-        log.info("Configuring HDFS HA for Nameservice: {}", nameservice);
-        
-        org.apache.hadoop.conf.Configuration config = new org.apache.hadoop.conf.Configuration();
-
-        // 1. Set the default FileSystem to the logical Nameservice URI
-        String authority = "hdfs://" + nameservice;
-        config.set("fs.defaultFS", authority);
-
-        // 2. Configure HA Nameservice
-        config.set("dfs.nameservices", nameservice);
-        config.set("dfs.ha.namenodes." + nameservice, nnIds); // "nn1,nn2,nn3"
-
-        // 3. Configure RPC Addresses for each NameNode
-        config.set("dfs.namenode.rpc-address." + nameservice + ".nn1", nn1Rpc);
-        config.set("dfs.namenode.rpc-address." + nameservice + ".nn2", nn2Rpc);
-        config.set("dfs.namenode.rpc-address." + nameservice + ".nn3", nn3Rpc);
-
-        // 4. Configure Failover Provider (UPDATED TO HEDGING)
-        // RequestHedgingProxyProvider checks multiple NameNodes in parallel to find the Active one faster.
-        config.set("dfs.client.failover.proxy.provider." + nameservice, 
-                   "org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider");
-
-        // 5. Disable FS Cache to prevent singleton lifecycle issues
-        config.set("fs.hdfs.impl.disable.cache", "true");
-
-        // 6. Robustness Settings
-        // Increase retry counts for HA failover scenarios
-        config.set("ipc.client.connect.max.retries.on.timeouts", "3");
-        config.set("dfs.client.failover.max.attempts", "10");
-        config.set("ipc.client.connect.timeout", "5000"); // 5s timeout
-        
-        log.info("HDFS HA Configuration complete. Mode: Hedging. Nodes: {}, {}, {}", nn1Rpc, nn2Rpc, nn3Rpc);
-        
-        return config;
-    }
-
-    @Bean
-    public FileSystem fileSystem(org.apache.hadoop.conf.Configuration config) {
-        try {
-            // Create the FileSystem using the HA config and the specific user
-            URI logicalUri = new URI("hdfs://" + nameservice);
-            return FileSystem.get(logicalUri, config, hadoopUser);
-
-        } catch (IOException | InterruptedException | URISyntaxException e) {
-            log.error("CRITICAL: Failed to initialize HDFS HA Connection.", e);
-            throw new RuntimeException("Could not initialize Hadoop FileSystem", e);
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ===================================================================
-# HADOOP / HDFS HA CONFIGURATION
-# ===================================================================
-hadoop.fs.nameservice=fincoredev
-hadoop.fs.user=root
-glif.reports.base-path=/reports
-
-# HA NameNode Details
-hadoop.fs.ha.namenodes=nn1,nn2,nn3
-hadoop.fs.ha.nn1.rpc=10.177.103.199:8022
-hadoop.fs.ha.nn2.rpc=10.177.103.192:8022
-hadoop.fs.ha.nn3.rpc=10.177.103.196:8022
-
-### Why this works
-* **Sequential (`ConfiguredFailoverProxyProvider`):** Tries `nn1`. If `nn1` is Standby, it throws an exception. The client catches it and tries `nn2`. If network latency is high or the Standby response is slow, the user sees a "Not Downloading" error (timeout).
-* **Hedging (`RequestHedgingProxyProvider`):** Spawns threads to contact `nn1`, `nn2`, and `nn3` simultaneously. `nn3` (if active) will respond "Success" immediately. The client uses that connection and ignores the others.
-
-**Action:** Replace `HadoopConfig.java` and restart the service. The download should now work regardless of which node is Active.
+Added connection oracle.jdbc.driver.T4CConnection@6409855f 
+2026-02-05 16:46:47.862 INFO  [restartedMain] c.z.h.HikariDataSource: HikariPool-1 - Start completed. 
+2026-02-05 16:46:48.072 WARN  [restartedMain] o.h.e.j.d.i.DialectFactoryImpl: HHH90000025: OracleDialect does not need to be specified explicitly using 'hibernate.dialect' (remove the property setting and it will be selected by default) 
+2026-02-05 16:46:49.221 INFO  [restartedMain] o.h.e.t.j.p.i.JtaPlatformInitiator: HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration) 
+2026-02-05 16:46:50.364 INFO  [restartedMain] o.s.o.j.AbstractEntityManagerFactoryBean: Initialized JPA EntityManagerFactory for persistence unit 'default' 
+2026-02-05 16:46:50.704 INFO  [restartedMain] o.s.d.j.r.q.QueryEnhancerFactory: Hibernate is in classpath; If applicable, HQL parser will be used. 
+2026-02-05 16:46:51.417 INFO  [restartedMain] c.f.R.c.HadoopConfig: Configuring HDFS HA for Nameservice: fincoredev 
+2026-02-05 16:46:51.464 INFO  [restartedMain] c.f.R.c.HadoopConfig: HDFS HA Configuration complete. Mode: Hedging. Nodes: 10.177.103.199:8022, 10.177.103.192:8022, 10.177.103.196:8022 
+2026-02-05 16:46:52.266 INFO  [restartedMain] c.f.R.u.HadoopConnectivityTester: TEST: Attempting to connect to HDFS Cluster: hdfs://fincoredev as user: root 
+2026-02-05 16:46:57.353 WARN  [restartedMain] o.a.h.h.s.n.h.RequestHedgingProxyProvider: Invocation returned exception on [/10.177.103.192:8022] 
+org.apache.hadoop.net.ConnectTimeoutException: Call From GCBTCS5D17142/172.17.48.1 to fcdevoracle:8022 failed on socket timeout exception: org.apache.hadoop.net.ConnectTimeoutException: 5000 millis timeout while waiting for channel to be ready for connect. ch : java.nio.channels.SocketChannel[connection-pending remote=fcdevoracle/10.177.103.192:8022]; For more details see:  http://wiki.apache.org/hadoop/SocketTimeout
+	at java.base/jdk.internal.reflect.DirectConstructorHandleAccessor.newInstance(DirectConstructorHandleAccessor.java:62)
+	at java.base/java.lang.reflect.Constructor.newInstanceWithCaller(Constructor.java:502)
+	at java.base/java.lang.reflect.Constructor.newInstance(Constructor.java:486)
+	at org.apache.hadoop.net.NetUtils.wrapWithMessage(NetUtils.java:930)
+	at org.apache.hadoop.net.NetUtils.wrapException(NetUtils.java:865)
+	at org.apache.hadoop.ipc.Client.getRpcResponse(Client.java:1571)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1513)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1410)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine2$Invoker.invoke(ProtobufRpcEngine2.java:258)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine2$Invoker.invoke(ProtobufRpcEngine2.java:139)
+	at jdk.proxy2/jdk.proxy2.$Proxy185.getFileInfo(Unknown Source)
+	at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.getFileInfo(ClientNamenodeProtocolTranslatorPB.java:966)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider$RequestHedgingInvocationHandler$1.call(RequestHedgingProxyProvider.java:133)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:572)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1570)
+Caused by: org.apache.hadoop.net.ConnectTimeoutException: 5000 millis timeout while waiting for channel to be ready for connect. ch : java.nio.channels.SocketChannel[connection-pending remote=fcdevoracle/10.177.103.192:8022]
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:603)
+	at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:652)
+	at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:773)
+	at org.apache.hadoop.ipc.Client$Connection.access$3800(Client.java:347)
+	at org.apache.hadoop.ipc.Client.getConnection(Client.java:1632)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1457)
+	... 14 common frames omitted
+2026-02-05 16:46:57.356 WARN  [restartedMain] o.a.h.h.s.n.h.RequestHedgingProxyProvider: Invocation returned exception on [/10.177.103.196:8022] 
+org.apache.hadoop.net.ConnectTimeoutException: Call From GCBTCS5D17142/172.17.48.1 to fcdevpostgres:8022 failed on socket timeout exception: org.apache.hadoop.net.ConnectTimeoutException: 5000 millis timeout while waiting for channel to be ready for connect. ch : java.nio.channels.SocketChannel[connection-pending remote=fcdevpostgres/10.177.103.196:8022]; For more details see:  http://wiki.apache.org/hadoop/SocketTimeout
+	at java.base/jdk.internal.reflect.DirectConstructorHandleAccessor.newInstance(DirectConstructorHandleAccessor.java:62)
+	at java.base/java.lang.reflect.Constructor.newInstanceWithCaller(Constructor.java:502)
+	at java.base/java.lang.reflect.Constructor.newInstance(Constructor.java:486)
+	at org.apache.hadoop.net.NetUtils.wrapWithMessage(NetUtils.java:930)
+	at org.apache.hadoop.net.NetUtils.wrapException(NetUtils.java:865)
+	at org.apache.hadoop.ipc.Client.getRpcResponse(Client.java:1571)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1513)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1410)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine2$Invoker.invoke(ProtobufRpcEngine2.java:258)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine2$Invoker.invoke(ProtobufRpcEngine2.java:139)
+	at jdk.proxy2/jdk.proxy2.$Proxy185.getFileInfo(Unknown Source)
+	at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.getFileInfo(ClientNamenodeProtocolTranslatorPB.java:966)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider$RequestHedgingInvocationHandler$1.call(RequestHedgingProxyProvider.java:133)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:572)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1570)
+Caused by: org.apache.hadoop.net.ConnectTimeoutException: 5000 millis timeout while waiting for channel to be ready for connect. ch : java.nio.channels.SocketChannel[connection-pending remote=fcdevpostgres/10.177.103.196:8022]
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:603)
+	at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:652)
+	at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:773)
+	at org.apache.hadoop.ipc.Client$Connection.access$3800(Client.java:347)
+	at org.apache.hadoop.ipc.Client.getConnection(Client.java:1632)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1457)
+	... 14 common frames omitted
