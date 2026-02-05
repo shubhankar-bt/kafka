@@ -1,43 +1,66 @@
-Hi [Client Name/Team],
-Following our discussion on system robustness and security, I would like to present a comprehensive overview of the architectural patterns, security controls, and performance optimizations implemented in the FINCORE application.
-Our architecture leverages a Microservices-based, Event-Driven approach designed for high scalability, banking-grade security, and fault tolerance. Below is the detailed breakdown of our technical stack and design choices:
-1. Advanced Security & Access Control
-• Dual-Token Authentication Strategy:
-• Access Token (9 mins): Short-lived for API access.
-• Refresh Token (12 hours): Stored strictly in HTTP-Only, Secure Cookies to prevent XSS attacks.
-• Zero-Trust RBAC: Implemented a custom ContextRbacFilter that validates every request against Redis-cached permissions. It enforces Context-Aware Security (e.g., Maker vs. Checker roles) via the X-Request-Type header.
-• Internal Service Mesh Security: Service-to-service communication is secured via Custom JWT Validation and Internal Trust Headers (HMAC signatures), ensuring no unauthorized internal access.
-• PII Data Protection:
-• At Rest/Motion: TLS encryption for transport; DB-level encryption for storage.
-• In Logs: Custom Logback Masking Decorators and DTO toString() overrides ensure sensitive data (PAN, Mobile, Passwords) is masked (x****x) before being written to logs.
-2. Design Patterns & Code Quality
-• Strategy Pattern for Validation: We utilize the Strategy Design Pattern for complex server-side validation. This allows us to dynamically switch validation logic (e.g., for different Request Types or User Roles) without creating "Spaghetti Code" with if-else blocks.
-• Strict DTO Contracts: We enforce strict Input/Output structures using Data Transfer Objects (DTOs), ensuring internal domain entities are never exposed directly to the API consumers.
-• AOP (Aspect-Oriented Programming): utilized for Cross-Cutting Concerns like Logging and Retry logic. This keeps our business logic clean and focused purely on functionality.  
-• Global Exception Handling: A centralized @ControllerAdvice catches all exceptions, translating them into standardized, secure JSON error responses (hiding stack traces from clients).  
-3. Resilience & Fault Tolerance
-• Resilience4j Integration: We implemented a centralized Circuit Breaker and Retry Mechanism.
-• Transient Failures: Automatically retried (DB blips, Network timeouts).
-• Circuit Breaking: Fails fast during outages to prevent cascading system failures.
-• Outbox Pattern: For critical notifications, we use the Transactional Outbox Pattern. Events are saved to the DB in the same transaction as the data, ensuring no notification is ever lost even if the Message Broker is down.
-4. High-Performance Data Processing
-• HDFS Direct Streaming: For large file downloads/reports, we implemented StreamingResponseBody. Data is streamed directly from HDFS to the Client through the backend without loading the file into Java Heap memory, preventing Out-Of-Memory (OOM) errors.  
-• Asynchronous Processing: Heavy tasks (Journal Uploads, Bulk Executions) are offloaded to @Async thread pools.
-• Real-Time Progress Tracking: We utilize Redis Pub/Sub to push real-time progress updates (e.g., "File Processing: 45%") to the frontend via SSE, enhancing user experience during long-running tasks.  
-5. Event-Driven & Real-Time Data
-• Kafka & Debezium: We use Change Data Capture (CDC) via Debezium to stream database changes to Kafka. This powers our real-time RBAC permission updates—when an Admin changes a permission, it reflects instantly across all services without restarts.  
-• Redis Caching: Frequently accessed, non-volatile data (Master Data, Currencies) is cached in Redis to reduce Database load and improve API response times.
-6. Observability & Monitoring
-• Structured Logging: All logs are output in JSON format with correlation IDs (TraceId), User IDs, and Client IPs automatically injected via MDC, making them ETL-ready for Splunk/ELK.
-• Metrics: Spring Actuator and Micrometer expose JVM and API metrics (Latency, Error Rates, Heap Usage) to Prometheus and Grafana for real-time health monitoring.  
-• Spring Profiling: Environment-specific configurations (dev, uat, prod) ensure appropriate logging levels and security settings for Kubernetes deployments.
-Attachments / Evidence:
-To validate these implementations, please refer to the attached screenshots:
-1. Validation Logic: Screenshot of the ValidationStrategy interface and a concrete implementation (e.g., CreateRequestValidator).
-2. Streaming: Screenshot of the Controller method using StreamingResponseBody for HDFS.
-3. Resilience: Screenshot of GlobalResilienceAspect.java and application.properties showing Retry/CircuitBreaker rules.
-4. Security: Screenshot of ContextRbacFilter and the HTTP-Only Cookie logic in AuthController.
-5. Observability: Screenshot of a JSON log entry containing traceId and masked PII.
+spring.application.name=ReportService
+
+# LOGIN SERVICE KEY USED BY common-entities
+jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
+
+spring.profiles.active=dev
+
+# ===================================================================
+# SERVER CONFIGURATION
+# ===================================================================
+server.port=9005
+
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.mvc.async.request-timeout=3600000
+
+# ===================================================================
+# CUSTOM APPLICATION PROPERTIES
+# ===================================================================
+notification.progress.topic=notifications:progress
+
+# ===================================================================
+# SPRING DATASOURCE (ORACLE)
+# ===================================================================
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+
+
+# ========================== actuator =============================
+management.endpoints.web.exposure.include=*
+management.endpoint.health.show-details=always
+info.app.name=ReportService
+info.app.description=Service to manage and retrieve different reports
+info.app.version=1.0.0
+
+# ===================================================================
+# JPA / HIBERNATE CONFIGURATION
+# ===================================================================
+spring.jpa.database-platform=org.hibernate.dialect.OracleDialect
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+spring.jpa.properties.hibernate.format_sql=false
+logging.level.org.hibernate.SQL=OFF
+logging.level.org.hibernate.orm.jdbc.bind=OFF
+
+# ===================================================================
+# HADOOP / HDFS HA CONFIGURATION
+# ===================================================================
+# The logical name of the cluster (Nameservice ID)
+hadoop.fs.nameservice=fincoredev
+hadoop.fs.user=root
+glif.reports.base-path=/reports
+
+# HA NameNode Details
+hadoop.fs.ha.namenodes=nn1,nn2,nn3
+hadoop.fs.ha.nn1.rpc=10.177.103.199:8022
+hadoop.fs.ha.nn2.rpc=10.177.103.192:8022
+hadoop.fs.ha.nn3.rpc=10.177.103.196:8022
+
+# Redis Configuration
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.cache.type=redis
 
 
 
@@ -57,6 +80,91 @@ To validate these implementations, please refer to the attached screenshots:
 
 
 
+package com.fincore.ReportService.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.FileSystem;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+
+@Configuration
+@Slf4j
+public class HadoopConfig {
+
+    @Value("${hadoop.fs.nameservice}")
+    private String nameservice;
+
+    @Value("${hadoop.fs.user}")
+    private String hadoopUser;
+
+    @Value("${hadoop.fs.ha.namenodes}")
+    private String nnIds;
+
+    @Value("${hadoop.fs.ha.nn1.rpc}")
+    private String nn1Rpc;
+
+    @Value("${hadoop.fs.ha.nn2.rpc}")
+    private String nn2Rpc;
+
+    @Value("${hadoop.fs.ha.nn3.rpc}")
+    private String nn3Rpc;
+
+    /**
+     * Creates the Hadoop Configuration object with HA settings.
+     * Defined as a Bean so it can be reused by the ConnectivityTester.
+     */
+    @Bean
+    public org.apache.hadoop.conf.Configuration hadoopConfiguration() {
+        log.info("Configuring HDFS HA for Nameservice: {}", nameservice);
+        
+        org.apache.hadoop.conf.Configuration config = new org.apache.hadoop.conf.Configuration();
+
+        // 1. Set the default FileSystem to the logical Nameservice URI
+        String authority = "hdfs://" + nameservice;
+        config.set("fs.defaultFS", authority);
+
+        // 2. Configure HA Nameservice
+        config.set("dfs.nameservices", nameservice);
+        config.set("dfs.ha.namenodes." + nameservice, nnIds); // "nn1,nn2,nn3"
+
+        // 3. Configure RPC Addresses for each NameNode
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn1", nn1Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn2", nn2Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn3", nn3Rpc);
+
+        // 4. Configure Failover Provider (Critical for HA)
+        // This tells the client how to switch between NameNodes
+        config.set("dfs.client.failover.proxy.provider." + nameservice, 
+                   "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider");
+
+        // 5. Robustness Settings
+        config.set("ipc.client.connect.timeout", "5000"); // 5s timeout
+        config.set("ipc.client.rpc-timeout.ms", "30000"); // 30s timeout
+        
+        log.info("HDFS HA Configuration complete. NN1: {}, NN2: {}, NN3: {}", nn1Rpc, nn2Rpc, nn3Rpc);
+        
+        return config;
+    }
+
+    @Bean
+    public FileSystem fileSystem(org.apache.hadoop.conf.Configuration config) {
+        try {
+            // Create the FileSystem using the HA config and the specific user
+            // Note: We use the logical URI (hdfs://fincoredev) here
+            URI logicalUri = new URI("hdfs://" + nameservice);
+            return FileSystem.get(logicalUri, config, hadoopUser);
+
+        } catch (IOException | InterruptedException | URISyntaxException e) {
+            log.error("CRITICAL: Failed to initialize HDFS HA Connection.", e);
+            throw new RuntimeException("Could not initialize Hadoop FileSystem", e);
+        }
+    }
+}
 
 
 
@@ -66,34 +174,82 @@ To validate these implementations, please refer to the attached screenshots:
 
 
 
-Subject: Compliance with Secure Coding Practices
-Our application enforces a Defense-in-Depth security strategy, adhering to OWASP guidelines. Below are the specific secure coding practices implemented in the Login Service and Gateway:
-1. Credential Security & Storage (OWASP A02: Cryptographic Failures)
-• Adaptive Hashing: We do not store plain-text passwords. All passwords are hashed using BCrypt (BCryptPasswordEncoder), which includes automatic salting to prevent Rainbow Table attacks.
-• No Sensitive Data Logging: The application is configured to strictly avoid logging sensitive fields (passwords, tokens, OTPs). The LoginServiceImpl logs only non-sensitive metadata (User ID, IP).
-2. Advanced Authentication Architecture (OWASP A07: Identification Failures)
-• Hybrid Token Security (XSS & CSRF Protection): We utilize a dual-token strategy to mitigate client-side attacks:
-• Refresh Tokens are stored in HttpOnly, Secure Cookies. This makes them inaccessible to JavaScript, preventing XSS (Cross-Site Scripting) attacks from stealing the long-term session.
-• Access Tokens are passed via Headers. This prevents CSRF (Cross-Site Request Forgery) because headers are not automatically sent by the browser.
-• Stateful Validation (Kill Switch): Unlike standard stateless JWTs, we validate every token against a Redis Session Store (TokenSessionValidator). This allows us to instantly revoke compromised tokens or logout users remotely.
-3. Brute Force & Abuse Protection
-• Account Locking Policy: The system enforces a strict limit (configurable, e.g., 5 attempts) on failed logins.
-• After 5 failed attempts, the account is logically locked (PASSWORD_LOGIN set to INACTIVE) in the database.
-• Subsequent attempts are rejected at the pre-check level without hitting the password hasher to save CPU resources.
-• IP Blacklisting: The AuthController includes logic to check client IPs against a blocked configuration list before processing requests.
-4. Session Management (OWASP A01: Broken Access Control)
-• Concurrent Session Control: The system tracks the unique JWT ID (JTI) in Redis. If a user logs in from a new device, the system detects the concurrency and manages the session accordingly.
-• Secure Logout: The logout endpoint performs a "hard" cleanup:
-1. Invalidates the session in Redis.
-2. Adds the token to a Blacklist.
-3. Clears the HttpOnly cookie from the browser.
-5. Authorization & RBAC
-• Context-Aware RBAC: Downstream services use a ContextRbacFilter that validates permissions dynamically from Redis based on:
-• User Role.
-• HTTP Method & Endpoint.
-• Context Header (X-Request-Type).
-• Deny-by-Default: The SecurityConfig follows the "Least Privilege" principle. All endpoints are blocked (.anyExchange().authenticated()) unless explicitly whitelisted (e.g., login, health checks).
-6. Error Handling & Input Validation
-• Information Leakage Prevention: The GlobalExceptionHandler catches internal exceptions (like SQL errors or NullPointers) and returns generic error messages to the client ("System Error") to prevent exposing stack traces or database structures.
-• Strict Input Validation: We use Java Bean Validation (@Valid) on incoming DTOs to ensure data integrity before processing.
-• Input Sanitization: Utility methods (e.g., sanitizeIp) are used to clean input data before using it in logic or logs.
+
+
+
+
+
+
+
+
+
+
+package com.fincore.ReportService.util;
+
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.net.URI;
+
+@Component
+@Slf4j
+public class HadoopConnectivityTester {
+
+    @Value("${hadoop.fs.nameservice}")
+    private String nameservice;
+
+    @Value("${hadoop.fs.user}")
+    private String hdfsUser;
+
+    // Inject the config created in HadoopConfig.java
+    @Autowired
+    private Configuration hadoopConfig;
+
+    @PostConstruct
+    public void testHdfsConnection() {
+        String logicalUri = "hdfs://" + nameservice;
+        log.info("TEST: Attempting to connect to HDFS Cluster: {} as user: {}", logicalUri, hdfsUser);
+
+        // We create a *separate* FileSystem instance for testing so we can close it safely
+        // without affecting the main application bean.
+        try (FileSystem fs = FileSystem.get(URI.create(logicalUri), hadoopConfig, hdfsUser)) {
+
+            Path rootPath = new Path("/");
+            if (fs.exists(rootPath)) {
+                log.info("TEST SUCCESS: Connected to HDFS HA Cluster ({}). Root directory exists.", nameservice);
+                
+                // Print Active NameNode status (indirectly via operation success)
+                log.info("HDFS Status: HA Mode Active. Block Size: {}", fs.getDefaultBlockSize(rootPath));
+            } else {
+                log.warn("TEST FAILURE: Connected, but root path '/' does not exist.");
+            }
+
+        } catch (IOException | InterruptedException e) {
+            log.error("TEST ERROR: Failed to connect to HDFS Cluster.", e);
+            log.info("Troubleshooting: Check if all 3 NameNodes are reachable and the Nameservice ID matches.");
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
