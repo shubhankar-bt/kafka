@@ -1,16 +1,116 @@
-127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
-::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+package com.fincore.ReportService.config;
 
-10.191.240.144 deploymentserver1.sbi.co.in     deploymentserver1
-10.177.103.198 fcdevhdfsdata2    dn2
-10.177.103.197 fcdevhdfsdata1    dn1
-10.177.103.199 fcdevhdfsname     nn1
-10.177.103.195 fcdevdruidhist    jn1
-10.177.103.193 fcdevdruidcordi   jn3
-10.177.103.194 fcdevdruidbroker  jn2
-10.177.103.196 fcdevpostgres     nn3
-10.177.103.192 fcdevoracle       nn2
-10.191.71.213 ITSAMPRAPSNOW01.corp.ad.sbi
-10.177.81.163 ITSAMDRAPSNOW01.corp.ad.sbi
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.fs.FileSystem;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
-------------------------------------------------
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+
+@Configuration
+@Slf4j
+public class HadoopConfig {
+
+    @Value("${hadoop.fs.nameservice}")
+    private String nameservice;
+
+    @Value("${hadoop.fs.user}")
+    private String hadoopUser;
+
+    @Value("${hadoop.fs.ha.namenodes}")
+    private String nnIds;
+
+    @Value("${hadoop.fs.ha.nn1.rpc}")
+    private String nn1Rpc;
+
+    @Value("${hadoop.fs.ha.nn2.rpc}")
+    private String nn2Rpc;
+
+    @Value("${hadoop.fs.ha.nn3.rpc}")
+    private String nn3Rpc;
+
+    @Bean
+    public org.apache.hadoop.conf.Configuration hadoopConfiguration() {
+        log.info("Configuring HDFS HA for Nameservice: {}", nameservice);
+        
+        org.apache.hadoop.conf.Configuration config = new org.apache.hadoop.conf.Configuration();
+
+        // 1. Set the default FileSystem to the logical Nameservice URI
+        String authority = "hdfs://" + nameservice;
+        config.set("fs.defaultFS", authority);
+
+        // 2. Configure HA Nameservice
+        config.set("dfs.nameservices", nameservice);
+        config.set("dfs.ha.namenodes." + nameservice, nnIds); // "nn1,nn2,nn3"
+
+        // 3. Configure RPC Addresses for each NameNode
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn1", nn1Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn2", nn2Rpc);
+        config.set("dfs.namenode.rpc-address." + nameservice + ".nn3", nn3Rpc);
+
+        // 4. Configure Failover Provider (UPDATED TO HEDGING)
+        // RequestHedgingProxyProvider checks multiple NameNodes in parallel to find the Active one faster.
+        config.set("dfs.client.failover.proxy.provider." + nameservice, 
+                   "org.apache.hadoop.hdfs.server.namenode.ha.RequestHedgingProxyProvider");
+
+        // 5. Disable FS Cache to prevent singleton lifecycle issues
+        config.set("fs.hdfs.impl.disable.cache", "true");
+
+        // 6. Robustness Settings
+        // Increase retry counts for HA failover scenarios
+        config.set("ipc.client.connect.max.retries.on.timeouts", "3");
+        config.set("dfs.client.failover.max.attempts", "10");
+        config.set("ipc.client.connect.timeout", "5000"); // 5s timeout
+        
+        log.info("HDFS HA Configuration complete. Mode: Hedging. Nodes: {}, {}, {}", nn1Rpc, nn2Rpc, nn3Rpc);
+        
+        return config;
+    }
+
+    @Bean
+    public FileSystem fileSystem(org.apache.hadoop.conf.Configuration config) {
+        try {
+            // Create the FileSystem using the HA config and the specific user
+            URI logicalUri = new URI("hdfs://" + nameservice);
+            return FileSystem.get(logicalUri, config, hadoopUser);
+
+        } catch (IOException | InterruptedException | URISyntaxException e) {
+            log.error("CRITICAL: Failed to initialize HDFS HA Connection.", e);
+            throw new RuntimeException("Could not initialize Hadoop FileSystem", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===================================================================
+# HADOOP / HDFS HA CONFIGURATION
+# ===================================================================
+hadoop.fs.nameservice=fincoredev
+hadoop.fs.user=root
+glif.reports.base-path=/reports
+
+# HA NameNode Details
+hadoop.fs.ha.namenodes=nn1,nn2,nn3
+hadoop.fs.ha.nn1.rpc=10.177.103.199:8022
+hadoop.fs.ha.nn2.rpc=10.177.103.192:8022
+hadoop.fs.ha.nn3.rpc=10.177.103.196:8022
+
+### Why this works
+* **Sequential (`ConfiguredFailoverProxyProvider`):** Tries `nn1`. If `nn1` is Standby, it throws an exception. The client catches it and tries `nn2`. If network latency is high or the Standby response is slow, the user sees a "Not Downloading" error (timeout).
+* **Hedging (`RequestHedgingProxyProvider`):** Spawns threads to contact `nn1`, `nn2`, and `nn3` simultaneously. `nn3` (if active) will respond "Success" immediately. The client uses that connection and ignores the others.
+
+**Action:** Replace `HadoopConfig.java` and restart the service. The download should now work regardless of which node is Active.
