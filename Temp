@@ -1,2 +1,242 @@
 dn: DC=UATAD,DC=SBI objectClass: top objectClass: domain dc: UATAD
 dn: cn=1015698,DC=UATAD,DC=SBI objectClass: top objectClass: person objectClass: organizationalPerson objectClass: user cn: 1015698 sn: TestUser sAMAccountName: 1015698 userPassword: pass123
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import com.unboundid.ldap.listener.InMemoryDirectoryServer;
+import com.unboundid.ldap.listener.InMemoryDirectoryServerConfig;
+import com.unboundid.ldap.listener.InMemoryListenerConfig;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.ClassPathResource;
+
+import java.io.File;
+
+/**
+ * Starts an embedded LDAP server for local testing ONLY.
+ * Activated when the configured LDAP URL contains "localhost".
+ */
+@Slf4j
+@Configuration
+public class LocalLdapServer {
+
+    @Value("${spring.ldap.urls}")
+    private String ldapUrl;
+
+    @Value("${spring.ldap.base}")
+    private String baseDn;
+
+    private InMemoryDirectoryServer directoryServer;
+
+    @PostConstruct
+    public void startServer() {
+        // Only start if we are pointing to localhost (Testing Mode)
+        if (ldapUrl != null && ldapUrl.contains("localhost")) {
+            try {
+                log.info("STARTING LOCAL MOCK LDAP SERVER...");
+                
+                // Configure the server
+                InMemoryDirectoryServerConfig config = new InMemoryDirectoryServerConfig(baseDn);
+                config.addAdditionalBindCredentials("cn=admin", "admin");
+                
+                // Disable Schema Validation because 'sAMAccountName' is an Active Directory specific attribute
+                // and standard LDAP servers don't like it by default.
+                config.setSchema(null); 
+
+                // Set Listener on port 8389 (Standard for local test)
+                config.setListenerConfigs(InMemoryListenerConfig.createLDAPConfig("default", 8389));
+
+                directoryServer = new InMemoryDirectoryServer(config);
+                
+                // Load the data from the LDIF file
+                ClassPathResource ldifResource = new ClassPathResource("users.ldif");
+                if (ldifResource.exists()) {
+                    // UnboundID needs a File object or path string
+                    // We copy to temp file to ensure it works inside JARs/IDEs
+                    File ldifFile = ldifResource.getFile();
+                    directoryServer.importFromLDIF(true, ldifFile.getAbsolutePath());
+                    log.info("Loaded Mock Data from users.ldif");
+                }
+
+                directoryServer.startListening();
+                log.info("LOCAL MOCK LDAP SERVER STARTED on port 8389");
+                log.info("Test User: 1015698 / pass123");
+
+            } catch (Exception e) {
+                log.error("Failed to start Local LDAP Server", e);
+            }
+        }
+    }
+
+    @PreDestroy
+    public void stopServer() {
+        if (directoryServer != null) {
+            directoryServer.shutDown(true);
+            log.info("Local LDAP Server Stopped.");
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Configuration
+public class LdapConfig {
+
+    @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
+    private String ldapUrl;
+
+    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
+    private String ldapBaseDn;
+
+    private final ResourceLoader resourceLoader;
+
+    public LdapConfig(ResourceLoader resourceLoader) {
+        this.resourceLoader = resourceLoader;
+    }
+
+    @Bean
+    public LdapContextSource contextSource() {
+        log.info("Configuring LDAP Context Source. URL: {}", ldapUrl);
+        LdapContextSource contextSource = new LdapContextSource();
+        contextSource.setUrl(ldapUrl);
+        contextSource.setBase(ldapBaseDn);
+        
+        Map<String, Object> baseEnv = new HashMap<>();
+
+        // === SMART SSL LOGIC ===
+        if (ldapUrl.toLowerCase().startsWith("ldaps")) {
+            // UAT / PROD MODE (SSL ENABLED)
+            log.info("Enabling SSL for LDAP Connection");
+            baseEnv.put("java.naming.security.protocol", "ssl");
+            
+            // Load Truststore
+            try {
+                Resource trustStore = resourceLoader.getResource("classpath:ad-truststore.jks");
+                if (trustStore.exists()) {
+                    String trustStorePath = trustStore.getFile().getAbsolutePath();
+                    System.setProperty("javax.net.ssl.trustStore", trustStorePath);
+                    System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+                }
+            } catch (IOException e) {
+                log.error("Could not load custom truststore", e);
+            }
+        } else {
+            // LOCAL TESTING MODE (NO SSL)
+            log.info("SSL Disabled for Local/Plain LDAP Connection");
+        }
+
+        // Common Timeouts
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); 
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    
+        
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+        return contextSource;
+    }
+
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        return new LdapTemplate(contextSource());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+spring:
+  ldap:
+    urls: ldaps://10.189.42.83:636
+    base: DC=UATAD,DC=SBI
+    domain: UATAD.SBI
+
+
+
+
+
+
+
+
+
+
+spring:
+  ldap:
+    urls: ldap://localhost:8389  # <--- Note: ldap:// (not ldaps) and port 8389
+    base: DC=UATAD,DC=SBI
+    domain: UATAD.SBI
+
+**Keep this in Database:**
+Ensure `LOGIN_PARAM` has `ACTIVE_LOGIN_MODE` = **'L'**.
+
+---
+
+### **How to Test**
+
+1.  **Start your Application:**
+    * Look for logs: `STARTING LOCAL MOCK LDAP SERVER...` and `Loaded Mock Data...`.
+    * Look for logs: `SSL Disabled for Local/Plain LDAP Connection`.
+
+2.  **Test Case 1: Success Flow**
+    * **Action:** Login with User: `1015698` and Password: `pass123`.
+    * **Expected:** "Login Successful" + Token generated.
+    * *Verify:* This confirms your `AdAuthenticationService` is correctly binding and returning true, and `LoginServiceImpl` is generating the token.
+
+3.  **Test Case 2: Wrong Password**
+    * **Action:** Login with User: `1015698` and Password: `wrongpass`.
+    * **Expected:** "Incorrect credentials".
+    * *Verify:* Check DB. The `USER_WRONG_PASSWORD_COUNT` for this user should increment.
+
+4.  **Test Case 3: Non-Existent User**
+    * **Action:** Login with User: `999999` and Password: `any`.
+    * **Expected:** "Invalid User" (Authorization check failed) OR "Incorrect credentials" (if user exists in local DB but not in LDAP).
+
+**When you are ready for UAT:**
+Simply change the URL in `application.yml` back to `ldaps://10.189.42.83:636` and redeploy. The code will automatically switch to SSL mode.
