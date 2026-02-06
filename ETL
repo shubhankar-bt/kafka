@@ -1,141 +1,37 @@
-package com.fincore.gateway.Config;
-
-import com.unboundid.ldap.listener.InMemoryDirectoryServer;
-import com.unboundid.ldap.listener.InMemoryDirectoryServerConfig;
-import com.unboundid.ldap.listener.InMemoryListenerConfig;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.ClassPathResource;
-
-import java.io.File;
-
-/**
- * Starts an embedded LDAP server for local testing ONLY.
- * Activated when the configured LDAP URL contains "localhost".
- */
-@Slf4j
-@Configuration
-public class LocalLdapServer {
-
-    @Value("${spring.ldap.urls:}")
-    private String ldapUrl;
-
-    // We hardcode this for the Mock Server to match the LDIF file exactly
-    private static final String MOCK_BASE_DN = "DC=UATAD,DC=SBI";
-
-    private InMemoryDirectoryServer directoryServer;
-
-    @PostConstruct
-    public void startServer() {
-        // Only start if we are pointing to localhost (Testing Mode)
-        if (ldapUrl != null && ldapUrl.contains("localhost")) {
-            try {
-                log.info("STARTING LOCAL MOCK LDAP SERVER for Base DN: {}", MOCK_BASE_DN);
-                
-                // 1. Configure the server with the specific Base DN
-                InMemoryDirectoryServerConfig config = new InMemoryDirectoryServerConfig(MOCK_BASE_DN);
-                config.addAdditionalBindCredentials("cn=admin", "admin");
-                
-                // 2. Disable Schema Validation (Crucial for Active Directory simulation)
-                config.setSchema(null); 
-
-                // 3. Set Listener on port 8389
-                config.setListenerConfigs(InMemoryListenerConfig.createLDAPConfig("default", 8389));
-
-                directoryServer = new InMemoryDirectoryServer(config);
-                
-                // 4. Load the data
-                ClassPathResource ldifResource = new ClassPathResource("users.ldif");
-                if (ldifResource.exists()) {
-                    File ldifFile = ldifResource.getFile();
-                    // Import only the entries (users), do not try to validate the root structure strictly
-                    directoryServer.importFromLDIF(true, ldifFile.getAbsolutePath());
-                    log.info("Loaded Mock Data from users.ldif");
-                } else {
-                    log.warn("users.ldif not found! Server started empty.");
-                }
-
-                directoryServer.startListening();
-                log.info("LOCAL MOCK LDAP SERVER STARTED on port 8389");
-                log.info("Test Credentials -> User: 1015698 | Password: pass123");
-
-            } catch (Exception e) {
-                log.error("Failed to start Local LDAP Server", e);
-            }
-        }
-    }
-
-    @PreDestroy
-    public void stopServer() {
-        if (directoryServer != null) {
-            directoryServer.shutDown(true);
-            log.info("Local LDAP Server Stopped.");
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-dn: cn=1015698,DC=UATAD,DC=SBI
-objectClass: top
-objectClass: person
-objectClass: organizationalPerson
-objectClass: user
-cn: 1015698
-sn: TestUser
-sAMAccountName: 1015698
-userPassword: pass123
-
-
-
-
-
-
-
-
-
-
-
-
-
-spring:
-  ldap:
-    urls: ldap://localhost:8389
-    base: DC=UATAD,DC=SBI
-    domain: UATAD.SBI
-
-### **How to Run & Validate**
-
-1.  **Restart the Application.**
-2.  **Check Logs:** You should see:
-    * `STARTING LOCAL MOCK LDAP SERVER...`
-    * `Loaded Mock Data from users.ldif` (No Errors!)
-    * `LOCAL MOCK LDAP SERVER STARTED on port 8389`
-3.  **Test Login (Postman/Curl):**
-    * **User:** `1015698`
-    * **Password:** `pass123`
-    * **Result:** `Login Successful` (Token Generated).
-4.  **Test Wrong Password:**
-    * **User:** `1015698`
-    * **Password:** `wrong`
-    * **Result:** `Incorrect credentials`.
-
-This setup allows you to test the **exact** `LoginServiceImpl` logic without needing the bank's firewall to be open yet.
-
+STARTING LOCAL MOCK LDAP SERVER for Base DN: DC=UATAD,DC=SBI
+2026-02-06 :: 19:43:15.420 || ERROR:: LocalLdapServer.java: | 66 | :: Failed to start Local LDAP Server
+com.unboundid.ldap.sdk.LDAPException: Unable to add entry 'cn=2488766,DC=UATAD,DC=SBI' because its parent entry 'DC=UATAD,DC=SBI' does not exist in the server.
+	at com.unboundid.ldap.listener.InMemoryRequestHandler.addEntry(InMemoryRequestHandler.java:5067)
+	at com.unboundid.ldap.listener.InMemoryRequestHandler.importFromLDIF(InMemoryRequestHandler.java:4769)
+	at com.unboundid.ldap.listener.InMemoryDirectoryServer.importFromLDIF(InMemoryDirectoryServer.java:1340)
+	at com.unboundid.ldap.listener.InMemoryDirectoryServer.importFromLDIF(InMemoryDirectoryServer.java:1311)
+	at com.unboundid.ldap.listener.InMemoryDirectoryServer.importFromLDIF(InMemoryDirectoryServer.java:1263)
+	at com.fincore.gateway.Config.LocalLdapServer.startServer(LocalLdapServer.java:55)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor$LifecycleMethod.invoke(InitDestroyAnnotationBeanPostProcessor.java:457)
+	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor$LifecycleMetadata.invokeInitMethods(InitDestroyAnnotationBeanPostProcessor.java:401)
+	at org.springframework.beans.factory.annotation.InitDestroyAnnotationBeanPostProcessor.postProcessBeforeInitialization(InitDestroyAnnotationBeanPostProcessor.java:219)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.applyBeanPostProcessorsBeforeInitialization(AbstractAutowireCapableBeanFactory.java:429)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.initializeBean(AbstractAutowireCapableBeanFactory.java:1818)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.doCreateBean(AbstractAutowireCapableBeanFactory.java:607)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBean(AbstractAutowireCapableBeanFactory.java:529)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.lambda$doGetBean$0(AbstractBeanFactory.java:339)
+	at org.springframework.beans.factory.support.DefaultSingletonBeanRegistry.getSingleton(DefaultSingletonBeanRegistry.java:373)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.doGetBean(AbstractBeanFactory.java:337)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.getBean(AbstractBeanFactory.java:202)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.instantiateSingleton(DefaultListableBeanFactory.java:1222)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.preInstantiateSingleton(DefaultListableBeanFactory.java:1188)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.preInstantiateSingletons(DefaultListableBeanFactory.java:1123)
+	at org.springframework.context.support.AbstractApplicationContext.finishBeanFactoryInitialization(AbstractApplicationContext.java:987)
+	at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:627)
+	at org.springframework.boot.web.reactive.context.ReactiveWebServerApplicationContext.refresh(ReactiveWebServerApplicationContext.java:66)
+	at org.springframework.boot.SpringApplication.refresh(SpringApplication.java:752)
+	at org.springframework.boot.SpringApplication.refreshContext(SpringApplication.java:439)
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:318)
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1361)
+	at org.springframework.boot.SpringApplication.run(SpringApplication.java:1350)
+	at com.fincore.gateway.LoginService.main(LoginService.java:12)
+2026-02-06 :: 19:43:16.115 || INFO :: QueryEnhancerFactory.java: | 49 | :: Hibernate is in classpath; If applicable, HQL parser will be used.
+2026-02-06 :: 19:43:16.202 || INFO :: LdapConfig.java: | 113 | :: Configuring LDAP Context Source. URL: ldap://localhost:8389
+2026-02-06 :: 19:43:16.209 || INFO :: LdapConfig.java: | 139 | :: SSL Disabled for Local/Plain LDAP Connection
