@@ -1,15 +1,14 @@
-<!-- Fixes: jakarta.validation.NoProviderFoundException -->
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-validation</artifactId>
-</dependency>
-
-<!-- Required for Local LDAP Mock Server -->
-<dependency>
-    <groupId>com.unboundid</groupId>
-    <artifactId>unboundid-ldapsdk</artifactId>
-</dependency>
-
+spring:
+  ldap:
+    urls: ldaps://10.189.42.83:636
+    base: DC=UATAD,DC=SBI
+    
+security:
+  ldap:
+    # LOCAL WINDOWS PATH EXAMPLE (Note the forward slashes /)
+    truststore-path: file:C:/fincore/secrets/ad-truststore.jks
+    # FOR LINUX SERVER IT WOULD BE: file:/etc/fincore/secrets/ad-truststore.jks
+    truststore-password: changeit
 
 
 
@@ -24,80 +23,91 @@
 
 package com.fincore.gateway.Config;
 
-import com.unboundid.ldap.listener.InMemoryDirectoryServer;
-import com.unboundid.ldap.listener.InMemoryDirectoryServerConfig;
-import com.unboundid.ldap.listener.InMemoryListenerConfig;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
 
-import java.io.File;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
-/**
- * Starts an embedded LDAP server for local testing ONLY.
- * Activated when the configured LDAP URL contains "localhost".
- */
 @Slf4j
 @Configuration
-public class LocalLdapServer {
+public class LdapConfig {
 
-    @Value("${spring.ldap.urls:}")
+    @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
     private String ldapUrl;
 
-    private InMemoryDirectoryServer directoryServer;
+    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
+    private String ldapBaseDn;
 
-    @PostConstruct
-    public void startServer() {
-        // Only start if we are pointing to localhost (Testing Mode)
-        if (ldapUrl != null && ldapUrl.contains("localhost")) {
-            try {
-                log.info("STARTING LOCAL MOCK LDAP SERVER...");
+    // INJECT THE PATH FROM YML
+    @Value("${security.ldap.truststore-path:}")
+    private String trustStorePath;
 
-                // CRITICAL FIX:
-                // We initialize the server with the TOP-MOST Root ("dc=SBI").
-                // This ensures it accepts "dc=SBI", "dc=UATAD,dc=SBI", etc.
-                InMemoryDirectoryServerConfig config = new InMemoryDirectoryServerConfig("dc=SBI");
-                
-                config.addAdditionalBindCredentials("cn=admin", "admin");
-                
-                // Disable Schema Validation (Active Directory simulation)
-                config.setSchema(null); 
+    // INJECT THE PASSWORD FROM YML
+    @Value("${security.ldap.truststore-password:changeit}")
+    private String trustStorePassword;
 
-                // Set Listener on port 8389
-                config.setListenerConfigs(InMemoryListenerConfig.createLDAPConfig("default", 8389));
+    private final ResourceLoader resourceLoader;
 
-                directoryServer = new InMemoryDirectoryServer(config);
-                
-                // Load the data
-                ClassPathResource ldifResource = new ClassPathResource("users.ldif");
-                if (ldifResource.exists()) {
-                    File ldifFile = ldifResource.getFile();
-                    // Import from LDIF. 
-                    directoryServer.importFromLDIF(true, ldifFile.getAbsolutePath());
-                    log.info("Loaded Mock Data from users.ldif");
-                } else {
-                    log.warn("users.ldif not found! Server started empty.");
-                }
-
-                directoryServer.startListening();
-                log.info("LOCAL MOCK LDAP SERVER STARTED on port 8389");
-                log.info("Test Credentials -> User: 1015698 | Password: pass123");
-
-            } catch (Exception e) {
-                log.error("Failed to start Local LDAP Server", e);
-            }
-        }
+    public LdapConfig(ResourceLoader resourceLoader) {
+        this.resourceLoader = resourceLoader;
     }
 
-    @PreDestroy
-    public void stopServer() {
-        if (directoryServer != null) {
-            directoryServer.shutDown(true);
-            log.info("Local LDAP Server Stopped.");
+    @Bean
+    public LdapContextSource contextSource() {
+        log.info("Configuring LDAP Context Source. URL: {}", ldapUrl);
+
+        // =========================================================================
+        // SECURE DYNAMIC TRUSTSTORE LOADING
+        // Reads from external file location defined in application.yml
+        // =========================================================================
+        if (ldapUrl.toLowerCase().startsWith("ldaps") && trustStorePath != null && !trustStorePath.isBlank()) {
+            try {
+                // ResourceLoader handles "file:C:/..." or "classpath:..." automatically
+                Resource trustStore = resourceLoader.getResource(trustStorePath);
+                
+                if (trustStore.exists()) {
+                    String absolutePath = trustStore.getFile().getAbsolutePath();
+                    log.info("Loading External Truststore from: {}", absolutePath);
+
+                    System.setProperty("javax.net.ssl.trustStore", absolutePath);
+                    System.setProperty("javax.net.ssl.trustStorePassword", trustStorePassword);
+                } else {
+                    log.error("CRITICAL: Truststore configured at '{}' but FILE NOT FOUND.", trustStorePath);
+                }
+            } catch (IOException e) {
+                log.error("Error loading truststore file", e);
+            }
         }
+
+        LdapContextSource contextSource = new LdapContextSource();
+        contextSource.setUrl(ldapUrl);
+        contextSource.setBase(ldapBaseDn);
+
+        Map<String, Object> baseEnv = new HashMap<>();
+        
+        // Smart Protocol logic
+        if (ldapUrl.toLowerCase().startsWith("ldaps")) {
+             baseEnv.put("java.naming.security.protocol", "ssl");
+        }
+       
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000");
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");
+
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+        return contextSource;
+    }
+
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        return new LdapTemplate(contextSource());
     }
 }
 
@@ -110,48 +120,8 @@ public class LocalLdapServer {
 
 
 
-
-
-
-
-
-
-
-
-# 1. Define the Top Level Domain (SBI)
-dn: dc=SBI
-objectClass: top
-objectClass: domain
-dc: SBI
-
-# 2. Define the Sub Domain (UATAD) - The Parent
-dn: dc=UATAD,dc=SBI
-objectClass: top
-objectClass: domain
-dc: UATAD
-
-# 3. Define the User (The Child)
-dn: cn=1015698,dc=UATAD,dc=SBI
-objectClass: top
-objectClass: person
-objectClass: organizationalPerson
-objectClass: user
-cn: 1015698
-sn: TestUser
-sAMAccountName: 1015698
-userPassword: pass123
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+security:
+  ldap:
+    truststore-path: ${LDAP_TRUSTSTORE_PATH}
+    truststore-password: ${LDAP_TRUSTSTORE_PASSWORD}
 
