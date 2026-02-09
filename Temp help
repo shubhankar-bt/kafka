@@ -1,174 +1,137 @@
-DROP TABLE HELP_SEARCH_ANALYTICS;
+// ... imports
+import org.springframework.security.core.context.SecurityContextHolder;
 
-CREATE TABLE HELP_SEARCH_ANALYTICS (
-    LOG_ID          VARCHAR2(50 CHAR) NOT NULL,
-    USER_ID         VARCHAR2(50 CHAR),         -- To track who asked
-    SEARCH_QUERY    VARCHAR2(500 CHAR),        -- The chat message
-    SCREEN_CONTEXT  VARCHAR2(100 CHAR),        -- Where were they? (e.g. CGL Management)
-    RESULT_STATUS   VARCHAR2(20 CHAR),         -- New: ANSWERED, SUGGESTION, NO_MATCH
-    CONFIDENCE_SCORE NUMBER(3,0),              -- New: 0-100
-    CLICKED_Q_ID    VARCHAR2(50 CHAR),         -- Populated later via Feedback API
-    SEARCH_TIMESTAMP TIMESTAMP DEFAULT SYSTIMESTAMP,
-    
-    CONSTRAINT PK_HELP_ANALYTICS PRIMARY KEY (LOG_ID)
-);
+// ... inside HelpService class ...
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.entity;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
-
-import java.time.LocalDateTime;
-import java.util.UUID;
-
-/**
- * Entity: HELP_SEARCH_ANALYTICS
- * Purpose: Logs every chat interaction for future analysis.
- */
-@Data
-@Entity
-@Table(name = "HELP_SEARCH_ANALYTICS")
-public class HelpSearchAnalyticsEntity {
-
-    @Id
-    @Column(name = "LOG_ID", length = 50)
-    private String logId;
-
-    @Column(name = "USER_ID", length = 50)
-    private String userId;
-
-    @Column(name = "SEARCH_QUERY", length = 500) // Matches SQL Column
-    private String searchQuery;
-
-    @Column(name = "SCREEN_CONTEXT", length = 100)
-    private String screenContext;
-
-    // Enum values: "ANSWERED", "SUGGESTION", "NO_MATCH"
-    @Column(name = "RESULT_STATUS", length = 20)
-    private String resultStatus;
-
-    // 0-100
-    @Column(name = "CONFIDENCE_SCORE")
-    private Integer confidenceScore;
-
-    // Populated later if user clicks a suggestion
-    @Column(name = "CLICKED_Q_ID", length = 50)
-    private String clickedQuestionId;
-
-    @CreationTimestamp
-    @Column(name = "SEARCH_TIMESTAMP", updatable = false)
-    private LocalDateTime searchTimestamp;
-
-    @PrePersist
-    public void generateId() {
-        if (this.logId == null || this.logId.isEmpty()) {
-            this.logId = UUID.randomUUID().toString();
+    // --- HANDLER 4: CHAT (The Smart Part with Context Boosting) ---
+    private HelpResponseDTO handleChat(String message, List<String> userActions, String currentScreenName) {
+        // 1. Validation
+        if (!StringUtils.hasText(message)) {
+            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
         }
-    }
-}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.entity.HelpSearchAnalyticsEntity;
-import com.fincore.helpservice.repository.HelpAnalyticsRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HelpAnalyticsService {
-
-    private final HelpAnalyticsRepository analyticsRepository;
-
-    /**
-     * Async Logging to ensure Chat response time is not affected.
-     */
-    @Async
-    public void logChatInteraction(String userId, String screenContext, String query, String status, int score) {
+        // 2. Extract Current User ID from JWT Context
+        String userId = "ANONYMOUS";
         try {
-            HelpSearchAnalyticsEntity entity = new HelpSearchAnalyticsEntity();
-            
-            entity.setUserId(userId != null ? userId : "ANONYMOUS");
-            entity.setScreenContext(screenContext);
-            entity.setSearchQuery(query);
-            entity.setResultStatus(status);
-            entity.setConfidenceScore(score);
-            
-            analyticsRepository.save(entity);
-            
+            userId = SecurityContextHolder.getContext().getAuthentication().getName();
         } catch (Exception e) {
-            // Log error but don't break the application flow
-            log.error("Failed to log analytics for query: [{}]", query, e);
+            log.warn("Could not retrieve User ID from Security Context", e);
+        }
+
+        // 3. Run Search Algorithm (With Context Boosting)
+        List<HelpItemDTO> matches = performSmartSearch(message, userActions, currentScreenName);
+
+        // 4. Analyze Scores & Decision Tree
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, currentScreenName, message, "NO_MATCH", 0);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I don't have information about that. Please try rephrasing or check the FAQ.")
+                    .build();
+        }
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int bestScore = (int) bestMatch.getSearchScore();
+
+        if (bestScore >= SCORE_THRESHOLD_HIGH) {
+            // Case A: High Confidence -> Direct Answer
+            analyticsService.logChatInteraction(userId, currentScreenName, message, "ANSWERED", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(bestMatch.getAnswer())
+                    .build();
+
+        } else if (bestScore >= SCORE_THRESHOLD_LOW) {
+            // Case B: Medium Confidence -> Suggestions
+            analyticsService.logChatInteraction(userId, currentScreenName, message, "SUGGESTION", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply("I'm not sure, but did you mean one of these?")
+                    // Return top 3 suggestions
+                    .items(matches.stream().limit(3).collect(Collectors.toList()))
+                    .build();
+
+        } else {
+            // Case C: Low Confidence -> Treat as No Match
+            analyticsService.logChatInteraction(userId, currentScreenName, message, "NO_MATCH_LOW_SCORE", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I didn't understand that. Could you try rephrasing?")
+                    .build();
         }
     }
-}
 
+    // =========================================================================
+    // SEARCH ALGORITHM (Updated with Context Boosting)
+    // =========================================================================
 
+    private List<HelpItemDTO> performSmartSearch(String query, List<String> userActions, String currentScreenName) {
+        List<HelpQuestionEntity> allQuestions = getAllActiveQuestions();
+        String normalizedQuery = query.toLowerCase().trim();
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\W+"));
 
+        return allQuestions.stream()
+                // 1. RBAC Filter
+                .filter(q -> isActionAllowed(q, userActions))
+                // 2. Score Calculation
+                .map(q -> {
+                    int score = calculateScore(q, normalizedQuery, tokens, currentScreenName);
+                    return new AbstractMap.SimpleEntry<>(q, score);
+                })
+                // 3. Filter Zero Scores
+                .filter(entry -> entry.getValue() > 0)
+                // 4. Sort Descending
+                .sorted((e1, e2) -> Integer.compare(e2.getValue(), e1.getValue()))
+                // 5. Limit Results
+                .limit(5)
+                // 6. Map to DTO
+                .map(entry -> HelpItemDTO.builder()
+                        .id(entry.getKey().getQuestionId())
+                        .text(entry.getKey().getQuestionText())
+                        .answer(entry.getKey().getAnswerContent())
+                        .searchScore(entry.getValue())
+                        .type("SEARCH_RESULT")
+                        .build())
+                .collect(Collectors.toList());
+    }
 
+    private int calculateScore(HelpQuestionEntity q, String fullQuery, List<String> tokens, String currentScreenName) {
+        double score = 0;
+        String qText = q.getQuestionText().toLowerCase();
 
+        // --- Core Matching Logic ---
 
+        // 1. Exact Phrase Match (Highest Priority)
+        if (qText.equals(fullQuery)) score = 100;
+        else if (qText.contains(fullQuery)) score += 60;
 
+        // 2. Token Matching
+        int tokenMatches = 0;
+        for (String token : tokens) {
+            if (STOP_WORDS.contains(token)) continue;
 
+            if (qText.contains(token)) {
+                score += 15;
+                tokenMatches++;
+            } else if (q.getKeywords() != null && q.getKeywords().toLowerCase().contains(token)) {
+                score += 10; // Hidden keyword match
+                tokenMatches++;
+            } else if (fuzzyMatch(token, qText)) {
+                score += 5; // Typo match
+            }
+        }
 
+        // Bonus for matching multiple tokens (Context)
+        if (tokenMatches > 1) score += (tokenMatches * 5);
 
+        // --- CONTEXT BOOSTING ---
+        // If the question belongs to the screen the user is currently viewing, boost the score.
+        if (currentScreenName != null && currentScreenName.equalsIgnoreCase(q.getScreenName())) {
+            score = score * 2.5; // 250% Boost
+        }
 
+        // Cap at 100 to keep semantics clean (though higher internal scores help sorting)
+        return (int) Math.min(score, 100);
+    }
 
-
-
-
-
-
-
-
-// In handleChat method inside HelpService.java
-
-    // ... inside handleChat ...
-    
-    // Case A: High Confidence
-    if (bestScore >= SCORE_THRESHOLD_HIGH) {
-        // Update: Pass UserId (if available in request headers/context) and ScreenName
-        analyticsService.logChatInteraction("CURRENT_USER", request.getScreenName(), message, "ANSWERED", bestScore);
-        
-        return HelpResponseDTO.builder()
-                .responseType("TEXT_REPLY")
-                .botReply(bestMatch.getAnswer())
-                .build();
-    } 
-    // ... repeat for other cases (SUGGESTION, NO_MATCH) ...
 
