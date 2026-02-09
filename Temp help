@@ -1,1 +1,811 @@
-shcb shcs
+package com.fincore.helpservice.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+    // Enables @Async annotation support
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class HelpRequestDTO {
+
+    /**
+     * The intent of the user.
+     * Values: MODULE_QUESTIONS, FAQ_LIST, GET_ANSWER, CHAT
+     */
+    @NotNull(message = "Request Type is mandatory")
+    private String requestType;
+
+    // --- Conditional Fields (based on requestType) ---
+
+    // For MODULE_QUESTIONS
+    private String screenName;
+
+    // For GET_ANSWER (When user clicks a specific question)
+    private String questionId;
+
+    // For CHAT (When user types)
+    private String chatMessage;
+
+    // RBAC: User's Allowed Actions (from Login Token)
+    @NotNull(message = "User actions cannot be null")
+    private List<String> userActions;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class HelpResponseDTO {
+
+    /**
+     * Tells the Frontend how to render the response.
+     * - "TEXT_REPLY": Show a bot bubble with text.
+     * - "LIST_SELECTION": Show a list of clickable options (Questions).
+     * - "SUGGESTION": Show "Did you mean?" with options.
+     * - "NO_MATCH": Show apology.
+     */
+    private String responseType;
+
+    // The main text content (Answer or Apology)
+    private String botReply;
+
+    // List of items (Questions for Module, Suggestions, or FAQs)
+    private List<HelpItemDTO> items;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Data
+@Entity
+@Table(name = "HELP_SEARCH_ANALYTICS")
+public class HelpSearchAnalyticsEntity {
+
+    @Id
+    @Column(name = "LOG_ID", length = 50)
+    private String logId;
+
+    @Column(name = "USER_QUERY", length = 500)
+    private String userQuery;
+
+    // "FOUND", "NO_MATCH", "SUGGESTION"
+    @Column(name = "RESULT_STATUS", length = 20)
+    private String resultStatus;
+
+    // How confident was the bot? (0-100)
+    @Column(name = "CONFIDENCE_SCORE")
+    private Integer confidenceScore;
+
+    @CreationTimestamp
+    @Column(name = "SEARCH_TIMESTAMP")
+    private LocalDateTime searchTimestamp;
+
+    @PrePersist
+    public void generateId() {
+        if (this.logId == null) {
+            this.logId = UUID.randomUUID().toString();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.entity.HelpSearchAnalyticsEntity;
+import com.fincore.helpservice.repository.HelpAnalyticsRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpAnalyticsService {
+
+    private final HelpAnalyticsRepository analyticsRepository;
+
+    @Async
+    public void logChatInteraction(String query, String status, int score) {
+        try {
+            HelpSearchAnalyticsEntity entity = new HelpSearchAnalyticsEntity();
+            entity.setUserQuery(query);
+            entity.setResultStatus(status);
+            entity.setConfidenceScore(score);
+            
+            analyticsRepository.save(entity);
+            // log.info("Async Analytics Logged: [{}] - Status: {}", query, status);
+        } catch (Exception e) {
+            log.error("Failed to log analytics", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpItemDTO;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.entity.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpService {
+
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpAnalyticsService analyticsService;
+
+    // Thresholds for "Smart Chat"
+    private static final int SCORE_THRESHOLD_HIGH = 75; // Above this -> Direct Answer
+    private static final int SCORE_THRESHOLD_LOW = 30;  // Between 30-75 -> Suggestions
+
+    /**
+     * MAIN PROCESSOR: Routes based on Intent (Request Type)
+     */
+    public HelpResponseDTO processRequest(HelpRequestDTO request) {
+        
+        // 1. Normalize Actions (Permissions)
+        List<String> userActions = normalizeActions(request.getUserActions());
+        String type = request.getRequestType();
+
+        switch (type) {
+            case "MODULE_QUESTIONS":
+                return handleModuleFetch(request.getScreenName(), userActions);
+            
+            case "FAQ_LIST":
+                return handleFaqFetch();
+
+            case "GET_ANSWER":
+                return handleGetAnswer(request.getQuestionId());
+
+            case "CHAT":
+                return handleChat(request.getChatMessage(), userActions);
+
+            default:
+                throw new IllegalArgumentException("Invalid Request Type: " + type);
+        }
+    }
+
+    // --- HANDLER 1: MODULE QUESTIONS ---
+    private HelpResponseDTO handleModuleFetch(String screenName, List<String> userActions) {
+        if (!StringUtils.hasText(screenName)) throw new IllegalArgumentException("Screen Name is required");
+
+        List<HelpItemDTO> items = getQuestionsForScreen(screenName).stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> HelpItemDTO.builder()
+                        .id(q.getQuestionId())
+                        .text(q.getQuestionText())
+                        .type("QUESTION")
+                        .build()) // Note: We do NOT send the full answer content here to keep it light
+                .collect(Collectors.toList());
+
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the topics for " + screenName + ":")
+                .items(items)
+                .build();
+    }
+
+    // --- HANDLER 2: FAQ FETCH ---
+    private HelpResponseDTO handleFaqFetch() {
+        List<HelpItemDTO> faqs = fetchGlobalFaqs();
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the frequently asked questions:")
+                .items(faqs)
+                .build();
+    }
+
+    // --- HANDLER 3: DIRECT ANSWER (Click) ---
+    private HelpResponseDTO handleGetAnswer(String questionId) {
+        return questionRepository.findById(questionId)
+                .map(q -> HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(q.getAnswerContent()) // HTML/Text Answer
+                        .build())
+                .orElse(HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("Sorry, I couldn't find the content for that question.")
+                        .build());
+    }
+
+    // --- HANDLER 4: CHAT (The Smart Part) ---
+    private HelpResponseDTO handleChat(String message, List<String> userActions) {
+        if (!StringUtils.hasText(message)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+
+        // 1. Run Search Algorithm
+        List<HelpItemDTO> matches = performSmartSearch(message, userActions);
+
+        // 2. Analyze Scores
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(message, "NO_MATCH", 0);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I don't have information about that. Please try rephrasing or check the FAQ.")
+                    .build();
+        }
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int bestScore = (int) bestMatch.getSearchScore();
+
+        // 3. Decision Tree
+        if (bestScore >= SCORE_THRESHOLD_HIGH) {
+            // Case A: High Confidence -> Direct Answer
+            analyticsService.logChatInteraction(message, "ANSWERED", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(bestMatch.getAnswer())
+                    .build();
+        } else if (bestScore >= SCORE_THRESHOLD_LOW) {
+            // Case B: Medium Confidence -> Suggestions
+            analyticsService.logChatInteraction(message, "SUGGESTION", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply("I'm not sure, but did you mean one of these?")
+                    .items(matches.stream().limit(3).collect(Collectors.toList())) // Top 3
+                    .build();
+        } else {
+            // Case C: Low Confidence -> Treat as No Match
+            analyticsService.logChatInteraction(message, "NO_MATCH_LOW_SCORE", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I didn't understand that. Could you try rephrasing?")
+                    .build();
+        }
+    }
+
+    // =========================================================================
+    // SEARCH ALGORITHM (Refined)
+    // =========================================================================
+
+    private List<HelpItemDTO> performSmartSearch(String query, List<String> userActions) {
+        List<HelpQuestionEntity> allQuestions = getAllActiveQuestions();
+        String normalizedQuery = query.toLowerCase().trim();
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\W+"));
+
+        return allQuestions.stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> {
+                    int score = calculateScore(q, normalizedQuery, tokens);
+                    return new AbstractMap.SimpleEntry<>(q, score);
+                })
+                .filter(entry -> entry.getValue() > 0)
+                .sorted((e1, e2) -> Integer.compare(e2.getValue(), e1.getValue())) // Sort Descending
+                .limit(5)
+                .map(entry -> HelpItemDTO.builder()
+                        .id(entry.getKey().getQuestionId())
+                        .text(entry.getKey().getQuestionText())
+                        .answer(entry.getKey().getAnswerContent())
+                        .searchScore(entry.getValue())
+                        .type("SEARCH_RESULT")
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    private int calculateScore(HelpQuestionEntity q, String fullQuery, List<String> tokens) {
+        int score = 0;
+        String qText = q.getQuestionText().toLowerCase();
+        
+        // 1. Exact Phrase Match (Highest Priority)
+        if (qText.equals(fullQuery)) return 100;
+        if (qText.contains(fullQuery)) score += 60;
+
+        // 2. Token Matching
+        int tokenMatches = 0;
+        for (String token : tokens) {
+            if (STOP_WORDS.contains(token)) continue;
+            
+            if (qText.contains(token)) {
+                score += 15;
+                tokenMatches++;
+            } else if (q.getKeywords() != null && q.getKeywords().toLowerCase().contains(token)) {
+                score += 10; // Hidden keyword match
+                tokenMatches++;
+            } else if (fuzzyMatch(token, qText)) {
+                score += 5; // Typo match
+            }
+        }
+        
+        // Bonus for matching multiple tokens (Context)
+        if (tokenMatches > 1) score += (tokenMatches * 5);
+
+        return Math.min(score, 100); // Cap at 100
+    }
+
+    // Existing Helpers (Fuzzy Match, Stop Words, etc.) remain the same...
+    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is", "does");
+    
+    private boolean fuzzyMatch(String token, String target) {
+        if (token.length() < 3) return false; // Don't fuzzy match short words
+        for(String word : target.split("\\W+")) {
+            if (calculateDistance(token, word) <= 1) return true; // Distance 1 for strictness
+        }
+        return false;
+    }
+
+    private int calculateDistance(String x, String y) {
+        // ... (Standard Levenshtein implementation as provided before) ...
+        int[][] dp = new int[x.length() + 1][y.length() + 1];
+        for (int i = 0; i <= x.length(); i++) {
+            for (int j = 0; j <= y.length(); j++) {
+                if (i == 0) dp[i][j] = j;
+                else if (j == 0) dp[i][j] = i;
+                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
+                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+            }
+        }
+        return dp[x.length()][y.length()];
+    }
+
+    // Database Fetchers
+    @Cacheable(value = "help_questions", key = "#screenName")
+    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
+        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    }
+
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() {
+        return questionRepository.findByIsActive("Y");
+    }
+    
+    public List<HelpItemDTO> fetchGlobalFaqs() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
+                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
+                .collect(Collectors.toList());
+    }
+
+    private List<String> normalizeActions(List<String> actions) {
+        return actions == null ? Collections.emptyList() : actions.stream().map(String::toUpperCase).collect(Collectors.toList());
+    }
+
+    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
+        if (q.getRequiredAction() == null || q.getRequiredAction().trim().isEmpty()) return true;
+        if (userActions.contains("ALL") || userActions.contains("*")) return true;
+        return userActions.contains(q.getRequiredAction().toUpperCase());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------
+
+4. 
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpItemDTO;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.entity.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpService {
+
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpAnalyticsService analyticsService;
+
+    // Thresholds for "Smart Chat"
+    private static final int SCORE_THRESHOLD_HIGH = 75; // Above this -> Direct Answer
+    private static final int SCORE_THRESHOLD_LOW = 30;  // Between 30-75 -> Suggestions
+
+    /**
+     * MAIN PROCESSOR: Routes based on Intent (Request Type)
+     */
+    public HelpResponseDTO processRequest(HelpRequestDTO request) {
+        
+        // 1. Normalize Actions (Permissions)
+        List<String> userActions = normalizeActions(request.getUserActions());
+        String type = request.getRequestType();
+
+        switch (type) {
+            case "MODULE_QUESTIONS":
+                return handleModuleFetch(request.getScreenName(), userActions);
+            
+            case "FAQ_LIST":
+                return handleFaqFetch();
+
+            case "GET_ANSWER":
+                return handleGetAnswer(request.getQuestionId());
+
+            case "CHAT":
+                return handleChat(request.getChatMessage(), userActions);
+
+            default:
+                throw new IllegalArgumentException("Invalid Request Type: " + type);
+        }
+    }
+
+    // --- HANDLER 1: MODULE QUESTIONS ---
+    private HelpResponseDTO handleModuleFetch(String screenName, List<String> userActions) {
+        if (!StringUtils.hasText(screenName)) throw new IllegalArgumentException("Screen Name is required");
+
+        List<HelpItemDTO> items = getQuestionsForScreen(screenName).stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> HelpItemDTO.builder()
+                        .id(q.getQuestionId())
+                        .text(q.getQuestionText())
+                        .type("QUESTION")
+                        .build()) // Note: We do NOT send the full answer content here to keep it light
+                .collect(Collectors.toList());
+
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the topics for " + screenName + ":")
+                .items(items)
+                .build();
+    }
+
+    // --- HANDLER 2: FAQ FETCH ---
+    private HelpResponseDTO handleFaqFetch() {
+        List<HelpItemDTO> faqs = fetchGlobalFaqs();
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the frequently asked questions:")
+                .items(faqs)
+                .build();
+    }
+
+    // --- HANDLER 3: DIRECT ANSWER (Click) ---
+    private HelpResponseDTO handleGetAnswer(String questionId) {
+        return questionRepository.findById(questionId)
+                .map(q -> HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(q.getAnswerContent()) // HTML/Text Answer
+                        .build())
+                .orElse(HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("Sorry, I couldn't find the content for that question.")
+                        .build());
+    }
+
+    // --- HANDLER 4: CHAT (The Smart Part) ---
+    private HelpResponseDTO handleChat(String message, List<String> userActions) {
+        if (!StringUtils.hasText(message)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+
+        // 1. Run Search Algorithm
+        List<HelpItemDTO> matches = performSmartSearch(message, userActions);
+
+        // 2. Analyze Scores
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(message, "NO_MATCH", 0);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I don't have information about that. Please try rephrasing or check the FAQ.")
+                    .build();
+        }
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int bestScore = (int) bestMatch.getSearchScore();
+
+        // 3. Decision Tree
+        if (bestScore >= SCORE_THRESHOLD_HIGH) {
+            // Case A: High Confidence -> Direct Answer
+            analyticsService.logChatInteraction(message, "ANSWERED", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(bestMatch.getAnswer())
+                    .build();
+        } else if (bestScore >= SCORE_THRESHOLD_LOW) {
+            // Case B: Medium Confidence -> Suggestions
+            analyticsService.logChatInteraction(message, "SUGGESTION", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply("I'm not sure, but did you mean one of these?")
+                    .items(matches.stream().limit(3).collect(Collectors.toList())) // Top 3
+                    .build();
+        } else {
+            // Case C: Low Confidence -> Treat as No Match
+            analyticsService.logChatInteraction(message, "NO_MATCH_LOW_SCORE", bestScore);
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I didn't understand that. Could you try rephrasing?")
+                    .build();
+        }
+    }
+
+    // =========================================================================
+    // SEARCH ALGORITHM (Refined)
+    // =========================================================================
+
+    private List<HelpItemDTO> performSmartSearch(String query, List<String> userActions) {
+        List<HelpQuestionEntity> allQuestions = getAllActiveQuestions();
+        String normalizedQuery = query.toLowerCase().trim();
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\W+"));
+
+        return allQuestions.stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> {
+                    int score = calculateScore(q, normalizedQuery, tokens);
+                    return new AbstractMap.SimpleEntry<>(q, score);
+                })
+                .filter(entry -> entry.getValue() > 0)
+                .sorted((e1, e2) -> Integer.compare(e2.getValue(), e1.getValue())) // Sort Descending
+                .limit(5)
+                .map(entry -> HelpItemDTO.builder()
+                        .id(entry.getKey().getQuestionId())
+                        .text(entry.getKey().getQuestionText())
+                        .answer(entry.getKey().getAnswerContent())
+                        .searchScore(entry.getValue())
+                        .type("SEARCH_RESULT")
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    private int calculateScore(HelpQuestionEntity q, String fullQuery, List<String> tokens) {
+        int score = 0;
+        String qText = q.getQuestionText().toLowerCase();
+        
+        // 1. Exact Phrase Match (Highest Priority)
+        if (qText.equals(fullQuery)) return 100;
+        if (qText.contains(fullQuery)) score += 60;
+
+        // 2. Token Matching
+        int tokenMatches = 0;
+        for (String token : tokens) {
+            if (STOP_WORDS.contains(token)) continue;
+            
+            if (qText.contains(token)) {
+                score += 15;
+                tokenMatches++;
+            } else if (q.getKeywords() != null && q.getKeywords().toLowerCase().contains(token)) {
+                score += 10; // Hidden keyword match
+                tokenMatches++;
+            } else if (fuzzyMatch(token, qText)) {
+                score += 5; // Typo match
+            }
+        }
+        
+        // Bonus for matching multiple tokens (Context)
+        if (tokenMatches > 1) score += (tokenMatches * 5);
+
+        return Math.min(score, 100); // Cap at 100
+    }
+
+    // Existing Helpers (Fuzzy Match, Stop Words, etc.) remain the same...
+    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is", "does");
+    
+    private boolean fuzzyMatch(String token, String target) {
+        if (token.length() < 3) return false; // Don't fuzzy match short words
+        for(String word : target.split("\\W+")) {
+            if (calculateDistance(token, word) <= 1) return true; // Distance 1 for strictness
+        }
+        return false;
+    }
+
+    private int calculateDistance(String x, String y) {
+        // ... (Standard Levenshtein implementation as provided before) ...
+        int[][] dp = new int[x.length() + 1][y.length() + 1];
+        for (int i = 0; i <= x.length(); i++) {
+            for (int j = 0; j <= y.length(); j++) {
+                if (i == 0) dp[i][j] = j;
+                else if (j == 0) dp[i][j] = i;
+                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
+                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+            }
+        }
+        return dp[x.length()][y.length()];
+    }
+
+    // Database Fetchers
+    @Cacheable(value = "help_questions", key = "#screenName")
+    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
+        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    }
+
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() {
+        return questionRepository.findByIsActive("Y");
+    }
+    
+    public List<HelpItemDTO> fetchGlobalFaqs() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
+                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
+                .collect(Collectors.toList());
+    }
+
+    private List<String> normalizeActions(List<String> actions) {
+        return actions == null ? Collections.emptyList() : actions.stream().map(String::toUpperCase).collect(Collectors.toList());
+    }
+
+    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
+        if (q.getRequiredAction() == null || q.getRequiredAction().trim().isEmpty()) return true;
+        if (userActions.contains("ALL") || userActions.contains("*")) return true;
+        return userActions.contains(q.getRequiredAction().toUpperCase());
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.entity.HelpSearchAnalyticsEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyticsEntity, String> {
+    // Standard CRUD
+}
+
+
+
+
+
+
+
+
+
+
+
