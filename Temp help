@@ -1,239 +1,237 @@
-payload i tried :  
+package com.fincore.helpservice.service;
 
-{
-   "requestType": "CHAT",
-   "chatMessage": "cgl create",
-   "userActions": [""]
+import org.springframework.stereotype.Service;
+import java.util.*;
+import java.util.regex.Pattern;
+
+/**
+ * THE BRAIN.
+ * Responsible for understanding English grammar, identifying intents, 
+ * and normalizing complex sentences into executable commands.
+ */
+@Service
+public class NLPEngine {
+
+    // Noise words that don't add meaning to our specific domain
+    private static final Set<String> STOP_WORDS = Set.of(
+        "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", 
+        "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", 
+        "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves", 
+        "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are", 
+        "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", 
+        "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until", 
+        "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", 
+        "through", "during", "before", "after", "above", "below", "to", "from", "up", "down", 
+        "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here", 
+        "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", 
+        "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", 
+        "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "please", "kindly", "help"
+    );
+
+    // ACTION MAPPING: Maps various English variations to a Core Action
+    private static final Map<String, String> ACTION_ROOTS = new HashMap<>();
+    static {
+        // CREATE roots
+        List.of("create", "creation", "creating", "created", "add", "adding", "addition", "new", "generate", "generation", "make", "making", "raise", "raising")
+            .forEach(w -> ACTION_ROOTS.put(w, "CREATE"));
+        
+        // MODIFY roots
+        List.of("modify", "modification", "modifying", "edit", "editing", "edits", "update", "updating", "change", "changing", "correction", "correct")
+            .forEach(w -> ACTION_ROOTS.put(w, "MODIFY"));
+        
+        // APPROVE roots
+        List.of("approve", "approval", "approving", "approved", "accept", "accepting", "accepted", "authorize", "authorization", "sign", "pass", "passing")
+            .forEach(w -> ACTION_ROOTS.put(w, "APPROVE"));
+            
+        // VIEW roots
+        List.of("view", "viewing", "show", "showing", "see", "seeing", "check", "checking", "display", "list", "listing", "fetch", "get")
+            .forEach(w -> ACTION_ROOTS.put(w, "VIEW"));
+            
+        // DELETE roots
+        List.of("delete", "deletion", "deleting", "remove", "removing", "removal", "cancel", "cancelling", "trash", "drop")
+            .forEach(w -> ACTION_ROOTS.put(w, "DELETE"));
+
+        // DOWNLOAD roots
+        List.of("download", "export", "save", "print")
+            .forEach(w -> ACTION_ROOTS.put(w, "DOWNLOAD"));
+    }
+
+    /**
+     * Input: "Can I please creating a new CGL?"
+     * Output: "create cgl"
+     */
+    public String extractNormalizedIntent(String sentence) {
+        if (sentence == null) return "";
+        
+        // 1. Lowercase & Remove Special Chars
+        String clean = sentence.toLowerCase().replaceAll("[^a-z0-9\\s]", " ");
+        
+        StringBuilder normalized = new StringBuilder();
+        
+        for (String word : clean.split("\\s+")) {
+            if (word.isEmpty()) continue;
+            
+            // 2. Stop Word Removal
+            if (STOP_WORDS.contains(word)) continue;
+            
+            // 3. Stemming/Root Mapping (The "Smart" part)
+            // If word is "creation", map to "CREATE"
+            String root = ACTION_ROOTS.getOrDefault(word, word);
+            
+            normalized.append(root).append(" ");
+        }
+        
+        return normalized.toString().trim();
+    }
+
+    /**
+     * Identifies the ACTION verb from the sentence.
+     */
+    public String detectAction(String normalizedSentence) {
+        for (String word : normalizedSentence.split(" ")) {
+            if (ACTION_ROOTS.containsValue(word.toUpperCase())) {
+                return word.toUpperCase();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Identifies the MODULE/CONTEXT from the sentence based on known screens.
+     */
+    public String detectScreen(String sentence) {
+        String lower = sentence.toLowerCase();
+        // Specific checks for multi-word screens
+        if (lower.contains("cgl")) return "CGL Management";
+        if (lower.contains("segment")) return "Segment Management";
+        if (lower.contains("branch")) return "Branch Management";
+        if (lower.contains("user")) return "User Management";
+        if (lower.contains("role")) return "Role Management";
+        if (lower.contains("calendar")) return "Calendar Configuration";
+        if (lower.contains("state")) return "State Management";
+        if (lower.contains("currency") && lower.contains("rate")) return "Currency Rate Management";
+        if (lower.contains("currency")) return "Currency Management";
+        if (lower.contains("journal")) return "Journal Management";
+        if (lower.contains("report")) return "Reports";
+        
+        return null;
+    }
 }
 
-got the error : 
-2026-02-10 18:14:50.259 INFO  [http-nio-9099-exec-3] c.f.h.c.HelpController: Received Help Bot Request for Type: CHAT 
-2026-02-10 18:14:50.402 ERROR [http-nio-9099-exec-3] c.f.h.e.GlobalExceptionHandler: Unhandled Exception at /api/help/fetch:  
-org.springframework.dao.IncorrectResultSizeDataAccessException: Query did not return a unique result: 3 results were returned
-	at org.springframework.orm.jpa.vendor.HibernateJpaDialect.convertHibernateAccessException(HibernateJpaDialect.java:301)
-	at org.springframework.orm.jpa.vendor.HibernateJpaDialect.translateExceptionIfPossible(HibernateJpaDialect.java:244)
-	at org.springframework.orm.jpa.AbstractEntityManagerFactoryBean.translateExceptionIfPossible(AbstractEntityManagerFactoryBean.java:550)
-	at org.springframework.dao.support.ChainedPersistenceExceptionTranslator.translateExceptionIfPossible(ChainedPersistenceExceptionTranslator.java:61)
-	at org.springframework.dao.support.DataAccessUtils.translateIfNecessary(DataAccessUtils.java:335)
-	at org.springframework.dao.support.PersistenceExceptionTranslationInterceptor.invoke(PersistenceExceptionTranslationInterceptor.java:152)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.data.jpa.repository.support.CrudMethodMetadataPostProcessor$CrudMethodMetadataPopulatingMethodInterceptor.invoke(CrudMethodMetadataPostProcessor.java:136)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:223)
-	at jdk.proxy2/jdk.proxy2.$Proxy167.findActionForUserAndScreen(Unknown Source)
-	at com.fincore.helpservice.service.PermissionService.getUserActions(PermissionService.java:26)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)
-	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.lambda$applyResilience$0(GlobalResilienceAspect.java:56)
-	at io.github.resilience4j.retry.Retry.lambda$decorateSupplier$5(Retry.java:301)
-	at io.github.resilience4j.circuitbreaker.CircuitBreaker.lambda$decorateSupplier$5(CircuitBreaker.java:194)
-	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.applyResilience(GlobalResilienceAspect.java:75)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:637)
-	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:627)
-	at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720)
-	at com.fincore.helpservice.service.PermissionService$$SpringCGLIB$$0.getUserActions(<generated>)
-	at com.fincore.helpservice.service.HelpService.handleChat(HelpService.java:162)
-	at com.fincore.helpservice.service.HelpService.processRequest(HelpService.java:69)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)
-	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.lambda$applyResilience$0(GlobalResilienceAspect.java:56)
-	at io.github.resilience4j.retry.Retry.lambda$decorateSupplier$5(Retry.java:301)
-	at io.github.resilience4j.circuitbreaker.CircuitBreaker.lambda$decorateSupplier$5(CircuitBreaker.java:194)
-	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.applyResilience(GlobalResilienceAspect.java:75)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:637)
-	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:627)
-	at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
-	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720)
-	at com.fincore.helpservice.service.HelpService$$SpringCGLIB$$0.processRequest(<generated>)
-	at com.fincore.helpservice.controller.HelpController.getHelp(HelpController.java:32)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:255)
-	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:188)
-	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118)
-	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:926)
-	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:831)
-	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
-	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)
-	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979)
-	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1014)
-	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:914)
-	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:590)
-	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
-	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:658)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:108)
-	at org.springframework.security.web.FilterChainProxy.lambda$doFilterInternal$3(FilterChainProxy.java:231)
-	at org.springframework.security.web.ObservationFilterChainDecorator$FilterObservation$SimpleFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:479)
-	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:340)
-	at org.springframework.security.web.ObservationFilterChainDecorator.lambda$wrapSecured$0(ObservationFilterChainDecorator.java:82)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:128)
-	at org.springframework.security.web.access.intercept.AuthorizationFilter.doFilter(AuthorizationFilter.java:100)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:126)
-	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:120)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:131)
-	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:85)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.authentication.AnonymousAuthenticationFilter.doFilter(AnonymousAuthenticationFilter.java:100)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter.doFilter(SecurityContextHolderAwareRequestFilter.java:179)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.savedrequest.RequestCacheAwareFilter.doFilter(RequestCacheAwareFilter.java:63)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at com.fincore.commonutilities.security.ContextRbacFilter.doFilterInternal(ContextRbacFilter.java:145)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at com.fincore.commonutilities.logging.MdcLoggingFilter.doFilterInternal(MdcLoggingFilter.java:66)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:107)
-	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:93)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.web.filter.CorsFilter.doFilterInternal(CorsFilter.java:91)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.header.HeaderWriterFilter.doHeadersAfter(HeaderWriterFilter.java:90)
-	at org.springframework.security.web.header.HeaderWriterFilter.doFilterInternal(HeaderWriterFilter.java:75)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:82)
-	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:69)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter.doFilterInternal(WebAsyncManagerIntegrationFilter.java:62)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.session.DisableEncodeUrlFilter.doFilterInternal(DisableEncodeUrlFilter.java:42)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
-	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$0(ObservationFilterChainDecorator.java:323)
-	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:224)
-	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
-	at org.springframework.security.web.FilterChainProxy.doFilterInternal(FilterChainProxy.java:233)
-	at org.springframework.security.web.FilterChainProxy.doFilter(FilterChainProxy.java:191)
-	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
-	at org.springframework.web.servlet.handler.HandlerMappingIntrospector.lambda$createCacheFilter$3(HandlerMappingIntrospector.java:195)
-	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
-	at org.springframework.web.filter.CompositeFilter.doFilter(CompositeFilter.java:74)
-	at org.springframework.security.config.annotation.web.configuration.WebMvcSecurityConfiguration$CompositeFilterChainProxy.doFilter(WebMvcSecurityConfiguration.java:230)
-	at org.springframework.web.filter.DelegatingFilterProxy.invokeDelegate(DelegatingFilterProxy.java:352)
-	at org.springframework.web.filter.DelegatingFilterProxy.doFilter(DelegatingFilterProxy.java:268)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.springframework.web.filter.ServerHttpObservationFilter.doFilterInternal(ServerHttpObservationFilter.java:109)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
-	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
-	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
-	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
-	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167)
-	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
-	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482)
-	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115)
-	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
-	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74)
-	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344)
-	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:389)
-	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63)
-	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:896)
-	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1741)
-	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
-	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190)
-	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659)
-	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:63)
-	at java.base/java.lang.Thread.run(Thread.java:1570)
-Caused by: org.hibernate.NonUniqueResultException: Query did not return a unique result: 3 results were returned
-	at org.hibernate.query.spi.AbstractSelectionQuery.uniqueElement(AbstractSelectionQuery.java:578)
-	at org.hibernate.query.spi.AbstractSelectionQuery.getSingleResult(AbstractSelectionQuery.java:561)
-	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
-	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
-	at org.springframework.orm.jpa.SharedEntityManagerCreator$DeferredQueryInvocationHandler.invoke(SharedEntityManagerCreator.java:418)
-	at jdk.proxy2/jdk.proxy2.$Proxy207.getSingleResult(Unknown Source)
-	at org.springframework.data.jpa.repository.query.JpaQueryExecution$SingleEntityExecution.doExecute(JpaQueryExecution.java:223)
-	at org.springframework.data.jpa.repository.query.JpaQueryExecution.execute(JpaQueryExecution.java:92)
-	at org.springframework.data.jpa.repository.query.AbstractJpaQuery.doExecute(AbstractJpaQuery.java:152)
-	at org.springframework.data.jpa.repository.query.AbstractJpaQuery.execute(AbstractJpaQuery.java:140)
-	at org.springframework.data.repository.core.support.RepositoryMethodInvoker.doInvoke(RepositoryMethodInvoker.java:170)
-	at org.springframework.data.repository.core.support.RepositoryMethodInvoker.invoke(RepositoryMethodInvoker.java:158)
-	at org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor.doInvoke(QueryExecutorMethodInterceptor.java:164)
-	at org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor.invoke(QueryExecutorMethodInterceptor.java:143)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.data.projection.DefaultMethodInvokingMethodInterceptor.invoke(DefaultMethodInvokingMethodInterceptor.java:70)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.transaction.interceptor.TransactionInterceptor$1.proceedWithInvocation(TransactionInterceptor.java:123)
-	at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:392)
-	at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:119)
-	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
-	at org.springframework.dao.support.PersistenceExceptionTranslationInterceptor.invoke(PersistenceExceptionTranslationInterceptor.java:137)
-	... 194 common frames omitted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.util.*;
+
+@Service
+public class SmallTalkService {
+
+    private static final Map<List<String>, List<String>> CONVERSATIONS = new HashMap<>();
+
+    static {
+        // Greetings
+        CONVERSATIONS.put(List.of("hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"), 
+            List.of("Hello! How can I help you today?", "Hi there! What can I do for you?", "Greetings! Need help with FinCore?"));
+
+        // Status
+        CONVERSATIONS.put(List.of("how are you", "how are you doing", "what's up"), 
+            List.of("I'm doing great, thanks for asking! How about you?", "I am fully operational and ready to help."));
+
+        // Gratitude
+        CONVERSATIONS.put(List.of("thank", "thanks", "thank you", "thx", "cool", "awesome"), 
+            List.of("You're welcome!", "Glad I could help.", "Anytime!"));
+
+        // Identity
+        CONVERSATIONS.put(List.of("who are you", "what are you", "your name"), 
+            List.of("I am the FinCore Smart Assistant.", "I'm a bot designed to help you navigate FinCore."));
+        
+        // Frustration (Handling negative sentiment)
+        CONVERSATIONS.put(List.of("stupid", "useless", "dumb", "hate", "idiot"), 
+            List.of("I'm sorry if I wasn't helpful. I'm still learning.", "Apologies. Could you try rephrasing your question?"));
+    }
+
+    public String getSmallTalkResponse(String userMessage) {
+        String lower = userMessage.toLowerCase().replaceAll("[^a-z\\s]", "");
+        
+        for (Map.Entry<List<String>, List<String>> entry : CONVERSATIONS.entrySet()) {
+            for (String keyPhrase : entry.getKey()) {
+                // Check if message is essentially just this phrase (fuzzy match)
+                if (lower.contains(keyPhrase)) {
+                    List<String> responses = entry.getValue();
+                    return responses.get(new Random().nextInt(responses.size()));
+                }
+            }
+        }
+        return null; // Not small talk
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+@Service
+public class SmartResponseGenerator {
+
+    public String generatePermissionResponse(boolean isAllowed, String action, String module, String user) {
+        String userName = (user != null) ? user : "User";
+        
+        if (isAllowed) {
+            return String.format("Yes, %s, you have permission to **%s** in **%s**.", userName, action, module);
+        } else {
+            return switch (action) {
+                case "CREATE" -> 
+                    String.format("I checked your profile, %s. Unfortunately, you **do not** have rights to create entries in **%s**.", userName, module);
+                case "APPROVE" -> 
+                    String.format("No, %s. Approval in **%s** is restricted. You need 'APPROVER' rights for this.", userName, module);
+                case "DELETE" -> 
+                    String.format("Sorry %s, deletion is a sensitive action in **%s** and you don't have the required permissions.", userName, module);
+                default -> 
+                    String.format("No, %s. You are not authorized to perform **%s** in **%s**.", userName, module, action);
+            };
+        }
+    }
+    
+    public String generateSuggestionResponse() {
+         List<String> intros = List.of(
+             "I'm not 100% sure, but did you mean one of these?",
+             "I found a few things that might help:",
+             "Here is what I found related to that:"
+         );
+         return intros.get((int) (Math.random() * intros.size()));
+    }
+}
 
 
 
@@ -251,28 +249,6 @@ Caused by: org.hibernate.NonUniqueResultException: Query did not return a unique
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// ============================================================================================
-// updated code of the application :
-// ============================================================================================
 
 package com.fincore.helpservice.service;
 
@@ -281,8 +257,10 @@ import com.fincore.helpservice.dto.HelpRequestDTO;
 import com.fincore.helpservice.dto.HelpResponseDTO;
 import com.fincore.helpservice.model.HelpFaqEntity;
 import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.model.HelpScreenEntity; // Assuming you have this
 import com.fincore.helpservice.repository.HelpFaqRepository;
 import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.repository.HelpScreenRepository; // Needed for disambiguation
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
@@ -298,363 +276,192 @@ import java.util.stream.Stream;
 @Slf4j
 public class HelpService {
 
-    // Thresholds for "Smart Chat"
-    private static final int SCORE_THRESHOLD_HIGH = 65; // Above this -> Direct Answer
-    private static final int SCORE_THRESHOLD_LOW = 25;  // Between 30-75 -> Suggestions
-
-    // --- SYNONYM MAP (The Smart Dictionary) ---
-    private static final Map<String, List<String>> SYNONYMS = new HashMap<>();
-    // Words to ignore in search to improve relevance
-    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is");
-
-    static {
-        SYNONYMS.put("create", List.of("add", "new", "generate", "make", "raise"));
-        SYNONYMS.put("modify", List.of("edit", "update", "change", "correct"));
-        SYNONYMS.put("approve", List.of("authorize", "pass", "accept", "sign"));
-        SYNONYMS.put("view", List.of("show", "see", "check", "display", "list"));
-        SYNONYMS.put("delete", List.of("remove", "cancel", "trash"));
-        SYNONYMS.put("logout", List.of("sign out", "log out", "exit"));
-    }
-
+    // ... [Existing Repositories] ...
     private final HelpQuestionRepository questionRepository;
     private final HelpFaqRepository faqRepository;
+    private final HelpScreenRepository screenRepository; // Needs to be added
     private final HelpAnalyticsService analyticsService;
     private final PermissionService permissionService;
+    
+    // ... [Existing Services] ...
+    private final NLPEngine nlpEngine;
+    private final SmallTalkService smallTalkService;
+    private final SmartResponseGenerator responseGenerator;
+    
+    // NEW SERVICES
+    private final ChatSessionService sessionService;
+    private final SentimentAnalyzer sentimentAnalyzer;
 
+    // Thresholds
+    private static final int SCORE_THRESHOLD_HIGH = 60; 
+    private static final int SCORE_THRESHOLD_LOW = 20;
 
-    /**
-     * MAIN PROCESSOR: Routes based on Intent (Request Type)
-     */
     public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
-
-        // 1. Normalize Actions (Permissions)
-        List<String> userActions = normalizeActions(request.getUserActions());
+        // ... [Existing Switch Case logic remains same] ...
         String type = request.getRequestType();
-
         switch (type) {
-            case "MODULE_QUESTIONS":
-                return handleModuleFetch(request.getScreenName(), roleId);
-
-            case "FAQ_LIST":
-                return handleFaqFetch();
-
-            case "GET_ANSWER":
-                return handleGetAnswer(request.getQuestionId());
-
-            case "CHAT":
-                return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
-
-            default:
-                throw new IllegalArgumentException("Invalid Request Type: " + type);
+             case "MODULE_QUESTIONS": return handleModuleFetch(request.getScreenName(), roleId);
+             case "FAQ_LIST": return handleFaqFetch();
+             case "GET_ANSWER": return handleGetAnswer(request.getQuestionId());
+             case "CHAT": return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
+             default: throw new IllegalArgumentException("Invalid Request Type");
         }
     }
 
+    // ... [Other Handlers remain same] ...
 
     // =========================================================================
-    // HANDLER 1: MODULE QUESTIONS
+    // THE ULTIMATE SMART CHAT HANDLER
     // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        if (!StringUtils.hasText(rawMessage)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
 
-    private HelpResponseDTO handleModuleFetch(String screenName, String roleId) {
-        if (!StringUtils.hasText(screenName)) throw new IllegalArgumentException("Screen Name is required");
+        StringBuilder botPrefix = new StringBuilder();
 
-        // Fetch User Permissions
-        List<String> userActions = permissionService.getUserActions(roleId, screenName);
-
-        List<HelpItemDTO> items = getQuestionsForScreen(screenName).stream()
-                .filter(q -> isActionAllowed(q, userActions))
-                .map(q -> HelpItemDTO.builder()
-                        .id(q.getQuestionId())
-                        .text(q.getQuestionText())
-                        .type("QUESTION")
-                        .build()) // Note: We do NOT send the full answer content here to keep it light
-                .collect(Collectors.toList());
-
-        return HelpResponseDTO.builder()
-                .responseType("LIST_SELECTION")
-                .botReply("Here are the topics for " + screenName + ":")
-                .items(items)
-                .build();
-    }
-
-    // =========================================================================
-    // HANDLER 2: FAQ FETCH
-    // =========================================================================
-    private HelpResponseDTO handleFaqFetch() {
-        List<HelpItemDTO> faqs = fetchGlobalFaqs();
-        return HelpResponseDTO.builder()
-                .responseType("LIST_SELECTION")
-                .botReply("Here are the frequently asked questions:")
-                .items(faqs)
-                .build();
-    }
-
-    // =========================================================================
-    // HANDLER 3: DIRECT ANSWER
-    // =========================================================================
-    private HelpResponseDTO handleGetAnswer(String questionId) {
-        return questionRepository.findById(questionId)
-                .map(q -> HelpResponseDTO.builder()
-                        .responseType("TEXT_REPLY")
-                        .botReply(q.getAnswerContent()) // HTML/Text Answer
-                        .build())
-                .orElse(HelpResponseDTO.builder()
-                        .responseType("NO_MATCH")
-                        .botReply("Sorry, I couldn't find the content for that question.")
-                        .build());
-    }
-
-    // =========================================================================
-    // HANDLER 4: CHAT
-    // =========================================================================
-    private HelpResponseDTO handleChat(String userId, String message, String clientScreenName, String roleid) {
-        if (!StringUtils.hasText(message)) {
-            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+        // 1. SENTIMENT ANALYSIS (Empathy Layer)
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        if (sentiment != SentimentAnalyzer.Sentiment.NEUTRAL) {
+            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
         }
 
-        // 1. Infer Context (If user types "CGL" but is on Home screen)
-        String inferredScreen = inferScreenFromQuery(message);
-        String activeScreen = (inferredScreen != null) ? inferredScreen : clientScreenName;
+        // 2. CHECK SMALL TALK (Personality Layer)
+        // Only if sentiment is neutral (don't joke if user is angry)
+        if (sentiment == SentimentAnalyzer.Sentiment.NEUTRAL) {
+            String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
+            if (smallTalk != null) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
+            }
+        }
 
-        // 2. Perform Search (Includes FAQs & Questions)
-        List<HelpItemDTO> matches = performSmartSearch(message, activeScreen);
+        // 3. NLP & CONTEXT RESOLUTION (Memory Layer)
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        String detectedAction = nlpEngine.detectAction(normalizedIntent);
+        String detectedScreen = nlpEngine.detectScreen(rawMessage);
 
-        // 3. Analyze Scores
+        // Retrieve History
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // A. CONTEXT MERGING: "What about Segment?" -> Uses previous Action "CREATE"
+        if (detectedAction == null && detectedScreen != null && session != null && session.getLastAction() != null) {
+            detectedAction = session.getLastAction();
+            normalizedIntent = detectedAction + " " + normalizedIntent; // Inject action into query
+            botPrefix.append("*(Assuming you want to ").append(detectedAction).append(")*<br/>");
+        }
+        
+        // B. CONTEXT MERGING: "How to create?" (Inside CGL Screen) -> Uses previous Screen
+        if (detectedScreen == null && detectedAction != null && clientScreenName != null) {
+            // Check if clientScreenName is valid module
+            detectedScreen = clientScreenName; 
+        }
+
+        // 4. DISAMBIGUATION (The "Clarifier")
+        // Scenario: User says "Approve" (Action) but NO Screen detected.
+        if (detectedAction != null && detectedScreen == null) {
+            // Find all screens where this user has this Action permission
+            List<String> validScreens = findScreensForAction(roleId, detectedAction);
+            
+            if (validScreens.size() > 1) {
+                // Return a "Clarification" response
+                sessionService.updateSession(userId, detectedAction, null); // Remember Action
+                return HelpResponseDTO.builder()
+                        .responseType("LIST_SELECTION") // Or a new type "DISAMBIGUATION"
+                        .botReply(botPrefix + "I see you want to **" + detectedAction + "**. Which module are you referring to?")
+                        .items(validScreens.stream().map(s -> HelpItemDTO.builder().text(s).id("CTX_" + s).type("CONTEXT_SUGGESTION").build()).collect(Collectors.toList()))
+                        .build();
+            } else if (validScreens.size() == 1) {
+                // Auto-select the only option
+                detectedScreen = validScreens.get(0);
+            }
+        }
+
+        // Update Session for next turn
+        sessionService.updateSession(userId, detectedAction, detectedScreen);
+
+        // 5. INTENT-BASED PERMISSION CHECK
+        String activeScreen = (detectedScreen != null) ? detectedScreen : clientScreenName;
+
+        if (detectedAction != null && activeScreen != null) {
+            List<String> allowedActions = permissionService.getUserActions(roleId, activeScreen);
+            boolean isAllowed = allowedActions.contains(detectedAction);
+            
+            String reply = responseGenerator.generatePermissionResponse(isAllowed, detectedAction, activeScreen, userId);
+            
+            if (!isAllowed) {
+                 analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", 100);
+                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + reply).build();
+            }
+        }
+
+        // 6. PERFORM SEARCH
+        // We use the "normalizedIntent" which might have been enriched by Context Merging
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen);
+
         if (matches.isEmpty()) {
-            analyticsService.logChatInteraction(userId, activeScreen, message, "NO_MATCH", 0);
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
             return HelpResponseDTO.builder()
-                    .responseType("NO_MATCH")
-                    .botReply("Sorry, I don't have information about that. Please try rephrasing.")
-                    .build();
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I'm sorry, I couldn't find an answer for that. Could you try rephrasing?")
+                .build();
         }
 
         HelpItemDTO bestMatch = matches.get(0);
         int score = (int) bestMatch.getSearchScore();
 
-        // 3. Permission Check (The "Polite Rejection" Logic)
         if (score >= SCORE_THRESHOLD_HIGH) {
-
-            // Check if it's a Restricted Question
-            if ("QUESTION".equals(bestMatch.getType()) && bestMatch.getRequiredAction() != null) {
-                List<String> userActions = permissionService.getUserActions(roleid, bestMatch.getScreenName());
-
-                // If user LACKS permission
-                if (!userActions.contains(bestMatch.getRequiredAction())) {
-                    String deniedMsg = permissionService.getAccessDeniedMessage(bestMatch.getRequiredAction(), bestMatch.getScreenName());
-
-                    analyticsService.logChatInteraction(userId, activeScreen, message, "ACCESS_DENIED", score);
-                    return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(deniedMsg).build();
-                }
+            // RBAC Check on Result
+             if ("QUESTION".equals(bestMatch.getType()) && bestMatch.getRequiredAction() != null) {
+                 List<String> allowedActions = permissionService.getUserActions(roleId, bestMatch.getScreenName());
+                 if (!allowedActions.contains(bestMatch.getRequiredAction())) {
+                     String deniedMsg = responseGenerator.generatePermissionResponse(false, bestMatch.getRequiredAction(), bestMatch.getScreenName(), userId);
+                     analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", score);
+                     return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + deniedMsg).build();
+                 }
+            }
+            
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ANSWERED", score);
+            
+            String finalReply = bestMatch.getAnswer();
+            if (detectedAction != null && activeScreen != null) {
+                String prefix = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalReply = prefix + "<br/><br/>" + bestMatch.getAnswer();
             }
 
-            // Access Granted or Public FAQ
-            analyticsService.logChatInteraction(userId, activeScreen, message, "ANSWERED", score);
-            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(bestMatch.getAnswer()).build();
-        }
-
-        // 4. Suggestions (Ambiguous)
-        else if (score >= SCORE_THRESHOLD_LOW) {
-            analyticsService.logChatInteraction(userId, activeScreen, message, "SUGGESTION", score);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + finalReply).build();
+        } 
+        else {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "SUGGESTION", score);
             return HelpResponseDTO.builder()
                     .responseType("SUGGESTION")
-                    .botReply("I'm not sure, but did you mean one of these?")
+                    .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
                     .items(matches.stream().limit(3).collect(Collectors.toList()))
                     .build();
         }
-
-        // 5. No Match
-        analyticsService.logChatInteraction(userId, activeScreen, message, "NO_MATCH_LOW", score);
-
-        return HelpResponseDTO.builder()
-                .responseType("NO_MATCH")
-                .botReply("I didn't quite get that. Could you be more specific?")
-                .build();
     }
 
-    // =========================================================================
-    // SEARCH ALGORITHM
-    // =========================================================================
-    private List<HelpItemDTO> performSmartSearch(String query, String activeScreen) {
-        String normalizedQuery = query.toLowerCase().trim();
-        List<String> tokens = tokenize(normalizedQuery);
-
-        // 1. Process Questions
-        Stream<HelpItemDTO> questions = getAllActiveQuestions().stream()
-                .map(q -> {
-                    int score = calculateScore(q.getQuestionText(), q.getKeywords(), q.getScreenName(), normalizedQuery, tokens, activeScreen);
-                    // Add Action Bonus (If query is "Create" and Question Action is "CREATE")
-                    if (q.getRequiredAction() != null && isActionMatch(normalizedQuery, q.getRequiredAction())) {
-                        score += 30; // Huge Intent Bonus
-                    }
-                    return HelpItemDTO.builder()
-                            .id(q.getQuestionId()).text(q.getQuestionText()).answer(q.getAnswerContent())
-                            .type("QUESTION").requiredAction(q.getRequiredAction()).screenName(q.getScreenName())
-                            .searchScore(score).build();
-                });
-
-        // 2. Process FAQs (Now included!)
-        Stream<HelpItemDTO> faqs = fetchGlobalFaqsEntity().stream()
-                .map(f -> {
-                    int score = calculateScore(f.getQuestionText(), null, "FAQ", normalizedQuery, tokens, null);
-                    return HelpItemDTO.builder()
-                            .id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent())
-                            .type("FAQ").searchScore(score).build();
-                });
-
-        // 3. Merge & Sort
-        return Stream.concat(questions, faqs)
-                .filter(item -> item.getSearchScore() > 0)
-                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore()))
-                .limit(5)
-                .collect(Collectors.toList());
-    }
-
-    private int calculateScore(String text, String keywords, String screenName, String fullQuery, List<String> tokens, String activeScreen) {
-        double score = 0;
-        String lowerText = text.toLowerCase();
-        String lowerKeywords = (keywords != null) ? keywords.toLowerCase() : "";
-
-        // A. Exact Match
-        if (lowerText.equals(fullQuery)) return 100;
-        if (lowerText.contains(fullQuery)) score += 50;
-
-        // B. Token Match with Synonyms
-        int matches = 0;
-        for (String token : tokens) {
-            if (STOP_WORDS.contains(token)) continue;
-
-            boolean tokenMatched = false;
-            // Direct Contain
-            if (lowerText.contains(token) || lowerKeywords.contains(token)) {
-                score += 15;
-                tokenMatched = true;
-            }
-            // Synonym Check
-            else if (matchesSynonym(token, lowerText)) {
-                score += 12; // Slightly less than exact word
-                tokenMatched = true;
-            }
-            // Fuzzy Check (Typo)
-            else if (fuzzyMatch(token, lowerText)) {
-                score += 5;
-                tokenMatched = true;
-            }
-
-            if (tokenMatched) matches++;
-        }
-
-        if (matches > 1) score += (matches * 5); // Combo bonus
-
-        // C. Context Boost
-        if (activeScreen != null && activeScreen.equalsIgnoreCase(screenName)) {
-            score = score * 2.5;
-        }
-
-        return (int) Math.min(score, 100);
-    }
-
-    // Levenshtein check (tolerance of 2 edits for words > 3 chars)
-    private boolean fuzzyMatch(String token, String target) {
-        if (target.contains(token)) return true;
-        if(token.length() < 3) return false;
-
-        // Check against each word in target to avoid matching across word boundaries
-        for (String word : target.split("\\W+")) {
-            if (calculateDistance(token, word) <= 1) return true;
-        }
-        return false;
-    }
-
-    // Standard Edit Distance Algo
-    private int calculateDistance(String x, String y) {
-        int[][] dp = new int[x.length() + 1][y.length() + 1];
-        for (int i = 0; i <= x.length(); i++) {
-            for (int j = 0; j <= y.length(); j++) {
-                if (i == 0) dp[i][j] = j;
-                else if (j == 0) dp[i][j] = i;
-                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
-                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+    // --- Helper for Disambiguation ---
+    private List<String> findScreensForAction(String roleId, String action) {
+        // 1. Get all screens
+        List<HelpScreenEntity> allScreens = screenRepository.findAll();
+        List<String> matchingScreens = new ArrayList<>();
+        
+        // 2. Check permissions for each
+        for(HelpScreenEntity screen : allScreens) {
+            List<String> actions = permissionService.getUserActions(roleId, screen.getScreenName());
+            if (actions.contains(action)) {
+                matchingScreens.add(screen.getScreenName());
             }
         }
-        return dp[x.length()][y.length()];
+        return matchingScreens;
     }
 
-    // =========================================================================
-    // CACHING & UTILS
-    // =========================================================================
-
-    @Cacheable(value = "help_questions", key = "#screenName")
-    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
-        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    // ... [Search Algorithm remains same, just ensure it handles the enriched normalizedQuery] ...
+     private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, String activeScreen) {
+        // ... same logic as previous step ...
+        // Ensure "tokens" are split from "normalizedQuery" which might now contain injected action
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+")); 
+        // ... rest of logic ...
+        return new ArrayList<>(); // Stub for brevity, use previous code
     }
-
-    @Cacheable(value = "help_questions_all", key = "'active_global'")
-    public List<HelpQuestionEntity> getAllActiveQuestions() {
-        return questionRepository.findByIsActive("Y");
-    }
-
-    @Cacheable(value = "help_faqs_all")
-    public List<HelpFaqEntity> fetchGlobalFaqsEntity() {
-        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y");
-    }
-
-    public List<HelpItemDTO> fetchGlobalFaqs() {
-        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
-                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
-                .collect(Collectors.toList());
-    }
-
-    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
-        // If question has no restricted action, it's public for that screen
-        if (q.getRequiredAction() == null || q.getRequiredAction().trim().isEmpty()) return true;
-
-        // Super Admin Bypass
-        if (userActions.contains("ALL") || userActions.contains("*")) return true;
-
-        // Check List Inclusion
-        return userActions.contains(q.getRequiredAction().toUpperCase());
-    }
-
-    private List<String> normalizeActions(List<String> actions) {
-        return actions == null ? Collections.emptyList() : actions.stream().map(String::toUpperCase).collect(Collectors.toList());
-    }
-
-
-    private boolean isActionMatch(String query, String action) {
-        // Check exact action
-        if (query.contains(action.toLowerCase())) return true;
-        // Check synonyms (e.g., "Add" matches "CREATE")
-        List<String> synonyms = SYNONYMS.getOrDefault(action.toLowerCase(), Collections.emptyList());
-        for(String syn : synonyms) {
-            if (query.contains(syn)) return true;
-        }
-        return false;
-    }
-
-    private boolean matchesSynonym(String token, String text) {
-        for (List<String> synonymList : SYNONYMS.values()) {
-            if (synonymList.contains(token)) {
-                for (String syn : synonymList) {
-                    if (text.contains(syn)) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private String inferScreenFromQuery(String query) {
-        String lower = query.toLowerCase();
-        if (lower.contains("cgl")) return "CGL Management";
-        if (lower.contains("segment")) return "Segment Management";
-        if (lower.contains("branch")) return "Branch Management";
-        if (lower.contains("user")) return "User Management";
-        return null;
-    }
-
-    private List<String> tokenize(String query) {
-        return Arrays.asList(query.split("\\W+"));
-    }
-
-
 }
 
 
@@ -674,134 +481,67 @@ public class HelpService {
 
 
 
-package com.fincore.helpservice.dto;
 
-import lombok.Builder;
+package com.fincore.helpservice.service;
+
 import lombok.Data;
-import java.io.Serializable;
-
-@Data
-@Builder
-public class HelpItemDTO implements Serializable {
-
-    private String id;
-    private String text;       // The Question
-    private String answer;     // The Answer (HTML/Text)
-    private String actionLink; // Deep Link
-    private String actionLabel;// Button Text
-    private String type;       // QUESTION, FAQ, SEARCH_RESULT
-    private double searchScore;
-
-    // New Fields for Internal Logic
-    private String requiredAction;
-    private String screenName;
-}
-
-
-
-
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
+import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.UUID;
-
-/**
- * Entity: HELP_SEARCH_ANALYTICS
- * Purpose: Logs every chat interaction for future analysis.
- */
-@Data
-@Entity
-@Table(name = "HELP_SEARCH_ANALYTICS")
-public class HelpSearchAnalyticsEntity {
-
-    @Id
-    @Column(name = "LOG_ID", length = 50)
-    private String logId;
-
-    @Column(name = "USER_ID", length = 50)
-    private String userId;
-
-    @Column(name = "SEARCH_QUERY", length = 500)
-    private String searchQuery;
-
-    @Column(name = "SCREEN_CONTEXT", length = 100)
-    private String screenContext;
-
-    // Enum values: "ANSWERED", "SUGGESTION", "NO_MATCH"
-    @Column(name = "RESULT_STATUS", length = 20)
-    private String resultStatus;
-
-    // 0-100
-    @Column(name = "CONFIDENCE_SCORE")
-    private Integer confidenceScore;
-
-    // Populated later if user clicks a suggestion
-    @Column(name = "CLICKED_Q_ID", length = 50)
-    private String clickedQuestionId;
-
-    @CreationTimestamp
-    @Column(name = "SEARCH_TIMESTAMP", updatable = false)
-    private LocalDateTime searchTimestamp;
-
-    @PrePersist
-    public void generateId() {
-        if (this.logId == null || this.logId.isEmpty()) {
-            this.logId = UUID.randomUUID().toString();
-        }
-    }
-}
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
-import com.fincore.helpservice.repository.HelpAnalyticsRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
-@RequiredArgsConstructor
-@Slf4j
-public class HelpAnalyticsService {
+public class ChatSessionService {
 
-    private final HelpAnalyticsRepository analyticsRepository;
+    // In a real prod env, use Redis. For now, ConcurrentMap is perfect for single instance.
+    private final Map<String, UserSession> sessions = new ConcurrentHashMap<>();
 
-    /**
-     * Async Logging to ensure Chat response time is not affected.
-     */
-    @Async
-    public void logChatInteraction(String userId, String screenContext, String query, String status, int score) {
-        try {
-            HelpSearchAnalyticsEntity entity = new HelpSearchAnalyticsEntity();
+    @Data
+    public static class UserSession {
+        private String lastAction;      // e.g., "CREATE"
+        private String lastScreen;      // e.g., "CGL Management"
+        private LocalDateTime lastInteraction;
+    }
 
-            entity.setUserId(userId != null ? userId : "ANONYMOUS");
-            entity.setScreenContext(screenContext);
-            entity.setSearchQuery(query);
-            entity.setResultStatus(status);
-            entity.setConfidenceScore(score);
+    public void updateSession(String userId, String action, String screen) {
+        UserSession session = sessions.getOrDefault(userId, new UserSession());
+        
+        // Only update if not null (keep old context if current is null)
+        if (action != null) session.setLastAction(action);
+        if (screen != null) session.setLastScreen(screen);
+        
+        session.setLastInteraction(LocalDateTime.now());
+        sessions.put(userId, session);
+    }
 
-            analyticsRepository.save(entity);
-//            log.info("Log analytics for query : {} is Successful.", query);
-        } catch (Exception e) {
-            // Log error but don't break the application flow
-            log.error("Failed to log analytics for query: [{}]", query, e);
+    public UserSession getSession(String userId) {
+        UserSession session = sessions.get(userId);
+        if (session == null) return null;
+
+        // Session Timeout (e.g., 5 minutes)
+        if (session.getLastInteraction().plusMinutes(5).isBefore(LocalDateTime.now())) {
+            sessions.remove(userId);
+            return null;
         }
+        return session;
+    }
+
+    public void clearSession(String userId) {
+        sessions.remove(userId);
     }
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -814,62 +554,49 @@ public class HelpAnalyticsService {
 
 package com.fincore.helpservice.service;
 
-import com.fincore.helpservice.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 @Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionService {
+public class SentimentAnalyzer {
 
-    private final PermissionRepository permissionRepository;
+    private static final Set<String> NEGATIVE_WORDS = Set.of(
+        "stupid", "useless", "bad", "hate", "broken", "fail", "idiot", "worst", "garbage", "nonsense"
+    );
 
-    /**
-     * Fetches the list of allowed actions (CREATE, APPROVE, etc.) for a user on a specific screen.
-     */
-    public List<String> getUserActions(String roleId, String screenName) {
-        if (screenName == null) return Collections.emptyList();
+    public enum Sentiment {
+        NEUTRAL, FRUSTRATED, ANGRY
+    }
 
-        String actionString = permissionRepository.findActionForUserAndScreen(roleId, screenName);
+    public Sentiment analyze(String text) {
+        if (text == null || text.trim().isEmpty()) return Sentiment.NEUTRAL;
 
-        if (actionString == null || actionString.isBlank()) {
-            return Collections.emptyList();
+        String clean = text.trim();
+        
+        // 1. CAPS LOCK DETECTION (If > 60% of chars are uppercase and length > 5)
+        long upperCount = clean.chars().filter(Character::isUpperCase).count();
+        long letterCount = clean.chars().filter(Character::isLetter).count();
+        
+        if (letterCount > 5 && ((double) upperCount / letterCount) > 0.6) {
+            return Sentiment.ANGRY;
         }
 
-        log.info("actionString : {}", actionString);
-        // Split "view|create|modify" -> ["VIEW", "CREATE", "MODIFY"]
-        return Arrays.stream(actionString.split("\\|"))
-                .map(String::trim)
-                .map(String::toUpperCase)
-                .collect(Collectors.toList());
+        // 2. KEYWORD DETECTION
+        String lower = clean.toLowerCase();
+        for (String badWord : NEGATIVE_WORDS) {
+            if (lower.contains(badWord)) return Sentiment.FRUSTRATED;
+        }
+
+        return Sentiment.NEUTRAL;
     }
 
-    /**
-     * Generates a polite "Access Denied" message based on the missing action.
-     */
-    public String getAccessDeniedMessage(String requiredAction, String screenName) {
-        String module = (screenName != null) ? screenName : "this module";
-        requiredAction = (requiredAction != null) ? requiredAction.toLowerCase() : "perform this action";
-
-        return switch (requiredAction.toUpperCase()) {
-            case "CREATE" ->
-                    "You do not have rights to create entries in " + module + ". Users with creation rights can perform this. Please contact support.";
-            case "APPROVE" ->
-                    "You do not have approval rights for " + module + ". Please wait for an executor to process requests, or check 'My Requests' to view status.";
-            case "MODIFY" ->
-                    "You do not have permission to modify records in " + module + ".";
-            case "DELETE" ->
-                    "Deletion is restricted. You do not have the required permissions.";
-            default ->
-                    "You do not have the required permissions (" + requiredAction + ") to perform this action.";
-        };
+    public String getDeEscalationMessage(Sentiment sentiment) {
+        if (sentiment == Sentiment.ANGRY) {
+            return "I notice you seem upset. I apologize if I haven't been helpful. Let's try to solve this step-by-step.";
+        } else if (sentiment == Sentiment.FRUSTRATED) {
+            return "I understand this might be frustrating. I'm doing my best to find the right information for you.";
+        }
+        return "";
     }
 }
 
@@ -882,33 +609,6 @@ public class PermissionService {
 
 
 
-package com.fincore.helpservice.repository;
-
-import com.fincore.helpservice.model.PermissionEntity;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-
-@Repository
-public interface PermissionRepository extends JpaRepository<PermissionEntity, Integer> {
-
-    // Get Actions for a specific User and Screen
-    @Query(value = """
-            SELECT p.MENU_ACTION
-            FROM PERMISSIONS p
-            JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
-            WHERE rp.role_id = :roleId
-            AND UPPER(p.MENU_TITLE) = UPPER(:screenName)
-            """, nativeQuery = true)
-    String findActionForUserAndScreen(@Param("roleId") String roleId, @Param("screenName") String screenName);
-}
-
-
-// for the above query in sql developer i retrived this response : 
-1.view|create|modify|cancel
-2.view|approve|reject
 
 
 
@@ -920,370 +620,218 @@ public interface PermissionRepository extends JpaRepository<PermissionEntity, In
 
 
 
-package com.fincore.helpservice.controller;
 
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.helpservice.dto.ApiResponse;
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpItemDTO;
 import com.fincore.helpservice.dto.HelpRequestDTO;
 import com.fincore.helpservice.dto.HelpResponseDTO;
-import com.fincore.helpservice.service.HelpService;
-import jakarta.validation.Valid;
+import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.model.HelpScreenEntity; // Assuming you have this
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.repository.HelpScreenRepository; // Needed for disambiguation
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
-@RestController
-@RequestMapping("/api/help")
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Service
 @RequiredArgsConstructor
 @Slf4j
-public class HelpController {
+public class HelpService {
 
-    private final HelpService helpService;
-    private final JwtUtil jwtUtil;
+    // ... [Existing Repositories] ...
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpScreenRepository screenRepository; // Needs to be added
+    private final HelpAnalyticsService analyticsService;
+    private final PermissionService permissionService;
+    
+    // ... [Existing Services] ...
+    private final NLPEngine nlpEngine;
+    private final SmallTalkService smallTalkService;
+    private final SmartResponseGenerator responseGenerator;
+    
+    // NEW SERVICES
+    private final ChatSessionService sessionService;
+    private final SentimentAnalyzer sentimentAnalyzer;
 
-    /**
-     * Unified Help Endpoint.
-     */
-    @PostMapping("/fetch")
-    public ResponseEntity<ApiResponse<HelpResponseDTO>> getHelp(@RequestHeader("Authorization") String token, @RequestBody @Valid HelpRequestDTO request) {
+    // Thresholds
+    private static final int SCORE_THRESHOLD_HIGH = 60; 
+    private static final int SCORE_THRESHOLD_LOW = 20;
 
-        log.info("Received Help Bot Request for Type: {}", request.getRequestType());
-
-        // Delegate business logic to Service
-        HelpResponseDTO result = helpService.processRequest(request, jwtUtil.getUserIdFromToken(token), String.valueOf(jwtUtil.getUserRoleFromToken(token)));
-
-        // Return clean success response
-        return ResponseEntity.ok(ApiResponse.success(result));
-    }
-}
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import lombok.Builder;
-import lombok.Data;
-import java.io.Serializable;
-
-@Data
-@Builder
-public class HelpItemDTO implements Serializable {
-
-    private String id;
-    private String text;       // The Question
-    private String answer;     // The Answer (HTML/Text)
-    private String actionLink; // Deep Link
-    private String actionLabel;// Button Text
-    private String type;       // QUESTION, FAQ, SEARCH_RESULT
-    private double searchScore;
-
-    // New Fields for Internal Logic
-    private String requiredAction;
-    private String screenName;
-}
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import jakarta.validation.constraints.NotNull;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-import java.util.List;
-
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class HelpRequestDTO {
-
-    /**
-     * The intent of the user.
-     * Values: MODULE_QUESTIONS, FAQ_LIST, GET_ANSWER, CHAT
-     */
-    @NotNull(message = "Request Type is mandatory")
-    private String requestType;
-
-    // --- Conditional Fields (based on requestType) ---
-
-    // For MODULE_QUESTIONS
-    private String screenName;
-
-    // For GET_ANSWER (When user clicks a specific question)
-    private String questionId;
-
-    // For CHAT (When user types)
-    private String chatMessage;
-
-    // RBAC: User's Allowed Actions (from Login Token)
-//    @NotNull(message = "User actions cannot be null")
-    private List<String> userActions;
-}
-
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import com.fasterxml.jackson.annotation.JsonInclude;
-import lombok.Builder;
-import lombok.Data;
-
-import java.util.List;
-
-@Data
-@Builder
-@JsonInclude(JsonInclude.Include.NON_NULL)
-public class HelpResponseDTO {
-
-    /**
-     * Tells the Client how to render the response.
-     * - "TEXT_REPLY": Show a bot bubble with text.
-     * - "LIST_SELECTION": Show a list of clickable options (Questions).
-     * - "SUGGESTION": Show "Did you mean?" with options.
-     * - "NO_MATCH": Show apology.
-     */
-    private String responseType;
-
-    // The main text content (Answer or Apology)
-    private String botReply;
-
-    // List of items (Questions for Module, Suggestions, or FAQs)
-    private List<HelpItemDTO> items;
-}
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
-
-import java.io.Serializable;
-import java.time.LocalDateTime;
-import java.util.UUID;
-
-
-/**
- * ENTITY: HELP_FAQ_MASTER
- * Global FAQs.
- */
-@Data
-@Entity
-@Table(name = "HELP_FAQ_MASTER")
-public class HelpFaqEntity implements Serializable {
-
-    @Id
-    @Column(name = "FAQ_ID", length = 50)
-    private String faqId;
-
-    @Column(name = "QUESTION_TEXT", length = 500)
-    private String questionText;
-
-    @Lob
-    @Column(name = "ANSWER_CONTENT")
-    private String answerContent;
-
-    @Column(name = "DISPLAY_ORDER")
-    private Integer displayOrder;
-
-    @Column(name = "IS_ACTIVE")
-    private String isActive;
-
-    @PrePersist
-    public void prePersist() {
-        if (this.faqId == null || this.faqId.isEmpty()) {
-            this.faqId = UUID.randomUUID().toString();
+    public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
+        // ... [Existing Switch Case logic remains same] ...
+        String type = request.getRequestType();
+        switch (type) {
+             case "MODULE_QUESTIONS": return handleModuleFetch(request.getScreenName(), roleId);
+             case "FAQ_LIST": return handleFaqFetch();
+             case "GET_ANSWER": return handleGetAnswer(request.getQuestionId());
+             case "CHAT": return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
+             default: throw new IllegalArgumentException("Invalid Request Type");
         }
     }
-}
 
+    // ... [Other Handlers remain same] ...
 
+    // =========================================================================
+    // THE ULTIMATE SMART CHAT HANDLER
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        if (!StringUtils.hasText(rawMessage)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
 
+        StringBuilder botPrefix = new StringBuilder();
 
+        // 1. SENTIMENT ANALYSIS (Empathy Layer)
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        if (sentiment != SentimentAnalyzer.Sentiment.NEUTRAL) {
+            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
+        }
 
-package com.fincore.helpservice.model;
+        // 2. CHECK SMALL TALK (Personality Layer)
+        // Only if sentiment is neutral (don't joke if user is angry)
+        if (sentiment == SentimentAnalyzer.Sentiment.NEUTRAL) {
+            String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
+            if (smallTalk != null) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
+            }
+        }
 
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
+        // 3. NLP & CONTEXT RESOLUTION (Memory Layer)
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        String detectedAction = nlpEngine.detectAction(normalizedIntent);
+        String detectedScreen = nlpEngine.detectScreen(rawMessage);
 
-import java.io.Serializable;
-import java.time.LocalDateTime;
-import java.util.UUID;
+        // Retrieve History
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // A. CONTEXT MERGING: "What about Segment?" -> Uses previous Action "CREATE"
+        if (detectedAction == null && detectedScreen != null && session != null && session.getLastAction() != null) {
+            detectedAction = session.getLastAction();
+            normalizedIntent = detectedAction + " " + normalizedIntent; // Inject action into query
+            botPrefix.append("*(Assuming you want to ").append(detectedAction).append(")*<br/>");
+        }
+        
+        // B. CONTEXT MERGING: "How to create?" (Inside CGL Screen) -> Uses previous Screen
+        if (detectedScreen == null && detectedAction != null && clientScreenName != null) {
+            // Check if clientScreenName is valid module
+            detectedScreen = clientScreenName; 
+        }
 
+        // 4. DISAMBIGUATION (The "Clarifier")
+        // Scenario: User says "Approve" (Action) but NO Screen detected.
+        if (detectedAction != null && detectedScreen == null) {
+            // Find all screens where this user has this Action permission
+            List<String> validScreens = findScreensForAction(roleId, detectedAction);
+            
+            if (validScreens.size() > 1) {
+                // Return a "Clarification" response
+                sessionService.updateSession(userId, detectedAction, null); // Remember Action
+                return HelpResponseDTO.builder()
+                        .responseType("LIST_SELECTION") // Or a new type "DISAMBIGUATION"
+                        .botReply(botPrefix + "I see you want to **" + detectedAction + "**. Which module are you referring to?")
+                        .items(validScreens.stream().map(s -> HelpItemDTO.builder().text(s).id("CTX_" + s).type("CONTEXT_SUGGESTION").build()).collect(Collectors.toList()))
+                        .build();
+            } else if (validScreens.size() == 1) {
+                // Auto-select the only option
+                detectedScreen = validScreens.get(0);
+            }
+        }
 
-/**
- * ENTITY: HELP_QUESTION_MASTER
- * Represents individual help items.
- * Includes logic for auto-generating UUIDs if not provided.
- */
-@Data
-@Entity
-@Table(name = "HELP_QUESTION_MASTER")
-public class HelpQuestionEntity implements Serializable {
+        // Update Session for next turn
+        sessionService.updateSession(userId, detectedAction, detectedScreen);
 
-    @Id
-    @Column(name = "QUESTION_ID", length = 50)
-    private String questionId;
+        // 5. INTENT-BASED PERMISSION CHECK
+        String activeScreen = (detectedScreen != null) ? detectedScreen : clientScreenName;
 
-    @Column(name = "SCREEN_NAME", length = 100, nullable = false)
-    private String screenName;
+        if (detectedAction != null && activeScreen != null) {
+            List<String> allowedActions = permissionService.getUserActions(roleId, activeScreen);
+            boolean isAllowed = allowedActions.contains(detectedAction);
+            
+            String reply = responseGenerator.generatePermissionResponse(isAllowed, detectedAction, activeScreen, userId);
+            
+            if (!isAllowed) {
+                 analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", 100);
+                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + reply).build();
+            }
+        }
 
-    @Column(name = "QUESTION_TEXT", length = 500, nullable = false)
-    private String questionText;
+        // 6. PERFORM SEARCH
+        // We use the "normalizedIntent" which might have been enriched by Context Merging
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen);
 
-    // Use @Lob for Oracle CLOB types
-    @Lob
-    @Column(name = "ANSWER_CONTENT")
-    private String answerContent;
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
+            return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I'm sorry, I couldn't find an answer for that. Could you try rephrasing?")
+                .build();
+        }
 
-    @Column(name = "ACTION_LINK")
-    private String actionLink;
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
 
-    @Column(name = "ACTION_LABEL")
-    private String actionLabel;
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // RBAC Check on Result
+             if ("QUESTION".equals(bestMatch.getType()) && bestMatch.getRequiredAction() != null) {
+                 List<String> allowedActions = permissionService.getUserActions(roleId, bestMatch.getScreenName());
+                 if (!allowedActions.contains(bestMatch.getRequiredAction())) {
+                     String deniedMsg = responseGenerator.generatePermissionResponse(false, bestMatch.getRequiredAction(), bestMatch.getScreenName(), userId);
+                     analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", score);
+                     return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + deniedMsg).build();
+                 }
+            }
+            
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ANSWERED", score);
+            
+            String finalReply = bestMatch.getAnswer();
+            if (detectedAction != null && activeScreen != null) {
+                String prefix = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalReply = prefix + "<br/><br/>" + bestMatch.getAnswer();
+            }
 
-    @Column(name = "REQUIRED_ACTION", length = 50)
-    private String requiredAction;
-
-    @Column(name = "KEYWORDS", length = 1000)
-    private String keywords;
-
-    @Column(name = "DISPLAY_ORDER")
-    private Integer displayOrder;
-
-    @Column(name = "IS_ACTIVE", length = 1)
-    private String isActive;
-
-    @CreationTimestamp
-    @Column(name = "CREATED_AT", updatable = false)
-    private LocalDateTime createdAt;
-
-    @UpdateTimestamp
-    @Column(name = "UPDATED_AT")
-    private LocalDateTime updatedAt;
-
-    // Auto-generate UUID if missing
-    @PrePersist
-    public void prePersist() {
-        if (this.questionId == null || this.questionId.isEmpty()) {
-            this.questionId = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + finalReply).build();
+        } 
+        else {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "SUGGESTION", score);
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
+                    .items(matches.stream().limit(3).collect(Collectors.toList()))
+                    .build();
         }
     }
-}
 
-
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
-import java.io.Serializable;
-import java.time.LocalDateTime;
-
-
-/**
- * ENTITY: HELP_SCREEN_MASTER
- * Represents a functional module in the application (e.g., "CGL Management").
- */
-@Data
-@Entity
-@Table(name = "HELP_SCREEN_MASTER")
-public class HelpScreenEntity implements Serializable {
-
-    @Id
-    @Column(name = "SCREEN_NAME", length = 100)
-    private String screenName;
-
-    @Column(name = "SCREEN_LABEL", length = 100)
-    private String screenLabel;
-
-    @Column(name = "IS_ACTIVE", length = 1)
-    private String isActive;
-
-    @CreationTimestamp
-    @Column(name = "CREATED_AT", updatable = false)
-    private LocalDateTime createdAt;
-}
-
-
-
-
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-import org.hibernate.annotations.CreationTimestamp;
-
-import java.time.LocalDateTime;
-import java.util.UUID;
-
-/**
- * Entity: HELP_SEARCH_ANALYTICS
- * Purpose: Logs every chat interaction for future analysis.
- */
-@Data
-@Entity
-@Table(name = "HELP_SEARCH_ANALYTICS")
-public class HelpSearchAnalyticsEntity {
-
-    @Id
-    @Column(name = "LOG_ID", length = 50)
-    private String logId;
-
-    @Column(name = "USER_ID", length = 50)
-    private String userId;
-
-    @Column(name = "SEARCH_QUERY", length = 500)
-    private String searchQuery;
-
-    @Column(name = "SCREEN_CONTEXT", length = 100)
-    private String screenContext;
-
-    // Enum values: "ANSWERED", "SUGGESTION", "NO_MATCH"
-    @Column(name = "RESULT_STATUS", length = 20)
-    private String resultStatus;
-
-    // 0-100
-    @Column(name = "CONFIDENCE_SCORE")
-    private Integer confidenceScore;
-
-    // Populated later if user clicks a suggestion
-    @Column(name = "CLICKED_Q_ID", length = 50)
-    private String clickedQuestionId;
-
-    @CreationTimestamp
-    @Column(name = "SEARCH_TIMESTAMP", updatable = false)
-    private LocalDateTime searchTimestamp;
-
-    @PrePersist
-    public void generateId() {
-        if (this.logId == null || this.logId.isEmpty()) {
-            this.logId = UUID.randomUUID().toString();
+    // --- Helper for Disambiguation ---
+    private List<String> findScreensForAction(String roleId, String action) {
+        // 1. Get all screens
+        List<HelpScreenEntity> allScreens = screenRepository.findAll();
+        List<String> matchingScreens = new ArrayList<>();
+        
+        // 2. Check permissions for each
+        for(HelpScreenEntity screen : allScreens) {
+            List<String> actions = permissionService.getUserActions(roleId, screen.getScreenName());
+            if (actions.contains(action)) {
+                matchingScreens.add(screen.getScreenName());
+            }
         }
+        return matchingScreens;
+    }
+
+    // ... [Search Algorithm remains same, just ensure it handles the enriched normalizedQuery] ...
+     private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, String activeScreen) {
+        // ... same logic as previous step ...
+        // Ensure "tokens" are split from "normalizedQuery" which might now contain injected action
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+")); 
+        // ... rest of logic ...
+        return new ArrayList<>(); // Stub for brevity, use previous code
     }
 }
 
@@ -1291,30 +839,6 @@ public class HelpSearchAnalyticsEntity {
 
 
 
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
-import lombok.Data;
-
-@Data
-@Entity
-@Table(name = "PERMISSIONS")
-public class PermissionEntity {
-
-    @Id
-    @Column(name = "MENU_ID")
-    private Integer menuId;
-
-    @Column(name = "MENU_TITLE") // e.g. "CGL Management"
-    private String menuTitle;
-
-    @Column(name = "MENU_ACTION") // e.g. "view|create|modify"
-    private String menuAction;
-
-}
 
 
 
@@ -1323,81 +847,6 @@ public class PermissionEntity {
 
 
 
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-
-@Data
-@Entity
-@Table(name = "ROLE_PERMISSIONS")
-@IdClass(RolePermissionId.class)
-public class RolePermissionEntity {
-    @Id
-    @Column(name = "ROLE_ID")
-    private Integer roleId;
-
-    @Id
-    @Column(name = "PERMISSION_ID")
-    private Integer permissionId;
-}
-
-
-
-
-
-
-
-package com.fincore.helpservice.model;
-
-
-import lombok.Data;
-
-import java.io.Serializable;
-
-@Data
-class RolePermissionId implements Serializable {
-    private Integer roleId;
-    private Integer permissionId;
-}
-
-
-
-
-
-package com.fincore.helpservice.model;
-
-import jakarta.persistence.*;
-import lombok.Data;
-
-// --- 1. User Roles (To get Role ID) ---
-@Data
-@Entity
-@Table(name = "USER_ROLES")
-public class UserRoleEntity {
-    @Id
-    @Column(name = "USER_ID")
-    private String userId;
-
-    @Column(name = "ROLE_ID")
-    private Integer roleId;
-}
-
-
-
-
-
-package com.fincore.helpservice.repository;
-
-import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyticsEntity, String> {
-}
 
 
 
@@ -1407,96 +856,12 @@ public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyti
 
 package com.fincore.helpservice.repository;
 
-
-import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpScreenEntity;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
-import java.util.List;
-
 @Repository
-public interface HelpFaqRepository extends JpaRepository<HelpFaqEntity, String> {
-
-    // Global FAQs
-    List<HelpFaqEntity> findByIsActiveOrderByDisplayOrderAsc(String isActive);
+public interface HelpScreenRepository extends JpaRepository<HelpScreenEntity, String> {
 }
 
 
-
-
-package com.fincore.helpservice.repository;
-
-
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.stereotype.Repository;
-import java.util.List;
-
-@Repository
-public interface HelpQuestionRepository extends JpaRepository<HelpQuestionEntity, String> {
-
-    // For Context Mode: Select Module
-    List<HelpQuestionEntity> findByScreenNameAndIsActiveOrderByDisplayOrderAsc(String screenName, String isActive);
-
-    // For Search Mode: Fetch All Active
-    List<HelpQuestionEntity> findByIsActive(String isActive);
-}
-
-
-
-
-
-
-
-
-
-
-permissions table sample data :
-
-
-1	Circle Management	AccountTree	Manage Circles	view|create|modify|cancel	/circle-management	circle/CircleMaster	To manage circles and view status of self request		CIRCLE		/api/common-master/circle-codes/**,/api/common-master/zone-codes/**
-2	Circle Management	Ballot	Circle Requests	view|approve|reject	/circle-requests	common/CommonRequestScreen	To review/approve pending requests for circles created by other user		CIRCLE		/api/common-master/circle-codes/**,/api/common-master/zone-codes/**
-5	CGL Management	Casino	Manage CGL's	view|create|modify|cancel	/cgl-management	cgl/CGLMaster	To edit or update active CGLs and to view pending CGL requests		CGL_CODE		/api/common-master/cgl*
-6	CGL Management	WorkspacePremium	CGL Requests	view|approve|reject	/cgl-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for CGL master		CGL_CODE		/api/common-master/cgl*
-7	Segment Management	Segment	Manage Segments	view|create|modify|cancel	/segment-management	segment/SegmentMaster	To manage segments in application		SEGMENT_CODE		/api/common-master/segment-codes
-8	Segment Management	Grading	Segment Requests	view|approve|reject	/segment-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for segment master		SEGMENT_CODE		/api/common-master/segment-codes
-9	Branch Management	AccountBalance	Manage Branches	view|create|modify|cancel	/branch-management	branch/BranchMaster	To edit update branches and to check pending branch update requests		BRANCH		/api/common-master/branches*,/api/common-master/branches-check,/api/common-master/states,/api/common-master/circle-codes
-10	Branch Management	AssuredWorkload	Branch Requests	view|approve|reject	/branch-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for branch master		BRANCH		/api/common-master/branches*
-12	User Management	People	Manage Users	view|create|modify|delete|cancel	/manage-user	user/pages/UserManagement	For creating new user		USER_MANAGEMENT		/api/user/**
-13	User Management	WorkspacePremium	User Requests	view|approve|reject	/user-requests	user/pages/UserApprovals	To approve or reject user requests		USER_MANAGEMENT		/api/user/**
-14	Calendar Configuration	EditCalendar	Calendar Configuration	view|create|modify|cancel	/calendar-configuration	calendarConfig/CalendarConfig	To manage financial calender configuration in application		CALENDER		/api/common-master/calendar-configuration,/api/common-master/calendar-config/**,/api/calendar-config/next-year-info/**
-15	Calendar Configuration	EventAvailable	Calendar Config Requests	view|approve|reject	/calendar-config-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for calender config master		CALENDER		/api/common-master/calendar-configuration
-16	State Management	Domain	Manage States	view|create|modify|cancel	/state-management	state/StateMaster	To manage states in application		STATE		/api/common-master/states
-17	State Management	DomainVerification	State Requests	view|approve|reject	/state-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for state master		STATE		/api/common-master/states
-18	Currency Management	LocalAtm	Manage Currencies	view|create|modify|cancel	/manage-currencies	currency/CurrencyMaster	To manage currency in application		CURRENCY		/api/common-master/currency*
-19	Currency Management	CreditScore	Currency Requests	view|approve|reject	/currency-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for currency master		CURRENCY		/api/common-master/currency*
-20	Currency Rate Management	PriceChange	Currency Rate Change	view|modify|cancel	/manage-currency-rate	currency/CurrencyRateChange	To manage currency rate in application		CURRENCY_RATE_CHANGE		/api/common-master/currency-rate-change
-21	Currency Rate Management	CurrencyRupee	Currency Rate Requests	view|approve|reject	/currency-rate-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for currency rate master		CURRENCY_RATE_CHANGE		/api/common-master/currency-rate-change
-22	Role Management	Badge	Manage Roles	view|create|modify|cancel	/manage-roles	role/RoleManagement	To manage roles in application		ROLE_MANAGEMENT		/api/role/**
-23	Role Management	Elevator	Role Management Requests	view|approve|reject	/role-requests	role/RoleApprovals	To approve/reject role management related requests		ROLE_MANAGEMENT		/api/role/**
-24	User Management	People	User Requests Audit	view	/user-audit	user/pages/UserLogs	Shows user audit requests		USER_MANAGEMENT		/api/user/**
-25	Process Status	Memory		view|approve|reject|download|start|stop|restart|finish	/process-status	process-status/ProcessStatusPage	This is demo description				/api/process/**,/api/airflow/**,/api/reports/**
-26	Reports	Summarize	Whole Bank Reports	view|download	/reports	glifReports/GlifReports	Manage whole bank report handling for various level of users and report types featured.				/api/reports/**
-27	Reports	Summarize	Branch Wise Reports	view|download	/branchwise-reports	glifReports/ReportsBranchWise	Manage branch wise report handling for various level of users and report types featured.				/api/reports/**,/api/differences/**
-30	Journal Management	EditCalendar	Journal Posting	view|create	/journal-posting	journal/JournalPosting	This is demo description		JOURNAL_AUTH		/api/journals/**,/api/cgl-journal/**,/api/branches-journal/**,/api/common-master/currency,/api/**
-31	Journal Management	Ballot	Journal Authorization	view|approve|reject	/journal-Authorization	journal/JournalAuthorization	This is demo description		JOURNAL_AUTH		/api/journals/**,/api/cgl-journal/**,/api/branches-journal/**
-32	Journal Management	Ballot	Journal Posting Status	view|cancel	/journal-posting-status	journal/JournalPostingStatus	to cansel there own Request		JOURNAL_AUTH		/api/journals/**,/api/cgl-journal/**,/api/branches-journal/**
-33	Balance Enquiry	AccountBalance		view	/balance-enquiry	balanceEnquiry/BalanceEnquiryScreen	This provides closing balance for each day according to selected range				/api/balance-enquiry/**
-34	Transaction Enquiry	ReceiptLong		view	/transaction-enquiry	transaction-enquiry/TransactionEnquiry	This is demo description				/api/transactions*
-35	Dashboard	GridView		view	/dashboard	dashboard/DashboardPage	Sample Dashboard screen MUI				/api/notifications/**,/api/dashboard/**
-36	Journal Management	UploadFile	Journal Bulk Upload	view|upload	/journal-bulk-upload	journal/JournalBulkUpload	To Upload the Bulk Journals		JOURNAL_AUTH		/api/journals/**,/api/cgl-journal/**,/api/branches-journal/**
-37	CGL Management	Visibility	View CGL Details	view	/view-cgl-details	cgl/CGLView	To View CGL details		CGL_CODE		/api/common-master/view-cgl*
-38	Branch Management	Visibility	View Branch Details	view	/view-branch-details	branch/BranchView	To View Branch details				/api/common-master/view-branch*
-39	Announcement Management	Campaign		view|create|modify|cancel	/announcements	announcements/Announcements	To manage announcements				/api/announcements/**
-40	File Type	Topic	File Manager	view|create|modify|cancel|delete	/manage-files	filetype/FileTypeMain	type of file		FILE_TYPE_MASTER		
-41	File Type	RuleFolder	File Manager Requests	view|approve|reject	/filemanage-requests	common/CommonRequestScreen	To efficiently review and process the pending requests for file manager		FILE_TYPE_MASTER		/api/common-master/file
-81	Template Management	ReceiptLong	Report Template Manager	view|create|modify|delete|cancel	/template-configuration	reportTemplateManager/pages/TemplateConfiguration	Configure, manage, and monitor your report templates				/api/template-config/**,/api/report-builder/**,/api/create-request/**
-101	Template Management	ReceiptLong	Create Template	view|create|modify|delete|cancel	/report-builder	reportTemplateBuilder/ReportBuilder.page	Create dynamic report templates with report builder		RB_REPORT_TEMPLATE		/api/template-config/**
-102	View Template Reports	GridView		View	/report-view	viewReports/ReportView.page	view				/api/report-builder/**
-103	Monitoring	GridView		view	/Monitoring	journal/Monitoring	demo text		Monitoring		
-121	Template Management	DomainVerification	Template Requests	view|approve|reject	/template-requests	reportTemplate/TemplateRequestScreen	Efficiently review and process the pending requests for report templates		RB_REPORT_TEMPLATE		
-164	Balance Compare Diffrence	EditCalendar	Range Search	view|cancel	/balance-renge-search	balanceCompareDifference/BalanceRengeSearchScreen	Date wise search glcc and compare difference				
-181	Balance Compare Diffrence	History	Particular Search	view|cancel	/balance-particular-search	balanceCompareDifference/BalanceParticularSearchScreen	Date wise search glcc and compare difference				
-182	Balance Compare Diffrence	ManageSearch	Current Search	view|cancel	/balance-current-search	balanceCompareDifference/BalanceCurrentSearchScreen	Date wise search glcc and compare difference				
-
-	
