@@ -865,3 +865,543 @@ public interface HelpScreenRepository extends JpaRepository<HelpScreenEntity, St
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------
+
+package com.fincore.helpservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+import java.util.List;
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class HelpResponseDTO {
+
+    // "TEXT_REPLY", "LIST_SELECTION", "SUGGESTION", "NO_MATCH", "DISAMBIGUATION"
+    private String responseType;
+
+    private String botReply;
+    private List<HelpItemDTO> items;
+    private String logId;
+
+    // --- NEW: ACTIONABLE INTELLIGENCE ---
+    // If the bot finds a direct link (e.g., "Take me to Create CGL"), send it here.
+    private String navigationLink;  // e.g. "/cgl-management/create"
+    private String navigationLabel; // e.g. "Go to Create Screen"
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import lombok.Data;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages Short-Term Conversational Memory.
+ * Allows the bot to understand follow-up questions like "What about Segment?"
+ */
+@Service
+public class ChatSessionService {
+
+    // In PROD, use Redis with TTL. For single-instance, ConcurrentMap is fine.
+    private final Map<String, UserSession> sessions = new ConcurrentHashMap<>();
+
+    @Data
+    public static class UserSession {
+        private String lastAction;      // e.g., "CREATE"
+        private String lastScreen;      // e.g., "CGL Management"
+        private LocalDateTime lastInteraction;
+    }
+
+    public void updateSession(String userId, String action, String screen) {
+        if (userId == null) return;
+        
+        UserSession session = sessions.getOrDefault(userId, new UserSession());
+        
+        // Only update if not null (preserve old context if current query is vague)
+        if (action != null) session.setLastAction(action);
+        if (screen != null) session.setLastScreen(screen);
+        
+        session.setLastInteraction(LocalDateTime.now());
+        sessions.put(userId, session);
+    }
+
+    public UserSession getSession(String userId) {
+        if (userId == null) return null;
+        
+        UserSession session = sessions.get(userId);
+        if (session == null) return null;
+
+        // Session Timeout (5 minutes) - mimicking human short-term memory
+        if (session.getLastInteraction().plusMinutes(5).isBefore(LocalDateTime.now())) {
+            sessions.remove(userId);
+            return null;
+        }
+        return session;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.util.Set;
+
+@Service
+public class SentimentAnalyzer {
+
+    private static final Set<String> NEGATIVE_WORDS = Set.of(
+        "stupid", "useless", "bad", "hate", "broken", "fail", "idiot", "worst", "garbage", "nonsense", "ridiculous"
+    );
+
+    public enum Sentiment {
+        NEUTRAL, FRUSTRATED, ANGRY
+    }
+
+    public Sentiment analyze(String text) {
+        if (text == null || text.trim().isEmpty()) return Sentiment.NEUTRAL;
+        String clean = text.trim();
+        
+        // 1. CAPS LOCK DETECTION (> 60% Uppercase)
+        long upperCount = clean.chars().filter(Character::isUpperCase).count();
+        long letterCount = clean.chars().filter(Character::isLetter).count();
+        
+        if (letterCount > 5 && ((double) upperCount / letterCount) > 0.6) {
+            return Sentiment.ANGRY;
+        }
+
+        // 2. KEYWORD DETECTION
+        String lower = clean.toLowerCase();
+        for (String badWord : NEGATIVE_WORDS) {
+            if (lower.contains(badWord)) return Sentiment.FRUSTRATED;
+        }
+
+        return Sentiment.NEUTRAL;
+    }
+
+    public String getDeEscalationMessage(Sentiment sentiment) {
+        if (sentiment == Sentiment.ANGRY) {
+            return "I notice you seem upset. I apologize if I haven't been helpful. Let's try to solve this step-by-step.";
+        } else if (sentiment == Sentiment.FRUSTRATED) {
+            return "I understand this might be frustrating. I'm doing my best to find the right info.";
+        }
+        return "";
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpItemDTO;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.model.HelpScreenEntity;
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.repository.HelpScreenRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpService {
+
+    // CORE REPOS
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpScreenRepository screenRepository; 
+    
+    // SERVICES
+    private final HelpAnalyticsService analyticsService;
+    private final PermissionService permissionService;
+    private final NLPEngine nlpEngine;
+    private final SmallTalkService smallTalkService;
+    private final SmartResponseGenerator responseGenerator;
+    
+    // NEW BRAIN MODULES
+    private final ChatSessionService sessionService;
+    private final SentimentAnalyzer sentimentAnalyzer;
+
+    // Thresholds
+    private static final int SCORE_THRESHOLD_HIGH = 60; 
+    private static final int SCORE_THRESHOLD_LOW = 20;
+
+    public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
+        String type = request.getRequestType();
+        switch (type) {
+             case "MODULE_QUESTIONS": return handleModuleFetch(request.getScreenName(), roleId);
+             case "FAQ_LIST": return handleFaqFetch();
+             case "GET_ANSWER": return handleGetAnswer(request.getQuestionId());
+             case "CHAT": return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
+             default: throw new IllegalArgumentException("Invalid Request Type");
+        }
+    }
+
+    // [Previous Handlers: Module, FAQ, GetAnswer remain same as before]
+    private HelpResponseDTO handleModuleFetch(String screenName, String roleId) {
+         // ... same code ...
+         return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply("Topics for " + screenName).build(); // Simplified for brevity
+    }
+    private HelpResponseDTO handleFaqFetch() { return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply("FAQs").items(fetchGlobalFaqs()).build(); }
+    private HelpResponseDTO handleGetAnswer(String questionId) {
+        return questionRepository.findById(questionId)
+                .map(q -> HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(q.getAnswerContent())
+                        // PASS NAVIGATION IF AVAILABLE
+                        .navigationLink(q.getActionLink())
+                        .navigationLabel(q.getActionLabel())
+                        .build())
+                .orElse(HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Content not found.").build());
+    }
+
+    // =========================================================================
+    // THE ULTRA-SMART CHAT HANDLER
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        if (!StringUtils.hasText(rawMessage)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+
+        StringBuilder botPrefix = new StringBuilder();
+
+        // 1. SENTIMENT ANALYSIS
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        if (sentiment != SentimentAnalyzer.Sentiment.NEUTRAL) {
+            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
+        }
+
+        // 2. SMALL TALK (Only if calm)
+        if (sentiment == SentimentAnalyzer.Sentiment.NEUTRAL) {
+            String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
+            if (smallTalk != null) return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
+        }
+
+        // 3. NLP & CONTEXT RESOLUTION
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        String detectedAction = nlpEngine.detectAction(normalizedIntent);
+        String detectedScreen = nlpEngine.detectScreen(rawMessage);
+
+        // -- MEMORY RETRIEVAL --
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // A. CONTEXT MERGING: "What about Segment?" -> Inherits Action "CREATE" from history
+        if (detectedAction == null && detectedScreen != null && session != null && session.getLastAction() != null) {
+            detectedAction = session.getLastAction();
+            normalizedIntent = detectedAction + " " + normalizedIntent; 
+            botPrefix.append("*(Context: ").append(detectedAction).append(")*<br/>");
+        }
+        
+        // B. CONTEXT MERGING: "How to create?" (Inside CGL Screen) -> Inherits Screen
+        if (detectedScreen == null && detectedAction != null && clientScreenName != null) {
+            detectedScreen = clientScreenName; 
+        }
+
+        // 4. DISAMBIGUATION (The "Clarifier")
+        // User says "Approve" (Action) but NO Screen detected.
+        if (detectedAction != null && detectedScreen == null) {
+            List<String> validScreens = findScreensForAction(roleId, detectedAction);
+            
+            if (validScreens.size() > 1) {
+                // Ask user to choose context
+                sessionService.updateSession(userId, detectedAction, null); // Remember Action
+                return HelpResponseDTO.builder()
+                        .responseType("LIST_SELECTION") // Or DISAMBIGUATION
+                        .botReply(botPrefix + "I see you want to **" + detectedAction + "**. Which module?")
+                        .items(validScreens.stream().map(s -> HelpItemDTO.builder().text(s).id("CTX_" + s).type("CONTEXT_SUGGESTION").build()).collect(Collectors.toList()))
+                        .build();
+            } else if (validScreens.size() == 1) {
+                detectedScreen = validScreens.get(0); // Auto-select
+            }
+        }
+
+        // Update Memory
+        sessionService.updateSession(userId, detectedAction, detectedScreen);
+
+        // 5. INTENT-BASED PERMISSION CHECK
+        String activeScreen = (detectedScreen != null) ? detectedScreen : clientScreenName;
+
+        if (detectedAction != null && activeScreen != null) {
+            List<String> allowedActions = permissionService.getUserActions(roleId, activeScreen);
+            boolean isAllowed = allowedActions.contains(detectedAction);
+            
+            String reply = responseGenerator.generatePermissionResponse(isAllowed, detectedAction, activeScreen, userId);
+            
+            if (!isAllowed) {
+                 analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", 100);
+                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + reply).build();
+            }
+        }
+
+        // 6. PERFORM SEARCH
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen);
+
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
+            return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I'm sorry, I couldn't find an answer for that. Could you try rephrasing?")
+                .build();
+        }
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // RBAC Check on Result
+             if ("QUESTION".equals(bestMatch.getType()) && bestMatch.getRequiredAction() != null) {
+                 List<String> allowedActions = permissionService.getUserActions(roleId, bestMatch.getScreenName());
+                 if (!allowedActions.contains(bestMatch.getRequiredAction())) {
+                     String deniedMsg = responseGenerator.generatePermissionResponse(false, bestMatch.getRequiredAction(), bestMatch.getScreenName(), userId);
+                     analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ACCESS_DENIED", score);
+                     return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + deniedMsg).build();
+                 }
+            }
+            
+            String logId = analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ANSWERED", score);
+            
+            String finalReply = bestMatch.getAnswer();
+            if (detectedAction != null && activeScreen != null) {
+                String prefix = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalReply = prefix + "<br/><br/>" + bestMatch.getAnswer();
+            }
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(botPrefix + finalReply)
+                    .logId(logId)
+                    // --- PASS ACTION BUTTON ---
+                    .navigationLink(bestMatch.getActionLink())
+                    .navigationLabel(bestMatch.getActionLabel())
+                    .build();
+        } 
+        else {
+            String logId = analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "SUGGESTION", score);
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
+                    .items(matches.stream().limit(3).collect(Collectors.toList()))
+                    .logId(logId)
+                    .build();
+        }
+    }
+
+    // --- Helper for Disambiguation ---
+    private List<String> findScreensForAction(String roleId, String action) {
+        List<HelpScreenEntity> allScreens = screenRepository.findAll();
+        List<String> matchingScreens = new ArrayList<>();
+        for(HelpScreenEntity screen : allScreens) {
+            List<String> actions = permissionService.getUserActions(roleId, screen.getScreenName());
+            if (actions.contains(action)) matchingScreens.add(screen.getScreenName());
+        }
+        return matchingScreens;
+    }
+
+    // [Search Methods & Caching - Same as Previous Logic, omitted for brevity but required]
+    // ... insert performSmartSearch, calculateScore, caching methods here ...
+    // Note: ensure performSmartSearch uses "normalizedIntent" for tokens
+    
+    // --- CACHING & UTILS (Include these) ---
+    private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, String activeScreen) {
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+")); 
+        Stream<HelpItemDTO> questions = getAllActiveQuestions().stream().map(q -> {
+             int score = calculateScore(q.getQuestionText(), q.getKeywords(), q.getScreenName(), normalizedQuery, rawQuery, tokens, activeScreen);
+             // Action Boost
+             if (q.getRequiredAction() != null && isActionMatchFuzzy(normalizedQuery, q.getRequiredAction())) score += 30;
+             return HelpItemDTO.builder().id(q.getQuestionId()).text(q.getQuestionText()).answer(q.getAnswerContent())
+                    .type("QUESTION").requiredAction(q.getRequiredAction()).screenName(q.getScreenName())
+                    .actionLink(q.getActionLink()).actionLabel(q.getActionLabel()) // Important for button
+                    .searchScore(score).build();
+        });
+        Stream<HelpItemDTO> faqs = fetchGlobalFaqsEntity().stream().map(f -> {
+             int score = calculateScore(f.getQuestionText(), null, "FAQ", normalizedQuery, rawQuery, tokens, null);
+             return HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent()).type("FAQ").searchScore(score).build();
+        });
+        return Stream.concat(questions, faqs).filter(item -> item.getSearchScore() > 0)
+                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore())).limit(5).collect(Collectors.toList());
+    }
+    
+    // Need full implementation of calculateScore, fuzzyMatch etc (from previous turn)
+    private int calculateScore(String qText, String qKeywords, String qScreen, String normalizedQuery, String rawQuery, List<String> tokens, String activeScreen) {
+        double score = 0;
+        String lowerText = qText.toLowerCase();
+        String lowerKeywords = (qKeywords != null) ? qKeywords.toLowerCase() : "";
+        String lowerRaw = rawQuery.toLowerCase();
+        if (lowerText.equals(lowerRaw)) return 100;
+        if (lowerText.contains(lowerRaw)) score += 50;
+        int matches = 0;
+        for (String token : tokens) {
+            if (STOP_WORDS.contains(token)) continue;
+            boolean tokenMatched = false;
+            if (lowerText.contains(token) || lowerKeywords.contains(token)) { score += 15; tokenMatched = true; }
+            else if (fuzzyMatch(token, lowerText)) { score += 10; tokenMatched = true; }
+            if (tokenMatched) matches++;
+        }
+        if (matches > 1) score += (matches * 5);
+        if (activeScreen != null && activeScreen.equalsIgnoreCase(qScreen)) score = score * 2.5;
+        return (int) Math.min(score, 100);
+    }
+    
+    private boolean fuzzyMatch(String token, String target) {
+        if(token.length() < 3) return false;
+        if (target.contains(token)) return true;
+        for (String word : target.split("\\W+")) if (word.length() > 2 && calculateDistance(token, word) <= 1) return true;
+        return false;
+    }
+    private int calculateDistance(String x, String y) {
+        int[][] dp = new int[x.length() + 1][y.length() + 1];
+        for (int i = 0; i <= x.length(); i++) {
+            for (int j = 0; j <= y.length(); j++) {
+                if (i == 0) dp[i][j] = j; else if (j == 0) dp[i][j] = i;
+                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1), Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+            }
+        }
+        return dp[x.length()][y.length()];
+    }
+    // Getters and Caches
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() { return questionRepository.findByIsActive("Y"); }
+    @Cacheable(value = "help_faqs_all")
+    public List<HelpFaqEntity> fetchGlobalFaqsEntity() { return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y"); }
+    public List<HelpItemDTO> fetchGlobalFaqs() { return fetchGlobalFaqsEntity().stream().map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build()).collect(Collectors.toList()); }
+    
+    private boolean isActionMatchFuzzy(String query, String action) {
+         if (query.contains(action.toLowerCase())) return true;
+         // Add synonym check from NLPEngine/Map here if needed
+         return false;
+    }
+    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.HelpScreenEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface HelpScreenRepository extends JpaRepository<HelpScreenEntity, String> {
+}
+
+
+
+
+
+
+
+
+
+
+
+
