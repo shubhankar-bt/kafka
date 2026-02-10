@@ -1,217 +1,291 @@
-package com.fincore.helpservice.entity;
+payload i tried :  
 
-import jakarta.persistence.*;
-import lombok.Data;
-import java.io.Serializable;
-
-// --- 1. User Roles (To get Role ID) ---
-@Data
-@Entity
-@Table(name = "USER_ROLES")
-public class UserRoleEntity {
-    @Id
-    @Column(name = "USER_ID")
-    private String userId;
-
-    @Column(name = "ROLE_ID")
-    private Integer roleId;
+{
+   "requestType": "CHAT",
+   "chatMessage": "cgl create",
+   "userActions": [""]
 }
 
-// --- 2. Role Permissions (To get Permission IDs) ---
-@Data
-@Entity
-@Table(name = "ROLE_PERMISSIONS")
-@IdClass(RolePermissionId.class)
-public class RolePermissionEntity {
-    @Id
-    @Column(name = "ROLE_ID")
-    private Integer roleId;
-
-    @Id
-    @Column(name = "PERMISSION_ID")
-    private Integer permissionId;
-}
-
-@Data
-class RolePermissionId implements Serializable {
-    private Integer roleId;
-    private Integer permissionId;
-}
-
-// --- 3. Permissions (To get Screen Name & Actions) ---
-@Data
-@Entity
-@Table(name = "PERMISSIONS")
-public class PermissionEntity {
-    @Id
-    @Column(name = "MENU_ID")
-    private Integer menuId;
-
-    @Column(name = "MENU_TITLE") // e.g. "CGL Management"
-    private String menuTitle;
-
-    @Column(name = "MENU_ACTION") // e.g. "view|create|modify"
-    private String menuAction;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.repository;
-
-import com.fincore.helpservice.entity.PermissionEntity;
-import com.fincore.helpservice.entity.RolePermissionEntity;
-import com.fincore.helpservice.entity.UserRoleEntity;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-import java.util.List;
-
-@Repository
-public interface UserRoleRepository extends JpaRepository<UserRoleEntity, String> {}
-
-@Repository
-public interface RolePermissionRepository extends JpaRepository<RolePermissionEntity, Integer> {
-    List<RolePermissionEntity> findByRoleId(Integer roleId);
-}
-
-@Repository
-public interface PermissionRepository extends JpaRepository<PermissionEntity, Integer> {
-    
-    // Complex Query: Get Actions for a specific User and Screen
-    @Query(value = """
-        SELECT p.MENU_ACTION 
-        FROM PERMISSIONS p
-        JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
-        JOIN USER_ROLES ur ON rp.ROLE_ID = ur.ROLE_ID
-        WHERE ur.USER_ID = :userId 
-        AND UPPER(p.MENU_TITLE) = UPPER(:screenName)
-    """, nativeQuery = true)
-    String findActionForUserAndScreen(@Param("userId") String userId, @Param("screenName") String screenName);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionService {
-
-    private final PermissionRepository permissionRepository;
-
-    /**
-     * Fetches the list of allowed actions (CREATE, APPROVE, etc.) for a user on a specific screen.
-     */
-    public List<String> getUserActions(String userId, String screenName) {
-        if (screenName == null) return Collections.emptyList();
-
-        String actionString = permissionRepository.findActionForUserAndScreen(userId, screenName);
-        
-        if (actionString == null || actionString.isBlank()) {
-            return Collections.emptyList();
-        }
-
-        // Split "view|create|modify" -> ["VIEW", "CREATE", "MODIFY"]
-        return Arrays.stream(actionString.split("\\|"))
-                .map(String::trim)
-                .map(String::toUpperCase)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Generates a polite "Access Denied" message based on the missing action.
-     */
-    public String getAccessDeniedMessage(String requiredAction, String screenName) {
-        String module = (screenName != null) ? screenName : "this module";
-        requiredAction = (requiredAction != null) ? requiredAction.toLowerCase() : "perform this action";
-
-        return switch (requiredAction.toUpperCase()) {
-            case "CREATE" -> 
-                "You do not have rights to create entries in " + module + ". Users with creation rights can perform this. Please contact your administrator.";
-            case "APPROVE" -> 
-                "You do not have approval rights for " + module + ". Please wait for an executor to process requests, or check 'My Requests' to view status.";
-            case "MODIFY" -> 
-                "You do not have permission to modify records in " + module + ".";
-            case "DELETE" -> 
-                "Deletion is restricted. You do not have the required permissions.";
-            default -> 
-                "You do not have the required permissions (" + requiredAction + ") to perform this action.";
-        };
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+got the error : 
+2026-02-10 18:14:50.259 INFO  [http-nio-9099-exec-3] c.f.h.c.HelpController: Received Help Bot Request for Type: CHAT 
+2026-02-10 18:14:50.402 ERROR [http-nio-9099-exec-3] c.f.h.e.GlobalExceptionHandler: Unhandled Exception at /api/help/fetch:  
+org.springframework.dao.IncorrectResultSizeDataAccessException: Query did not return a unique result: 3 results were returned
+	at org.springframework.orm.jpa.vendor.HibernateJpaDialect.convertHibernateAccessException(HibernateJpaDialect.java:301)
+	at org.springframework.orm.jpa.vendor.HibernateJpaDialect.translateExceptionIfPossible(HibernateJpaDialect.java:244)
+	at org.springframework.orm.jpa.AbstractEntityManagerFactoryBean.translateExceptionIfPossible(AbstractEntityManagerFactoryBean.java:550)
+	at org.springframework.dao.support.ChainedPersistenceExceptionTranslator.translateExceptionIfPossible(ChainedPersistenceExceptionTranslator.java:61)
+	at org.springframework.dao.support.DataAccessUtils.translateIfNecessary(DataAccessUtils.java:335)
+	at org.springframework.dao.support.PersistenceExceptionTranslationInterceptor.invoke(PersistenceExceptionTranslationInterceptor.java:152)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.data.jpa.repository.support.CrudMethodMetadataPostProcessor$CrudMethodMetadataPopulatingMethodInterceptor.invoke(CrudMethodMetadataPostProcessor.java:136)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.JdkDynamicAopProxy.invoke(JdkDynamicAopProxy.java:223)
+	at jdk.proxy2/jdk.proxy2.$Proxy167.findActionForUserAndScreen(Unknown Source)
+	at com.fincore.helpservice.service.PermissionService.getUserActions(PermissionService.java:26)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.lambda$applyResilience$0(GlobalResilienceAspect.java:56)
+	at io.github.resilience4j.retry.Retry.lambda$decorateSupplier$5(Retry.java:301)
+	at io.github.resilience4j.circuitbreaker.CircuitBreaker.lambda$decorateSupplier$5(CircuitBreaker.java:194)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.applyResilience(GlobalResilienceAspect.java:75)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:637)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:627)
+	at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720)
+	at com.fincore.helpservice.service.PermissionService$$SpringCGLIB$$0.getUserActions(<generated>)
+	at com.fincore.helpservice.service.HelpService.handleChat(HelpService.java:162)
+	at com.fincore.helpservice.service.HelpService.processRequest(HelpService.java:69)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.lambda$applyResilience$0(GlobalResilienceAspect.java:56)
+	at io.github.resilience4j.retry.Retry.lambda$decorateSupplier$5(Retry.java:301)
+	at io.github.resilience4j.circuitbreaker.CircuitBreaker.lambda$decorateSupplier$5(CircuitBreaker.java:194)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.applyResilience(GlobalResilienceAspect.java:75)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:637)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:627)
+	at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720)
+	at com.fincore.helpservice.service.HelpService$$SpringCGLIB$$0.processRequest(<generated>)
+	at com.fincore.helpservice.controller.HelpController.getHelp(HelpController.java:32)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:255)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:188)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:926)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:831)
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979)
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1014)
+	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:914)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:590)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:658)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:108)
+	at org.springframework.security.web.FilterChainProxy.lambda$doFilterInternal$3(FilterChainProxy.java:231)
+	at org.springframework.security.web.ObservationFilterChainDecorator$FilterObservation$SimpleFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:479)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:340)
+	at org.springframework.security.web.ObservationFilterChainDecorator.lambda$wrapSecured$0(ObservationFilterChainDecorator.java:82)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:128)
+	at org.springframework.security.web.access.intercept.AuthorizationFilter.doFilter(AuthorizationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:126)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:120)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:131)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:85)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.AnonymousAuthenticationFilter.doFilter(AnonymousAuthenticationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter.doFilter(SecurityContextHolderAwareRequestFilter.java:179)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.savedrequest.RequestCacheAwareFilter.doFilter(RequestCacheAwareFilter.java:63)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at com.fincore.commonutilities.security.ContextRbacFilter.doFilterInternal(ContextRbacFilter.java:145)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at com.fincore.commonutilities.logging.MdcLoggingFilter.doFilterInternal(MdcLoggingFilter.java:66)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:107)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:93)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.web.filter.CorsFilter.doFilterInternal(CorsFilter.java:91)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.header.HeaderWriterFilter.doHeadersAfter(HeaderWriterFilter.java:90)
+	at org.springframework.security.web.header.HeaderWriterFilter.doFilterInternal(HeaderWriterFilter.java:75)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:82)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:69)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter.doFilterInternal(WebAsyncManagerIntegrationFilter.java:62)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.DisableEncodeUrlFilter.doFilterInternal(DisableEncodeUrlFilter.java:42)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$0(ObservationFilterChainDecorator.java:323)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:224)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.FilterChainProxy.doFilterInternal(FilterChainProxy.java:233)
+	at org.springframework.security.web.FilterChainProxy.doFilter(FilterChainProxy.java:191)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.servlet.handler.HandlerMappingIntrospector.lambda$createCacheFilter$3(HandlerMappingIntrospector.java:195)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.filter.CompositeFilter.doFilter(CompositeFilter.java:74)
+	at org.springframework.security.config.annotation.web.configuration.WebMvcSecurityConfiguration$CompositeFilterChainProxy.doFilter(WebMvcSecurityConfiguration.java:230)
+	at org.springframework.web.filter.DelegatingFilterProxy.invokeDelegate(DelegatingFilterProxy.java:352)
+	at org.springframework.web.filter.DelegatingFilterProxy.doFilter(DelegatingFilterProxy.java:268)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.ServerHttpObservationFilter.doFilterInternal(ServerHttpObservationFilter.java:109)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167)
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482)
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115)
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74)
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344)
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:389)
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63)
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:896)
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1741)
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659)
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:63)
+	at java.base/java.lang.Thread.run(Thread.java:1570)
+Caused by: org.hibernate.NonUniqueResultException: Query did not return a unique result: 3 results were returned
+	at org.hibernate.query.spi.AbstractSelectionQuery.uniqueElement(AbstractSelectionQuery.java:578)
+	at org.hibernate.query.spi.AbstractSelectionQuery.getSingleResult(AbstractSelectionQuery.java:561)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.orm.jpa.SharedEntityManagerCreator$DeferredQueryInvocationHandler.invoke(SharedEntityManagerCreator.java:418)
+	at jdk.proxy2/jdk.proxy2.$Proxy207.getSingleResult(Unknown Source)
+	at org.springframework.data.jpa.repository.query.JpaQueryExecution$SingleEntityExecution.doExecute(JpaQueryExecution.java:223)
+	at org.springframework.data.jpa.repository.query.JpaQueryExecution.execute(JpaQueryExecution.java:92)
+	at org.springframework.data.jpa.repository.query.AbstractJpaQuery.doExecute(AbstractJpaQuery.java:152)
+	at org.springframework.data.jpa.repository.query.AbstractJpaQuery.execute(AbstractJpaQuery.java:140)
+	at org.springframework.data.repository.core.support.RepositoryMethodInvoker.doInvoke(RepositoryMethodInvoker.java:170)
+	at org.springframework.data.repository.core.support.RepositoryMethodInvoker.invoke(RepositoryMethodInvoker.java:158)
+	at org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor.doInvoke(QueryExecutorMethodInterceptor.java:164)
+	at org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor.invoke(QueryExecutorMethodInterceptor.java:143)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.data.projection.DefaultMethodInvokingMethodInterceptor.invoke(DefaultMethodInvokingMethodInterceptor.java:70)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.transaction.interceptor.TransactionInterceptor$1.proceedWithInvocation(TransactionInterceptor.java:123)
+	at org.springframework.transaction.interceptor.TransactionAspectSupport.invokeWithinTransaction(TransactionAspectSupport.java:392)
+	at org.springframework.transaction.interceptor.TransactionInterceptor.invoke(TransactionInterceptor.java:119)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.dao.support.PersistenceExceptionTranslationInterceptor.invoke(PersistenceExceptionTranslationInterceptor.java:137)
+	... 194 common frames omitted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ============================================================================================
+// updated code of the application :
+// ============================================================================================
 
 package com.fincore.helpservice.service;
 
 import com.fincore.helpservice.dto.HelpItemDTO;
 import com.fincore.helpservice.dto.HelpRequestDTO;
 import com.fincore.helpservice.dto.HelpResponseDTO;
-import com.fincore.helpservice.entity.HelpFaqEntity;
-import com.fincore.helpservice.entity.HelpQuestionEntity;
+import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpQuestionEntity;
 import com.fincore.helpservice.repository.HelpFaqRepository;
 import com.fincore.helpservice.repository.HelpQuestionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -224,17 +298,15 @@ import java.util.stream.Stream;
 @Slf4j
 public class HelpService {
 
-    private final HelpQuestionRepository questionRepository;
-    private final HelpFaqRepository faqRepository;
-    private final HelpAnalyticsService analyticsService;
-    private final PermissionService permissionService;
-
-    // Tuning Thresholds
-    private static final int SCORE_THRESHOLD_HIGH = 65; // Lowered slightly for better responsiveness
-    private static final int SCORE_THRESHOLD_LOW = 25;
+    // Thresholds for "Smart Chat"
+    private static final int SCORE_THRESHOLD_HIGH = 65; // Above this -> Direct Answer
+    private static final int SCORE_THRESHOLD_LOW = 25;  // Between 30-75 -> Suggestions
 
     // --- SYNONYM MAP (The Smart Dictionary) ---
     private static final Map<String, List<String>> SYNONYMS = new HashMap<>();
+    // Words to ignore in search to improve relevance
+    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is");
+
     static {
         SYNONYMS.put("create", List.of("add", "new", "generate", "make", "raise"));
         SYNONYMS.put("modify", List.of("edit", "update", "change", "correct"));
@@ -244,62 +316,100 @@ public class HelpService {
         SYNONYMS.put("logout", List.of("sign out", "log out", "exit"));
     }
 
-    public HelpResponseDTO processRequest(HelpRequestDTO request) {
-        String userId = getUserIdFromContext();
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpAnalyticsService analyticsService;
+    private final PermissionService permissionService;
+
+
+    /**
+     * MAIN PROCESSOR: Routes based on Intent (Request Type)
+     */
+    public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
+
+        // 1. Normalize Actions (Permissions)
+        List<String> userActions = normalizeActions(request.getUserActions());
         String type = request.getRequestType();
 
-        // Server-Side RBAC: Fetch actions based on User ID & Screen
-        // We do this inside specific handlers now to be context-aware
-        
         switch (type) {
             case "MODULE_QUESTIONS":
-                return handleModuleFetch(userId, request.getScreenName());
+                return handleModuleFetch(request.getScreenName(), roleId);
+
             case "FAQ_LIST":
                 return handleFaqFetch();
+
             case "GET_ANSWER":
                 return handleGetAnswer(request.getQuestionId());
+
             case "CHAT":
-                return handleChat(userId, request.getChatMessage(), request.getScreenName());
+                return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
+
             default:
-                throw new IllegalArgumentException("Invalid Request Type");
+                throw new IllegalArgumentException("Invalid Request Type: " + type);
         }
     }
 
-    // --- HANDLER 1: MODULE QUESTIONS ---
-    private HelpResponseDTO handleModuleFetch(String userId, String screenName) {
+
+    // =========================================================================
+    // HANDLER 1: MODULE QUESTIONS
+    // =========================================================================
+
+    private HelpResponseDTO handleModuleFetch(String screenName, String roleId) {
         if (!StringUtils.hasText(screenName)) throw new IllegalArgumentException("Screen Name is required");
 
         // Fetch User Permissions
-        List<String> userActions = permissionService.getUserActions(userId, screenName);
+        List<String> userActions = permissionService.getUserActions(roleId, screenName);
 
         List<HelpItemDTO> items = getQuestionsForScreen(screenName).stream()
-                // Only show relevant questions in the list (Hide restricted ones here to avoid clutter)
-                .filter(q -> isActionAllowed(q, userActions)) 
-                .map(q -> HelpItemDTO.builder().id(q.getQuestionId()).text(q.getQuestionText()).type("QUESTION").build())
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> HelpItemDTO.builder()
+                        .id(q.getQuestionId())
+                        .text(q.getQuestionText())
+                        .type("QUESTION")
+                        .build()) // Note: We do NOT send the full answer content here to keep it light
                 .collect(Collectors.toList());
 
-        return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply("Topics for " + screenName + ":").items(items).build();
-    }
-
-    // --- HANDLER 2: FAQ FETCH ---
-    private HelpResponseDTO handleFaqFetch() {
         return HelpResponseDTO.builder()
                 .responseType("LIST_SELECTION")
-                .botReply("Frequently Asked Questions:")
-                .items(fetchGlobalFaqs())
+                .botReply("Here are the topics for " + screenName + ":")
+                .items(items)
                 .build();
     }
 
-    // --- HANDLER 3: GET ANSWER (Direct Click) ---
-    private HelpResponseDTO handleGetAnswer(String questionId) {
-        return questionRepository.findById(questionId)
-                .map(q -> HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(q.getAnswerContent()).build())
-                .orElse(HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Content not found.").build());
+    // =========================================================================
+    // HANDLER 2: FAQ FETCH
+    // =========================================================================
+    private HelpResponseDTO handleFaqFetch() {
+        List<HelpItemDTO> faqs = fetchGlobalFaqs();
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the frequently asked questions:")
+                .items(faqs)
+                .build();
     }
 
-    // --- HANDLER 4: SMART CHAT ---
-    private HelpResponseDTO handleChat(String userId, String message, String clientScreenName) {
-        if (!StringUtils.hasText(message)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+    // =========================================================================
+    // HANDLER 3: DIRECT ANSWER
+    // =========================================================================
+    private HelpResponseDTO handleGetAnswer(String questionId) {
+        return questionRepository.findById(questionId)
+                .map(q -> HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(q.getAnswerContent()) // HTML/Text Answer
+                        .build())
+                .orElse(HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("Sorry, I couldn't find the content for that question.")
+                        .build());
+    }
+
+    // =========================================================================
+    // HANDLER 4: CHAT
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String message, String clientScreenName, String roleid) {
+        if (!StringUtils.hasText(message)) {
+            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+        }
 
         // 1. Infer Context (If user types "CGL" but is on Home screen)
         String inferredScreen = inferScreenFromQuery(message);
@@ -308,9 +418,13 @@ public class HelpService {
         // 2. Perform Search (Includes FAQs & Questions)
         List<HelpItemDTO> matches = performSmartSearch(message, activeScreen);
 
+        // 3. Analyze Scores
         if (matches.isEmpty()) {
             analyticsService.logChatInteraction(userId, activeScreen, message, "NO_MATCH", 0);
-            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Sorry, I couldn't find anything related to that. Try rephrasing?").build();
+            return HelpResponseDTO.builder()
+                    .responseType("NO_MATCH")
+                    .botReply("Sorry, I don't have information about that. Please try rephrasing.")
+                    .build();
         }
 
         HelpItemDTO bestMatch = matches.get(0);
@@ -318,25 +432,25 @@ public class HelpService {
 
         // 3. Permission Check (The "Polite Rejection" Logic)
         if (score >= SCORE_THRESHOLD_HIGH) {
-            
+
             // Check if it's a Restricted Question
             if ("QUESTION".equals(bestMatch.getType()) && bestMatch.getRequiredAction() != null) {
-                List<String> userActions = permissionService.getUserActions(userId, bestMatch.getScreenName());
-                
+                List<String> userActions = permissionService.getUserActions(roleid, bestMatch.getScreenName());
+
                 // If user LACKS permission
                 if (!userActions.contains(bestMatch.getRequiredAction())) {
                     String deniedMsg = permissionService.getAccessDeniedMessage(bestMatch.getRequiredAction(), bestMatch.getScreenName());
-                    
+
                     analyticsService.logChatInteraction(userId, activeScreen, message, "ACCESS_DENIED", score);
                     return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(deniedMsg).build();
                 }
             }
-            
+
             // Access Granted or Public FAQ
             analyticsService.logChatInteraction(userId, activeScreen, message, "ANSWERED", score);
             return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(bestMatch.getAnswer()).build();
-        } 
-        
+        }
+
         // 4. Suggestions (Ambiguous)
         else if (score >= SCORE_THRESHOLD_LOW) {
             analyticsService.logChatInteraction(userId, activeScreen, message, "SUGGESTION", score);
@@ -349,13 +463,16 @@ public class HelpService {
 
         // 5. No Match
         analyticsService.logChatInteraction(userId, activeScreen, message, "NO_MATCH_LOW", score);
-        return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("I didn't quite get that. Could you be more specific?").build();
+
+        return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply("I didn't quite get that. Could you be more specific?")
+                .build();
     }
 
     // =========================================================================
-    // SEARCH ENGINE
+    // SEARCH ALGORITHM
     // =========================================================================
-
     private List<HelpItemDTO> performSmartSearch(String query, String activeScreen) {
         String normalizedQuery = query.toLowerCase().trim();
         List<String> tokens = tokenize(normalizedQuery);
@@ -365,7 +482,7 @@ public class HelpService {
                 .map(q -> {
                     int score = calculateScore(q.getQuestionText(), q.getKeywords(), q.getScreenName(), normalizedQuery, tokens, activeScreen);
                     // Add Action Bonus (If query is "Create" and Question Action is "CREATE")
-                    if(q.getRequiredAction() != null && isActionMatch(normalizedQuery, q.getRequiredAction())) {
+                    if (q.getRequiredAction() != null && isActionMatch(normalizedQuery, q.getRequiredAction())) {
                         score += 30; // Huge Intent Bonus
                     }
                     return HelpItemDTO.builder()
@@ -410,7 +527,7 @@ public class HelpService {
             if (lowerText.contains(token) || lowerKeywords.contains(token)) {
                 score += 15;
                 tokenMatched = true;
-            } 
+            }
             // Synonym Check
             else if (matchesSynonym(token, lowerText)) {
                 score += 12; // Slightly less than exact word
@@ -435,7 +552,72 @@ public class HelpService {
         return (int) Math.min(score, 100);
     }
 
-    // --- HELPERS ---
+    // Levenshtein check (tolerance of 2 edits for words > 3 chars)
+    private boolean fuzzyMatch(String token, String target) {
+        if (target.contains(token)) return true;
+        if(token.length() < 3) return false;
+
+        // Check against each word in target to avoid matching across word boundaries
+        for (String word : target.split("\\W+")) {
+            if (calculateDistance(token, word) <= 1) return true;
+        }
+        return false;
+    }
+
+    // Standard Edit Distance Algo
+    private int calculateDistance(String x, String y) {
+        int[][] dp = new int[x.length() + 1][y.length() + 1];
+        for (int i = 0; i <= x.length(); i++) {
+            for (int j = 0; j <= y.length(); j++) {
+                if (i == 0) dp[i][j] = j;
+                else if (j == 0) dp[i][j] = i;
+                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
+                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+            }
+        }
+        return dp[x.length()][y.length()];
+    }
+
+    // =========================================================================
+    // CACHING & UTILS
+    // =========================================================================
+
+    @Cacheable(value = "help_questions", key = "#screenName")
+    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
+        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    }
+
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() {
+        return questionRepository.findByIsActive("Y");
+    }
+
+    @Cacheable(value = "help_faqs_all")
+    public List<HelpFaqEntity> fetchGlobalFaqsEntity() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y");
+    }
+
+    public List<HelpItemDTO> fetchGlobalFaqs() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
+                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
+                .collect(Collectors.toList());
+    }
+
+    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
+        // If question has no restricted action, it's public for that screen
+        if (q.getRequiredAction() == null || q.getRequiredAction().trim().isEmpty()) return true;
+
+        // Super Admin Bypass
+        if (userActions.contains("ALL") || userActions.contains("*")) return true;
+
+        // Check List Inclusion
+        return userActions.contains(q.getRequiredAction().toUpperCase());
+    }
+
+    private List<String> normalizeActions(List<String> actions) {
+        return actions == null ? Collections.emptyList() : actions.stream().map(String::toUpperCase).collect(Collectors.toList());
+    }
+
 
     private boolean isActionMatch(String query, String action) {
         // Check exact action
@@ -468,46 +650,12 @@ public class HelpService {
         return null;
     }
 
-    private String getUserIdFromContext() {
-        try {
-            return SecurityContextHolder.getContext().getAuthentication().getName();
-        } catch (Exception e) { return "ANONYMOUS"; }
+    private List<String> tokenize(String query) {
+        return Arrays.asList(query.split("\\W+"));
     }
 
-    // Standard getters/cache/utils...
-    private List<String> tokenize(String query) { return Arrays.asList(query.split("\\W+")); }
-    
-    @Cacheable(value = "help_questions_all")
-    public List<HelpQuestionEntity> getAllActiveQuestions() { return questionRepository.findByIsActive("Y"); }
-    
-    @Cacheable(value = "help_faqs_all")
-    public List<HelpFaqEntity> fetchGlobalFaqsEntity() { return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y"); }
 
-    private static final Set<String> STOP_WORDS = Set.of("how", "to", "i", "can", "do", "a", "the", "in", "on", "what", "is");
-    
-    // Levenshtein Implementation (Same as before)
-    private boolean fuzzyMatch(String token, String target) {
-        if(token.length() < 3) return false;
-        for(String w : target.split("\\W+")) if(calculateDistance(token, w) <= 1) return true;
-        return false;
-    }
-    private int calculateDistance(String x, String y) { /* ... same as before ... */ return 0; }
-    
-    // List Filter (Used for Module Fetch only)
-    private boolean isActionAllowed(HelpQuestionEntity q, List<String> actions) {
-        if (q.getRequiredAction() == null) return true;
-        if (actions.contains("ALL")) return true;
-        return actions.contains(q.getRequiredAction().toUpperCase());
-    }
-    
-    // Helper for FAQ Fetch Handler
-    private List<HelpItemDTO> fetchGlobalFaqs() {
-        return fetchGlobalFaqsEntity().stream().map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build()).collect(Collectors.toList());
-    }
 }
-
-
-
 
 
 
@@ -542,8 +690,8 @@ public class HelpItemDTO implements Serializable {
     private String actionLink; // Deep Link
     private String actionLabel;// Button Text
     private String type;       // QUESTION, FAQ, SEARCH_RESULT
-    private double searchScore; 
-    
+    private double searchScore;
+
     // New Fields for Internal Logic
     private String requiredAction;
     private String screenName;
@@ -552,6 +700,743 @@ public class HelpItemDTO implements Serializable {
 
 
 
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * Entity: HELP_SEARCH_ANALYTICS
+ * Purpose: Logs every chat interaction for future analysis.
+ */
+@Data
+@Entity
+@Table(name = "HELP_SEARCH_ANALYTICS")
+public class HelpSearchAnalyticsEntity {
+
+    @Id
+    @Column(name = "LOG_ID", length = 50)
+    private String logId;
+
+    @Column(name = "USER_ID", length = 50)
+    private String userId;
+
+    @Column(name = "SEARCH_QUERY", length = 500)
+    private String searchQuery;
+
+    @Column(name = "SCREEN_CONTEXT", length = 100)
+    private String screenContext;
+
+    // Enum values: "ANSWERED", "SUGGESTION", "NO_MATCH"
+    @Column(name = "RESULT_STATUS", length = 20)
+    private String resultStatus;
+
+    // 0-100
+    @Column(name = "CONFIDENCE_SCORE")
+    private Integer confidenceScore;
+
+    // Populated later if user clicks a suggestion
+    @Column(name = "CLICKED_Q_ID", length = 50)
+    private String clickedQuestionId;
+
+    @CreationTimestamp
+    @Column(name = "SEARCH_TIMESTAMP", updatable = false)
+    private LocalDateTime searchTimestamp;
+
+    @PrePersist
+    public void generateId() {
+        if (this.logId == null || this.logId.isEmpty()) {
+            this.logId = UUID.randomUUID().toString();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
+import com.fincore.helpservice.repository.HelpAnalyticsRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpAnalyticsService {
+
+    private final HelpAnalyticsRepository analyticsRepository;
+
+    /**
+     * Async Logging to ensure Chat response time is not affected.
+     */
+    @Async
+    public void logChatInteraction(String userId, String screenContext, String query, String status, int score) {
+        try {
+            HelpSearchAnalyticsEntity entity = new HelpSearchAnalyticsEntity();
+
+            entity.setUserId(userId != null ? userId : "ANONYMOUS");
+            entity.setScreenContext(screenContext);
+            entity.setSearchQuery(query);
+            entity.setResultStatus(status);
+            entity.setConfidenceScore(score);
+
+            analyticsRepository.save(entity);
+//            log.info("Log analytics for query : {} is Successful.", query);
+        } catch (Exception e) {
+            // Log error but don't break the application flow
+            log.error("Failed to log analytics for query: [{}]", query, e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.repository.PermissionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PermissionService {
+
+    private final PermissionRepository permissionRepository;
+
+    /**
+     * Fetches the list of allowed actions (CREATE, APPROVE, etc.) for a user on a specific screen.
+     */
+    public List<String> getUserActions(String roleId, String screenName) {
+        if (screenName == null) return Collections.emptyList();
+
+        String actionString = permissionRepository.findActionForUserAndScreen(roleId, screenName);
+
+        if (actionString == null || actionString.isBlank()) {
+            return Collections.emptyList();
+        }
+
+        log.info("actionString : {}", actionString);
+        // Split "view|create|modify" -> ["VIEW", "CREATE", "MODIFY"]
+        return Arrays.stream(actionString.split("\\|"))
+                .map(String::trim)
+                .map(String::toUpperCase)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Generates a polite "Access Denied" message based on the missing action.
+     */
+    public String getAccessDeniedMessage(String requiredAction, String screenName) {
+        String module = (screenName != null) ? screenName : "this module";
+        requiredAction = (requiredAction != null) ? requiredAction.toLowerCase() : "perform this action";
+
+        return switch (requiredAction.toUpperCase()) {
+            case "CREATE" ->
+                    "You do not have rights to create entries in " + module + ". Users with creation rights can perform this. Please contact support.";
+            case "APPROVE" ->
+                    "You do not have approval rights for " + module + ". Please wait for an executor to process requests, or check 'My Requests' to view status.";
+            case "MODIFY" ->
+                    "You do not have permission to modify records in " + module + ".";
+            case "DELETE" ->
+                    "Deletion is restricted. You do not have the required permissions.";
+            default ->
+                    "You do not have the required permissions (" + requiredAction + ") to perform this action.";
+        };
+    }
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.PermissionEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+
+@Repository
+public interface PermissionRepository extends JpaRepository<PermissionEntity, Integer> {
+
+    // Get Actions for a specific User and Screen
+    @Query(value = """
+            SELECT p.MENU_ACTION
+            FROM PERMISSIONS p
+            JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+            WHERE rp.role_id = :roleId
+            AND UPPER(p.MENU_TITLE) = UPPER(:screenName)
+            """, nativeQuery = true)
+    String findActionForUserAndScreen(@Param("roleId") String roleId, @Param("screenName") String screenName);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.controller;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.helpservice.dto.ApiResponse;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.service.HelpService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/help")
+@RequiredArgsConstructor
+@Slf4j
+public class HelpController {
+
+    private final HelpService helpService;
+    private final JwtUtil jwtUtil;
+
+    /**
+     * Unified Help Endpoint.
+     */
+    @PostMapping("/fetch")
+    public ResponseEntity<ApiResponse<HelpResponseDTO>> getHelp(@RequestHeader("Authorization") String token, @RequestBody @Valid HelpRequestDTO request) {
+
+        log.info("Received Help Bot Request for Type: {}", request.getRequestType());
+
+        // Delegate business logic to Service
+        HelpResponseDTO result = helpService.processRequest(request, jwtUtil.getUserIdFromToken(token), String.valueOf(jwtUtil.getUserRoleFromToken(token)));
+
+        // Return clean success response
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+}
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import lombok.Builder;
+import lombok.Data;
+import java.io.Serializable;
+
+@Data
+@Builder
+public class HelpItemDTO implements Serializable {
+
+    private String id;
+    private String text;       // The Question
+    private String answer;     // The Answer (HTML/Text)
+    private String actionLink; // Deep Link
+    private String actionLabel;// Button Text
+    private String type;       // QUESTION, FAQ, SEARCH_RESULT
+    private double searchScore;
+
+    // New Fields for Internal Logic
+    private String requiredAction;
+    private String screenName;
+}
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class HelpRequestDTO {
+
+    /**
+     * The intent of the user.
+     * Values: MODULE_QUESTIONS, FAQ_LIST, GET_ANSWER, CHAT
+     */
+    @NotNull(message = "Request Type is mandatory")
+    private String requestType;
+
+    // --- Conditional Fields (based on requestType) ---
+
+    // For MODULE_QUESTIONS
+    private String screenName;
+
+    // For GET_ANSWER (When user clicks a specific question)
+    private String questionId;
+
+    // For CHAT (When user types)
+    private String chatMessage;
+
+    // RBAC: User's Allowed Actions (from Login Token)
+//    @NotNull(message = "User actions cannot be null")
+    private List<String> userActions;
+}
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class HelpResponseDTO {
+
+    /**
+     * Tells the Client how to render the response.
+     * - "TEXT_REPLY": Show a bot bubble with text.
+     * - "LIST_SELECTION": Show a list of clickable options (Questions).
+     * - "SUGGESTION": Show "Did you mean?" with options.
+     * - "NO_MATCH": Show apology.
+     */
+    private String responseType;
+
+    // The main text content (Answer or Apology)
+    private String botReply;
+
+    // List of items (Questions for Module, Suggestions, or FAQs)
+    private List<HelpItemDTO> items;
+}
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.io.Serializable;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+
+/**
+ * ENTITY: HELP_FAQ_MASTER
+ * Global FAQs.
+ */
+@Data
+@Entity
+@Table(name = "HELP_FAQ_MASTER")
+public class HelpFaqEntity implements Serializable {
+
+    @Id
+    @Column(name = "FAQ_ID", length = 50)
+    private String faqId;
+
+    @Column(name = "QUESTION_TEXT", length = 500)
+    private String questionText;
+
+    @Lob
+    @Column(name = "ANSWER_CONTENT")
+    private String answerContent;
+
+    @Column(name = "DISPLAY_ORDER")
+    private Integer displayOrder;
+
+    @Column(name = "IS_ACTIVE")
+    private String isActive;
+
+    @PrePersist
+    public void prePersist() {
+        if (this.faqId == null || this.faqId.isEmpty()) {
+            this.faqId = UUID.randomUUID().toString();
+        }
+    }
+}
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.io.Serializable;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+
+/**
+ * ENTITY: HELP_QUESTION_MASTER
+ * Represents individual help items.
+ * Includes logic for auto-generating UUIDs if not provided.
+ */
+@Data
+@Entity
+@Table(name = "HELP_QUESTION_MASTER")
+public class HelpQuestionEntity implements Serializable {
+
+    @Id
+    @Column(name = "QUESTION_ID", length = 50)
+    private String questionId;
+
+    @Column(name = "SCREEN_NAME", length = 100, nullable = false)
+    private String screenName;
+
+    @Column(name = "QUESTION_TEXT", length = 500, nullable = false)
+    private String questionText;
+
+    // Use @Lob for Oracle CLOB types
+    @Lob
+    @Column(name = "ANSWER_CONTENT")
+    private String answerContent;
+
+    @Column(name = "ACTION_LINK")
+    private String actionLink;
+
+    @Column(name = "ACTION_LABEL")
+    private String actionLabel;
+
+    @Column(name = "REQUIRED_ACTION", length = 50)
+    private String requiredAction;
+
+    @Column(name = "KEYWORDS", length = 1000)
+    private String keywords;
+
+    @Column(name = "DISPLAY_ORDER")
+    private Integer displayOrder;
+
+    @Column(name = "IS_ACTIVE", length = 1)
+    private String isActive;
+
+    @CreationTimestamp
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UPDATED_AT")
+    private LocalDateTime updatedAt;
+
+    // Auto-generate UUID if missing
+    @PrePersist
+    public void prePersist() {
+        if (this.questionId == null || this.questionId.isEmpty()) {
+            this.questionId = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+        }
+    }
+}
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import java.io.Serializable;
+import java.time.LocalDateTime;
+
+
+/**
+ * ENTITY: HELP_SCREEN_MASTER
+ * Represents a functional module in the application (e.g., "CGL Management").
+ */
+@Data
+@Entity
+@Table(name = "HELP_SCREEN_MASTER")
+public class HelpScreenEntity implements Serializable {
+
+    @Id
+    @Column(name = "SCREEN_NAME", length = 100)
+    private String screenName;
+
+    @Column(name = "SCREEN_LABEL", length = 100)
+    private String screenLabel;
+
+    @Column(name = "IS_ACTIVE", length = 1)
+    private String isActive;
+
+    @CreationTimestamp
+    @Column(name = "CREATED_AT", updatable = false)
+    private LocalDateTime createdAt;
+}
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * Entity: HELP_SEARCH_ANALYTICS
+ * Purpose: Logs every chat interaction for future analysis.
+ */
+@Data
+@Entity
+@Table(name = "HELP_SEARCH_ANALYTICS")
+public class HelpSearchAnalyticsEntity {
+
+    @Id
+    @Column(name = "LOG_ID", length = 50)
+    private String logId;
+
+    @Column(name = "USER_ID", length = 50)
+    private String userId;
+
+    @Column(name = "SEARCH_QUERY", length = 500)
+    private String searchQuery;
+
+    @Column(name = "SCREEN_CONTEXT", length = 100)
+    private String screenContext;
+
+    // Enum values: "ANSWERED", "SUGGESTION", "NO_MATCH"
+    @Column(name = "RESULT_STATUS", length = 20)
+    private String resultStatus;
+
+    // 0-100
+    @Column(name = "CONFIDENCE_SCORE")
+    private Integer confidenceScore;
+
+    // Populated later if user clicks a suggestion
+    @Column(name = "CLICKED_Q_ID", length = 50)
+    private String clickedQuestionId;
+
+    @CreationTimestamp
+    @Column(name = "SEARCH_TIMESTAMP", updatable = false)
+    private LocalDateTime searchTimestamp;
+
+    @PrePersist
+    public void generateId() {
+        if (this.logId == null || this.logId.isEmpty()) {
+            this.logId = UUID.randomUUID().toString();
+        }
+    }
+}
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+public class PermissionEntity {
+
+    @Id
+    @Column(name = "MENU_ID")
+    private Integer menuId;
+
+    @Column(name = "MENU_TITLE") // e.g. "CGL Management"
+    private String menuTitle;
+
+    @Column(name = "MENU_ACTION") // e.g. "view|create|modify"
+    private String menuAction;
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Data
+@Entity
+@Table(name = "ROLE_PERMISSIONS")
+@IdClass(RolePermissionId.class)
+public class RolePermissionEntity {
+    @Id
+    @Column(name = "ROLE_ID")
+    private Integer roleId;
+
+    @Id
+    @Column(name = "PERMISSION_ID")
+    private Integer permissionId;
+}
+
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+
+import lombok.Data;
+
+import java.io.Serializable;
+
+@Data
+class RolePermissionId implements Serializable {
+    private Integer roleId;
+    private Integer permissionId;
+}
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+// --- 1. User Roles (To get Role ID) ---
+@Data
+@Entity
+@Table(name = "USER_ROLES")
+public class UserRoleEntity {
+    @Id
+    @Column(name = "USER_ID")
+    private String userId;
+
+    @Column(name = "ROLE_ID")
+    private Integer roleId;
+}
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyticsEntity, String> {
+}
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+
+import com.fincore.helpservice.model.HelpFaqEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface HelpFaqRepository extends JpaRepository<HelpFaqEntity, String> {
+
+    // Global FAQs
+    List<HelpFaqEntity> findByIsActiveOrderByDisplayOrderAsc(String isActive);
+}
+
+
+
+
+package com.fincore.helpservice.repository;
+
+
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface HelpQuestionRepository extends JpaRepository<HelpQuestionEntity, String> {
+
+    // For Context Mode: Select Module
+    List<HelpQuestionEntity> findByScreenNameAndIsActiveOrderByDisplayOrderAsc(String screenName, String isActive);
+
+    // For Search Mode: Fetch All Active
+    List<HelpQuestionEntity> findByIsActive(String isActive);
+}
 
 
 
