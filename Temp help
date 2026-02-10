@@ -1,137 +1,43 @@
-// ... imports
-import org.springframework.security.core.context.SecurityContextHolder;
-
-// ... inside HelpService class ...
-
-    // --- HANDLER 4: CHAT (The Smart Part with Context Boosting) ---
-    private HelpResponseDTO handleChat(String message, List<String> userActions, String currentScreenName) {
-        // 1. Validation
-        if (!StringUtils.hasText(message)) {
-            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
-        }
-
-        // 2. Extract Current User ID from JWT Context
-        String userId = "ANONYMOUS";
-        try {
-            userId = SecurityContextHolder.getContext().getAuthentication().getName();
-        } catch (Exception e) {
-            log.warn("Could not retrieve User ID from Security Context", e);
-        }
-
-        // 3. Run Search Algorithm (With Context Boosting)
-        List<HelpItemDTO> matches = performSmartSearch(message, userActions, currentScreenName);
-
-        // 4. Analyze Scores & Decision Tree
-        if (matches.isEmpty()) {
-            analyticsService.logChatInteraction(userId, currentScreenName, message, "NO_MATCH", 0);
-            return HelpResponseDTO.builder()
-                    .responseType("NO_MATCH")
-                    .botReply("Sorry, I don't have information about that. Please try rephrasing or check the FAQ.")
-                    .build();
-        }
-
-        HelpItemDTO bestMatch = matches.get(0);
-        int bestScore = (int) bestMatch.getSearchScore();
-
-        if (bestScore >= SCORE_THRESHOLD_HIGH) {
-            // Case A: High Confidence -> Direct Answer
-            analyticsService.logChatInteraction(userId, currentScreenName, message, "ANSWERED", bestScore);
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(bestMatch.getAnswer())
-                    .build();
-
-        } else if (bestScore >= SCORE_THRESHOLD_LOW) {
-            // Case B: Medium Confidence -> Suggestions
-            analyticsService.logChatInteraction(userId, currentScreenName, message, "SUGGESTION", bestScore);
-            return HelpResponseDTO.builder()
-                    .responseType("SUGGESTION")
-                    .botReply("I'm not sure, but did you mean one of these?")
-                    // Return top 3 suggestions
-                    .items(matches.stream().limit(3).collect(Collectors.toList()))
-                    .build();
-
-        } else {
-            // Case C: Low Confidence -> Treat as No Match
-            analyticsService.logChatInteraction(userId, currentScreenName, message, "NO_MATCH_LOW_SCORE", bestScore);
-            return HelpResponseDTO.builder()
-                    .responseType("NO_MATCH")
-                    .botReply("Sorry, I didn't understand that. Could you try rephrasing?")
-                    .build();
-        }
-    }
-
-    // =========================================================================
-    // SEARCH ALGORITHM (Updated with Context Boosting)
-    // =========================================================================
-
-    private List<HelpItemDTO> performSmartSearch(String query, List<String> userActions, String currentScreenName) {
-        List<HelpQuestionEntity> allQuestions = getAllActiveQuestions();
-        String normalizedQuery = query.toLowerCase().trim();
-        List<String> tokens = Arrays.asList(normalizedQuery.split("\\W+"));
-
-        return allQuestions.stream()
-                // 1. RBAC Filter
-                .filter(q -> isActionAllowed(q, userActions))
-                // 2. Score Calculation
-                .map(q -> {
-                    int score = calculateScore(q, normalizedQuery, tokens, currentScreenName);
-                    return new AbstractMap.SimpleEntry<>(q, score);
-                })
-                // 3. Filter Zero Scores
-                .filter(entry -> entry.getValue() > 0)
-                // 4. Sort Descending
-                .sorted((e1, e2) -> Integer.compare(e2.getValue(), e1.getValue()))
-                // 5. Limit Results
-                .limit(5)
-                // 6. Map to DTO
-                .map(entry -> HelpItemDTO.builder()
-                        .id(entry.getKey().getQuestionId())
-                        .text(entry.getKey().getQuestionText())
-                        .answer(entry.getKey().getAnswerContent())
-                        .searchScore(entry.getValue())
-                        .type("SEARCH_RESULT")
-                        .build())
-                .collect(Collectors.toList());
-    }
-
-    private int calculateScore(HelpQuestionEntity q, String fullQuery, List<String> tokens, String currentScreenName) {
-        double score = 0;
-        String qText = q.getQuestionText().toLowerCase();
-
-        // --- Core Matching Logic ---
-
-        // 1. Exact Phrase Match (Highest Priority)
-        if (qText.equals(fullQuery)) score = 100;
-        else if (qText.contains(fullQuery)) score += 60;
-
-        // 2. Token Matching
-        int tokenMatches = 0;
-        for (String token : tokens) {
-            if (STOP_WORDS.contains(token)) continue;
-
-            if (qText.contains(token)) {
-                score += 15;
-                tokenMatches++;
-            } else if (q.getKeywords() != null && q.getKeywords().toLowerCase().contains(token)) {
-                score += 10; // Hidden keyword match
-                tokenMatches++;
-            } else if (fuzzyMatch(token, qText)) {
-                score += 5; // Typo match
-            }
-        }
-
-        // Bonus for matching multiple tokens (Context)
-        if (tokenMatches > 1) score += (tokenMatches * 5);
-
-        // --- CONTEXT BOOSTING ---
-        // If the question belongs to the screen the user is currently viewing, boost the score.
-        if (currentScreenName != null && currentScreenName.equalsIgnoreCase(q.getScreenName())) {
-            score = score * 2.5; // 250% Boost
-        }
-
-        // Cap at 100 to keep semantics clean (though higher internal scores help sorting)
-        return (int) Math.min(score, 100);
-    }
-
-
+82e969d3-76ac-49e5-b084-e0ee2ba61f42	2488766	What is a CGL Code?		ANSWERED	100		10-02-26 03:27:05.199384000 PM
+453d8046-5b3e-4d86-b7bd-8af5a24373eb	2488766	What is a CGL Code?		ANSWERED	100		10-02-26 03:30:54.450449000 PM
+1d068390-dbe5-4edf-91a1-f7a5132f4476	2488766	create	CGL Management	NO_MATCH	0		10-02-26 03:34:45.680700000 PM
+3d389484-7353-4ad3-8746-a6dc21560982	2488766	create	CGL Management	NO_MATCH	0		10-02-26 03:35:04.029796000 PM
+8aaadef2-0d78-4596-a505-804aafed52c6	2488766	create	CGL Management	ANSWERED	100		10-02-26 03:36:01.439123000 PM
+8c790c68-3fe3-4db0-ab98-2b76ebc64da0	2488766	create	CGL Management	NO_MATCH	0		10-02-26 03:37:48.768502000 PM
+e8a78481-4dbd-4088-9423-17adcf4c4e17	2488766	create c	CGL Management	SUGGESTION	37		10-02-26 03:37:57.302419000 PM
+654a8d3f-8209-40a3-94fe-8e7d3b8f02c9	2488766	create	CGL Management	ANSWERED	100		10-02-26 03:39:04.699232000 PM
+f06e7c5b-c647-4edc-baa7-9f4564d48465	2488766	create	Segment Management	ANSWERED	75		10-02-26 03:39:24.472369000 PM
+3c4e245c-3aa5-4e3f-9fd3-bc1155e2915a	2488766	create	Segment Management	ANSWERED	75		10-02-26 03:39:38.050317000 PM
+8bf29e05-1455-4fd8-a3c2-e1e863497658	2488766	create seg	Segment Management	ANSWERED	87		10-02-26 03:40:03.624418000 PM
+8fc9dc6d-41a1-4e4d-9b18-5d5cd7492fcc	2488766	create	Segment Management	ANSWERED	75		10-02-26 03:40:10.610850000 PM
+27cdac5f-f899-4c6c-a34c-0005c861fdef	2488766	create	Segment Management	NO_MATCH	0		10-02-26 03:41:12.118233000 PM
+2b340496-fc19-463e-9d1d-c5063c4b4e19	2488766	how to create segmEnn		NO_MATCH	0		10-02-26 03:42:55.364684000 PM
+cf3a4b11-aed9-4a11-aa79-2371c0a34009	2488766	how to create Segment		NO_MATCH	0		10-02-26 03:43:05.871888000 PM
+96847720-03f5-4da5-aabc-b698f0b665e9	2488766	how to create Segment	Segment Management	NO_MATCH	0		10-02-26 03:43:21.801423000 PM
+3fa7d423-5f25-4a1a-b45c-4e4a6b026b58	2488766	Segment	Segment Management	NO_MATCH	0		10-02-26 03:43:30.669354000 PM
+8ce28270-e3cb-44d3-a361-359f96dcf623	2488766	How to add a new Segment?	Segment Management	NO_MATCH	0		10-02-26 03:43:44.415621000 PM
+2906f39e-b17d-4f97-a6f9-c08d3b32b15d	2488766	cgl	Segment Management	ANSWERED	75		10-02-26 03:43:58.119581000 PM
+14903a6a-43f7-4ae0-bbc2-d1df2ae557b8	2488766	cgl	Segment Management	ANSWERED	75		10-02-26 03:44:19.238583000 PM
+295b1365-1dc7-4299-9ad5-b5809eff4bad	2488766	segment	Segment Management	NO_MATCH	0		10-02-26 03:44:25.109545000 PM
+e162941a-b485-4c1d-995d-1e4baea3b653	2488766	segment add	Segment Management	NO_MATCH	0		10-02-26 03:44:34.814817000 PM
+ce51a38a-322a-4e40-9467-5f183a29234f	2488766	segment add	Segment Management	ANSWERED	100		10-02-26 03:44:42.661603000 PM
+6ac4fb84-e78c-48a6-b598-62806fbed44e	2488766	how to create	Segment Management	NO_MATCH_LOW_SCORE	25		10-02-26 03:45:03.936748000 PM
+a0170667-67cb-42e1-b88d-52019f18c307	2488766	how to create segment	Segment Management	ANSWERED	87		10-02-26 03:45:10.024215000 PM
+36571c16-457c-4703-a1cf-8d6ce0ec6273	2488766	how to create segme	Segment Management	ANSWERED	87		10-02-26 03:45:16.848793000 PM
+573a9be3-0526-4ca9-b81f-95bf2af58758	2488766	how to Cregvx segme	Segment Management	SUGGESTION	37		10-02-26 03:45:25.559878000 PM
+fa9b9cef-cb2b-40a2-8c69-49f00f0c53b0	2488766	create	Segment Management	ANSWERED	75		10-02-26 03:47:10.492259000 PM
+48d0f5d6-6728-4126-85e5-8ff2885d53d6	2488766	add	Segment Management	NO_MATCH	0		10-02-26 03:47:32.121955000 PM
+65018f33-3e8e-464e-9195-bc15a590e0cf	2488766	add s	Segment Management	NO_MATCH_LOW_SCORE	15		10-02-26 03:47:37.855527000 PM
+8e540f82-dfcc-4b89-a61f-9ad59b6236cc	2488766	add se	Segment Management	NO_MATCH	0		10-02-26 03:47:44.316232000 PM
+b826570d-69b8-4d2f-a1ab-3d89e74ae58f	2488766	add seg	Segment Management	NO_MATCH	0		10-02-26 03:47:49.556077000 PM
+c772373b-139c-42d7-9906-ef1e2795f5ba	2488766	add segm	Segment Management	NO_MATCH	0		10-02-26 03:47:54.720785000 PM
+1da0adf4-edf5-464f-b941-a8d808c2c636	2488766	add segme	Segment Management	NO_MATCH	0		10-02-26 03:48:00.888438000 PM
+5fcad2d3-e7a0-4a31-ba6a-9a9844454a73	2488766	add segmen	Segment Management	NO_MATCH	0		10-02-26 03:48:05.728427000 PM
+e969726e-9da2-477c-8098-ca57a9697946	2488766	add segment	Segment Management	NO_MATCH	0		10-02-26 03:48:10.348827000 PM
+fd6376c0-d4de-4462-a041-e52269b80845	2488766	add segment	Segment Management	ANSWERED	100		10-02-26 03:48:20.763381000 PM
+91247751-133e-45d5-9178-ef40ce0f9012	2488766	add 	Segment Management	ANSWERED	100		10-02-26 03:48:26.775425000 PM
+9dea9ec0-baaf-497f-87f9-346468d059e2	2488766	add	Segment Management	ANSWERED	100		10-02-26 03:48:30.698251000 PM
+71ba1aa6-816d-4388-8b4f-4b1a739fc98a	2488766	create	Segment Management	ANSWERED	75		10-02-26 03:48:41.331215000 PM
+c47fb47c-650f-4a6b-8f5a-ffcc94d0f0f2	2488766	ADD	Segment Management	ANSWERED	100		10-02-26 03:48:48.712534000 PM
+20f00303-2243-4daa-97de-4d884c2f51eb	2488766	how to crreate cgl		NO_MATCH_LOW_SCORE	20		10-02-26 03:49:47.364067000 PM
+de1eca2f-7fec-4190-8681-6ef80c02e12e	2488766	how to create cgl		SUGGESTION	40		10-02-26 03:51:21.899116000 PM
