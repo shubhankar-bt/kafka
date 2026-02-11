@@ -1,121 +1,3 @@
-package com.fincore.helpservice.exception;
-
-import com.fincore.helpservice.dto.ApiResponse;
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-
-@RestControllerAdvice
-@Slf4j
-public class GlobalExceptionHandler {
-
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<ApiResponse<HelpResponseDTO>> handleBadRequest(IllegalArgumentException ex) {
-        log.warn("Bad Request: {}", ex.getMessage());
-        return buildErrorResponse(ex.getMessage());
-    }
-
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ApiResponse<HelpResponseDTO>> handleGeneralException(Exception ex) {
-        log.error("Unexpected Error", ex);
-        return buildErrorResponse("I encountered a technical issue. Please contact support if this persists.");
-    }
-
-    // Handle Validation Errors (@NotNull, @Size in DTOs)
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ApiResponse<HelpResponseDTO>> handleValidationException(MethodArgumentNotValidException ex) {
-        String errorMsg = ex.getBindingResult().getFieldError() != null 
-                ? ex.getBindingResult().getFieldError().getDefaultMessage() 
-                : "Invalid Request Data";
-        log.warn("Validation Error: {}", errorMsg);
-        return buildErrorResponse(errorMsg);
-    }
-
-    private ResponseEntity<ApiResponse<HelpResponseDTO>> buildErrorResponse(String message) {
-        // Construct a safe "Chatbot Response" so the UI doesn't break
-        HelpResponseDTO safeBotResponse = HelpResponseDTO.builder()
-                .responseType("TEXT_REPLY")
-                .botReply("⚠️ **Error:** " + message)
-                .build();
-        
-        return ResponseEntity.status(HttpStatus.OK) // Return 200 OK so frontend renders the bot message
-                .body(ApiResponse.success(safeBotResponse)); 
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.repository;
-
-import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
-import org.springframework.data.domain.Pageable; // Correct Import
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-import java.util.List;
-
-@Repository
-public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyticsEntity, String> {
-
-    // Find top 3 most searched phrases for a specific user
-    @Query("SELECT h.searchQuery FROM HelpSearchAnalyticsEntity h " +
-            "WHERE h.userId = :userId " +
-            "GROUP BY h.searchQuery " +
-            "ORDER BY COUNT(h) DESC")
-    List<String> findTopSearchesByUser(@Param("userId") String userId, Pageable pageable);
-
-    // NEW: Count how many times a specific question was clicked for a similar search
-    // We use 'LIKE' to match partial queries (Simple fuzzy logic)
-    @Query("SELECT COUNT(h) FROM HelpSearchAnalyticsEntity h " +
-            "WHERE h.clickedQuestionId = :questionId " +
-            "AND LOWER(h.searchQuery) LIKE LOWER(CONCAT('%', :query, '%'))")
-    Long countSuccessfulInteractions(@Param("query") String query, @Param("questionId") String questionId);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.helpservice.service;
 
 import com.fincore.helpservice.model.HelpSynonymEntity;
@@ -124,12 +6,13 @@ import com.fincore.helpservice.repository.HelpSynonymRepository;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @RequiredArgsConstructor
@@ -138,72 +21,99 @@ public class AdaptiveSearchService {
 
     private final HelpSynonymRepository synonymRepository;
     private final HelpAnalyticsRepository analyticsRepository;
-    
-    // Cache for Synonyms to avoid hitting DB on every word
-    private final Map<String, String> synonymCache = new ConcurrentHashMap<>();
+    private final StringRedisTemplate redisTemplate;
 
-    // Cache for Behavioral Boosts to avoid hitting Analytics DB on every search loop
-    // Key: "query_questionId", Value: BoostScore
-    private final Map<String, Integer> boostCache = new ConcurrentHashMap<>();
+    // Redis Keys
+    private static final String REDIS_KEY_SYNONYMS = "help:synonyms";
+    private static final String REDIS_KEY_BOOST_PREFIX = "help:boost:";
 
     @PostConstruct
-    @Scheduled(fixedRate = 1800000) // 30 mins
+    @Scheduled(fixedRate = 3600000) // Refresh every hour
     public void refreshKnowledge() {
-        refreshSynonyms();
-        // We don't refresh boost cache here; we let it build up or expire individually
-        // In a real app, use Caffeine/Redis with TTL
+        refreshSynonymsInRedis();
     }
 
-    private void refreshSynonyms() {
+    /**
+     * SYNC DB -> REDIS
+     * Loads all active synonyms from Oracle into Redis Hash.
+     */
+    private void refreshSynonymsInRedis() {
         try {
             List<HelpSynonymEntity> synonyms = synonymRepository.findByIsActive("Y");
-            synonymCache.clear();
-            for (HelpSynonymEntity syn : synonyms) {
-                synonymCache.put(syn.getTerm().toLowerCase(), syn.getRootIntent().toUpperCase());
-            }
-            log.info("AdaptiveSearch: Loaded {} synonyms.", synonymCache.size());
+            if (synonyms.isEmpty()) return;
+
+            // 1. Clear old cache (Optional, depending on strategy)
+            redisTemplate.delete(REDIS_KEY_SYNONYMS);
+
+            // 2. Push new data
+            synonyms.forEach(syn -> {
+                if (syn.getTerm() != null && syn.getRootIntent() != null) {
+                    redisTemplate.opsForHash().put(
+                        REDIS_KEY_SYNONYMS, 
+                        syn.getTerm().toLowerCase(), 
+                        syn.getRootIntent().toUpperCase()
+                    );
+                }
+            });
+            log.info("AdaptiveSearch: Synced {} synonyms to Redis.", synonyms.size());
         } catch (Exception e) {
-            log.error("AdaptiveSearch: Failed to load synonyms", e);
+            log.error("AdaptiveSearch: Redis Sync Failed. Bot will use fallback logic.", e);
         }
     }
 
     public String getRootFromSynonym(String word) {
         if (word == null) return "";
-        return synonymCache.getOrDefault(word.toLowerCase(), word);
+        try {
+            // fast lookup in Redis
+            Object root = redisTemplate.opsForHash().get(REDIS_KEY_SYNONYMS, word.toLowerCase());
+            if (root != null) {
+                return root.toString();
+            }
+        } catch (Exception e) {
+            log.warn("Redis unavailable, returning original word.");
+        }
+        return word; // Default to original if not found or Redis down
     }
 
     /**
-     * THE HIVE MIND LOGIC
-     * Returns a score boost (0-20) if other users have successfully used this result
-     * for similar queries.
+     * THE HIVE MIND LOGIC (Redis Backed)
+     * Check Redis for a boost score. If missing, calculate from DB and cache it for 24 hours.
      */
     public int getBehavioralBoost(String normalizedQuery, String questionId) {
         if (normalizedQuery == null || questionId == null) return 0;
-        
-        // Create a cache key (Simple combination)
-        String key = normalizedQuery.hashCode() + "_" + questionId;
 
-        // Check Cache first
-        if (boostCache.containsKey(key)) {
-            return boostCache.get(key);
-        }
+        // Key: help:boost:hashcode_questionId
+        String key = REDIS_KEY_BOOST_PREFIX + normalizedQuery.hashCode() + "_" + questionId;
 
         try {
-            // DB Query: "How many times did people search X and click Y?"
-            // We strip the query to first 2 words to make it broader
-            String looseQuery = normalizedQuery.split("\\s+")[0]; 
+            // 1. Check Redis
+            String cachedScore = redisTemplate.opsForValue().get(key);
+            if (cachedScore != null) {
+                return Integer.parseInt(cachedScore);
+            }
+
+            // 2. Cache Miss -> Calculate from DB
+            // We use the first 2 words for broader matching
+            String looseQuery = normalizedQuery.split("\\s+")[0];
             if (looseQuery.length() < 3) looseQuery = normalizedQuery;
 
             Long count = analyticsRepository.countSuccessfulInteractions(looseQuery, questionId);
-            
+
             // Logic: 1 click = 1 point, Max 20 points
             int boost = (int) Math.min(count * 2, 20);
-            
-            boostCache.put(key, boost);
+
+            // 3. Store in Redis (TTL: 24 Hours)
+            if (boost > 0) {
+                redisTemplate.opsForValue().set(key, String.valueOf(boost), 24, TimeUnit.HOURS);
+            }
+
             return boost;
+
         } catch (Exception e) {
+            log.error("Adaptive Boost Error", e);
             return 0; // Fail safe
         }
     }
 }
+
 
