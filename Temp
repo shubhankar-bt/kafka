@@ -1,90 +1,118 @@
-dn: DC=UATAD,DC=SBI objectClass: top objectClass: domain dc: UATAD
-dn: cn=1015698,DC=UATAD,DC=SBI objectClass: top objectClass: person objectClass: organizationalPerson objectClass: user cn: 1015698 sn: TestUser sAMAccountName: 1015698 userPassword: pass123
+// ... imports
+import org.springframework.cache.annotation.Cacheable;
 
-
-
-
-
-
-
-
-
-package com.fincore.gateway.Config;
-
-import com.unboundid.ldap.listener.InMemoryDirectoryServer;
-import com.unboundid.ldap.listener.InMemoryDirectoryServerConfig;
-import com.unboundid.ldap.listener.InMemoryListenerConfig;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.ClassPathResource;
-
-import java.io.File;
-
-/**
- * Starts an embedded LDAP server for local testing ONLY.
- * Activated when the configured LDAP URL contains "localhost".
- */
+@Service
+@RequiredArgsConstructor
 @Slf4j
-@Configuration
-public class LocalLdapServer {
+public class PermissionService {
 
-    @Value("${spring.ldap.urls}")
-    private String ldapUrl;
+    private final PermissionRepository permissionRepository;
 
-    @Value("${spring.ldap.base}")
-    private String baseDn;
+    /**
+     * CACHED: Roles/Permissions rarely change mid-session. 
+     * Cache for 10-15 mins (configured in app.properties).
+     */
+    @Cacheable(value = "user_actions_cache", key = "#roleId + '_' + #screenName")
+    public List<String> getUserActions(String roleId, String screenName) {
+        if (screenName == null) return Collections.emptyList();
 
-    private InMemoryDirectoryServer directoryServer;
+        List<String> actionStrings = permissionRepository.findActionForUserAndScreen(roleId, screenName);
 
-    @PostConstruct
-    public void startServer() {
-        // Only start if we are pointing to localhost (Testing Mode)
-        if (ldapUrl != null && ldapUrl.contains("localhost")) {
-            try {
-                log.info("STARTING LOCAL MOCK LDAP SERVER...");
-                
-                // Configure the server
-                InMemoryDirectoryServerConfig config = new InMemoryDirectoryServerConfig(baseDn);
-                config.addAdditionalBindCredentials("cn=admin", "admin");
-                
-                // Disable Schema Validation because 'sAMAccountName' is an Active Directory specific attribute
-                // and standard LDAP servers don't like it by default.
-                config.setSchema(null); 
-
-                // Set Listener on port 8389 (Standard for local test)
-                config.setListenerConfigs(InMemoryListenerConfig.createLDAPConfig("default", 8389));
-
-                directoryServer = new InMemoryDirectoryServer(config);
-                
-                // Load the data from the LDIF file
-                ClassPathResource ldifResource = new ClassPathResource("users.ldif");
-                if (ldifResource.exists()) {
-                    // UnboundID needs a File object or path string
-                    // We copy to temp file to ensure it works inside JARs/IDEs
-                    File ldifFile = ldifResource.getFile();
-                    directoryServer.importFromLDIF(true, ldifFile.getAbsolutePath());
-                    log.info("Loaded Mock Data from users.ldif");
-                }
-
-                directoryServer.startListening();
-                log.info("LOCAL MOCK LDAP SERVER STARTED on port 8389");
-                log.info("Test User: 1015698 / pass123");
-
-            } catch (Exception e) {
-                log.error("Failed to start Local LDAP Server", e);
-            }
+        if (actionStrings == null || actionStrings.isEmpty()) {
+            return Collections.emptyList();
         }
+
+        return actionStrings.stream()
+                .filter(Objects::nonNull)
+                .flatMap(s -> Arrays.stream(s.split("\\|")))
+                .map(String::trim)
+                .map(String::toUpperCase)
+                .distinct()
+                .collect(Collectors.toList());
     }
 
-    @PreDestroy
-    public void stopServer() {
-        if (directoryServer != null) {
-            directoryServer.shutDown(true);
-            log.info("Local LDAP Server Stopped.");
+    // ... getAccessDeniedMessage remains same ...
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing class structure ...
+
+    private static final Set<String> NEGATION_WORDS = Set.of(
+        "not", "cant", "cannot", "unable", "fail", "failed", "failing", "error", "issue", "problem", "broken", "wont"
+    );
+
+    /**
+     * Detects if the user is expressing inability to perform an action.
+     * "I cannot create" -> true
+     */
+    public boolean isNegatedOrTrouble(String sentence) {
+        if (sentence == null) return false;
+        String lower = sentence.toLowerCase();
+        
+        for (String neg : NEGATION_WORDS) {
+            // Check word boundaries so "note" doesn't trigger "not"
+            if (java.util.regex.Pattern.compile("\\b" + neg + "\\b").matcher(lower).find()) {
+                return true;
+            }
         }
+        return false;
+    }
+
+    // ... existing methods (extractNormalizedIntent, detectAction, etc.) ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing imports
+import java.util.regex.Pattern;
+
+@Service
+public class SmallTalkService {
+    // ... CONVERSATIONS map ...
+
+    public String getSmallTalkResponse(String userMessage) {
+        if (userMessage == null) return null;
+        String lower = userMessage.toLowerCase();
+
+        for (Map.Entry<List<String>, List<String>> entry : CONVERSATIONS.entrySet()) {
+            for (String keyPhrase : entry.getKey()) {
+                // STRICT MATCH: Use Regex \b to ensure whole word match
+                // Matches "hi" but not "high"
+                if (Pattern.compile("\\b" + Pattern.quote(keyPhrase) + "\\b").matcher(lower).find()) {
+                    List<String> responses = entry.getValue();
+                    return responses.get(new Random().nextInt(responses.size()));
+                }
+            }
+        }
+        return null;
     }
 }
 
@@ -105,79 +133,1750 @@ public class LocalLdapServer {
 
 
 
-package com.fincore.gateway.Config;
 
+
+
+
+// ... existing imports
+import java.util.regex.Pattern;
+
+@Service
+public class SmallTalkService {
+    // ... CONVERSATIONS map ...
+
+    public String getSmallTalkResponse(String userMessage) {
+        if (userMessage == null) return null;
+        String lower = userMessage.toLowerCase();
+
+        for (Map.Entry<List<String>, List<String>> entry : CONVERSATIONS.entrySet()) {
+            for (String keyPhrase : entry.getKey()) {
+                // STRICT MATCH: Use Regex \b to ensure whole word match
+                // Matches "hi" but not "high"
+                if (Pattern.compile("\\b" + Pattern.quote(keyPhrase) + "\\b").matcher(lower).find()) {
+                    List<String> responses = entry.getValue();
+                    return responses.get(new Random().nextInt(responses.size()));
+                }
+            }
+        }
+        return null;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... inside handleChat method ...
+
+    // 1. SENTIMENT (Keep existing)
+    // 2. SMALL TALK (Keep existing)
+
+    // 3. NLP & CONTEXT RESOLUTION
+    String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+    String detectedAction = nlpEngine.detectAction(normalizedIntent);
+    String detectedScreen = nlpEngine.detectScreen(rawMessage);
+    boolean isTroubleshooting = nlpEngine.isNegatedOrTrouble(rawMessage); // NEW CHECK
+
+    // -- MEMORY RETRIEVAL --
+    ChatSessionService.UserSession session = sessionService.getSession(userId);
+    
+    // A. CONTEXT MERGING: Action Inheritance
+    // "What about Segment?" (New Screen, Old Action)
+    if (detectedAction == null && detectedScreen != null && session != null && session.getLastAction() != null) {
+        detectedAction = session.getLastAction();
+        normalizedIntent = detectedAction + " " + normalizedIntent; 
+        botPrefix.append("*(Context: ").append(detectedAction).append(")*<br/>");
+    }
+    
+    // B. CONTEXT MERGING: Screen Inheritance (THE FIX)
+    // "How to Modify?" (New Action, Old Screen)
+    // Priority: Explicit Screen -> Session Screen -> Client Context
+    if (detectedScreen == null) {
+        if (session != null && session.getLastScreen() != null) {
+             detectedScreen = session.getLastScreen(); // Persistence!
+        } else if (clientScreenName != null) {
+             detectedScreen = clientScreenName; // Fallback
+        }
+    }
+
+    // -- LOGIC BRANCH: TROUBLESHOOTING VS PERMISSION --
+    // If user says "I cannot create", don't check permissions. Search for errors/issues.
+    if (isTroubleshooting) {
+        normalizedIntent = normalizedIntent + " issue error troubleshooting"; 
+        botPrefix.append("*(Searching for troubleshooting steps)*<br/>");
+        // Skip Permission Check block below to avoid saying "Yes you can create" when they clearly can't.
+    } 
+    else {
+        // ... (Standard Permission Check Logic from previous code) ...
+        // ... "Yes, you have permission..." ...
+    }
+
+    // 4. DISAMBIGUATION (Keep existing)
+    
+    // 5. PERFORM SEARCH
+    // Pass the potentially "Troubleshooting" enriched intent
+    List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, detectedScreen); // Use detectedScreen which is now robust
+
+    // ... rest of the method remains same ...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+************************
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.time.LocalTime;
+
+@Service
+public class SystemHealthService {
+
+    /**
+     * Checks if there are known system issues/maintenance.
+     * In a real app, this would query your Job Scheduler or Health Actuator.
+     */
+    public String getSystemStatusMessage() {
+        // Simulation: "EOD Batch" runs between 11 PM and 1 AM
+        LocalTime now = LocalTime.now();
+        if (now.isAfter(LocalTime.of(23, 0)) || now.isBefore(LocalTime.of(1, 0))) {
+            return "⚠️ **System Alert:** The End-of-Day (EOD) Batch Process is currently active. You may experience slower response times or read-only access in the Ledger modules.";
+        }
+        
+        // Simulation: Random "Database Maintenance" check
+        // return "⚠️ **Maintenance:** Scheduled database maintenance is in progress.";
+
+        return null; // System is healthy
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.util.Map;
+
+@Service
+public class ContentInjectorService {
+
+    // In a real app, inject your ConfigurationService here
+    private final Map<String, String> LIVE_CONFIGS = Map.of(
+        "{CUTOFF_TIME}", "3:30 PM",
+        "{SUPPORT_EMAIL}", "fincore-support@bank.com",
+        "{CURRENT_VERSION}", "v2.5.1",
+        "{FOREX_RATE_SOURCE}", "Reuters API"
+    );
+
+    public String injectDynamicContent(String rawContent) {
+        if (rawContent == null) return null;
+        String processed = rawContent;
+        
+        for (Map.Entry<String, String> entry : LIVE_CONFIGS.entrySet()) {
+            if (processed.contains(entry.getKey())) {
+                processed = processed.replace(entry.getKey(), entry.getValue());
+            }
+        }
+        return processed;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+import java.util.List;
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class HelpResponseDTO {
+
+    private String responseType;
+    private String botReply;
+    private List<HelpItemDTO> items;
+    private String logId;
+    
+    // Action Button
+    private String navigationLink;
+    private String navigationLabel;
+
+    // NEW: Predictive Workflow
+    private HelpItemDTO nextBestAction; 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... Existing imports ...
+    // NEW Services
+    private final SystemHealthService healthService;
+    private final ContentInjectorService contentInjector;
+
+    // ... [handleChat Method Update] ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        // ... [Sentiment & Small Talk Logic - Keep Existing] ...
+
+        // --- NEW: OPERATIONAL AWARENESS CHECK ---
+        // If user complains about slowness/errors, check System Health FIRST.
+        if (nlpEngine.isNegatedOrTrouble(rawMessage)) { // Re-using your NLP "trouble" check
+            String systemAlert = healthService.getSystemStatusMessage();
+            if (systemAlert != null) {
+                analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "SYSTEM_ALERT", 100);
+                return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(systemAlert + "<br/><br/>(If this persists, please contact support).")
+                        .build();
+            }
+        }
+
+        // ... [NLP Intent Extraction & Memory Logic - Keep Existing] ...
+
+        // ... [Permission Check Logic - Keep Existing] ...
+
+        // 6. PERFORM SEARCH
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen);
+
+        // ... [No Match Logic - Keep Existing] ...
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // ... [RBAC Check Logic - Keep Existing] ...
+            
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ANSWERED", score);
+            
+            // --- NEW: DYNAMIC CONTENT INJECTION ---
+            String rawAnswer = bestMatch.getAnswer();
+            String finalAnswer = contentInjector.injectDynamicContent(rawAnswer);
+
+            // Add Permission Prefix if needed
+            if (detectedAction != null && activeScreen != null) {
+                String prefix = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalAnswer = prefix + "<br/><br/>" + finalAnswer;
+            }
+
+            // --- NEW: PREDICTIVE WORKFLOW (Next Best Action) ---
+            HelpItemDTO nextAction = predictNextStep(bestMatch, roleId);
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(botPrefix + finalAnswer)
+                    .logId(analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "ANSWERED", score))
+                    .navigationLink(bestMatch.getActionLink())
+                    .navigationLabel(bestMatch.getActionLabel())
+                    .nextBestAction(nextAction) // Pass the prediction
+                    .build();
+        } 
+        
+        // ... [Suggestion Logic - Keep Existing] ...
+        return null; // (Placeholder for compilation)
+    }
+
+    // --- NEW: PREDICTIVE WORKFLOW ENGINE ---
+    private HelpItemDTO predictNextStep(HelpItemDTO currentMatch, String roleId) {
+        if (!"QUESTION".equals(currentMatch.getType()) || currentMatch.getRequiredAction() == null) return null;
+
+        String currentAction = currentMatch.getRequiredAction().toUpperCase();
+        String screen = currentMatch.getScreenName();
+        String nextAction = null;
+
+        // Banking Lifecycle Logic
+        switch (currentAction) {
+            case "CREATE": nextAction = "APPROVE"; break;     // Create -> Approve
+            case "MODIFY": nextAction = "APPROVE"; break;     // Modify -> Approve
+            case "APPROVE": nextAction = "VIEW"; break;       // Approve -> View Report
+            case "VIEW": nextAction = "DOWNLOAD"; break;      // View -> Export/Print
+        }
+
+        if (nextAction != null) {
+            // 1. Check Permissions for the Next Step
+            List<String> userActions = permissionService.getUserActions(roleId, screen);
+            if (userActions.contains(nextAction)) {
+                // 2. Search for the Question corresponding to this next step
+                String nextQuery = nextAction + " " + screen;
+                List<HelpItemDTO> predictions = performSmartSearch(nextQuery, nextQuery, screen);
+                if (!predictions.isEmpty() && predictions.get(0).getSearchScore() > 50) {
+                    HelpItemDTO predicted = predictions.get(0);
+                    // Override text to look like a suggestion
+                    predicted.setText("Next Step: " + predicted.getText());
+                    return predicted;
+                }
+            }
+        }
+        return null;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**************************
+Upgrade NLPEngine.java (Pattern Recognition)
+Add Regex capabilities to detect Error Codes, Navigation commands, and Capability question
+
+
+
+
+
+
+// ... existing imports
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Service
+public class NLPEngine {
+
+    // ... [Existing Constants & Methods] ...
+
+    // REGEX PATTERNS
+    private static final Pattern ERROR_CODE_PATTERN = Pattern.compile("\\b[A-Z]{3,4}-\\d{3,5}\\b"); // Matches FIN-101, ORA-9000
+    private static final Pattern NAV_PATTERN = Pattern.compile("\\b(go to|open|take me to|navigate to)\\b");
+    private static final Pattern CAPABILITY_PATTERN = Pattern.compile("\\b(what can i do|my rights|my permissions|access do i have)\\b");
+    private static final Pattern DEFINITION_PATTERN = Pattern.compile("\\b(what is|define|meaning of)\\b");
+    private static final Pattern RESET_PATTERN = Pattern.compile("\\b(stop|cancel|wrong|start over|reset)\\b");
+
+    /**
+     * Extracts an error code like "FIN-909" from the text.
+     */
+    public String extractErrorCode(String text) {
+        if (text == null) return null;
+        Matcher m = ERROR_CODE_PATTERN.matcher(text.toUpperCase());
+        if (m.find()) {
+            return m.group();
+        }
+        return null;
+    }
+
+    public boolean isNavigationCommand(String text) {
+        return text != null && NAV_PATTERN.matcher(text.toLowerCase()).find();
+    }
+
+    public boolean isCapabilityRequest(String text) {
+        return text != null && CAPABILITY_PATTERN.matcher(text.toLowerCase()).find();
+    }
+
+    public boolean isDefinitionRequest(String text) {
+        return text != null && DEFINITION_PATTERN.matcher(text.toLowerCase()).find();
+    }
+
+    public boolean isResetRequest(String text) {
+        return text != null && RESET_PATTERN.matcher(text.toLowerCase()).find();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+Upgrade HelpService.java (The Logic Flow)
+We inject these new checks at the top of the handleChat method.
+
+
+
+
+
+
+
+    // ... [Existing Imports & Fields] ...
+
+    // =========================================================================
+    // THE WORLD-CLASS CHAT HANDLER
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        if (!StringUtils.hasText(rawMessage)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+
+        // 0. CONTEXT RESET (The "Stop" Button)
+        if (nlpEngine.isResetRequest(rawMessage)) {
+            sessionService.clearSession(userId);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Okay, I've cleared our conversation context. How can I help you now?").build();
+        }
+
+        // 1. ERROR DETECTIVE (High Priority)
+        String errorCode = nlpEngine.extractErrorCode(rawMessage);
+        if (errorCode != null) {
+            // Force a search specifically for this code
+            List<HelpItemDTO> errorMatches = performSmartSearch(errorCode, errorCode, null);
+            if (!errorMatches.isEmpty()) {
+                 analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "ERROR_SOLVED", 100);
+                 return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply("I detected error code **" + errorCode + "**. Here is what I found:")
+                        .items(errorMatches.subList(0, 1)) // Return top match directly
+                        .build();
+            }
+        }
+
+        // 2. CAPABILITY INSPECTOR ("What can I do?")
+        if (nlpEngine.isCapabilityRequest(rawMessage)) {
+            // Use Client Screen Name (or infer it)
+            String targetScreen = (nlpEngine.detectScreen(rawMessage) != null) ? nlpEngine.detectScreen(rawMessage) : clientScreenName;
+            
+            if (targetScreen != null) {
+                List<String> actions = permissionService.getUserActions(roleId, targetScreen);
+                String reply = "In **" + targetScreen + "**, you have the following permissions:<br/>" + 
+                               "✅ " + String.join(", ", actions);
+                
+                if (actions.isEmpty()) reply = "You currently have **Read Only** or **No Access** to **" + targetScreen + "**.";
+                
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(reply).build();
+            } else {
+                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Which screen are you asking about? (e.g., 'What can I do in CGL?')").build();
+            }
+        }
+
+        // 3. SENTIMENT & SMALL TALK (Keep Existing)
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        // ... [Existing Sentiment Logic] ...
+        // ... [Existing Small Talk Logic] ...
+
+        // 4. NAVIGATION SHORTCUTS ("Go to CGL")
+        if (nlpEngine.isNavigationCommand(rawMessage)) {
+            String screen = nlpEngine.detectScreen(rawMessage);
+            if (screen != null) {
+                 // Mocking a link retrieval - in real app, query HelpScreenEntity for route
+                 return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply("Navigating you to **" + screen + "**...")
+                        .navigationLink("/app/" + screen.toLowerCase().replace(" ", "-")) // Mock logic
+                        .navigationLabel("Open " + screen)
+                        .build();
+            }
+        }
+
+        // 5. DEFINITION vs ACTION
+        boolean isDefinition = nlpEngine.isDefinitionRequest(rawMessage);
+        
+        // ... [Existing NLP & Context Logic] ...
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        // ...
+        
+        // 6. PERFORM SEARCH
+        // Pass 'isDefinition' flag to search engine to boost conceptual answers
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, detectedScreen, isDefinition);
+
+        // ... [Rest of Logic (Search Result Processing) remains same] ...
+        
+        return null; // Placeholder
+    }
+
+    // UPDATED SEARCH SIGNATURE
+    private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, String activeScreen, boolean isDefinition) {
+         // ... same stream logic ...
+         // Inside calculateScore:
+         // if (isDefinition && q.getQuestionText().startsWith("What is")) score += 20;
+         // if (!isDefinition && q.getRequiredAction() != null) score += 10; // Boost actions if not asking for definition
+         
+         // Calls updated calculateScore...
+         return new ArrayList<>(); // Stub
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... [Existing Imports & Fields] ...
+
+    // =========================================================================
+    // THE WORLD-CLASS CHAT HANDLER
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        if (!StringUtils.hasText(rawMessage)) return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+
+        // 0. CONTEXT RESET (The "Stop" Button)
+        if (nlpEngine.isResetRequest(rawMessage)) {
+            sessionService.clearSession(userId);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Okay, I've cleared our conversation context. How can I help you now?").build();
+        }
+
+        // 1. ERROR DETECTIVE (High Priority)
+        String errorCode = nlpEngine.extractErrorCode(rawMessage);
+        if (errorCode != null) {
+            // Force a search specifically for this code
+            List<HelpItemDTO> errorMatches = performSmartSearch(errorCode, errorCode, null);
+            if (!errorMatches.isEmpty()) {
+                 analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "ERROR_SOLVED", 100);
+                 return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply("I detected error code **" + errorCode + "**. Here is what I found:")
+                        .items(errorMatches.subList(0, 1)) // Return top match directly
+                        .build();
+            }
+        }
+
+        // 2. CAPABILITY INSPECTOR ("What can I do?")
+        if (nlpEngine.isCapabilityRequest(rawMessage)) {
+            // Use Client Screen Name (or infer it)
+            String targetScreen = (nlpEngine.detectScreen(rawMessage) != null) ? nlpEngine.detectScreen(rawMessage) : clientScreenName;
+            
+            if (targetScreen != null) {
+                List<String> actions = permissionService.getUserActions(roleId, targetScreen);
+                String reply = "In **" + targetScreen + "**, you have the following permissions:<br/>" + 
+                               "✅ " + String.join(", ", actions);
+                
+                if (actions.isEmpty()) reply = "You currently have **Read Only** or **No Access** to **" + targetScreen + "**.";
+                
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(reply).build();
+            } else {
+                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Which screen are you asking about? (e.g., 'What can I do in CGL?')").build();
+            }
+        }
+
+        // 3. SENTIMENT & SMALL TALK (Keep Existing)
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        // ... [Existing Sentiment Logic] ...
+        // ... [Existing Small Talk Logic] ...
+
+        // 4. NAVIGATION SHORTCUTS ("Go to CGL")
+        if (nlpEngine.isNavigationCommand(rawMessage)) {
+            String screen = nlpEngine.detectScreen(rawMessage);
+            if (screen != null) {
+                 // Mocking a link retrieval - in real app, query HelpScreenEntity for route
+                 return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply("Navigating you to **" + screen + "**...")
+                        .navigationLink("/app/" + screen.toLowerCase().replace(" ", "-")) // Mock logic
+                        .navigationLabel("Open " + screen)
+                        .build();
+            }
+        }
+
+        // 5. DEFINITION vs ACTION
+        boolean isDefinition = nlpEngine.isDefinitionRequest(rawMessage);
+        
+        // ... [Existing NLP & Context Logic] ...
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        // ...
+        
+        // 6. PERFORM SEARCH
+        // Pass 'isDefinition' flag to search engine to boost conceptual answers
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, detectedScreen, isDefinition);
+
+        // ... [Rest of Logic (Search Result Processing) remains same] ...
+        
+        return null; // Placeholder
+    }
+
+    // UPDATED SEARCH SIGNATURE
+    private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, String activeScreen, boolean isDefinition) {
+         // ... same stream logic ...
+         // Inside calculateScore:
+         // if (isDefinition && q.getQuestionText().startsWith("What is")) score += 20;
+         // if (!isDefinition && q.getRequiredAction() != null) score += 10; // Boost actions if not asking for definition
+         
+         // Calls updated calculateScore...
+         return new ArrayList<>(); // Stub
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------------
+search searcg search : 
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Data
+@Entity
+@Table(name = "HELP_SYNONYMS")
+public class HelpSynonymEntity {
+
+    @Id
+    @Column(name = "SYNONYM_ID")
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Integer synonymId;
+
+    @Column(name = "TERM", unique = true)
+    private String term; // e.g., "bucks", "glc", "add"
+
+    @Column(name = "ROOT_INTENT")
+    private String rootIntent; // e.g., "CURRENCY", "CGL", "CREATE"
+    
+    @Column(name = "IS_ACTIVE")
+    private String isActive; // "Y" or "N"
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpSynonymEntity;
+import com.fincore.helpservice.repository.HelpSynonymRepository;
+import com.fincore.helpservice.repository.HelpAnalyticsRepository;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.ResourceLoader;
-import org.springframework.ldap.core.LdapTemplate;
-import org.springframework.ldap.core.support.LdapContextSource;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
 
-import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AdaptiveSearchService {
+
+    private final HelpSynonymRepository synonymRepository;
+    private final HelpAnalyticsRepository analyticsRepository;
+
+    // Caches
+    private final Map<String, String> synonymCache = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Integer>> popularityCache = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void init() {
+        refreshKnowledge();
+    }
+
+    /**
+     * Refreshes Synonyms and Learning Data every 30 minutes.
+     */
+    @Scheduled(fixedRate = 1800000) 
+    public void refreshKnowledge() {
+        log.info("Refreshing Adaptive Knowledge Base...");
+        loadSynonyms();
+        learnFromBehavior();
+    }
+
+    private void loadSynonyms() {
+        List<HelpSynonymEntity> synonyms = synonymRepository.findByIsActive("Y");
+        synonymCache.clear();
+        for (HelpSynonymEntity syn : synonyms) {
+            synonymCache.put(syn.getTerm().toLowerCase(), syn.getRootIntent().toUpperCase());
+        }
+        log.info("Loaded {} dynamic synonyms.", synonymCache.size());
+    }
+
+    /**
+     * The "Self-Learning" Algorithm.
+     * Analyzes successful clicks from the Analytics table to boost future searches.
+     */
+    private void learnFromBehavior() {
+        // Pseudo-code for complex aggregation:
+        // SELECT SEARCH_QUERY, CLICKED_Q_ID, COUNT(*) FROM ANALYTICS 
+        // WHERE CLICKED_Q_ID IS NOT NULL GROUP BY SEARCH_QUERY, CLICKED_Q_ID
+        
+        // For implementation simplicty, we will assume a custom repository method returns a list of projections/DTOs
+        // List<PopularityMetric> metrics = analyticsRepository.findTopClicks();
+        
+        // Mocking the learning for demonstration:
+        popularityCache.clear();
+        
+        // Example: If query contains "money", users usually click "Q_CURRENCY_01"
+        Map<String, Integer> moneyMap = new HashMap<>();
+        moneyMap.put("Q_CURRENCY_01", 20); // 20 Clicks
+        popularityCache.put("money", moneyMap);
+        
+        log.info("Adaptive Learning Update Complete.");
+    }
+
+    // --- PUBLIC ACCESSORS ---
+
+    public String getRootFromSynonym(String word) {
+        return synonymCache.getOrDefault(word.toLowerCase(), word);
+    }
+
+    /**
+     * Returns a score boost (0 to 50) based on historical user clicks.
+     */
+    public int getBehavioralBoost(String normalizedQuery, String questionId) {
+        // Check exact query match
+        if (popularityCache.containsKey(normalizedQuery)) {
+            return calculateBoost(popularityCache.get(normalizedQuery), questionId);
+        }
+        
+        // Check token-based match (partial)
+        int maxBoost = 0;
+        for (String token : normalizedQuery.split(" ")) {
+            if (popularityCache.containsKey(token)) {
+                maxBoost = Math.max(maxBoost, calculateBoost(popularityCache.get(token), questionId));
+            }
+        }
+        return maxBoost;
+    }
+
+    private int calculateBoost(Map<String, Integer> clickMap, String questionId) {
+        Integer clicks = clickMap.get(questionId);
+        if (clicks == null) return 0;
+        
+        // Logarithmic scaling: 10 clicks = 10pts, 100 clicks = 20pts (Cap at 30)
+        return (int) Math.min(30, Math.log(clicks) * 5); 
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing imports
+import org.springframework.beans.factory.annotation.Autowired;
+
+@Service
+public class NLPEngine {
+
+    @Autowired
+    private AdaptiveSearchService adaptiveService;
+
+    // REMOVE static ACTION_ROOTS map.
+    // KEEP static STOP_WORDS (these are language constant).
+
+    public String extractNormalizedIntent(String sentence) {
+        if (sentence == null) return "";
+        String clean = sentence.toLowerCase().replaceAll("[^a-z0-9\\s]", " ");
+        StringBuilder normalized = new StringBuilder();
+        
+        for (String word : clean.split("\\s+")) {
+            if (word.isEmpty()) continue;
+            if (STOP_WORDS.contains(word)) continue;
+            
+            // DYNAMIC LOOKUP from DB/Cache
+            String root = adaptiveService.getRootFromSynonym(word);
+            normalized.append(root).append(" ");
+        }
+        return normalized.toString().trim();
+    }
+
+    public String detectAction(String normalizedSentence) {
+        // Simplified detection logic checking if words are known Actions
+        for (String word : normalizedSentence.split(" ")) {
+            String root = adaptiveService.getRootFromSynonym(word);
+            if (isKnownAction(root)) return root;
+        }
+        return null;
+    }
+    
+    private boolean isKnownAction(String word) {
+        return Set.of("CREATE", "MODIFY", "APPROVE", "VIEW", "DELETE", "DOWNLOAD").contains(word);
+    }
+    
+    // ... [Rest of regex methods remain same] ...
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... imports
+    private final AdaptiveSearchService adaptiveService; // Inject this
+
+    // ... inside performSmartSearch ...
+
+    // UPDATED calculateScore Method
+    private int calculateScore(String qText, String qKeywords, String qScreen, String normalizedQuery, String rawQuery, List<String> tokens, String activeScreen, boolean isDefinition, String questionId) {
+        double score = 0;
+        String lowerText = qText.toLowerCase();
+        
+        // 1. BASE SCORING (Text Match)
+        // ... [Existing Logic] ...
+        if (lowerText.equals(rawQuery)) return 100;
+        if (lowerText.contains(rawQuery)) score += 50;
+        
+        // 2. TOKEN MATCHING
+        // ... [Existing Logic] ...
+
+        // 3. CONTEXT BOOST
+        // ... [Existing Logic] ...
+
+        // 4. BEHAVIORAL BOOST (The Learning Layer)
+        // This makes the bot smarter over time.
+        int hiveBoost = adaptiveService.getBehavioralBoost(normalizedQuery, questionId);
+        if (hiveBoost > 0) {
+            score += hiveBoost;
+            // log.debug("Applied Hive Boost of {} to {}", hiveBoost, questionId);
+        }
+        
+        return (int) Math.min(score, 100);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.HelpSynonymEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface HelpSynonymRepository extends JpaRepository<HelpSynonymEntity, Integer> {
+    List<HelpSynonymEntity> findByIsActive(String isActive);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.Random;
+
+@Service
+public class SmartResponseGenerator {
+
+    private final Random random = new Random();
+
+    // --- HIGH CONFIDENCE PHRASES (90-100%) ---
+    private final List<String> HIGH_CONFIDENCE_INTROS = List.of(
+        "I found exactly what you're looking for:",
+        "Here is the answer:",
+        "Check this out:",
+        "According to the documentation, here is the procedure:",
+        "I can help with that. Here are the details:"
+    );
+
+    // --- MEDIUM CONFIDENCE PHRASES (60-89%) ---
+    private final List<String> MED_CONFIDENCE_INTROS = List.of(
+        "I think this is what you need:",
+        "This looks like the right topic:",
+        "I believe this answers your question:",
+        "Here is the most relevant information I found:"
+    );
+
+    // --- LOW CONFIDENCE PHRASES (<60%) ---
+    private final List<String> LOW_CONFIDENCE_INTROS = List.of(
+        "I'm not 100% sure, but this might help:",
+        "This is the closest match I could find:",
+        "I couldn't find an exact match, but take a look at this:"
+    );
+
+    // --- PERMISSION PHRASES ---
+    private final List<String> PERMISSION_GRANTED_INTROS = List.of(
+        "Good news, %s. You have the required permissions.",
+        "Yes, %s, your profile allows this action.",
+        "You are authorized to proceed, %s."
+    );
+
+    public String generateSearchIntro(int score) {
+        if (score >= 90) return getRandom(HIGH_CONFIDENCE_INTROS);
+        if (score >= 60) return getRandom(MED_CONFIDENCE_INTROS);
+        return getRandom(LOW_CONFIDENCE_INTROS);
+    }
+
+    public String generatePermissionResponse(boolean isAllowed, String action, String module, String user) {
+        String userName = (user != null) ? user : "there";
+        
+        if (isAllowed) {
+            String template = getRandom(PERMISSION_GRANTED_INTROS);
+            return String.format(template + " You can **%s** in **%s**.", userName, action, module);
+        } else {
+            return switch (action) {
+                case "CREATE" -> String.format("I checked your profile, %s. Unfortunately, you **do not** have rights to create entries in **%s**.", userName, module);
+                case "APPROVE" -> String.format("No, %s. Approval in **%s** is restricted. You need 'APPROVER' rights for this.", userName, module);
+                case "DELETE" -> String.format("Sorry %s, deletion is a sensitive action in **%s** and you don't have permissions.", userName, module);
+                default -> String.format("No, %s. You are not authorized to perform **%s** in **%s**.", userName, module, action);
+            };
+        }
+    }
+    
+    public String generateSuggestionResponse() {
+         List<String> intros = List.of(
+             "I'm not entirely sure, but did you mean one of these?",
+             "I found a few similar topics:",
+             "Here are a few options that might match:"
+         );
+         return getRandom(intros);
+    }
+
+    private String getRandom(List<String> options) {
+        return options.get(random.nextInt(options.size()));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing imports ...
+// Add this field to your existing class
+
+    @Column(name = "PRO_TIP", length = 500)
+    private String proTip; // e.g., "Note: This action cannot be reversed."
+    
+    // Getters and Setters
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... inside handleChat ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        
+        // ... [Existing Sentiment, Small Talk, NLP, Memory Logic] ...
+        
+        // 6. PERFORM SEARCH
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen, isDefinition);
+        
+        // ... [No Match Logic] ...
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+             // ... [RBAC Checks] ...
+             
+             // ... [Log Analytics] ...
+             
+             // --- A. DYNAMIC INTRO (The Human Voice) ---
+             // Instead of static "Here is the answer", use confidence-based hedging
+             StringBuilder finalReply = new StringBuilder();
+             
+             // If we detected a specific intent earlier, prepend the Permission Confirmation
+             if (detectedAction != null && activeScreen != null) {
+                String permMsg = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalReply.append(permMsg).append("<br/><br/>");
+             } else {
+                // Otherwise, use a variable intro
+                finalReply.append(responseGenerator.generateSearchIntro(score)).append("<br/>");
+             }
+
+             // --- B. CONTENT INJECTION ---
+             String rawAnswer = bestMatch.getAnswer();
+             String injectedAnswer = contentInjector.injectDynamicContent(rawAnswer);
+             finalReply.append(injectedAnswer);
+
+             // --- C. PRO TIP (The Senior Colleague) ---
+             // If the question has a Tip in the DB, show it prominently
+             if (StringUtils.hasText(bestMatch.getProTip())) {
+                 finalReply.append("<br/><br/>💡 <b>Pro Tip:</b> ").append(bestMatch.getProTip());
+             }
+
+             // --- D. PREDICTIVE WORKFLOW ---
+             HelpItemDTO nextAction = predictNextStep(bestMatch, roleId);
+             
+             return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(botPrefix + finalReply.toString())
+                    .logId(logId)
+                    .navigationLink(bestMatch.getActionLink())
+                    .navigationLabel(bestMatch.getActionLabel())
+                    .nextBestAction(nextAction)
+                    .build();
+        }
+        
+        // ... [Suggestion Logic] ...
+        return null; // Stub
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing fields ...
+    private String proTip;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... inside handleChat ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        
+        // ... [Existing Sentiment, Small Talk, NLP, Memory Logic] ...
+        
+        // 6. PERFORM SEARCH
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen, isDefinition);
+        
+        // ... [No Match Logic] ...
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+             // ... [RBAC Checks] ...
+             
+             // ... [Log Analytics] ...
+             
+             // --- A. DYNAMIC INTRO (The Human Voice) ---
+             // Instead of static "Here is the answer", use confidence-based hedging
+             StringBuilder finalReply = new StringBuilder();
+             
+             // If we detected a specific intent earlier, prepend the Permission Confirmation
+             if (detectedAction != null && activeScreen != null) {
+                String permMsg = responseGenerator.generatePermissionResponse(true, detectedAction, activeScreen, userId);
+                finalReply.append(permMsg).append("<br/><br/>");
+             } else {
+                // Otherwise, use a variable intro
+                finalReply.append(responseGenerator.generateSearchIntro(score)).append("<br/>");
+             }
+
+             // --- B. CONTENT INJECTION ---
+             String rawAnswer = bestMatch.getAnswer();
+             String injectedAnswer = contentInjector.injectDynamicContent(rawAnswer);
+             finalReply.append(injectedAnswer);
+
+             // --- C. PRO TIP (The Senior Colleague) ---
+             // If the question has a Tip in the DB, show it prominently
+             if (StringUtils.hasText(bestMatch.getProTip())) {
+                 finalReply.append("<br/><br/>💡 <b>Pro Tip:</b> ").append(bestMatch.getProTip());
+             }
+
+             // --- D. PREDICTIVE WORKFLOW ---
+             HelpItemDTO nextAction = predictNextStep(bestMatch, roleId);
+             
+             return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(botPrefix + finalReply.toString())
+                    .logId(logId)
+                    .navigationLink(bestMatch.getActionLink())
+                    .navigationLabel(bestMatch.getActionLabel())
+                    .nextBestAction(nextAction)
+                    .build();
+        }
+        
+        // ... [Suggestion Logic] ...
+        return null; // Stub
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------
+
+snart profiling : 
+
+
+
+// ... imports
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+@Repository
+public interface HelpAnalyticsRepository extends JpaRepository<HelpSearchAnalyticsEntity, String> {
+
+    // Find top 3 most searched phrases for a specific user
+    @Query("SELECT h.searchQuery FROM HelpSearchAnalyticsEntity h " +
+           "WHERE h.userId = :userId " +
+           "GROUP BY h.searchQuery " +
+           "ORDER BY COUNT(h) DESC")
+    List<String> findTopSearchesByUser(@Param("userId") String userId, Pageable pageable);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.repository.HelpAnalyticsRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class UserProfileService {
+
+    private final HelpAnalyticsRepository analyticsRepository;
+
+    /**
+     * Generates a personalized greeting based on history.
+     */
+    public String getSmartWelcomeMessage(String userId, String userName) {
+        // Fetch top 1 most frequent search
+        List<String> topSearches = analyticsRepository.findTopSearchesByUser(userId, PageRequest.of(0, 1));
+        
+        if (topSearches.isEmpty()) {
+            return "Hello " + userName + "! How can I help you navigate FinCore today?";
+        }
+
+        String favoriteTopic = topSearches.get(0);
+        return String.format("Welcome back, %s! picking up where you left off with **%s**? Or need help with something else?", 
+                userName, favoriteTopic);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import org.hibernate.annotations.CreationTimestamp;
+import java.time.LocalDateTime;
+
+@Data
+@Entity
+@Table(name = "HELP_UNANSWERED")
+public class HelpUnansweredEntity {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    private String userQuery;
+    private String userId;
+    
+    @CreationTimestamp
+    private LocalDateTime timestamp;
+}
+
+
+
+
+
+
+
+
+
+
+    // ... imports
+    private final HelpUnansweredRepository unansweredRepository; // Create this repo interface
+
+    @Async
+    public void logUnansweredQuery(String userId, String query) {
+        // Simple deduplication check could go here
+        HelpUnansweredEntity entity = new HelpUnansweredEntity();
+        entity.setUserId(userId);
+        entity.setUserQuery(query);
+        unansweredRepository.save(entity);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... imports
+    private final SupportRoutingService routingService; // NEW
+
+    // ... inside handleChat ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        // ... [Sentiment & Small Talk Logic] ...
+
+        // ... [NLP Extraction] ...
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        
+        // --- ANAPHORA RESOLUTION (The "It" Logic) ---
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // If user uses "it/this/that" and we have a previous topic
+        if (nlpEngine.containsPronoun(rawMessage) && session != null && session.getLastTopic() != null) {
+            String resolvedMessage = nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic());
+            normalizedIntent = nlpEngine.extractNormalizedIntent(resolvedMessage); // Re-process intent with resolved topic
+            botPrefix.append("*(Understanding \"it\" as \"").append(session.getLastTopic()).append("\")*<br/>");
+        }
+        
+        // ... [Existing Context Merging Logic] ...
+
+        // ... [Perform Search] ...
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen, isDefinition);
+
+        // --- INTELLIGENT FALLBACK (The Safety Net) ---
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
+            
+            // Analyze query to find the right department
+            String contactInfo = routingService.getSupportContact(rawMessage);
+            
+            return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I couldn't find a document for that. <br/><br/>" + 
+                          "For queries related to this topic, please contact **" + contactInfo + "**.")
+                .build();
+        }
+
+        // --- SUCCESS LOGIC ---
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // ... [Existing RBAC Checks] ...
+            
+            // SAVE TOPIC FOR NEXT TURN
+            // We assume the Screen Name (e.g. "CGL Management") or the first noun of the question is the Topic
+            String currentTopic = bestMatch.getScreenName(); 
+            // Or extract from Text: "How to Create CGL" -> "CGL"
+            
+            sessionService.updateSession(userId, detectedAction, detectedScreen, currentTopic); // Update Session
+            
+            // ... [Rest of Response Construction] ...
+        }
+        
+        // ...
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ... imports
+    private final SupportRoutingService routingService; // NEW
+
+    // ... inside handleChat ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        // ... [Sentiment & Small Talk Logic] ...
+
+        // ... [NLP Extraction] ...
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        
+        // --- ANAPHORA RESOLUTION (The "It" Logic) ---
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // If user uses "it/this/that" and we have a previous topic
+        if (nlpEngine.containsPronoun(rawMessage) && session != null && session.getLastTopic() != null) {
+            String resolvedMessage = nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic());
+            normalizedIntent = nlpEngine.extractNormalizedIntent(resolvedMessage); // Re-process intent with resolved topic
+            botPrefix.append("*(Understanding \"it\" as \"").append(session.getLastTopic()).append("\")*<br/>");
+        }
+        
+        // ... [Existing Context Merging Logic] ...
+
+        // ... [Perform Search] ...
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen, isDefinition);
+
+        // --- INTELLIGENT FALLBACK (The Safety Net) ---
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
+            
+            // Analyze query to find the right department
+            String contactInfo = routingService.getSupportContact(rawMessage);
+            
+            return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I couldn't find a document for that. <br/><br/>" + 
+                          "For queries related to this topic, please contact **" + contactInfo + "**.")
+                .build();
+        }
+
+        // --- SUCCESS LOGIC ---
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // ... [Existing RBAC Checks] ...
+            
+            // SAVE TOPIC FOR NEXT TURN
+            // We assume the Screen Name (e.g. "CGL Management") or the first noun of the question is the Topic
+            String currentTopic = bestMatch.getScreenName(); 
+            // Or extract from Text: "How to Create CGL" -> "CGL"
+            
+            sessionService.updateSession(userId, detectedAction, detectedScreen, currentTopic); // Update Session
+            
+            // ... [Rest of Response Construction] ...
+        }
+        
+        // ...
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+------------
+
+pronoun
+
+
+
+
+// ... existing imports
+import java.util.regex.Pattern;
+
+@Service
+public class NLPEngine {
+
+    // ... [Existing Constants] ...
+
+    // Pronouns that indicate a reference to the previous topic
+    private static final Pattern PRONOUN_PATTERN = Pattern.compile("\\b(it|this|that|them|these)\\b", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Checks if the sentence contains a reference like "approve it" or "what is that".
+     */
+    public boolean containsPronoun(String text) {
+        return text != null && PRONOUN_PATTERN.matcher(text).find();
+    }
+
+    /**
+     * Replaces pronouns with the actual topic.
+     * Input: "Who approves it", Topic: "CGL"
+     * Output: "Who approves CGL"
+     */
+    public String resolveAnaphora(String text, String previousTopic) {
+        if (text == null || previousTopic == null) return text;
+        return PRONOUN_PATTERN.matcher(text).replaceAll(previousTopic);
+    }
+    
+    // ... [Rest of existing logic] ...
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing imports
+
+@Service
+public class ChatSessionService {
+    
+    // ... existing Map ...
+
+    @Data
+    public static class UserSession {
+        private String lastAction;      // e.g. "CREATE"
+        private String lastScreen;      // e.g. "CGL Management"
+        private String lastTopic;       // NEW: e.g. "CGL", "Segment", "User"
+        private LocalDateTime lastInteraction;
+    }
+
+    public void updateSession(String userId, String action, String screen, String topic) {
+        if (userId == null) return;
+        
+        UserSession session = sessions.getOrDefault(userId, new UserSession());
+        
+        if (action != null) session.setLastAction(action);
+        if (screen != null) session.setLastScreen(screen);
+        if (topic != null) session.setLastTopic(topic); // Store the noun
+        
+        session.setLastInteraction(LocalDateTime.now());
+        sessions.put(userId, session);
+    }
+    
+    // ... [getSession remains same] ...
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import org.springframework.stereotype.Service;
 import java.util.HashMap;
 import java.util.Map;
 
-@Slf4j
-@Configuration
-public class LdapConfig {
+@Service
+public class SupportRoutingService {
 
-    @Value("${spring.ldap.urls:ldaps://10.189.42.83:636}")
-    private String ldapUrl;
+    private static final Map<String, String> DEPARTMENT_MAP = new HashMap<>();
 
-    @Value("${spring.ldap.base:DC=UATAD,DC=SBI}")
-    private String ldapBaseDn;
-
-    private final ResourceLoader resourceLoader;
-
-    public LdapConfig(ResourceLoader resourceLoader) {
-        this.resourceLoader = resourceLoader;
+    static {
+        DEPARTMENT_MAP.put("TAX", "Taxation Team (tax-ops@fincore.com)");
+        DEPARTMENT_MAP.put("GST", "Taxation Team (tax-ops@fincore.com)");
+        DEPARTMENT_MAP.put("VAT", "Taxation Team (tax-ops@fincore.com)");
+        DEPARTMENT_MAP.put("SERVER", "IT Operations (support@fincore.com)");
+        DEPARTMENT_MAP.put("SLOW", "IT Operations (support@fincore.com)");
+        DEPARTMENT_MAP.put("ERROR", "IT Operations (support@fincore.com)");
+        DEPARTMENT_MAP.put("LEDGER", "GL Ops Team (gl-support@fincore.com)");
+        DEPARTMENT_MAP.put("BALANCE", "GL Ops Team (gl-support@fincore.com)");
+        DEPARTMENT_MAP.put("USER", "Security Admin (security@fincore.com)");
+        DEPARTMENT_MAP.put("PASSWORD", "Security Admin (security@fincore.com)");
     }
 
-    @Bean
-    public LdapContextSource contextSource() {
-        log.info("Configuring LDAP Context Source. URL: {}", ldapUrl);
-        LdapContextSource contextSource = new LdapContextSource();
-        contextSource.setUrl(ldapUrl);
-        contextSource.setBase(ldapBaseDn);
-        
-        Map<String, Object> baseEnv = new HashMap<>();
-
-        // === SMART SSL LOGIC ===
-        if (ldapUrl.toLowerCase().startsWith("ldaps")) {
-            // UAT / PROD MODE (SSL ENABLED)
-            log.info("Enabling SSL for LDAP Connection");
-            baseEnv.put("java.naming.security.protocol", "ssl");
-            
-            // Load Truststore
-            try {
-                Resource trustStore = resourceLoader.getResource("classpath:ad-truststore.jks");
-                if (trustStore.exists()) {
-                    String trustStorePath = trustStore.getFile().getAbsolutePath();
-                    System.setProperty("javax.net.ssl.trustStore", trustStorePath);
-                    System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
-                }
-            } catch (IOException e) {
-                log.error("Could not load custom truststore", e);
+    public String getSupportContact(String query) {
+        String upperQuery = query.toUpperCase();
+        for (Map.Entry<String, String> entry : DEPARTMENT_MAP.entrySet()) {
+            if (upperQuery.contains(entry.getKey())) {
+                return entry.getValue();
             }
-        } else {
-            // LOCAL TESTING MODE (NO SSL)
-            log.info("SSL Disabled for Local/Plain LDAP Connection");
         }
-
-        // Common Timeouts
-        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "5000"); 
-        baseEnv.put("com.sun.jndi.ldap.read.timeout", "5000");    
-        
-        contextSource.setBaseEnvironmentProperties(baseEnv);
-        return contextSource;
-    }
-
-    @Bean
-    public LdapTemplate ldapTemplate() {
-        return new LdapTemplate(contextSource());
+        return "the IT Helpdesk (helpdesk@fincore.com)"; // Default
     }
 }
 
@@ -192,11 +1891,72 @@ public class LdapConfig {
 
 
 
-spring:
-  ldap:
-    urls: ldaps://10.189.42.83:636
-    base: DC=UATAD,DC=SBI
-    domain: UATAD.SBI
+
+
+
+
+
+
+
+    // ... imports
+    private final SupportRoutingService routingService; // NEW
+
+    // ... inside handleChat ...
+
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+        // ... [Sentiment & Small Talk Logic] ...
+
+        // ... [NLP Extraction] ...
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        
+        // --- ANAPHORA RESOLUTION (The "It" Logic) ---
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        
+        // If user uses "it/this/that" and we have a previous topic
+        if (nlpEngine.containsPronoun(rawMessage) && session != null && session.getLastTopic() != null) {
+            String resolvedMessage = nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic());
+            normalizedIntent = nlpEngine.extractNormalizedIntent(resolvedMessage); // Re-process intent with resolved topic
+            botPrefix.append("*(Understanding \"it\" as \"").append(session.getLastTopic()).append("\")*<br/>");
+        }
+        
+        // ... [Existing Context Merging Logic] ...
+
+        // ... [Perform Search] ...
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activeScreen, isDefinition);
+
+        // --- INTELLIGENT FALLBACK (The Safety Net) ---
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, activeScreen, rawMessage, "NO_MATCH", 0);
+            
+            // Analyze query to find the right department
+            String contactInfo = routingService.getSupportContact(rawMessage);
+            
+            return HelpResponseDTO.builder()
+                .responseType("NO_MATCH")
+                .botReply(botPrefix + "I couldn't find a document for that. <br/><br/>" + 
+                          "For queries related to this topic, please contact **" + contactInfo + "**.")
+                .build();
+        }
+
+        // --- SUCCESS LOGIC ---
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            // ... [Existing RBAC Checks] ...
+            
+            // SAVE TOPIC FOR NEXT TURN
+            // We assume the Screen Name (e.g. "CGL Management") or the first noun of the question is the Topic
+            String currentTopic = bestMatch.getScreenName(); 
+            // Or extract from Text: "How to Create CGL" -> "CGL"
+            
+            sessionService.updateSession(userId, detectedAction, detectedScreen, currentTopic); // Update Session
+            
+            // ... [Rest of Response Construction] ...
+        }
+        
+        // ...
+    }
 
 
 
@@ -207,36 +1967,25 @@ spring:
 
 
 
-spring:
-  ldap:
-    urls: ldap://localhost:8389  # <--- Note: ldap:// (not ldaps) and port 8389
-    base: DC=UATAD,DC=SBI
-    domain: UATAD.SBI
 
-**Keep this in Database:**
-Ensure `LOGIN_PARAM` has `ACTIVE_LOGIN_MODE` = **'L'**.
 
----
 
-### **How to Test**
 
-1.  **Start your Application:**
-    * Look for logs: `STARTING LOCAL MOCK LDAP SERVER...` and `Loaded Mock Data...`.
-    * Look for logs: `SSL Disabled for Local/Plain LDAP Connection`.
 
-2.  **Test Case 1: Success Flow**
-    * **Action:** Login with User: `1015698` and Password: `pass123`.
-    * **Expected:** "Login Successful" + Token generated.
-    * *Verify:* This confirms your `AdAuthenticationService` is correctly binding and returning true, and `LoginServiceImpl` is generating the token.
 
-3.  **Test Case 2: Wrong Password**
-    * **Action:** Login with User: `1015698` and Password: `wrongpass`.
-    * **Expected:** "Incorrect credentials".
-    * *Verify:* Check DB. The `USER_WRONG_PASSWORD_COUNT` for this user should increment.
 
-4.  **Test Case 3: Non-Existent User**
-    * **Action:** Login with User: `999999` and Password: `any`.
-    * **Expected:** "Invalid User" (Authorization check failed) OR "Incorrect credentials" (if user exists in local DB but not in LDAP).
 
-**When you are ready for UAT:**
-Simply change the URL in `application.yml` back to `ldaps://10.189.42.83:636` and redeploy. The code will automatically switch to SSL mode.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
