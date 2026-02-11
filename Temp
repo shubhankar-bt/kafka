@@ -12,16 +12,14 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * THE BRAIN.
- * Responsible for understanding English grammar, identifying intents,
- * and normalizing complex sentences into executable commands.
- * * FIXES APPLIED:
- * 1. Removed hardcoded screen checks (now loads from DB).
- * 2. Removed static ACTION_ROOTS map (now uses AdaptiveSearchService).
- * 3. Added caching for screen titles.
+ * Responsible for identifying intents and normalizing complex sentences.
+ * * CHANGES:
+ * - Removed unused 'isNegatedOrTrouble'.
+ * - Dynamic Screen Loading from DB.
+ * - Dynamic Synonym Resolution via AdaptiveSearchService.
  */
 @Service
 @RequiredArgsConstructor
@@ -33,41 +31,27 @@ public class NLPEngine {
 
     // Cache known screens for detection (Normalized Upper -> Display Name)
     private final Map<String, String> KNOWN_SCREENS = new ConcurrentHashMap<>();
-
-    private static final Set<String> NEGATION_WORDS = Set.of(
-            "not", "cant", "cannot", "unable", "fail", "failed", "failing", "error", "issue", "problem", "broken", "wont"
-    );
     
+    // Cache Screen Title -> URL for Navigation commands
+    private final Map<String, String> SCREEN_URLS = new ConcurrentHashMap<>();
+
     private static final Set<String> KNOWN_ACTIONS = Set.of("CREATE", "MODIFY", "APPROVE", "VIEW", "DELETE", "DOWNLOAD");
 
     // REGEX PATTERNS
     private static final Pattern ERROR_CODE_PATTERN = Pattern.compile("\\b[A-Z]{3,4}-\\d{3,5}\\b"); 
-    private static final Pattern NAV_PATTERN = Pattern.compile("\\b(go to|open|take me to|navigate to)\\b");
-    private static final Pattern CAPABILITY_PATTERN = Pattern.compile("\\b(what can i do|my rights|my permissions|access do i have)\\b");
+    private static final Pattern NAV_PATTERN = Pattern.compile("\\b(go to|open|take me to|navigate to|launch)\\b");
+    private static final Pattern CAPABILITY_PATTERN = Pattern.compile("\\b(what can i do|my rights|my permissions|access do i have|am i allowed)\\b");
     private static final Pattern DEFINITION_PATTERN = Pattern.compile("\\b(what is|define|meaning of)\\b");
     private static final Pattern RESET_PATTERN = Pattern.compile("\\b(stop|cancel|wrong|start over|reset)\\b");
     private static final Pattern PRONOUN_PATTERN = Pattern.compile("\\b(it|this|that)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern TROUBLE_PATTERN = Pattern.compile("\\b(cant|cannot|fail|error|issue)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TROUBLE_PATTERN = Pattern.compile("\\b(cant|cannot|fail|error|issue|problem|broken)\\b", Pattern.CASE_INSENSITIVE);
     
-    // Noise words
     private static final Set<String> STOP_WORDS = Set.of(
-            "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours",
-            "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers",
-            "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves",
-            "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are",
-            "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does",
-            "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until",
-            "while", "of", "at", "by", "for", "with", "about", "against", "between", "into",
-            "through", "during", "before", "after", "above", "below", "to", "from", "up", "down",
-            "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here",
-            "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more",
-            "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so",
-            "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "please", "kindly", "help"
+            "i", "can", "do", "a", "the", "in", "on", "what", "is", "please", "help", "me", "to", "how"
     );
 
     /**
-     * DYNAMICALLY LOAD SCREENS FROM DB
-     * Replaces hardcoded "if (lower.contains('cgl'))" logic.
+     * DYNAMICALLY LOAD SCREENS & URLs FROM DB
      */
     @PostConstruct
     @Scheduled(fixedRate = 3600000) // Refresh every hour
@@ -75,22 +59,29 @@ public class NLPEngine {
         try {
             List<PermissionEntity> allPermissions = permissionRepository.findAll();
             KNOWN_SCREENS.clear();
+            SCREEN_URLS.clear();
+            
             for (PermissionEntity p : allPermissions) {
                 if (p.getMenuTitle() != null) {
-                    // Map "CGL MANAGEMENT" -> "CGL Management"
-                    KNOWN_SCREENS.put(p.getMenuTitle().toUpperCase().trim(), p.getMenuTitle().trim());
+                    String upperTitle = p.getMenuTitle().toUpperCase().trim();
+                    KNOWN_SCREENS.put(upperTitle, p.getMenuTitle().trim());
+                    
+                    if (p.getMenuUrl() != null) {
+                        SCREEN_URLS.put(upperTitle, p.getMenuUrl());
+                    }
                 }
             }
-            log.info("NLPEngine: Loaded {} screens into knowledge base.", KNOWN_SCREENS.size());
+            log.info("NLPEngine: Loaded {} screens and URLs.", KNOWN_SCREENS.size());
         } catch (Exception e) {
             log.error("NLPEngine: Failed to load screens.", e);
         }
     }
 
-    /**
-     * Input: "Can I please creating a new CGL?"
-     * Output: "create cgl"
-     */
+    public String getScreenUrl(String screenName) {
+        if (screenName == null) return null;
+        return SCREEN_URLS.get(screenName.toUpperCase().trim());
+    }
+
     public String extractNormalizedIntent(String sentence) {
         if (sentence == null) return "";
         String clean = sentence.toLowerCase().replaceAll("[^a-z0-9\\s]", " ");
@@ -99,22 +90,16 @@ public class NLPEngine {
         for (String word : clean.split("\\s+")) {
             if (word.isEmpty()) continue;
             if (STOP_WORDS.contains(word)) continue;
-
-            // DYNAMIC LOOKUP from DB via AdaptiveSearchService
+            
+            // Resolve synonyms using DB (e.g., "add" -> "CREATE")
             String root = adaptiveService.getRootFromSynonym(word);
             normalized.append(root).append(" ");
         }
         return normalized.toString().trim();
     }
 
-    /**
-     * Identifies the ACTION verb from the sentence.
-     * Uses AdaptiveSearchService to resolve synonyms (e.g. "add" -> "CREATE")
-     */
     public String detectAction(String normalizedSentence) {
         for (String word : normalizedSentence.split(" ")) {
-            // "word" might already be normalized to "CREATE" by extractNormalizedIntent
-            // But we double check the root just in case
             String root = adaptiveService.getRootFromSynonym(word);
             if (KNOWN_ACTIONS.contains(root.toUpperCase())) {
                 return root.toUpperCase();
@@ -123,53 +108,28 @@ public class NLPEngine {
         return null;
     }
 
-    /**
-     * Identifies the MODULE/CONTEXT from the sentence based on DB Screens.
-     * Now Dynamic!
-     */
     public String detectScreen(String sentence) {
         if (sentence == null) return null;
         String upperSentence = sentence.toUpperCase();
         
-        // 1. Check for Exact Multi-Word Matches from DB (e.g. "CGL MANAGEMENT")
-        // We iterate KNOWN_SCREENS to find the longest matching substring
+        // 1. Exact Match
         for (String dbScreenUpper : KNOWN_SCREENS.keySet()) {
             if (upperSentence.contains(dbScreenUpper)) {
-                return KNOWN_SCREENS.get(dbScreenUpper); // Return display name
+                return KNOWN_SCREENS.get(dbScreenUpper);
             }
         }
 
-        // 2. Check for Synonyms (e.g. "cgl" -> "CGL Management")
-        // We tokenize the sentence and check if any word maps to a screen name
+        // 2. Token/Synonym Match
         List<String> tokens = Arrays.asList(sentence.split("\\W+"));
         for (String token : tokens) {
-            // e.g. token="cgl" -> root="CGL Management" (from AdaptiveService)
             String root = adaptiveService.getRootFromSynonym(token);
-            
-            // Check if this root is a known screen key
+            // Check if the synonym root is a screen (e.g. "ledger" -> "CGL Management")
+            // Note: You must ensure your HELP_SYNONYMS table maps "ledger" -> "CGL MANAGEMENT"
             if (KNOWN_SCREENS.containsKey(root.toUpperCase().trim())) {
                 return KNOWN_SCREENS.get(root.toUpperCase().trim());
             }
         }
-
         return null;
-    }
-
-    /**
-     * Detects if the user is expressing inability to perform an action.
-     * "I cannot create" -> true
-     */
-    public boolean isNegatedOrTrouble(String sentence) {
-        if (sentence == null) return false;
-        String lower = sentence.toLowerCase();
-
-        for (String neg : NEGATION_WORDS) {
-            // Check word boundaries so "note" doesn't trigger "not"
-            if (Pattern.compile("\\b" + neg + "\\b").matcher(lower).find()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     public boolean containsPronoun(String t) {
@@ -184,17 +144,13 @@ public class NLPEngine {
         return t != null && TROUBLE_PATTERN.matcher(t).find();
     }
 
-    /**
-     * Extracts an error code like "FIN-909" from the text.
-     */
     public String extractErrorCode(String text) {
         if (text == null) return null;
         Matcher m = ERROR_CODE_PATTERN.matcher(text.toUpperCase());
-        if (m.find()) {
-            return m.group();
-        }
-        return null;
+        return m.find() ? m.group() : null;
     }
+
+    // --- RE-ENABLED METHODS ---
 
     public boolean isNavigationCommand(String text) {
         return text != null && NAV_PATTERN.matcher(text.toLowerCase()).find();
@@ -222,4 +178,385 @@ public class NLPEngine {
 
 
 
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpItemDTO;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.repository.PermissionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpService {
+    
+    // Thresholds
+    private static final int SCORE_THRESHOLD_HIGH = 60; 
+    
+    // CORE REPOS
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final PermissionRepository permissionRepository;
+
+    // SERVICES
+    private final HelpAnalyticsService analyticsService;
+    private final PermissionService permissionService;
+    private final NLPEngine nlpEngine;
+    private final SmallTalkService smallTalkService;
+    private final SmartResponseGenerator responseGenerator;
+    private final SystemHealthService healthService;
+    private final ContentInjectorService contentInjector;
+    private final SupportRoutingService routingService;
+    private final AdaptiveSearchService adaptiveService;
+    private final ChatSessionService sessionService;
+    private final SentimentAnalyzer sentimentAnalyzer;
+
+    /**
+     * MAIN PROCESSOR
+     */
+    public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
+        try {
+            String type = request.getRequestType();
+            switch (type) {
+                case "MODULE_QUESTIONS":
+                    return handleModuleFetch(request.getScreenName(), roleId);
+                case "FAQ_LIST":
+                    return handleFaqFetch();
+                case "GET_ANSWER":
+                    return handleGetAnswer(request.getQuestionId());
+                case "CHAT":
+                    return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
+                default:
+                    throw new IllegalArgumentException("Invalid Request Type: " + type);
+            }
+        } catch (Exception e) {
+            log.error("Error processing help request", e);
+            // Fallback response to prevent UI crash
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply("I encountered a technical issue. Please try again or contact support.")
+                    .build();
+        }
+    }
+
+    // =========================================================================
+    // HANDLERS
+    // =========================================================================
+
+    private HelpResponseDTO handleModuleFetch(String screenName, String roleId) {
+        if (!StringUtils.hasText(screenName)) return handleFaqFetch(); // Fallback
+
+        Integer permissionId = resolveScreenToId(screenName);
+        if (permissionId == null) {
+            log.warn("Module fetch failed: Screen '{}' not found in DB.", screenName);
+            return handleFaqFetch(); // Graceful fallback
+        }
+
+        List<String> userActions = permissionService.getUserActions(roleId, permissionId);
+
+        List<HelpItemDTO> items = getQuestionsForScreen(screenName)
+                .stream()
+                .filter(q -> isActionAllowed(q, userActions))
+                .map(q -> mapToDTO(q, 100)) // 100% confidence as it's a direct listing
+                .collect(Collectors.toList());
+
+        return HelpResponseDTO.builder()
+                .responseType("LIST_SELECTION")
+                .botReply("Here are the help topics for " + screenName + ":")
+                .items(items)
+                .build();
+    }
+
+    private HelpResponseDTO handleFaqFetch() {
+        List<HelpItemDTO> faqs = fetchGlobalFaqs();
+        return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply("Here are the frequently asked questions:").items(faqs).build();
+    }
+
+    private HelpResponseDTO handleGetAnswer(String questionId) {
+        return questionRepository.findById(questionId)
+                .map(q -> HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(contentInjector.injectDynamicContent(q.getAnswerContent()))
+                        .navigationLink(q.getActionLink())
+                        .navigationLabel(q.getActionLabel())
+                        .build())
+                .orElse(HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Content not found.").build());
+    }
+
+    // =========================================================================
+    // CHAT HANDLER (UPDATED)
+    // =========================================================================
+    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
+
+        if (!StringUtils.hasText(rawMessage)) {
+            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+        }
+
+        StringBuilder botPrefix = new StringBuilder();
+
+        // 1. CONTEXT RESET
+        if (nlpEngine.isResetRequest(rawMessage)) {
+            sessionService.clearSession(userId);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Context cleared. How can I help?").build();
+        }
+
+        // 2. ERROR CODES
+        String errorCode = nlpEngine.extractErrorCode(rawMessage);
+        if (errorCode != null) {
+            List<HelpItemDTO> errMatches = performSmartSearch(errorCode, errorCode, null, false);
+            if (!errMatches.isEmpty()) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Error code **" + errorCode + "** detected:").items(errMatches.subList(0, 1)).build();
+            }
+        }
+
+        // 3. SYSTEM HEALTH / TROUBLE
+        if (nlpEngine.isTrouble(rawMessage)) {
+            String systemAlert = healthService.getSystemStatusMessage();
+            if (systemAlert != null) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(systemAlert).build();
+            }
+            // If no system alert, proceed to search (maybe user is asking "Why did my transaction fail?")
+        }
+
+        // 4. SENTIMENT & SMALL TALK
+        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
+        if (sentiment != SentimentAnalyzer.Sentiment.NEUTRAL) {
+            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
+        } else {
+            String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
+            if (smallTalk != null) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
+            }
+        }
+
+        // 5. NLP EXTRACTION
+        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
+        String detectedAction = nlpEngine.detectAction(normalizedIntent);
+        String detectedScreenName = nlpEngine.detectScreen(rawMessage);
+        
+        // 6. ANAPHORA (Memory)
+        ChatSessionService.UserSession session = sessionService.getSession(userId);
+        if (nlpEngine.containsPronoun(rawMessage) && session != null && session.getLastTopic() != null) {
+            normalizedIntent = nlpEngine.extractNormalizedIntent(nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic()));
+            botPrefix.append("*(Context: ").append(session.getLastTopic()).append(")*<br/>");
+        }
+
+        // 7. CONTEXT FALLBACK
+        if (detectedScreenName == null) {
+            if (session != null && session.getLastScreen() != null) {
+                detectedScreenName = session.getLastScreen();
+            } else if (clientScreenName != null) {
+                detectedScreenName = clientScreenName;
+            }
+        }
+
+        Integer activePermissionId = resolveScreenToId(detectedScreenName);
+        
+        // --- NEW FEATURE: NAVIGATION COMMANDS ---
+        if (nlpEngine.isNavigationCommand(rawMessage)) {
+            if (detectedScreenName != null) {
+                String url = nlpEngine.getScreenUrl(detectedScreenName);
+                if (url != null) {
+                    return HelpResponseDTO.builder()
+                            .responseType("NAVIGATION") // Client handles redirect
+                            .botReply("Navigating to " + detectedScreenName + "...")
+                            .navigationLink(url)
+                            .build();
+                }
+            }
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I'm not sure which screen you want to navigate to.").build();
+        }
+
+        // --- NEW FEATURE: CAPABILITY CHECK ---
+        if (nlpEngine.isCapabilityRequest(rawMessage)) {
+            if (activePermissionId != null) {
+                List<String> actions = permissionService.getUserActions(roleId, activePermissionId);
+                String actionList = actions.isEmpty() ? "View Only" : String.join(", ", actions);
+                return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply("In **" + detectedScreenName + "**, you have the following permissions: **" + actionList + "**.")
+                        .build();
+            } else {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Which module are you asking about? (e.g., 'rights in CGL')").build();
+            }
+        }
+
+        // 8. SESSION UPDATE
+        sessionService.updateSession(userId, detectedAction, detectedScreenName, detectedScreenName);
+
+        // 9. RBAC CHECK (Bot doesn't help if you can't do it)
+        if (detectedAction != null && activePermissionId != null) {
+            List<String> allowedActions = permissionService.getUserActions(roleId, activePermissionId);
+            boolean isAllowed = allowedActions.contains(detectedAction);
+            if (!isAllowed && !nlpEngine.isTrouble(rawMessage)) {
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY")
+                        .botReply(botPrefix + responseGenerator.generatePermissionResponse(false, detectedAction, detectedScreenName, userId))
+                        .build();
+            }
+        }
+
+        // 10. SMART SEARCH
+        boolean isDefinition = nlpEngine.isDefinitionRequest(rawMessage);
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activePermissionId, isDefinition);
+
+        if (matches.isEmpty()) {
+            analyticsService.logChatInteraction(userId, detectedScreenName, rawMessage, "NO_MATCH", 0);
+            String contact = routingService.getSupportContact(rawMessage);
+            return HelpResponseDTO.builder().responseType("NO_MATCH")
+                    .botReply(botPrefix + "I couldn't find a document for that. Please contact **" + contact + "**.").build();
+        }
+
+        HelpItemDTO bestMatch = matches.get(0);
+        int score = (int) bestMatch.getSearchScore();
+
+        if (score >= SCORE_THRESHOLD_HIGH) {
+            String logId = analyticsService.logChatInteraction(userId, detectedScreenName, rawMessage, "ANSWERED", score);
+            StringBuilder finalReply = new StringBuilder();
+            
+            finalReply.append(responseGenerator.generateSearchIntro(score)).append("<br/>");
+            finalReply.append(contentInjector.injectDynamicContent(bestMatch.getAnswer()));
+            
+            if (bestMatch.getProTip() != null) {
+                finalReply.append("<br/><br/>💡 <b>Pro Tip:</b> ").append(bestMatch.getProTip());
+            }
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(botPrefix + finalReply.toString())
+                    .logId(logId)
+                    .navigationLink(bestMatch.getActionLink())
+                    .navigationLabel(bestMatch.getActionLabel())
+                    // UI Selector removed as requested
+                    .build();
+        } else {
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
+                    .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
+                    .items(matches.stream().limit(3).collect(Collectors.toList()))
+                    .build();
+        }
+    }
+
+    // =========================================================================
+    // SEARCH ALGORITHM
+    // =========================================================================
+    private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, Integer activePermissionId, boolean isDefinition) {
+        List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+"));
+
+        Stream<HelpItemDTO> questions = getAllActiveQuestions().stream().map(q -> {
+            int score = calculateScore(q.getQuestionText(), q.getKeywords(), q.getPermissionId(), normalizedQuery, rawQuery, tokens, activePermissionId, isDefinition);
+            return mapToDTO(q, score);
+        });
+
+        Stream<HelpItemDTO> faqs = fetchGlobalFaqsEntity().stream().map(f -> {
+            int score = calculateScore(f.getQuestionText(), null, null, normalizedQuery, rawQuery, tokens, null, false);
+            return HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent()).type("FAQ").searchScore(score).build();
+        });
+
+        return Stream.concat(questions, faqs)
+                .filter(item -> item.getSearchScore() > 0)
+                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore()))
+                .limit(5)
+                .collect(Collectors.toList());
+    }
+
+    // =========================================================================
+    // UTILS
+    // =========================================================================
+
+    private int calculateScore(String text, String keywords, Integer qPermId, String normalizedQuery, String rawQuery, List<String> tokens, Integer activePermId, boolean isDefinition) {
+        double score = 0;
+        String lowerText = text.toLowerCase();
+        
+        if (lowerText.equals(rawQuery.toLowerCase())) return 100;
+        if (lowerText.contains(rawQuery.toLowerCase())) score += 50;
+
+        int matches = 0;
+        for (String token : tokens) {
+            // Check text OR keywords
+            if (lowerText.contains(token) || (keywords != null && keywords.toLowerCase().contains(token))) {
+                score += 15;
+                matches++;
+            }
+        }
+        if (matches > 1) score += (matches * 5);
+
+        if (activePermId != null && activePermId.equals(qPermId)) {
+            score = score * 2.5; // Huge context boost
+        }
+        if (isDefinition && lowerText.startsWith("what is")) {
+            score += 20;
+        }
+        return (int) Math.min(score, 100);
+    }
+
+    private HelpItemDTO mapToDTO(HelpQuestionEntity q, int score) {
+        return HelpItemDTO.builder()
+                .id(q.getQuestionId())
+                .text(q.getQuestionText())
+                .answer(q.getAnswerContent())
+                .type("QUESTION")
+                .requiredAction(q.getRequiredAction())
+                .screenName(q.getScreenName())
+                .permissionId(q.getPermissionId())
+                .actionLink(q.getActionLink())
+                .actionLabel(q.getActionLabel())
+                .proTip(q.getProTip())
+                .searchScore(score)
+                .build(); // REMOVED .uiSelector()
+    }
+
+    private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
+        if (q.getRequiredAction() == null || q.getRequiredAction().trim().isEmpty()) return true;
+        if (userActions.contains("ALL") || userActions.contains("*")) return true;
+        return userActions.contains(q.getRequiredAction().toUpperCase());
+    }
+
+    @Cacheable("screen_name_to_id")
+    public Integer resolveScreenToId(String screenName) {
+        if (screenName == null) return null;
+        return permissionRepository.findIdByTitle(screenName);
+    }
+
+    @Cacheable(value = "help_questions", key = "#screenName")
+    public List<HelpQuestionEntity> getQuestionsForScreen(String screenName) {
+        return questionRepository.findByScreenNameAndIsActiveOrderByDisplayOrderAsc(screenName, "Y");
+    }
+
+    @Cacheable(value = "help_questions_all", key = "'active_global'")
+    public List<HelpQuestionEntity> getAllActiveQuestions() {
+        return questionRepository.findByIsActive("Y");
+    }
+
+    @Cacheable(value = "help_faqs_all")
+    public List<HelpFaqEntity> fetchGlobalFaqsEntity() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y");
+    }
+
+    public List<HelpItemDTO> fetchGlobalFaqs() {
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
+                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
+                .collect(Collectors.toList());
+    }
+}
 
