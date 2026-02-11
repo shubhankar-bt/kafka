@@ -7,7 +7,6 @@ import com.fincore.helpservice.model.HelpFaqEntity;
 import com.fincore.helpservice.model.HelpQuestionEntity;
 import com.fincore.helpservice.repository.HelpFaqRepository;
 import com.fincore.helpservice.repository.HelpQuestionRepository;
-import com.fincore.helpservice.repository.HelpScreenRepository;
 import com.fincore.helpservice.repository.PermissionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -43,7 +42,6 @@ public class HelpService {
     // CORE REPOS
     private final HelpQuestionRepository questionRepository;
     private final HelpFaqRepository faqRepository;
-    private final HelpScreenRepository screenRepository;
     private final PermissionRepository permissionRepository; // Source of Truth for Screens
 
     // SERVICES
@@ -95,16 +93,21 @@ public class HelpService {
     private HelpResponseDTO handleModuleFetch(String screenName, String roleId) {
         if (!StringUtils.hasText(screenName)) throw new IllegalArgumentException("Screen Name is required");
 
-        // Fetch User Permissions
-        List<String> userActions = permissionService.getUserActions(roleId, screenName);
+        Integer permissionId = resolveScreenToId(screenName);
+        if (permissionId == null) throw new IllegalArgumentException("Invalid Screen Name");
 
-        List<HelpItemDTO> items = getQuestionsForScreen(screenName).stream()
+        // Fetch User Permissions
+        List<String> userActions = permissionService.getUserActions(roleId, permissionId);
+
+        List<HelpItemDTO> items = getQuestionsForScreen(screenName)
+                .stream()
                 .filter(q -> isActionAllowed(q, userActions))
-                .map(q -> HelpItemDTO.builder()
-                        .id(q.getQuestionId())
-                        .text(q.getQuestionText())
-                        .type("QUESTION")
-                        .build()) // Note: We do NOT send the full answer content here to keep it light
+                .map(q ->
+                        HelpItemDTO.builder()
+                                .id(q.getQuestionId())
+                                .text(q.getQuestionText())
+                                .type("QUESTION")
+                                .build())
                 .collect(Collectors.toList());
 
         return HelpResponseDTO.builder()
@@ -119,155 +122,187 @@ public class HelpService {
     // =========================================================================
     private HelpResponseDTO handleFaqFetch() {
         List<HelpItemDTO> faqs = fetchGlobalFaqs();
-        return HelpResponseDTO.builder()
-                .responseType("LIST_SELECTION")
-                .botReply("Here are the frequently asked questions:")
-                .items(faqs)
-                .build();
+        return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply("Here are the frequently asked questions:").items(faqs).build();
     }
 
     // =========================================================================
     // HANDLER 3: DIRECT ANSWER
     // =========================================================================
     private HelpResponseDTO handleGetAnswer(String questionId) {
-        return questionRepository.findById(questionId)
-                .map(q -> HelpResponseDTO.builder()
-                        .responseType("TEXT_REPLY")
-                        .botReply(q.getAnswerContent())
-                        .navigationLink(q.getActionLink())
-                        .navigationLabel(q.getActionLabel())
-                        .build())
-                .orElse(HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Content not found.").build());
+        return questionRepository.findById(questionId).map(q -> HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(q.getAnswerContent()).navigationLink(q.getActionLink()).navigationLabel(q.getActionLabel()).build()).orElse(HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Content not found.").build());
     }
 
     // =========================================================================
-    // THE ULTIMATE SMART CHAT HANDLER
+    // CHAT HANDLER (FINAL VERSION)
     // =========================================================================
     private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
-        if (!StringUtils.hasText(rawMessage))
+
+        // 1. INPUT VALIDATION
+        if (!StringUtils.hasText(rawMessage)) {
             return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
+        }
 
         StringBuilder botPrefix = new StringBuilder();
 
-        // 0. RESET
+        // 2. CONTEXT RESET (The "Stop" Button)
         if (nlpEngine.isResetRequest(rawMessage)) {
             sessionService.clearSession(userId);
-            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Conversation cleared.").build();
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Conversation context cleared. How can I help you now?").build();
         }
 
-        // 1. SENTIMENT ANALYSIS
+        // 3. OPERATIONAL AWARENESS (System Health)
+        // If user is complaining (e.g., "slow", "fail"), check system status first.
+        if (nlpEngine.isTrouble(rawMessage)) {
+            String systemAlert = healthService.getSystemStatusMessage();
+            if (systemAlert != null) {
+                analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "SYSTEM_ALERT", 100);
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(systemAlert + "<br/><br/>(If this persists, please contact support).").build();
+            }
+        }
+
+        // 4. ERROR CODE DETECTIVE
+        // If message contains "FIN-102" or similar, skip NLP and search directly.
+        String errorCode = nlpEngine.extractErrorCode(rawMessage);
+        if (errorCode != null) {
+            List<HelpItemDTO> errMatches = performSmartSearch(errorCode, errorCode, null, false);
+            if (!errMatches.isEmpty()) {
+                analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "ERROR_SOLVED", 100);
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I detected error code **" + errorCode + "**. Here is the solution:").items(errMatches.subList(0, 1)).build();
+            }
+        }
+
+        // 5. SENTIMENT ANALYSIS & SMALL TALK
         SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
         if (sentiment != SentimentAnalyzer.Sentiment.NEUTRAL) {
             botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
-        }
-
-        // 2. SMALL TALK
-        if (sentiment == SentimentAnalyzer.Sentiment.NEUTRAL) {
+        } else {
+            // Only check small talk if user is calm
             String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
-            if (smallTalk != null)
+            if (smallTalk != null) {
                 return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
+            }
         }
 
-        // 3. NLP & CONTEXT RESOLUTION
+        // 7. NLP & CONTEXT RESOLUTION
         String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
-        String detectedAction = nlpEngine.detectAction(normalizedIntent);
-        String detectedScreenName = nlpEngine.detectScreen(rawMessage); // Returns String Name
+        String detectedAction = nlpEngine.detectAction(normalizedIntent); // CREATE, APPROVE...
+        String detectedScreenName = nlpEngine.detectScreen(rawMessage);   // CGL Management...
 
-        // -- MEMORY & ANAPHORA --
+        // MEMORY & ANAPHORA RESOLUTION
         ChatSessionService.UserSession session = sessionService.getSession(userId);
 
-        // Resolve "it/this"
+        // A. Pronoun Resolution ("How to approve IT?")
         if (nlpEngine.containsPronoun(rawMessage) && session != null && session.getLastTopic() != null) {
-            String resolvedMsg = nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic());
-            normalizedIntent = nlpEngine.extractNormalizedIntent(resolvedMsg);
+            String resolvedMessage = nlpEngine.resolveAnaphora(rawMessage, session.getLastTopic());
+            // Re-run NLP on resolved text
+            normalizedIntent = nlpEngine.extractNormalizedIntent(resolvedMessage);
             botPrefix.append("*(Context: ").append(session.getLastTopic()).append(")*<br/>");
         }
 
-        // Merge Action from History
+        // B. Context Merging (History Inheritance)
+        // Scenario: "What about Segment?" (New Screen, Old Action)
         if (detectedAction == null && detectedScreenName != null && session != null && session.getLastAction() != null) {
             detectedAction = session.getLastAction();
             normalizedIntent = detectedAction + " " + normalizedIntent;
         }
 
-        // Merge Screen from History/Client
+        // Scenario: "How to Create?" (New Action, Old Screen)
         if (detectedScreenName == null) {
-            if (session != null && session.getLastScreen() != null) detectedScreenName = session.getLastScreen();
-            else if (clientScreenName != null) detectedScreenName = clientScreenName;
+            if (session != null && session.getLastScreen() != null) {
+                detectedScreenName = session.getLastScreen(); // Persistence from history
+            } else if (clientScreenName != null) {
+                detectedScreenName = clientScreenName; // Fallback to current browser screen
+            }
         }
 
-        // Resolve Screen Name to ID for Database Query
+        // 8. RESOLVE SCREEN TO ID (Robust Linking)
         Integer activePermissionId = resolveScreenToId(detectedScreenName);
-        String activeScreenName = detectedScreenName; // Keep string for UI/Text
+        String activeScreenName = (detectedScreenName != null) ? detectedScreenName : "Global";
 
-        // 4. DISAMBIGUATION (If Action found but Screen is null)
+        // 9. PROACTIVE DISAMBIGUATION
+        // User said "Approve" but we don't know which screen, and we couldn't infer it.
         if (detectedAction != null && activePermissionId == null) {
-            List<String> validScreens = findScreensForAction(roleId, detectedAction);
+            List<String> validScreens = permissionRepository.findScreensByRoleAndAction(roleId, detectedAction);
+
             if (validScreens.size() > 1) {
-                sessionService.updateSession(userId, detectedAction, null, null);
-                return HelpResponseDTO.builder()
-                        .responseType("LIST_SELECTION")
-                        .botReply(botPrefix + "I see you want to **" + detectedAction + "**. Which module?")
-                        .items(validScreens.stream().map(s -> HelpItemDTO.builder().text(s).id("CTX_" + s).type("CONTEXT_SUGGESTION").build()).collect(Collectors.toList()))
-                        .build();
+                sessionService.updateSession(userId, detectedAction, null, null); // Remember Action
+                return HelpResponseDTO.builder().responseType("LIST_SELECTION").botReply(botPrefix + "I see you want to **" + detectedAction + "**. Which module are you referring to?").items(validScreens.stream().map(s -> HelpItemDTO.builder().text(s).id("CTX_" + s).type("CONTEXT_SUGGESTION").build()).collect(Collectors.toList())).build();
             } else if (validScreens.size() == 1) {
+                // Auto-select the only possible screen
                 activeScreenName = validScreens.get(0);
                 activePermissionId = resolveScreenToId(activeScreenName);
             }
         }
 
-        // Update Memory
+        // Update Memory for next turn
         sessionService.updateSession(userId, detectedAction, activeScreenName, activeScreenName);
 
-        // 5. PERMISSION CHECK
-        if (detectedAction != null && activeScreenName != null) {
-            List<String> allowedActions = permissionService.getUserActions(roleId, activeScreenName);
+        // 10. SERVER-SIDE RBAC CHECK
+        if (detectedAction != null && activePermissionId != null) {
+            List<String> allowedActions = permissionService.getUserActions(roleId, activePermissionId);
             boolean isAllowed = allowedActions.contains(detectedAction);
 
-            if (!isAllowed && !nlpEngine.isTrouble(rawMessage)) { // Don't deny if they are troubleshooting
-                String reply = responseGenerator.generatePermissionResponse(false, detectedAction, activeScreenName, userId);
+            // If denied AND not troubleshooting (e.g. "I can't create" vs "How to create")
+            if (!isAllowed && !nlpEngine.isTrouble(rawMessage)) {
+                String deniedMsg = responseGenerator.generatePermissionResponse(false, detectedAction, activeScreenName, userId);
                 analyticsService.logChatInteraction(userId, activeScreenName, rawMessage, "ACCESS_DENIED", 100);
-                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + reply).build();
+                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + deniedMsg).build();
             }
         }
 
-        // 6. PERFORM SEARCH
-        boolean isDef = nlpEngine.isDefinitionRequest(rawMessage);
-        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activePermissionId, isDef);
+        // 11. PERFORM SMART SEARCH
+        boolean isDefinitionRequest = nlpEngine.isDefinitionRequest(rawMessage);
 
-        // --- FALLBACK ROUTING ---
+        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activePermissionId, isDefinitionRequest);
+
+        // 12. FALLBACK ROUTING (No Match)
         if (matches.isEmpty()) {
             analyticsService.logChatInteraction(userId, activeScreenName, rawMessage, "NO_MATCH", 0);
-            String contact = routingService.getSupportContact(rawMessage);
-            return HelpResponseDTO.builder().responseType("NO_MATCH")
-                    .botReply(botPrefix + "I couldn't find a document for that. For complex queries, please contact **" + contact + "**.").build();
+            String contactInfo = routingService.getSupportContact(rawMessage);
+            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply(botPrefix + "I couldn't find a document for that. For complex queries related to this, please contact **" + contactInfo + "**.").build();
         }
 
+        // 13. SUCCESS RESPONSE CONSTRUCTION
         HelpItemDTO bestMatch = matches.get(0);
         int score = (int) bestMatch.getSearchScore();
 
         if (score >= SCORE_THRESHOLD_HIGH) {
-            // Permission check on result
+            // A. Specific Permission Check for this Question (Double Check)
             if (bestMatch.getRequiredAction() != null) {
-                List<String> allowedActions = permissionService.getUserActions(roleId, bestMatch.getScreenName());
+                List<String> allowedActions = permissionService.getUserActions(roleId, bestMatch.getPermissionId());
+
                 if (!allowedActions.contains(bestMatch.getRequiredAction())) {
-                    String deniedMsg = responseGenerator.generatePermissionResponse(false, bestMatch.getRequiredAction(), bestMatch.getScreenName(), userId);
+                    String deniedMsg = responseGenerator.generatePermissionResponse(false, bestMatch.getRequiredAction(),
+                            bestMatch.getScreenName(), userId);
                     return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(botPrefix + deniedMsg).build();
                 }
             }
 
             String logId = analyticsService.logChatInteraction(userId, activeScreenName, rawMessage, "ANSWERED", score);
 
-            // Dynamic Reply Construction
             StringBuilder finalReply = new StringBuilder();
+
+            // B. Intro Construction (Hedging vs Confirmation)
             if (detectedAction != null && activeScreenName != null) {
-                finalReply.append(responseGenerator.generatePermissionResponse(true, detectedAction, activeScreenName, userId)).append("<br/><br/>");
+                // "Yes, you can create..."
+                finalReply.append(responseGenerator.generatePermissionResponse(true, detectedAction,
+                        activeScreenName, userId)).append("<br/><br/>");
             } else {
+                // "Here is what I found..."
                 finalReply.append(responseGenerator.generateSearchIntro(score)).append("<br/>");
             }
-            finalReply.append(bestMatch.getAnswer());
 
+            // C. Answer Injection (Live Variables)
+            finalReply.append(contentInjector.injectDynamicContent(bestMatch.getAnswer()));
+
+            // D. Pro Tip Injection
             if (bestMatch.getProTip() != null) {
                 finalReply.append("<br/><br/>💡 <b>Pro Tip:</b> ").append(bestMatch.getProTip());
+            }
+
+            // E. UI Highlighting Message
+            if (bestMatch.getUiSelector() != null) {
+                finalReply.append("<br/>(I've highlighted the relevant section on your screen)");
             }
 
             return HelpResponseDTO.builder()
@@ -276,13 +311,18 @@ public class HelpService {
                     .logId(logId)
                     .navigationLink(bestMatch.getActionLink())
                     .navigationLabel(bestMatch.getActionLabel())
-                    .uiElementSelector(bestMatch.getUiSelector()) // UI HIGHLIGHT
+                    .uiElementSelector(bestMatch.getUiSelector())
+                    .nextBestAction(predictNextStep(bestMatch, roleId))
                     .build();
         } else {
+            // Suggestion Mode (Low Confidence)
             String logId = analyticsService.logChatInteraction(userId, activeScreenName, rawMessage, "SUGGESTION", score);
-            return HelpResponseDTO.builder().responseType("SUGGESTION")
+            return HelpResponseDTO.builder()
+                    .responseType("SUGGESTION")
                     .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
-                    .items(matches.stream().limit(3).collect(Collectors.toList())).logId(logId).build();
+                    .items(matches.stream().limit(3).collect(Collectors.toList()))
+                    .logId(logId)
+                    .build();
         }
     }
 
@@ -293,21 +333,34 @@ public class HelpService {
     private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, Integer activePermissionId, boolean isDefinition) {
         List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+"));
 
+        // 1. Search Questions
         Stream<HelpItemDTO> questions = getAllActiveQuestions().stream().map(q -> {
-            int score = calculateScore(q, normalizedQuery, rawQuery, tokens, activePermissionId, isDefinition);
-            // Hive Mind Boost
+            int score = calculateScore(q.getQuestionText(), q.getKeywords(), q.getPermissionId(), normalizedQuery,
+                    rawQuery, tokens, activePermissionId, isDefinition);
+            // Adaptive Boost (Hive Mind)
             score += adaptiveService.getBehavioralBoost(normalizedQuery, q.getQuestionId());
-
             return mapToDTO(q, score);
+
         });
 
+        // 2. Search FAQs
         Stream<HelpItemDTO> faqs = fetchGlobalFaqsEntity().stream().map(f -> {
             int score = calculateScore(f.getQuestionText(), null, null, normalizedQuery, rawQuery, tokens, null, false);
-            return HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent()).type("FAQ").searchScore(score).build();
+            return HelpItemDTO.builder()
+                    .id(f.getFaqId())
+                    .text(f.getQuestionText())
+                    .answer(f.getAnswerContent())
+                    .type("FAQ")
+                    .searchScore(score)
+                    .build();
         });
 
-        return Stream.concat(questions, faqs).filter(i -> i.getSearchScore() > 0)
-                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore())).limit(5).collect(Collectors.toList());
+        // 3. Merge, Filter, Sort
+        return Stream.concat(questions, faqs)
+                .filter(item -> item.getSearchScore() > 0)
+                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore()))
+                .limit(5)
+                .collect(Collectors.toList());
     }
 
     // =========================================================================
@@ -321,67 +374,80 @@ public class HelpService {
         return permissionRepository.findIdByTitle(screenName);
     }
 
-
-    private HelpItemDTO mapToDTO(HelpQuestionEntity q) {
-        return mapToDTO(q, 0);
-    }
-
     private HelpItemDTO mapToDTO(HelpQuestionEntity q, int score) {
         return HelpItemDTO.builder()
-                .id(q.getQuestionId())
-                .text(q.getQuestionText())
-                .answer(q.getAnswerContent())
-                .type("QUESTION")
-                .requiredAction(q.getRequiredAction())
-                .screenName(q.getScreenName()) // Still need string for UI
-                .permissionId(q.getPermissionId())
-                .actionLink(q.getActionLink())
-                .actionLabel(q.getActionLabel())
-                .proTip(q.getProTip())
-                .uiSelector(q.getUiSelector())
-                .searchScore(score)
-                .build();
+                .id(q.getQuestionId()).text(q.getQuestionText()).answer(q.getAnswerContent())
+                .type("QUESTION").requiredAction(q.getRequiredAction()).screenName(q.getScreenName())
+                .permissionId(q.getPermissionId()).actionLink(q.getActionLink())
+                .actionLabel(q.getActionLabel()).proTip(q.getProTip())
+                .uiSelector(q.getUiSelector()).searchScore(score).build();
     }
 
     // =============================== Helper =================================
+
     private List<String> findScreensForAction(String roleId, String action) {
         // Fetch all permissions for role and filter by action
         // This logic mimics finding distinct screens where action is allowed
         return permissionRepository.findScreensByRoleAndAction(roleId, action);
     }
 
-
-    private int calculateScore(HelpQuestionEntity q, String normalizedQuery, String rawQuery, List<String> tokens,
-                               Integer activePermissionId, boolean isDefinition) {
-
-        return calculateScore(q.getQuestionText(), q.getKeywords(), q.getPermissionId(), normalizedQuery, rawQuery,
-                tokens, activePermissionId, isDefinition);
-    }
-
-    private int calculateScore(String text, String keywords, Integer qPermId, String normalizedQuery, String rawQuery,
-                               List<String> tokens, Integer activePermId, boolean isDefinition) {
-        double score = 0;
-        String lowerText = text.toLowerCase();
-
-        if (lowerText.equals(rawQuery.toLowerCase())) return 100;
-        if (lowerText.contains(rawQuery.toLowerCase())) score += 50;
-
-        int matches = 0;
-        for (String token : tokens) {
-            if (lowerText.contains(token) || (keywords != null && keywords.toLowerCase().contains(token))) {
-                score += 15;
-                matches++;
-            } else if (fuzzyMatch(token, lowerText)) {
-                score += 10;
-                matches++;
+    private HelpItemDTO predictNextStep(HelpItemDTO currentMatch, String roleId) {
+        if (!"QUESTION".equals(currentMatch.getType()) || currentMatch.getRequiredAction() == null) return null;
+        // Predictive Logic: Create -> Approve
+        String nextAction = switch (currentMatch.getRequiredAction()) {
+            case "CREATE", "MODIFY" -> "APPROVE";
+            case "APPROVE" -> "VIEW";
+            default -> null;
+        };
+        if (nextAction != null && currentMatch.getPermissionId() != null) {
+            // Check if user has permission for the next step
+            List<String> actions = permissionService.getUserActions(roleId, currentMatch.getPermissionId());
+            if (actions.contains(nextAction)) {
+                // Find a relevant question
+                String nextQuery = nextAction + " " + currentMatch.getScreenName();
+                List<HelpItemDTO> predictions = performSmartSearch(nextQuery, nextQuery, currentMatch.getPermissionId(), false);
+                if (!predictions.isEmpty()) {
+                    HelpItemDTO pred = predictions.get(0);
+                    pred.setText("Suggested Next Step: " + pred.getText());
+                    return pred;
+                }
             }
         }
-        if (matches > 1) score += (matches * 5);
+        return null;
+    }
 
-        if (activePermId != null && activePermId.equals(qPermId)) score = score * 2.5;
 
-        if (isDefinition && text.toLowerCase().startsWith("what is")) score += 20;
-
+    private int calculateScore(String text, String keywords, Integer qPermId, String normalizedQuery, String rawQuery, List<String> tokens, Integer activePermId, boolean isDefinition) {
+        double score = 0;
+        String lowerText = text.toLowerCase();
+        // Exact Phrase Match
+        if (lowerText.equals(rawQuery.toLowerCase())) return 100;
+        if (lowerText.contains(rawQuery.toLowerCase())) score += 50;
+        // Token Matching
+        int matches = 0;
+        for (String token : tokens) {
+            boolean matched = false;
+            // Direct or Keyword match
+            if (lowerText.contains(token) || (keywords != null && keywords.toLowerCase().contains(token))) {
+                score += 15;
+                matched = true;
+            }
+            // Fuzzy Match (Typos)
+            else if (fuzzyMatch(token, lowerText)) {
+                score += 10;
+                matched = true;
+            }
+            if (matched) matches++;
+        }
+        if (matches > 1) score += (matches * 5); // Combo bonus
+        // Context Boost (using Permission ID)
+        if (activePermId != null && activePermId.equals(qPermId)) {
+            score = score * 2.5;
+        }
+        // Definition Boost ("What is...")
+        if (isDefinition && lowerText.startsWith("what is")) {
+            score += 20;
+        }
         return (int) Math.min(score, 100);
     }
 
@@ -421,8 +487,8 @@ public class HelpService {
             for (int j = 0; j <= y.length(); j++) {
                 if (i == 0) dp[i][j] = j;
                 else if (j == 0) dp[i][j] = i;
-                else dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1),
-                            Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
+                else
+                    dp[i][j] = Math.min(dp[i - 1][j - 1] + (x.charAt(i - 1) == y.charAt(j - 1) ? 0 : 1), Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1));
             }
         }
         return dp[x.length()][y.length()];
@@ -448,9 +514,7 @@ public class HelpService {
     }
 
     public List<HelpItemDTO> fetchGlobalFaqs() {
-        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream()
-                .map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build())
-                .collect(Collectors.toList());
+        return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y").stream().map(f -> HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).type("FAQ").build()).collect(Collectors.toList());
     }
 
     private boolean isActionAllowed(HelpQuestionEntity q, List<String> userActions) {
@@ -505,6 +569,11 @@ public class HelpService {
 
 
 }
+
+
+
+
+
 
 
 
@@ -947,7 +1016,6 @@ public class NLPEngine {
 
 
 
-
 package com.fincore.helpservice.service;
 
 import com.fincore.helpservice.repository.PermissionRepository;
@@ -973,16 +1041,18 @@ public class PermissionService {
      * CACHED: Roles/Permissions rarely change mid-session.
      * Cache for 10-15 mins (configured in app.properties).
      */
-    @Cacheable(value = "user_actions_cache", key = "#roleId + '_' + #screenName")
-    public List<String> getUserActions(String roleId, String screenName) {
-        if (screenName == null) return Collections.emptyList();
+    @Cacheable(value = "user_actions", key = "#roleId + '_' + #permissionId")
+    public List<String> getUserActions(String roleId, Integer permissionId) {
 
-        List<String> actionStrings = permissionRepository.findActionForUserAndScreen(roleId, screenName);
+        if (roleId == null || permissionId == null) return Collections.emptyList();
+
+        List<String> actionStrings = permissionRepository.findActionForUserAndPermissionId(roleId, permissionId);
 
         if (actionStrings == null || actionStrings.isEmpty()) {
             return Collections.emptyList();
         }
 
+        // Flatten "view|create" strings into distinct actions
         return actionStrings.stream()
                 .filter(Objects::nonNull)
                 .flatMap(s -> Arrays.stream(s.split("\\|")))
@@ -1004,16 +1074,12 @@ public class PermissionService {
                     "You do not have rights to create entries in " + module + ". Users with creation rights can perform this. Please contact support.";
             case "APPROVE" ->
                     "You do not have approval rights for " + module + ". Please wait for an executor to process requests, or check 'My Requests' to view status.";
-            case "MODIFY" ->
-                    "You do not have permission to modify records in " + module + ".";
-            case "DELETE" ->
-                    "Deletion is restricted. You do not have the required permissions.";
-            default ->
-                    "You do not have the required permissions (" + requiredAction + ") to perform this action.";
+            case "MODIFY" -> "You do not have permission to modify records in " + module + ".";
+            case "DELETE" -> "Deletion is restricted. You do not have the required permissions.";
+            default -> "You do not have the required permissions (" + requiredAction + ") to perform this action.";
         };
     }
 }
-
 
 
 
@@ -1570,6 +1636,38 @@ public interface HelpFaqRepository extends JpaRepository<HelpFaqEntity, String> 
     List<HelpFaqEntity> findByIsActiveOrderByDisplayOrderAsc(String isActive);
 }
 
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.PermissionEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+
+@Repository
+public interface PermissionRepository extends JpaRepository<PermissionEntity, Integer> {
+    // Lookup Actions
+    @Query(value = "SELECT p.MENU_ACTION FROM PERMISSIONS p JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID WHERE rp.ROLE_ID = :roleId AND UPPER(p.MENU_TITLE) = UPPER(:screenName)", nativeQuery = true)
+    List<String> findActionForUserAndScreen(@Param("roleId") String roleId, @Param("screenName") String screenName);
+
+    // Lookup ID from Name (For NLP to DB mapping)
+    @Query("SELECT p.menuId FROM PermissionEntity p WHERE UPPER(p.menuTitle) = UPPER(:title)")
+    Integer findIdByTitle(@Param("title") String title);
+
+    // Lookup Screens for specific Action (For Disambiguation)
+    @Query(value = "SELECT DISTINCT p.MENU_TITLE FROM PERMISSIONS p JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID WHERE rp.ROLE_ID = :roleId AND p.MENU_ACTION LIKE %:action%", nativeQuery = true)
+    List<String> findScreensByRoleAndAction(@Param("roleId") String roleId, @Param("action") String action);
+
+
+    // Fixed: Expecting List<String> to handle multiple rows per screen/permission
+    @Query(value = "SELECT p.MENU_ACTION FROM PERMISSIONS p JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID WHERE rp.ROLE_ID = :roleId AND p.MENU_ID = :permissionId", nativeQuery = true)
+    List<String> findActionForUserAndPermissionId(@Param("roleId") String roleId, @Param("permissionId") Integer permissionId);
+}
 
 
 
