@@ -1,141 +1,303 @@
-package com.fincore.helpservice.service;
+package com.tcs.fincore.CommonRequestService.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.fincore.CommonRequestService.dto.*;
+import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
+import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
+import com.tcs.fincore.CommonRequestService.model.CGLMaster;
+import com.tcs.fincore.CommonRequestService.model.CommonReq;
+import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
+import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
+import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
+import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDate;
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
-import java.util.Random;
-import java.util.function.Supplier;
-import java.util.regex.Pattern;
+import java.util.Optional;
 
 /**
- * THE AI PERSONALITY ENGINE.
- * Handles general conversation, dynamic responses (time/date), and identity questions
- * gracefully, giving the bot a modern AI feel.
+ * - Handle all requests for different business objects [CGL, SEGMENT, CURRENCY]
+ * - Handle creator/executor scenarios
+ * - Used strategy design patter to differentiate different business objects
+ * - Injected NotificationWriterService and PermissionConfigService for notification
+ * - Injected BusinessSecurityService for second level RBAC authentication to check BLOCK/UNBLOCK/CREATE permissions
+ *
+ *   @author Shubhankar Das [v1018405]
+ *   @version 1.0
+ *   @since 2025-12-11
  */
 @Service
-public class SmallTalkService {
+@RequiredArgsConstructor
+@Slf4j
+public class RequestServiceImpl implements RequestService {
 
-    private final List<SmallTalkRule> rules = new ArrayList<>();
-    private final Random random = new Random();
+    private static final String EVENT_SOURCE = "CommonRequestService";
+    private final CommonRequestRepository commonRequestRepository;
+    private final RequestStrategyFactory strategyFactory;
+    private final ObjectMapper objectMapper;
+    private final NotificationWriterService notificationWriterService;
+    private final PermissionConfigService permissionConfigService;
+    private final BusinessSecurityService businessSecurityService;
 
-    public SmallTalkService() {
-        // Initialize conversational rules in order of priority
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public CommonReq createRequest(
+            CreateRequestDto dto,
+            String creatorId,
+            String token
+    ) throws JsonProcessingException {
 
-        // 1. CREATOR IDENTITY (Shubhankar)
-        addRule("\\b(who|which team).*(built|created|made|developed|programmed).*you\\b|\\bwho is your (maker|creator|developer|father)\\b", 
-            () -> "I was built by **Shubhankar**, a developer from the FinCore team. He designed me to make your banking operations smoother!");
 
-        // 2. SELF IDENTITY
-        addRule("\\b(who|what) are you\\b|\\b(your name)\\b", 
-            () -> getRandom(List.of(
-                "I am the FinCore Smart Assistant, an AI designed to help you navigate this application.",
-                "I'm your FinCore virtual assistant! I'm here to help you with CGLs, Segments, Journals, and more."
-            )));
+        // --- LAYER 2 SECURITY CHECK --- (rbac) <-------- 1st check in filter [shubhankar]
+        // Validate that the user is allowed to perform this SPECIFIC ChangeType (e.g. BLOCK)
+        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
 
-        // 3. CAPABILITIES
-        addRule("\\bwhat.*can you do\\b|\\bhow.*can you help\\b|\\bwhat are your features\\b", 
-            () -> "I can help you navigate modules, check your access permissions, guide you through processes like creating CGLs or posting Journals, and even redirect you to the right screens. Just ask!");
 
-        // 4. DYNAMIC TIME
-        addRule("\\b(what|tell me).*(is the |current )?time\\b", 
-            () -> {
-                String time = LocalTime.now().format(DateTimeFormatter.ofPattern("hh:mm a"));
-                return "The current time is **" + time + "**.";
-            });
+        KeyablePayload payload = (KeyablePayload) dto.getPayload();
 
-        // 5. DYNAMIC DATE
-        addRule("\\b(what|tell me).*(is the )?(date|day today)\\b", 
-            () -> {
-                String date = LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy"));
-                return "Today is **" + date + "**.";
-            });
+        // --- PRE CHECKS ---
+        String targetId = payload.getKey();
+        if (targetId == null || targetId.isBlank()) {
+            throw new IllegalArgumentException("Could not determine targetId from payload.");
+        }
+        log.info("Determined targetId for new request as: {}", targetId);
 
-        // 6. HOW ARE YOU / STATUS
-        addRule("\\bhow are you\\b|\\bhow are you doing\\b|\\bhow is it going\\b", 
-            () -> getRandom(List.of(
-                "I'm doing great, functioning at 100% capacity! How can I help you today?",
-                "I'm just a bunch of code, but I'm feeling helpful today! What do you need?",
-                "All systems go! Ready to assist you."
-            )));
+        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId,
+                RequestStatus.PENDING);
 
-        // 7. GREETINGS
-        addRule("\\b(hi|hello|hey|greetings|morning|afternoon|evening|wassup|sup)\\b", 
-            () -> getRandom(List.of(
-                "Hello! How can I assist you with FinCore today?",
-                "Hi there! What can I do for you?",
-                "Greetings! Need any help navigating the system?"
-            )));
+        if (!existingRequests.isEmpty()) {
+            log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
+                    targetId, existingRequests.get(0).getReqStatus());
+            throw new DataIntegrityViolationException(
+                    "An active or pending request for '" + targetId + "' already exists.");
+        }
+        log.info("Uniqueness check passed for targetId: {}", targetId);
 
-        // 8. GRATITUDE
-        addRule("\\b(thank|thanks|thank you|thx|cool|awesome|great|nice)\\b", 
-            () -> getRandom(List.of(
-                "You're very welcome! Let me know if you need anything else.",
-                "Glad I could help!",
-                "Anytime! I'm always here."
-            )));
+        // --- CREATE AND SAVE REQUEST ---
+        CommonReq request = new CommonReq();
+        request.setCreatorId(creatorId);
+        request.setReqType(dto.getRequestType());
+        request.setChangeType(dto.getChangeType());
+        request.setPayload(objectMapper.writeValueAsString(payload));
+        request.setTargetId(targetId);
+        request.setReqStatus(RequestStatus.PENDING);
+        // set correct time date
+        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
-        // 9. JOKES (Easter Egg)
-        addRule("\\b(tell me a joke|make me laugh|joke)\\b", 
-            () -> getRandom(List.of(
-                "Why do Java developers wear glasses? Because they don't C#!",
-                "Why did the database administrator leave his wife? She had one-to-many relationships.",
-                "There are 10 types of people in the world: those who understand binary, and those who don't."
-            )));
 
-        // 10. OUT OF SCOPE (Graceful handling of random AI questions)
-        addRule("\\b(weather|sing|dance|marry|recipe|food)\\b", 
-            () -> "I'd love to chat about that, but my expertise is strictly tied to the FinCore banking application right now! Need help with a module?");
-    }
+        log.info("Saving new, validated request for targetId {}", targetId);
+        CommonReq savedRequest = commonRequestRepository.save(request);
 
-    /**
-     * Evaluates the user's message against the regex rules.
-     * @return The dynamic string response, or null if it's a business query.
-     */
-    public String getSmallTalkResponse(String userMessage) {
-        if (userMessage == null || userMessage.trim().isEmpty()) return null;
-        
-        String lowerMessage = userMessage.toLowerCase().trim();
-        
-        // Strip punctuation for easier regex matching
-        String cleanMessage = lowerMessage.replaceAll("[^a-z0-9\\s]", "");
+        try {
+            // --- NOTIFICATION LOGIC ---
 
-        for (SmallTalkRule rule : rules) {
-            if (rule.getPattern().matcher(cleanMessage).find()) {
-                return rule.getResponseGenerator().get(); // Execute the dynamic function
+            // 1. Fetch Config from CACHE (Fast)
+            String requestTypeKey = dto.getRequestType().name(); // e.g., "SEGMENT_CODE"
+            log.info("Request Type String to fetch role ids from PERMISSIONS: {}", requestTypeKey);
+            NotificationConfigDto config = permissionConfigService.getConfig(requestTypeKey);
+
+            // 2. Customize Message
+            String action = request.getChangeType().name(); // ADD/ DELETE/ UPDATE / BLOCK
+
+            // Validate payload to detect "Block", "UNBLOCK action
+            if (request.getChangeType() == ChangeType.BLOCK || request.getChangeType() == ChangeType.UNBLOCK) {
+                // Parse payload to check if status is 0 (Blocked)
+                CGLMaster payload2 = objectMapper.readValue(request.getPayload(), CGLMaster.class);
+                if (payload2.getStatus() == 0) {
+                    action = "BLOCK"; // Override action name for the message
+                } else if (payload2.getStatus() == 1) {
+                    action = "UNBLOCK"; // Override action name for the message
+                }
             }
+            String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
+
+            // 3. Send to Group (1-to-Many via Outbox)
+            notificationWriterService.createNotification(
+                    creatorId,                  // USER ID TO EXCLUDE FROM ROLES, IN THIS CASE ROLE WILL BE USED TO TARGET USER
+                    config.getTargetRoles(),    // Group to SEND TO "51,55" (Fetched from Cache/DB)
+                    message,
+                    config.getTargetUrl(),      // "/segment-requests" (Fetched from Cache/DB)
+                    savedRequest.getId().toString(),
+                    EVENT_SOURCE
+            );
+
+        } catch (Exception e) {
+            // Log the error and re-throw as a RuntimeException to force a rollback.
+            log.error("CRITICAL: Failed to create 'pending' notification for request: {}. Rolling back transaction.", savedRequest.getId(), e);
+            throw new RuntimeException("Failed to create notification event, rolling back request creation.", e);
         }
-        
-        return null; // Not small talk; proceed to NLP & Database search
+        return savedRequest;
     }
 
-    private void addRule(String regex, Supplier<String> responseGenerator) {
-        // Compile regex once at startup for high performance
-        Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
-        rules.add(new SmallTalkRule(pattern, responseGenerator));
-    }
+    @Override
+    @Transactional(rollbackOn = Exception.class) // Ensure rollback on any exception
+    public Optional<CommonReq> updateRequestStatus(
+            ProcessRequestDto dto,
+            String executorId
+    ) throws JsonProcessingException {
 
-    private String getRandom(List<String> options) {
-        return options.get(random.nextInt(options.size()));
-    }
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
 
-    /**
-     * Internal class to hold the Regex Pattern and the Dynamic Execution Function (Supplier)
-     */
-    private static class SmallTalkRule {
-        private final Pattern pattern;
-        private final Supplier<String> responseGenerator;
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
 
-        public SmallTalkRule(Pattern pattern, Supplier<String> responseGenerator) {
-            this.pattern = pattern;
-            this.responseGenerator = responseGenerator;
+        // SELF-APPROVAL CHECK
+        if (executorId.equals(request.getCreatorId())) {
+            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId,
+                    requestId);
+            throw new IllegalStateException("User cannot approve or reject their own request.");
         }
 
-        public Pattern getPattern() { return pattern; }
-        public Supplier<String> getResponseGenerator() { return responseGenerator; }
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(),
+                    request.getReqStatus());
+            throw new IllegalStateException("Request has already been processed and cannot be modified.");
+        }
+
+        // --- UPDATE REQUEST STATE ---
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        request.setReqStatus(dto.getStatus());
+
+        // --- PROCESS BUSINESS LOGIC (STRATEGY) & PREPARE NOTIFICATION 1: TO MAKER (1-to-1) ---
+        // This is a 1-to-1, so USER_ID is the recipient, TARGET_ROLE is null.
+        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
+            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
+            // 1. Execute the business logic (e.g., save to master table)
+            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
+
+            // Notify Maker: Approved
+            notificationWriterService.createRequestApprovedNotification(request, executorId);
+            request.setExecutionRemarks("Successfully processed approval.");
+
+        } else {
+            log.info("Request {} REJECTED.", dto.getRequestId());
+
+            // Notify Maker: Rejected
+            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
+            request.setExecutionRemarks("Request rejected by user.");
+        }
+
+        // --- NOTIFICATION 2: CLOSURE (1-to-Many, Filtered) ---
+        // We wrap this in Try/Catch because if this fails, we do NOT want to roll back the actual Approval.
+        // The approval is critical data; the "FYI" notification to the group is secondary.
+        try {
+            // A. Get Group Config from Cache (Zero DB Cost)
+            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
+
+            // B. Prepare Message
+            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
+            String closureMessage = "Request " + request.getTargetId() + " was " + action + " by " + executorId;
+
+            // C. Send to Group (1-to-Many)
+            // Pass the CHECKER'S ID as the exclusion ID.
+            notificationWriterService.createNotification(
+                    executorId,                 // User to EXCLUDE
+                    config.getTargetRoles(),    // // Group to SEND TO -> The same roles that received the Pending alert excluding the executor
+                    closureMessage,
+                    config.getTargetUrl(),      // Link to history
+                    request.getId().toString(),
+                    "CommonRequestService"
+            );
+            log.info("Sent closure notification to group for Request ID: {}", requestId);
+
+        } catch (Exception e) {
+            // Log error but allow transaction to commit
+            log.error("Failed to send closure notification for Request ID: {}", requestId, e);
+        }
+
+        // --- SAVE THE UPDATED REQUEST ---
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+
+        return Optional.of(updatedRequest);
     }
+
+    @Override
+    @Transactional(rollbackOn = Exception.class)
+    public CommonReq cancelRequest(CancelRequestDto dto, String userId) {
+
+        Long requestId = dto.getRequestId();
+        log.info("Attempting to cancel request ID: {} by user: {}", requestId, userId);
+
+        // 1. Fetch Request
+        CommonReq request = commonRequestRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
+
+        // 2. Security Check: Only the CREATOR can cancel
+        if (!request.getCreatorId().equals(userId)) {
+            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}",
+                    userId, requestId, request.getCreatorId());
+            throw new AccessDeniedException("You are not authorized to cancel this request.");
+        }
+
+        // 3. State Check: Must be PENDING
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            log.warn("Attempted to cancel a processed request. ID: {}, Status: {}", requestId, request.getReqStatus());
+            throw new IllegalStateException("Only pending requests can be cancelled. Current status: " + request.getReqStatus());
+        }
+
+        // 4. Update State
+        request.setReqStatus(RequestStatus.CANCELLED);
+
+        // We use Executor fields to track who cancelled it (the creator themselves)
+        request.setExecutorId(userId);
+        request.setExecutionDate(LocalDateTime.now());
+        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
+
+        // 5. Save & Return
+        CommonReq updatedRequest = commonRequestRepository.save(request);
+        log.info("Request {} successfully cancelled by user.", requestId);
+
+        return updatedRequest;
+    }
+
+    @Override
+    public List<CommonReq> getMyRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch requests for user : {}",
+                    userId);
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch requests.");
+        }
+        log.info("Fetching my requests for user {} with type {}", userId, requestType);
+        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
+    }
+
+    @Override
+    public List<CommonReq> getPendingRequests(
+            String userId,
+            RequestType requestType
+    ) {
+        if (requestType == null) {
+            log.info("Request type is missing, Please provide correct request type to fetch pending requests.");
+            throw new IllegalArgumentException(
+                    "Request type is missing, Please provide correct request type to fetch pending requests."
+            );
+        }
+        log.info("Fetching pending requests for user :  {} with type : {}",userId, requestType);
+        return commonRequestRepository
+                .findByCreatorIdNotAndReqStatusAndReqType(userId, RequestStatus.PENDING, requestType);
+    }
+
+
+    @Override
+    public List<CommonReq> getAllRequests(
+    ) {
+        return commonRequestRepository.findAll();
+    }
+
 }
-
