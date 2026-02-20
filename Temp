@@ -1,1070 +1,141 @@
-<dependency>
-    <groupId>commons-codec</groupId>
-    <artifactId>commons-codec</artifactId>
-    <version>1.16.0</version>
-</dependency>
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.helpservice.service;
 
-import com.fincore.helpservice.model.HelpFaqEntity;
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpFaqRepository;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-
-/**
- * FEATURE 3: TF-IDF SEMANTIC SCORING
- * Calculates the Inverse Document Frequency (IDF) of words.
- * Rare words (like "Segment", "Ledger") get high multipliers (e.g., 4.5x).
- * Common words (like "create", "system") get low multipliers (e.g., 1.1x).
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class SemanticScoringEngine {
-
-    private final HelpQuestionRepository questionRepository;
-    private final HelpFaqRepository faqRepository;
-
-    // Cache of Word -> IDF Weight Multiplier
-    private final Map<String, Double> idfWeights = new ConcurrentHashMap<>();
-
-    @PostConstruct
-    @Scheduled(fixedRate = 3600000) // Recalculate every hour
-    public void buildSemanticWeights() {
-        try {
-            List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
-            List<HelpFaqEntity> faqs = faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y");
-
-            int totalDocuments = questions.size() + faqs.size();
-            if (totalDocuments == 0) return;
-
-            Map<String, Integer> documentFrequency = new HashMap<>();
-
-            // 1. Calculate Document Frequency (How many docs contain the word)
-            for (HelpQuestionEntity q : questions) {
-                Set<String> uniqueWordsInDoc = extractUniqueWords(q.getQuestionText() + " " + q.getKeywords());
-                uniqueWordsInDoc.forEach(w -> documentFrequency.put(w, documentFrequency.getOrDefault(w, 0) + 1));
-            }
-            for (HelpFaqEntity f : faqs) {
-                Set<String> uniqueWordsInDoc = extractUniqueWords(f.getQuestionText());
-                uniqueWordsInDoc.forEach(w -> documentFrequency.put(w, documentFrequency.getOrDefault(w, 0) + 1));
-            }
-
-            // 2. Calculate Inverse Document Frequency (IDF)
-            idfWeights.clear();
-            for (Map.Entry<String, Integer> entry : documentFrequency.entrySet()) {
-                String word = entry.getKey();
-                int df = entry.getValue();
-                
-                // Math: Log(TotalDocs / DocsWithWord). We add 1 to avoid division by zero.
-                double idf = Math.log((double) totalDocuments / (1 + df));
-                
-                // Normalize weight to be a multiplier between 1.0 and 5.0
-                double normalizedWeight = Math.max(1.0, Math.min(idf, 5.0));
-                idfWeights.put(word, normalizedWeight);
-            }
-            log.info("SemanticScoringEngine: Computed TF-IDF weights for {} unique terms.", idfWeights.size());
-
-        } catch (Exception e) {
-            log.error("SemanticScoringEngine: Failed to compute weights.", e);
-        }
-    }
-
-    /**
-     * Returns the multiplier for a word. 
-     * If the word is unknown (e.g., a highly specific code), we assume it's very rare -> High Weight.
-     */
-    public double getWordWeightMultiplier(String word) {
-        if (word == null || word.length() < 3) return 1.0; // Don't boost tiny words
-        return idfWeights.getOrDefault(word.toLowerCase(), 3.0); // Unknown words get 3.0x boost
-    }
-
-    private Set<String> extractUniqueWords(String text) {
-        if (text == null) return Collections.emptySet();
-        String[] words = text.toLowerCase().split("\\W+");
-        return new HashSet<>(Arrays.asList(words));
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import lombok.Data;
-
-@Data
-public class FeedbackRequestDTO {
-    private String logId;
-    private String clickedQuestionId;
-    
-    // NEW: "POSITIVE" (Thumbs Up) or "NEGATIVE" (Thumbs Down)
-    private String feedbackType; 
-    
-    // The exact query the user typed, needed to adjust the Redis score
-    private String searchQuery; 
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.FeedbackRequestDTO;
-import com.fincore.helpservice.model.HelpSearchAnalyticsEntity;
-import com.fincore.helpservice.repository.HelpAnalyticsRepository;
-import jakarta.transaction.Transactional;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HelpAnalyticsService {
-    private final HelpAnalyticsRepository analyticsRepository;
-    private final AdaptiveSearchService adaptiveSearchService; // Inject Adaptive Service
-
-    @Transactional
-    public String logChatInteraction(String userId, String screenContext, String query, String status, int score) {
-        try {
-            HelpSearchAnalyticsEntity entity = new HelpSearchAnalyticsEntity();
-            entity.generateId();
-            entity.setUserId(userId != null ? userId : "ANONYMOUS");
-            entity.setScreenContext(screenContext);
-            entity.setSearchQuery(query);
-            entity.setResultStatus(status);
-            entity.setConfidenceScore(score);
-            analyticsRepository.save(entity);
-            return entity.getLogId();
-        } catch (Exception e) {
-            log.error("Failed to log analytics", e);
-            return null;
-        }
-    }
-
-    @Transactional
-    public void submitFeedback(FeedbackRequestDTO request) {
-        analyticsRepository.findById(request.getLogId()).ifPresent(logEntry -> {
-            logEntry.setClickedQuestionId(request.getClickedQuestionId());
-            // Optional: Save feedback type to DB if you add a column for it
-            analyticsRepository.save(logEntry);
-            
-            // RLHF: Apply the feedback to the Redis Hive Mind
-            boolean isPositive = "POSITIVE".equalsIgnoreCase(request.getFeedbackType());
-            adaptiveSearchService.applyHumanFeedback(
-                request.getSearchQuery(), 
-                request.getClickedQuestionId(), 
-                isPositive
-            );
-        });
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpSynonymEntity;
-import com.fincore.helpservice.repository.HelpAnalyticsRepository;
-import com.fincore.helpservice.repository.HelpSynonymRepository;
-import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class AdaptiveSearchService {
-
-    private final HelpSynonymRepository synonymRepository;
-    private final HelpAnalyticsRepository analyticsRepository;
-    private final StringRedisTemplate redisTemplate;
-
-    private static final String REDIS_KEY_SYNONYMS = "help:synonyms";
-    private static final String REDIS_KEY_BOOST_PREFIX = "help:boost:";
-
-    @PostConstruct
-    @Scheduled(fixedRate = 3600000)
-    public void refreshKnowledge() {
-        refreshSynonymsInRedis();
-    }
-
-    private void refreshSynonymsInRedis() {
-        try {
-            List<HelpSynonymEntity> synonyms = synonymRepository.findByIsActive("Y");
-            if (synonyms.isEmpty()) return;
-
-            redisTemplate.delete(REDIS_KEY_SYNONYMS);
-            synonyms.forEach(syn -> {
-                if (syn.getTerm() != null && syn.getRootIntent() != null) {
-                    redisTemplate.opsForHash().put(REDIS_KEY_SYNONYMS, syn.getTerm().toLowerCase(), syn.getRootIntent().toUpperCase());
-                }
-            });
-        } catch (Exception e) {
-            log.error("AdaptiveSearch: Redis Sync Failed.", e);
-        }
-    }
-
-    public String getRootFromSynonym(String word) {
-        if (word == null) return "";
-        try {
-            Object root = redisTemplate.opsForHash().get(REDIS_KEY_SYNONYMS, word.toLowerCase());
-            if (root != null) return root.toString();
-        } catch (Exception e) {
-            log.warn("Redis unavailable for synonyms.");
-        }
-        return word;
-    }
-
-    /**
-     * RLHF LOGIC: Apply Explicit Human Feedback to Redis Score
-     * Thumbs Up = +3 points. Thumbs Down = -10 penalty.
-     */
-    public void applyHumanFeedback(String query, String questionId, boolean isPositive) {
-        if (query == null || questionId == null) return;
-        
-        String looseQuery = extractBroadIntent(query);
-        String key = REDIS_KEY_BOOST_PREFIX + looseQuery.hashCode() + "_" + questionId;
-
-        try {
-            String cachedScoreStr = redisTemplate.opsForValue().get(key);
-            int currentScore = (cachedScoreStr != null) ? Integer.parseInt(cachedScoreStr) : 0;
-            
-            // Penalty/Reward weights
-            int adjustment = isPositive ? 3 : -10;
-            int newScore = currentScore + adjustment;
-
-            // Ensure score doesn't become extremely negative forever (cap at -20)
-            newScore = Math.max(-20, Math.min(newScore, 30));
-
-            redisTemplate.opsForValue().set(key, String.valueOf(newScore), 24, TimeUnit.HOURS);
-            log.info("RLHF Applied: Query '{}', Question '{}', Score Adjusted to {}", looseQuery, questionId, newScore);
-            
-        } catch (Exception e) {
-            log.error("Failed to apply RLHF feedback", e);
-        }
-    }
-
-    public int getBehavioralBoost(String normalizedQuery, String questionId) {
-        if (normalizedQuery == null || questionId == null) return 0;
-
-        String looseQuery = extractBroadIntent(normalizedQuery);
-        String key = REDIS_KEY_BOOST_PREFIX + looseQuery.hashCode() + "_" + questionId;
-
-        try {
-            String cachedScore = redisTemplate.opsForValue().get(key);
-            if (cachedScore != null) return Integer.parseInt(cachedScore);
-
-            Long count = analyticsRepository.countSuccessfulInteractions(looseQuery, questionId);
-            int boost = (int) Math.min(count * 2, 20);
-
-            if (boost > 0) {
-                redisTemplate.opsForValue().set(key, String.valueOf(boost), 24, TimeUnit.HOURS);
-            }
-            return boost;
-        } catch (Exception e) {
-            return 0;
-        }
-    }
-
-    private String extractBroadIntent(String query) {
-        String[] words = query.split("\\s+");
-        return words.length > 1 ? words[0] + " " + words[1] : words[0];
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.HelpItemDTO;
-import com.fincore.helpservice.dto.HelpRequestDTO;
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import com.fincore.helpservice.model.HelpFaqEntity;
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpFaqRepository;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import com.fincore.helpservice.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.codec.language.DoubleMetaphone;
-import org.apache.commons.lang3.StringUtils;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.stereotype.Service;
-
-import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HelpService {
-    
-    private static final int SCORE_THRESHOLD_HIGH = 60; 
-    
-    // CORE REPOS
-    private final HelpQuestionRepository questionRepository;
-    private final HelpFaqRepository faqRepository;
-    private final PermissionRepository permissionRepository;
-
-    // SERVICES
-    private final HelpAnalyticsService analyticsService;
-    private final PermissionService permissionService;
-    private final NLPEngine nlpEngine;
-    private final SmallTalkService smallTalkService;
-    private final SmartResponseGenerator responseGenerator;
-    private final SystemHealthService healthService;
-    private final ContentInjectorService contentInjector;
-    private final SupportRoutingService routingService;
-    
-    // NEW ELITE SERVICES
-    private final AdaptiveSearchService adaptiveService;
-    private final SemanticScoringEngine semanticScoringEngine; // TF-IDF
-    private final ChatSessionService sessionService;
-    private final SentimentAnalyzer sentimentAnalyzer;
-    
-    // Phonetic Engine
-    private final DoubleMetaphone metaphone = new DoubleMetaphone();
-
-    public HelpResponseDTO processRequest(HelpRequestDTO request, String userId, String roleId) {
-        try {
-            String type = request.getRequestType();
-            switch (type) {
-                case "MODULE_QUESTIONS": return handleModuleFetch(request.getScreenName(), roleId);
-                case "FAQ_LIST": return handleFaqFetch();
-                case "GET_ANSWER": return handleGetAnswer(request.getQuestionId());
-                case "CHAT": return handleChat(userId, request.getChatMessage(), request.getScreenName(), roleId);
-                default: throw new IllegalArgumentException("Invalid Request Type");
-            }
-        } catch (Exception e) {
-            log.error("Error processing help request", e);
-            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I encountered a technical issue. Please try again.").build();
-        }
-    }
-
-    private HelpResponseDTO handleModuleFetch(String screenName, String roleId) { /* Unchanged */ return null; }
-    private HelpResponseDTO handleFaqFetch() { /* Unchanged */ return null; }
-    private HelpResponseDTO handleGetAnswer(String questionId) { /* Unchanged */ return null; }
-
-    // =========================================================================
-    // CHAT HANDLER
-    // =========================================================================
-    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
-        // [Existing logic up to Smart Search remains perfectly unchanged...]
-        // (Assuming you kept the logic from the previous turn)
-        
-        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
-        Integer activePermissionId = resolveScreenToId(clientScreenName);
-        boolean isDefinition = nlpEngine.isDefinitionRequest(rawMessage);
-        
-        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activePermissionId, isDefinition);
-
-        if (matches.isEmpty()) {
-            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("I couldn't find a document for that.").build();
-        }
-
-        HelpItemDTO bestMatch = matches.get(0);
-        int score = (int) bestMatch.getSearchScore();
-
-        if (score >= SCORE_THRESHOLD_HIGH) {
-            String logId = analyticsService.logChatInteraction(userId, clientScreenName, rawMessage, "ANSWERED", score);
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(contentInjector.injectDynamicContent(bestMatch.getAnswer()))
-                    .logId(logId)
-                    .build();
-        } else {
-            return HelpResponseDTO.builder()
-                    .responseType("SUGGESTION")
-                    .botReply("Did you mean one of these?")
-                    .items(matches.stream().limit(3).collect(Collectors.toList()))
-                    .build();
-        }
-    }
-
-    // =========================================================================
-    // SEARCH ALGORITHM (UPDATED WITH TF-IDF AND PHONETICS)
-    // =========================================================================
-    private List<HelpItemDTO> performSmartSearch(String normalizedQuery, String rawQuery, Integer activePermissionId, boolean isDefinition) {
-        List<String> tokens = Arrays.asList(normalizedQuery.split("\\s+"));
-
-        Stream<HelpItemDTO> questions = getAllActiveQuestions().stream().map(q -> {
-            int baseScore = calculateScore(q.getQuestionText(), q.getKeywords(), q.getPermissionId(), rawQuery, tokens, activePermissionId, isDefinition);
-            int hiveMindBoost = adaptiveService.getBehavioralBoost(normalizedQuery, q.getQuestionId());
-            return mapToDTO(q, baseScore + hiveMindBoost);
-        });
-
-        Stream<HelpItemDTO> faqs = fetchGlobalFaqsEntity().stream().map(f -> {
-            int score = calculateScore(f.getQuestionText(), null, null, rawQuery, tokens, null, false);
-            return HelpItemDTO.builder().id(f.getFaqId()).text(f.getQuestionText()).answer(f.getAnswerContent()).type("FAQ").searchScore(score).build();
-        });
-
-        return Stream.concat(questions, faqs)
-                .filter(item -> item.getSearchScore() > 0)
-                .sorted((a, b) -> Double.compare(b.getSearchScore(), a.getSearchScore()))
-                .limit(5)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * ELITE SCORING ALGORITHM
-     */
-    private int calculateScore(String text, String keywords, Integer qPermId, String rawQuery, List<String> tokens, Integer activePermId, boolean isDefinition) {
-        double score = 0;
-        String lowerText = text.toLowerCase();
-        
-        if (lowerText.equals(rawQuery.toLowerCase())) return 100;
-        if (lowerText.contains(rawQuery.toLowerCase())) score += 50;
-
-        String[] dbWords = lowerText.split("\\W+");
-        List<String> keywordList = (keywords != null) ? Arrays.asList(keywords.toLowerCase().split(",")) : Collections.emptyList();
-
-        for (String token : tokens) {
-            // Get TF-IDF Multiplier. Rare words (e.g. "Ledger") = high multiplier.
-            double idfWeight = semanticScoringEngine.getWordWeightMultiplier(token);
-            
-            boolean matched = false;
-
-            // 1. Exact DB Word Match or Keyword Match
-            if (lowerText.contains(token) || keywordList.stream().anyMatch(k -> k.trim().contains(token))) {
-                score += (15 * idfWeight);
-                matched = true;
-            } 
-            // 2. Levenshtein Fuzzy Match (for slight typos like "creeate")
-            else if (fuzzyMatch(token, dbWords)) {
-                score += (10 * idfWeight);
-                matched = true;
-            }
-            // 3. Phonetic Match (Double Metaphone - catches "aprove" == "approve")
-            else if (phoneticMatch(token, dbWords)) {
-                score += (8 * idfWeight);
-                matched = true;
-            }
-        }
-
-        // Contextual boost if user is on the right screen
-        if (activePermId != null && activePermId.equals(qPermId)) {
-            score = score * 2.0; 
-        }
-        
-        if (isDefinition && lowerText.startsWith("what is")) score += 20;
-
-        return (int) Math.min(score, 100);
-    }
-
-    private boolean fuzzyMatch(String token, String[] targetWords) {
-        if (token.length() <= 3) return false;
-        int allowedEdits = (token.length() <= 5) ? 1 : 2;
-
-        for (String word : targetWords) {
-            if (Math.abs(token.length() - word.length()) > allowedEdits) continue;
-            if (StringUtils.getLevenshteinDistance(token, word) <= allowedEdits) return true;
-        }
-        return false;
-    }
-
-    private boolean phoneticMatch(String token, String[] targetWords) {
-        if (token.length() <= 3) return false; // Phonetics on small words causes too many false positives
-        try {
-            // Converts "aprove" -> APRF. "approve" -> APRF.
-            String tokenSound = metaphone.doubleMetaphone(token);
-            if (tokenSound == null) return false;
-
-            for (String word : targetWords) {
-                if (metaphone.isDoubleMetaphoneEqual(token, word)) return true;
-            }
-        } catch (Exception e) {
-            // ignore codec failures
-        }
-        return false;
-    }
-
-    private HelpItemDTO mapToDTO(HelpQuestionEntity q, int score) {
-        return HelpItemDTO.builder()
-                .id(q.getQuestionId()).text(q.getQuestionText()).answer(q.getAnswerContent())
-                .type("QUESTION").actionLink(q.getActionLink()).actionLabel(q.getActionLabel())
-                .searchScore(score).build();
-    }
-    
-    // (Other utils unchanged: getAllActiveQuestions, etc)
-    @Cacheable(value = "help_questions_all", key = "'active_global'")
-    public List<HelpQuestionEntity> getAllActiveQuestions() { return questionRepository.findByIsActive("Y"); }
-    
-    @Cacheable(value = "help_faqs_all")
-    public List<HelpFaqEntity> fetchGlobalFaqsEntity() { return faqRepository.findByIsActiveOrderByDisplayOrderAsc("Y"); }
-    
-    @Cacheable("screen_name_to_id")
-    public Integer resolveScreenToId(String screenName) { return screenName == null ? null : permissionRepository.findIdByTitle(screenName); }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-********************
-support : 
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import lombok.Data;
-import org.springframework.stereotype.Service;
-
-import java.time.LocalDateTime;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Random;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
- * Manages Short-Term Conversational Memory and Escalation State.
+ * THE AI PERSONALITY ENGINE.
+ * Handles general conversation, dynamic responses (time/date), and identity questions
+ * gracefully, giving the bot a modern AI feel.
  */
 @Service
-public class ChatSessionService {
+public class SmallTalkService {
 
-    // Note: In production, switch this to Redis if deploying multi-node
-    private final Map<String, UserSession> sessions = new ConcurrentHashMap<>();
+    private final List<SmallTalkRule> rules = new ArrayList<>();
+    private final Random random = new Random();
 
-    @Data
-    public static class UserSession {
-        private String lastAction;      
-        private String lastScreen;      
-        private String lastTopic;       
-        private LocalDateTime lastInteraction;
+    public SmallTalkService() {
+        // Initialize conversational rules in order of priority
+
+        // 1. CREATOR IDENTITY (Shubhankar)
+        addRule("\\b(who|which team).*(built|created|made|developed|programmed).*you\\b|\\bwho is your (maker|creator|developer|father)\\b", 
+            () -> "I was built by **Shubhankar**, a developer from the FinCore team. He designed me to make your banking operations smoother!");
+
+        // 2. SELF IDENTITY
+        addRule("\\b(who|what) are you\\b|\\b(your name)\\b", 
+            () -> getRandom(List.of(
+                "I am the FinCore Smart Assistant, an AI designed to help you navigate this application.",
+                "I'm your FinCore virtual assistant! I'm here to help you with CGLs, Segments, Journals, and more."
+            )));
+
+        // 3. CAPABILITIES
+        addRule("\\bwhat.*can you do\\b|\\bhow.*can you help\\b|\\bwhat are your features\\b", 
+            () -> "I can help you navigate modules, check your access permissions, guide you through processes like creating CGLs or posting Journals, and even redirect you to the right screens. Just ask!");
+
+        // 4. DYNAMIC TIME
+        addRule("\\b(what|tell me).*(is the |current )?time\\b", 
+            () -> {
+                String time = LocalTime.now().format(DateTimeFormatter.ofPattern("hh:mm a"));
+                return "The current time is **" + time + "**.";
+            });
+
+        // 5. DYNAMIC DATE
+        addRule("\\b(what|tell me).*(is the )?(date|day today)\\b", 
+            () -> {
+                String date = LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy"));
+                return "Today is **" + date + "**.";
+            });
+
+        // 6. HOW ARE YOU / STATUS
+        addRule("\\bhow are you\\b|\\bhow are you doing\\b|\\bhow is it going\\b", 
+            () -> getRandom(List.of(
+                "I'm doing great, functioning at 100% capacity! How can I help you today?",
+                "I'm just a bunch of code, but I'm feeling helpful today! What do you need?",
+                "All systems go! Ready to assist you."
+            )));
+
+        // 7. GREETINGS
+        addRule("\\b(hi|hello|hey|greetings|morning|afternoon|evening|wassup|sup)\\b", 
+            () -> getRandom(List.of(
+                "Hello! How can I assist you with FinCore today?",
+                "Hi there! What can I do for you?",
+                "Greetings! Need any help navigating the system?"
+            )));
+
+        // 8. GRATITUDE
+        addRule("\\b(thank|thanks|thank you|thx|cool|awesome|great|nice)\\b", 
+            () -> getRandom(List.of(
+                "You're very welcome! Let me know if you need anything else.",
+                "Glad I could help!",
+                "Anytime! I'm always here."
+            )));
+
+        // 9. JOKES (Easter Egg)
+        addRule("\\b(tell me a joke|make me laugh|joke)\\b", 
+            () -> getRandom(List.of(
+                "Why do Java developers wear glasses? Because they don't C#!",
+                "Why did the database administrator leave his wife? She had one-to-many relationships.",
+                "There are 10 types of people in the world: those who understand binary, and those who don't."
+            )));
+
+        // 10. OUT OF SCOPE (Graceful handling of random AI questions)
+        addRule("\\b(weather|sing|dance|marry|recipe|food)\\b", 
+            () -> "I'd love to chat about that, but my expertise is strictly tied to the FinCore banking application right now! Need help with a module?");
+    }
+
+    /**
+     * Evaluates the user's message against the regex rules.
+     * @return The dynamic string response, or null if it's a business query.
+     */
+    public String getSmallTalkResponse(String userMessage) {
+        if (userMessage == null || userMessage.trim().isEmpty()) return null;
         
-        // --- NEW: ESCALATION ENGINE FIELDS ---
-        private int strikeCount = 0; 
-        private List<String> messageHistory = new ArrayList<>();
-    }
+        String lowerMessage = userMessage.toLowerCase().trim();
+        
+        // Strip punctuation for easier regex matching
+        String cleanMessage = lowerMessage.replaceAll("[^a-z0-9\\s]", "");
 
-    public void updateSession(String userId, String action, String screen, String topic) {
-        if (userId == null) return;
-        UserSession session = getOrCreateSession(userId);
-
-        if (action != null) session.setLastAction(action);
-        if (screen != null) session.setLastScreen(screen);
-        if (topic != null) session.setLastTopic(topic); 
-
-        session.setLastInteraction(LocalDateTime.now());
-        sessions.put(userId, session);
-    }
-
-    // --- ESCALATION METHODS ---
-
-    public void logMessageHistory(String userId, String message) {
-        UserSession session = getOrCreateSession(userId);
-        session.getMessageHistory().add(message);
-        // Keep only the last 5 messages to avoid massive payloads
-        if (session.getMessageHistory().size() > 5) {
-            session.getMessageHistory().remove(0);
+        for (SmallTalkRule rule : rules) {
+            if (rule.getPattern().matcher(cleanMessage).find()) {
+                return rule.getResponseGenerator().get(); // Execute the dynamic function
+            }
         }
+        
+        return null; // Not small talk; proceed to NLP & Database search
     }
 
-    public void addStrikes(String userId, int strikesToAdd) {
-        UserSession session = getOrCreateSession(userId);
-        session.setStrikeCount(session.getStrikeCount() + strikesToAdd);
+    private void addRule(String regex, Supplier<String> responseGenerator) {
+        // Compile regex once at startup for high performance
+        Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
+        rules.add(new SmallTalkRule(pattern, responseGenerator));
     }
 
-    public void resetStrikes(String userId) {
-        UserSession session = getOrCreateSession(userId);
-        session.setStrikeCount(0);
+    private String getRandom(List<String> options) {
+        return options.get(random.nextInt(options.size()));
     }
 
-    public boolean isEscalationRequired(String userId) {
-        return getOrCreateSession(userId).getStrikeCount() >= 3;
-    }
+    /**
+     * Internal class to hold the Regex Pattern and the Dynamic Execution Function (Supplier)
+     */
+    private static class SmallTalkRule {
+        private final Pattern pattern;
+        private final Supplier<String> responseGenerator;
 
-    public String getCompiledHistory(String userId) {
-        UserSession session = getOrCreateSession(userId);
-        return String.join(" | ", session.getMessageHistory());
-    }
-
-    // --- UTILS ---
-
-    public UserSession getSession(String userId) {
-        UserSession session = sessions.get(userId);
-        if (session != null && session.getLastInteraction().plusMinutes(10).isBefore(LocalDateTime.now())) {
-            sessions.remove(userId);
-            return null;
+        public SmallTalkRule(Pattern pattern, Supplier<String> responseGenerator) {
+            this.pattern = pattern;
+            this.responseGenerator = responseGenerator;
         }
-        return session;
-    }
 
-    private UserSession getOrCreateSession(String userId) {
-        UserSession session = sessions.get(userId);
-        if (session == null) {
-            session = new UserSession();
-            session.setLastInteraction(LocalDateTime.now());
-            sessions.put(userId, session);
-        }
-        return session;
-    }
-
-    public void clearSession(String userId) {
-        sessions.remove(userId);
+        public Pattern getPattern() { return pattern; }
+        public Supplier<String> getResponseGenerator() { return responseGenerator; }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // =========================================================================
-    // CHAT HANDLER (WITH ESCALATION ENGINE)
-    // =========================================================================
-    private HelpResponseDTO handleChat(String userId, String rawMessage, String clientScreenName, String roleId) {
-
-        if (!StringUtils.hasText(rawMessage)) {
-            return HelpResponseDTO.builder().responseType("NO_MATCH").botReply("Please type a message.").build();
-        }
-
-        // 1. LOG HISTORY FOR POTENTIAL ESCALATION
-        sessionService.logMessageHistory(userId, rawMessage);
-        StringBuilder botPrefix = new StringBuilder();
-
-        // 2. CONTEXT RESET
-        if (nlpEngine.isResetRequest(rawMessage)) {
-            sessionService.clearSession(userId);
-            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("Context cleared. How can I help?").build();
-        }
-
-        // 3. SENTIMENT ANALYSIS & STRIKE INJECTION
-        SentimentAnalyzer.Sentiment sentiment = sentimentAnalyzer.analyze(rawMessage);
-        if (sentiment == SentimentAnalyzer.Sentiment.ANGRY) {
-            sessionService.addStrikes(userId, 2); // Heavy penalty for anger
-            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
-        } else if (sentiment == SentimentAnalyzer.Sentiment.FRUSTRATED) {
-            sessionService.addStrikes(userId, 1);
-            botPrefix.append(sentimentAnalyzer.getDeEscalationMessage(sentiment)).append("<br/><br/>");
-        } else {
-            String smallTalk = smallTalkService.getSmallTalkResponse(rawMessage);
-            if (smallTalk != null) {
-                return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply(smallTalk).build();
-            }
-        }
-
-        // 4. NLP & MEMORY RESOLUTION
-        String normalizedIntent = nlpEngine.extractNormalizedIntent(rawMessage);
-        String detectedAction = nlpEngine.detectAction(normalizedIntent);
-        String detectedScreenName = nlpEngine.detectScreen(rawMessage);
-        
-        ChatSessionService.UserSession session = sessionService.getSession(userId);
-        if (detectedScreenName == null) {
-            if (session != null && session.getLastScreen() != null) {
-                detectedScreenName = session.getLastScreen();
-            } else if (clientScreenName != null) {
-                detectedScreenName = clientScreenName;
-            }
-        }
-        Integer activePermissionId = resolveScreenToId(detectedScreenName);
-
-        // =====================================================================
-        // 🚨 THE ESCALATION INTERCEPTOR
-        // =====================================================================
-        if (sessionService.isEscalationRequired(userId)) {
-            // Get the specific IT department for this screen
-            String contactInfo = routingService.getSupportContact(detectedScreenName != null ? detectedScreenName : rawMessage);
-            String recentHistory = sessionService.getCompiledHistory(userId);
-            
-            // Reset strikes so they don't get stuck in a loop if they decline
-            sessionService.resetStrikes(userId); 
-            
-            return HelpResponseDTO.builder()
-                    .responseType("ESCALATION_OFFER")
-                    .botReply("I see I'm having trouble resolving this for you in the **" + 
-                              (detectedScreenName != null ? detectedScreenName : "application") + 
-                              "**. <br/><br/>I have compiled your last few messages. Would you like me to raise a high-priority IT Support Ticket with the **" + contactInfo + "**?")
-                    // We pass the history back so the UI can attach it to a ticketing API if the user says "Yes"
-                    .navigationLabel(recentHistory) 
-                    .build();
-        }
-        // =====================================================================
-
-        // 5. CAPABILITY CHECK (e.g., "What can I do?")
-        if (nlpEngine.isCapabilityRequest(rawMessage)) {
-            if (activePermissionId != null) {
-                List<String> actions = permissionService.getUserActions(roleId, activePermissionId);
-                String actionList = actions.isEmpty() ? "View Only" : String.join(", ", actions);
-                sessionService.resetStrikes(userId); // Success, reset strikes
-                return HelpResponseDTO.builder().responseType("TEXT_REPLY")
-                        .botReply("In **" + detectedScreenName + "**, you have the following permissions: **" + actionList + "**.").build();
-            }
-        }
-
-        // 6. UPDATE SESSION & CHECK RBAC
-        sessionService.updateSession(userId, detectedAction, detectedScreenName, detectedScreenName);
-
-        if (detectedAction != null && activePermissionId != null) {
-            List<String> allowedActions = permissionService.getUserActions(roleId, activePermissionId);
-            if (!allowedActions.contains(detectedAction) && !nlpEngine.isTrouble(rawMessage)) {
-                return HelpResponseDTO.builder().responseType("TEXT_REPLY")
-                        .botReply(botPrefix + responseGenerator.generatePermissionResponse(false, detectedAction, detectedScreenName, userId))
-                        .build();
-            }
-        }
-
-        // 7. PERFORM SMART SEARCH (TF-IDF + Phonetics + Hive Mind)
-        boolean isDefinition = nlpEngine.isDefinitionRequest(rawMessage);
-        List<HelpItemDTO> matches = performSmartSearch(normalizedIntent, rawMessage, activePermissionId, isDefinition);
-
-        // 8. EVALUATE RESULTS & APPLY STRIKES
-        if (matches.isEmpty()) {
-            analyticsService.logChatInteraction(userId, detectedScreenName, rawMessage, "NO_MATCH", 0);
-            sessionService.addStrikes(userId, 1); // Failure Strike
-            
-            return HelpResponseDTO.builder().responseType("NO_MATCH")
-                    .botReply(botPrefix + "I couldn't find a document for that. Try rephrasing?").build();
-        }
-
-        HelpItemDTO bestMatch = matches.get(0);
-        int score = (int) bestMatch.getSearchScore();
-
-        if (score >= SCORE_THRESHOLD_HIGH) {
-            // SUCCESS! Reset the strikes.
-            sessionService.resetStrikes(userId); 
-            String logId = analyticsService.logChatInteraction(userId, detectedScreenName, rawMessage, "ANSWERED", score);
-            
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(botPrefix.toString() + responseGenerator.generateSearchIntro(score) + "<br/>" + contentInjector.injectDynamicContent(bestMatch.getAnswer()))
-                    .logId(logId)
-                    .navigationLink(bestMatch.getActionLink())
-                    .navigationLabel(bestMatch.getActionLabel())
-                    .build();
-        } else {
-            // PARTIAL FAILURE! (Low Confidence)
-            sessionService.addStrikes(userId, 1); 
-            String logId = analyticsService.logChatInteraction(userId, detectedScreenName, rawMessage, "SUGGESTION", score);
-            
-            return HelpResponseDTO.builder()
-                    .responseType("SUGGESTION")
-                    .botReply(botPrefix + responseGenerator.generateSuggestionResponse())
-                    .items(matches.stream().limit(3).collect(Collectors.toList()))
-                    .logId(logId)
-                    .build();
-        }
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
--- =========================================================================
--- 1. POPULATE SYNONYMS (The OpenNLP & TF-IDF Dictionary)
--- This teaches the bot banking terminology and Maps it to core Intents/Actions
--- =========================================================================
-
--- Clear existing for fresh insert
-DELETE FROM HELP_SYNONYMS;
-
--- ACTION SYNONYMS (Maps verbs to exact PERMISSION actions)
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (1, 'add', 'CREATE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (2, 'new', 'CREATE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (3, 'generate', 'CREATE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (4, 'make', 'CREATE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (5, 'post', 'CREATE', 'Y'); -- For Journals
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (6, 'change', 'MODIFY', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (7, 'update', 'MODIFY', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (8, 'edit', 'MODIFY', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (9, 'correct', 'MODIFY', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (10, 'authorize', 'APPROVE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (11, 'pass', 'APPROVE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (12, 'sign', 'APPROVE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (13, 'accept', 'APPROVE', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (14, 'remove', 'DELETE', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (15, 'trash', 'DELETE', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (16, 'show', 'VIEW', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (17, 'list', 'VIEW', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (18, 'see', 'VIEW', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (19, 'export', 'DOWNLOAD', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (20, 'print', 'DOWNLOAD', 'Y');
-
--- MODULE/NOUN SYNONYMS (Maps slang/acronyms to EXACT PERMISSION.MENU_TITLE)
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (21, 'glc', 'CGL Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (22, 'cgl', 'CGL Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (23, 'ledger', 'CGL Management', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (24, 'users', 'User Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (25, 'staff', 'User Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (26, 'employee', 'User Management', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (27, 'seg', 'Segment Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (28, 'segment', 'Segment Management', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (29, 'branch', 'Branch Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (30, 'office', 'Branch Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (31, 'locale', 'Branch Management', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (32, 'fx', 'Currency Management', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (33, 'forex', 'Currency Management', 'Y');
-
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (34, 'holiday', 'Calendar Configuration', 'Y');
-INSERT INTO HELP_SYNONYMS (SYNONYM_ID, TERM, ROOT_INTENT, IS_ACTIVE) VALUES (35, 'calendar', 'Calendar Configuration', 'Y');
-
-
--- =========================================================================
--- 2. POPULATE GLOBAL FAQs
--- General questions that do NOT require specific RBAC permissions
--- =========================================================================
-DELETE FROM HELP_FAQ_MASTER;
-
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER, IS_ACTIVE, CREATED_AT)
-VALUES ('FAQ_001', 'I forgot my password', 'Please navigate to the main login screen. Click on "Forgot Password" below the login button to receive an OTP on your registered email.', 1, 'Y', SYSTIMESTAMP);
-
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER, IS_ACTIVE, CREATED_AT)
-VALUES ('FAQ_002', 'Who do I contact for IT support?', 'For severe technical issues or error codes, please contact the IT Helpdesk at support@fincore.com or call extension 4040.', 2, 'Y', SYSTIMESTAMP);
-
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER, IS_ACTIVE, CREATED_AT)
-VALUES ('FAQ_003', 'What is the system cutoff time?', 'The end-of-day (EOD) cutoff time for journal postings is currently set to {CUTOFF_TIME}. Any entries after this will roll to the next business day.', 3, 'Y', SYSTIMESTAMP);
-
-INSERT INTO HELP_FAQ_MASTER (FAQ_ID, QUESTION_TEXT, ANSWER_CONTENT, DISPLAY_ORDER, IS_ACTIVE, CREATED_AT)
-VALUES ('FAQ_004', 'How do I change my theme to dark mode?', 'Click on your Profile Avatar in the top right corner, go to "Preferences", and toggle "Dark Mode".', 4, 'Y', SYSTIMESTAMP);
-
-
--- =========================================================================
--- 3. POPULATE HELP QUESTIONS (Highly mapped to PERMISSIONS table)
--- CRITICAL: Notice how Create CGL = Perm 5, but Approve CGL = Perm 6.
--- =========================================================================
-DELETE FROM HELP_QUESTION_MASTER;
-
--- ---------- CGL MANAGEMENT ----------
--- Menu ID 5: Manage CGL's (view|create|modify|cancel)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_CGL_ADD_01', 'CGL Management', 'How to create a new CGL?', 'To create a CGL:<br/>1. Navigate to CGL Management.<br/>2. Click "Add".<br/>3. Fill in the GL Code and Description.<br/>4. Select Account Type.<br/>5. Click Save.', '/cgl-management', 'Go to Manage CGL', 'CREATE', 'add cgl new gl code ledger', 5, 'Ensure the GL Code follows the corporate numbering convention. Once saved, the Code cannot be edited.', 'Y');
-
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_CGL_MOD_01', 'CGL Management', 'How to modify an existing CGL?', 'Locate the CGL in the data grid, click the "Edit" (Pencil) icon, update the description or status, and click Update.', '/cgl-management', 'Go to Manage CGL', 'MODIFY', 'edit update change cgl ledger', 5, 'You cannot modify a GL Code if it already has posted transactions against it.', 'Y');
-
--- Menu ID 6: CGL Requests (view|approve|reject)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_CGL_APP_01', 'CGL Management', 'How to approve a CGL request?', 'Go to CGL Requests. You will see a list of pending ballots. Select the record, review the maker details, and click "Approve".', '/cgl-requests', 'Go to CGL Approvals', 'APPROVE', 'authorize sign pass accept ballot', 6, 'Always cross-check the GL Type. Approving a wrong GL type can break end-of-day reporting.', 'Y');
-
-
--- ---------- USER MANAGEMENT ----------
--- Menu ID 12: Manage Users (view|create|modify|delete|cancel)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_USR_ADD_01', 'User Management', 'How to add a new User?', 'Click the "Create User" button. Enter the Employee ID, Full Name, Email, and assign a Role from the dropdown. The system will email them a temporary password.', '/manage-user', 'Go to Manage Users', 'CREATE', 'create staff member employee hire', 12, 'Make sure the Employee ID exactly matches HR records to avoid sync issues.', 'Y');
-
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_USR_DEL_01', 'User Management', 'How to delete or disable a User?', 'We recommend disabling rather than deleting to preserve audit logs. Edit the user and change their status to "Inactive".', '/manage-user', 'Go to Manage Users', 'DELETE', 'remove delete fire disable offboard', 12, 'Deleting a user removes their active sessions immediately.', 'Y');
-
--- Menu ID 13: User Requests (view|approve|reject)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_USR_APP_01', 'User Management', 'How to approve a new user creation?', 'Navigate to User Requests. Select the pending user profile, verify the assigned role matches their job title, and click Approve.', '/user-requests', 'View Pending Users', 'APPROVE', 'authorize new employee role', 13, NULL, 'Y');
-
-
--- ---------- JOURNAL MANAGEMENT ----------
--- Menu ID 30: Journal Posting (view|create)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_JNL_ADD_01', 'Journal Management', 'How to post a Journal Entry?', 'Navigate to Journal Posting. Select the Debit CGL and Credit CGL. Ensure the amounts balance to zero, add a narration, and submit.', '/journal-posting', 'Post Journal', 'CREATE', 'post entry debit credit', 30, 'Use the shortcut CTRL+S to quickly save draft journals.', 'Y');
-
--- Menu ID 31: Journal Authorization (view|approve|reject)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_JNL_APP_01', 'Journal Management', 'How to authorize a Journal?', 'Go to Journal Authorization. Review the Debits and Credits. If they balance and are compliant, click Authorize.', '/journal-Authorization', 'Authorize Journals', 'APPROVE', 'authorize pass journal', 31, 'You cannot authorize a journal that you created yourself (Maker-Checker rule).', 'Y');
-
--- Menu ID 36: Journal Bulk Upload (view|upload)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_JNL_UPL_01', 'Journal Management', 'How to bulk upload journals?', 'Go to Journal Bulk Upload. Download the Excel template, fill in your debit/credit pairs, and upload the file. Fix any errors highlighted in red before submitting.', '/journal-bulk-upload', 'Upload Journals', 'UPLOAD', 'bulk file excel csv import', 36, 'Ensure your Excel file is saved as .XLSX and does not exceed 10,000 rows.', 'Y');
-
-
--- ---------- TEMPLATE MANAGEMENT ----------
--- Menu ID 101: Create Template (view|create|modify|delete|cancel)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_TPL_ADD_01', 'Template Management', 'How to build a custom report template?', 'Navigate to the Report Builder. Drag and drop the data columns you need, set your filters, and click Save Template.', '/report-builder', 'Open Report Builder', 'CREATE', 'build report custom excel format', 101, 'Use relative date filters (e.g., "Last 30 Days") so you do not have to update the template manually.', 'Y');
-
-
--- ---------- DEFINITIONS (No Action Required, General Knowledge) ----------
--- Mapped to the primary view screen (Menu ID 5 for CGL, 7 for Segment)
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_DEF_CGL_01', 'CGL Management', 'What is a CGL?', 'CGL stands for Central General Ledger. It is the master account code used to record financial transactions across the bank.', '/view-cgl-details', 'View CGL List', NULL, 'definition meaning what is', 5, NULL, 'Y');
-
-INSERT INTO HELP_QUESTION_MASTER 
-(QUESTION_ID, SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, ACTION_LINK, ACTION_LABEL, REQUIRED_ACTION, KEYWORDS, PERMISSION_ID, PRO_TIP, IS_ACTIVE)
-VALUES 
-('Q_DEF_SEG_01', 'Segment Management', 'What is a Segment?', 'A Segment is a business unit or department used for internal reporting and cost-center tracking.', '/segment-management', 'View Segments', NULL, 'definition meaning what is', 7, NULL, 'Y');
-
-COMMIT;
-
-
 
