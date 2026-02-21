@@ -1,15 +1,77 @@
-<!-- Apache OpenNLP for POS Tagging & Tokenization -->
-<dependency>
-    <groupId>org.apache.opennlp</groupId>
-    <artifactId>opennlp-tools</artifactId>
-    <version>2.3.0</version>
-</dependency>
+version: '3.8'
+services:
+  # 1. The Vector Database
+  redis-vector:
+    image: redis/redis-stack-server:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
 
-<!-- Apache Commons Lang for optimized Levenshtein Distance -->
-<dependency>
-    <groupId>org.apache.commons</groupId>
-    <artifactId>commons-lang3</artifactId>
-</dependency>
+  # 2. The Local AI Engine
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  redis_data:
+  ollama_data:
+
+Crucial Setup Command:
+After running docker-compose up -d, your containers will be running, but Ollama is "empty". You must tell Ollama to download the two models we chose. Run these two commands in your terminal:
+ * docker exec -it ollama ollama run llama3 (Downloads the conversational brain - ~4.7GB)
+ * docker exec -it ollama ollama pull mxbai-embed-large (Downloads the embedding search brain - ~670MB)
+Step 2: Spring Boot Configuration (pom.xml & application.yml)
+Add the official Spring AI dependencies to your pom.xml (Requires Spring Boot 3.2+ and Java 17+):
+<!-- Spring AI BOM (Bill of Materials) -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-bom</artifactId>
+            <version>1.0.0-M1</version> <!-- Use the latest milestone or release -->
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<dependencies>
+    <!-- Connects to Ollama -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
+    </dependency>
+    <!-- Connects to Redis Vector Store -->
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-redis-spring-boot-starter</artifactId>
+    </dependency>
+</dependencies>
+
+Add this to your application.yml:
+spring:
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: llama3 # The talker
+      embedding:
+        model: mxbai-embed-large # The searcher
+    vectorstore:
+      redis:
+        uri: redis://localhost:6379
+        index: fincore-help-index
+        prefix: "fincore:doc:"
+
+
+
+
+
+
 
 
 
@@ -23,188 +85,194 @@
 
 package com.fincore.helpservice.service;
 
-import com.fincore.helpservice.model.PermissionEntity;
-import com.fincore.helpservice.repository.PermissionRepository;
-import jakarta.annotation.PostConstruct;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import opennlp.tools.postag.POSModel;
-import opennlp.tools.postag.POSTaggerME;
-import opennlp.tools.tokenize.TokenizerME;
-import opennlp.tools.tokenize.TokenizerModel;
-import org.springframework.core.io.ClassPathResource;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
-import java.io.InputStream;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
- * THE SMART BRAIN (Powered by Apache OpenNLP).
- * Uses Part-of-Speech (POS) tagging to accurately distinguish
- * Actions (Verbs) from Modules (Nouns).
+ * Handles converting Oracle DB text into AI Mathematical Vectors (Embeddings)
+ * and storing them securely in Redis Stack with RBAC metadata.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class NLPEngine {
+public class DocumentIngestionService {
 
-    private final AdaptiveSearchService adaptiveService;
-    private final PermissionRepository permissionRepository;
+    private final HelpQuestionRepository questionRepository;
+    private final VectorStore vectorStore; // Spring AI Redis Auto-Configuration
 
-    // OpenNLP Tools
-    private TokenizerME tokenizer;
-    private POSTaggerME posTagger;
+    @EventListener(ApplicationReadyEvent.class)
+    public void ingestKnowledgeBase() {
+        log.info("Starting AI Knowledge Ingestion to Redis...");
 
-    private final Map<String, String> KNOWN_SCREENS = new ConcurrentHashMap<>();
-    private final Map<String, String> SCREEN_URLS = new ConcurrentHashMap<>();
+        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
 
-    private static final Set<String> KNOWN_ACTIONS = Set.of("CREATE", "MODIFY", "APPROVE", "VIEW", "DELETE", "DOWNLOAD");
+        List<Document> documents = questions.stream().map(q -> {
+            // 1. Combine Question and Answer so the AI has full context
+            String content = "Q: " + q.getQuestionText() + "\nA: " + q.getAnswerContent();
+            if (q.getProTip() != null) {
+                content += "\nPro Tip: " + q.getProTip();
+            }
+
+            // 2. Attach Security Metadata (CRITICAL FOR RBAC)
+            // We store the Permission ID as a String for Redis filtering compatibility
+            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
+            
+            Map<String, Object> metadata = Map.of(
+                    "permissionId", permId,
+                    "screenName", q.getScreenName() != null ? q.getScreenName() : "General",
+                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE",
+                    "actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE"
+            );
+
+            // 3. Create Spring AI Document
+            return new Document(content, metadata);
+        }).collect(Collectors.toList());
+
+        // 4. Send to Ollama (Embed) -> Save to Redis (Store)
+        // Note: In production, we would check if docs already exist to avoid re-embedding.
+        if (!documents.isEmpty()) {
+            vectorStore.add(documents);
+            log.info("Successfully ingested {} documents into Redis Vector Store.", documents.size());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.memory.InMemoryChatMemory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * THE RAG ENGINE (Retrieval-Augmented Generation)
+ * The ultimate fusion of Vector Search, RBAC Security, and LLM Generation.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class FinCoreChatAgent {
+
+    private final ChatClient chatClient; // Configured automatically by Spring AI
+    private final VectorStore vectorStore;
+    private final PermissionService permissionService;
     
-    // Regex fallbacks for specific commands
-    private static final Pattern ERROR_CODE_PATTERN = Pattern.compile("\\b[A-Z]{3,4}-\\d{3,5}\\b");
-    private static final Pattern NAV_PATTERN = Pattern.compile("\\b(go to|open|take me to|navigate to|launch)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern CAPABILITY_PATTERN = Pattern.compile("\\b(what can i do|my rights|my permissions|access do i have)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern RESET_PATTERN = Pattern.compile("\\b(stop|cancel|wrong|start over|reset)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern PRONOUN_PATTERN = Pattern.compile("\\b(it|this|that)\\b", Pattern.CASE_INSENSITIVE);
-    private static final Pattern TROUBLE_PATTERN = Pattern.compile("\\b(cant|cannot|fail|error|issue|problem|broken)\\b", Pattern.CASE_INSENSITIVE);
+    // In-Memory Chat History (Conversational Context)
+    // Production: Use RedisChatMemory (custom implementation) for multi-node persistence
+    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
 
-    @PostConstruct
-    public void initOpenNLP() {
+    private static final String SYSTEM_PROMPT = """
+            You are the elite FinCore Banking Assistant. 
+            You must ONLY answer using the EXACT Context provided below. 
+            Do NOT hallucinate, guess, or provide information from outside the Context.
+            If the Context does not contain the answer, reply EXACTLY with: 
+            'I cannot find this information in your currently authorized FinCore manuals. Please check your permissions or contact IT.'
+            Always format your response cleanly using HTML tags like <br/> or <b> for the frontend UI.
+            """;
+
+    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, VectorStore vectorStore, PermissionService permissionService) {
+        this.vectorStore = vectorStore;
+        this.permissionService = permissionService;
+        
+        // Build the core Chat Client with our strict System Guardrails
+        this.chatClient = chatClientBuilder
+                .defaultSystem(SYSTEM_PROMPT)
+                .build();
+    }
+
+    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
         try {
-            // Load Tokenizer Model
-            InputStream tokenStream = new ClassPathResource("models/en-token.bin").getInputStream();
-            TokenizerModel tokenModel = new TokenizerModel(tokenStream);
-            tokenizer = new TokenizerME(tokenModel);
+            // 1. Get User's Allowed Permissions (e.g., [5, 6, 12, 30])
+            List<String> allowedPermIds = permissionService.getAllAllowedPermissionIdsForRole(roleId)
+                    .stream()
+                    .map(String::valueOf)
+                    .collect(Collectors.toList());
+            allowedPermIds.add("GLOBAL"); // Add global FAQs
 
-            // Load POS Tagger Model
-            InputStream posStream = new ClassPathResource("models/en-pos-maxent.bin").getInputStream();
-            POSModel posModel = new POSModel(posStream);
-            posTagger = new POSTaggerME(posModel);
+            // 2. Build RBAC Vector Search Request
+            // This ensures Redis ONLY returns paragraphs the user is allowed to read!
+            var filterBuilder = new FilterExpressionBuilder();
+            SearchRequest searchRequest = SearchRequest.query(userMessage)
+                    .withTopK(3) // Fetch top 3 matches
+                    .withFilterExpression(filterBuilder.in("permissionId", allowedPermIds).build());
 
-            log.info("NLPEngine: Apache OpenNLP Models loaded successfully.");
-            loadScreenKnowledge();
+            // 3. Pre-fetch documents to extract UI Action Links (Solving Gap 2)
+            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
+            String primaryActionLink = null;
+            String primaryActionLabel = null;
+            
+            if (!matchedDocs.isEmpty()) {
+                // Grab the link from the highest confidence document
+                Document topDoc = matchedDocs.get(0);
+                if (!"NONE".equals(topDoc.getMetadata().get("actionLink"))) {
+                    primaryActionLink = (String) topDoc.getMetadata().get("actionLink");
+                    primaryActionLabel = (String) topDoc.getMetadata().get("actionLabel");
+                }
+            }
+
+            // 4. Call Llama 3 with Memory and RAG Advisors
+            String aiResponse = this.chatClient.prompt()
+                    .user(userMessage)
+                    .advisors(
+                            // Advisor 1: RAG (I injects the Redis search results into the prompt securely)
+                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
+                            // Advisor 2: Memory (It remembers previous messages using the userId as a session key)
+                            new MessageChatMemoryAdvisor(chatMemory, userId, 5) // Remembers last 5 messages
+                    )
+                    .call()
+                    .content();
+
+            // 5. Construct final DTO to send to frontend
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(aiResponse)
+                    .navigationLink(primaryActionLink)   // Restores the UI button!
+                    .navigationLabel(primaryActionLabel)
+                    .build();
+
         } catch (Exception e) {
-            log.error("NLPEngine: CRITICAL - Failed to load OpenNLP models. Ensure .bin files are in src/main/resources/models/", e);
+            log.error("AI Generation Failed", e);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
+                    .build();
         }
     }
-
-    @Scheduled(fixedRate = 3600000)
-    public void loadScreenKnowledge() {
-        try {
-            List<PermissionEntity> allPermissions = permissionRepository.findAll();
-            KNOWN_SCREENS.clear();
-            SCREEN_URLS.clear();
-            for (PermissionEntity p : allPermissions) {
-                if (p.getMenuTitle() != null) {
-                    String upperTitle = p.getMenuTitle().toUpperCase().trim();
-                    KNOWN_SCREENS.put(upperTitle, p.getMenuTitle().trim());
-                    if (p.getMenuUrl() != null) SCREEN_URLS.put(upperTitle, p.getMenuUrl());
-                }
-            }
-        } catch (Exception e) {
-            log.error("NLPEngine: Failed to load screens.", e);
-        }
-    }
-
-    public String getScreenUrl(String screenName) {
-        return screenName == null ? null : SCREEN_URLS.get(screenName.toUpperCase().trim());
-    }
-
-    /**
-     * EXTRACT NORMALIZED INTENT USING OPENNLP TOKENIZER
-     */
-    public String extractNormalizedIntent(String sentence) {
-        if (sentence == null || tokenizer == null) return "";
-        
-        // Use OpenNLP for precise tokenization (handles punctuation beautifully)
-        String[] tokens = tokenizer.tokenize(sentence.toLowerCase());
-        StringBuilder normalized = new StringBuilder();
-
-        for (String word : tokens) {
-            if (word.matches("\\p{Punct}")) continue; // Skip raw punctuation
-            String root = adaptiveService.getRootFromSynonym(word);
-            normalized.append(root).append(" ");
-        }
-        return normalized.toString().trim();
-    }
-
-    /**
-     * SMART ACTION DETECTION: Only looks at Verbs (VB, VBD, VBG, VBN, VBP, VBZ)
-     */
-    public String detectAction(String originalSentence) {
-        if (originalSentence == null || posTagger == null) return null;
-
-        String[] tokens = tokenizer.tokenize(originalSentence);
-        String[] tags = posTagger.tag(tokens);
-
-        for (int i = 0; i < tokens.length; i++) {
-            // Check if the word is grammatically a Verb
-            if (tags[i].startsWith("VB")) {
-                String verb = tokens[i].toLowerCase();
-                String root = adaptiveService.getRootFromSynonym(verb);
-                if (KNOWN_ACTIONS.contains(root.toUpperCase())) {
-                    return root.toUpperCase();
-                }
-            }
-        }
-        
-        // Fallback: If OpenNLP misses it, do a basic scan
-        return fallbackActionDetection(originalSentence);
-    }
-
-    private String fallbackActionDetection(String sentence) {
-         for (String word : sentence.split("\\s+")) {
-            String root = adaptiveService.getRootFromSynonym(word.toLowerCase());
-            if (KNOWN_ACTIONS.contains(root.toUpperCase())) return root.toUpperCase();
-        }
-        return null;
-    }
-
-    /**
-     * SMART SCREEN DETECTION: Looks primarily at Nouns (NN, NNS, NNP, NNPS)
-     */
-    public String detectScreen(String originalSentence) {
-        if (originalSentence == null) return null;
-        
-        // 1. Exact phrase match first (highest priority for things like "CGL Management")
-        String upperSentence = originalSentence.toUpperCase();
-        for (String dbScreenUpper : KNOWN_SCREENS.keySet()) {
-            if (upperSentence.contains(dbScreenUpper)) {
-                return KNOWN_SCREENS.get(dbScreenUpper);
-            }
-        }
-
-        // 2. OpenNLP Noun Extraction
-        if (posTagger != null) {
-            String[] tokens = tokenizer.tokenize(originalSentence);
-            String[] tags = posTagger.tag(tokens);
-
-            for (int i = 0; i < tokens.length; i++) {
-                // If it's a Noun
-                if (tags[i].startsWith("NN")) {
-                    String noun = tokens[i].toLowerCase();
-                    String root = adaptiveService.getRootFromSynonym(noun);
-                    if (KNOWN_SCREENS.containsKey(root.toUpperCase().trim())) {
-                        return KNOWN_SCREENS.get(root.toUpperCase().trim());
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    public boolean containsPronoun(String t) { return t != null && PRONOUN_PATTERN.matcher(t).find(); }
-    public String resolveAnaphora(String t, String topic) { return PRONOUN_PATTERN.matcher(t).replaceAll(topic); }
-    public boolean isTrouble(String t) { return t != null && TROUBLE_PATTERN.matcher(t).find(); }
-    public String extractErrorCode(String text) { Matcher m = ERROR_CODE_PATTERN.matcher(text.toUpperCase()); return m.find() ? m.group() : null; }
-    public boolean isNavigationCommand(String text) { return text != null && NAV_PATTERN.matcher(text).find(); }
-    public boolean isCapabilityRequest(String text) { return text != null && CAPABILITY_PATTERN.matcher(text).find(); }
-    public boolean isDefinitionRequest(String text) { return text != null && text.toLowerCase().startsWith("what is"); }
-    public boolean isResetRequest(String text) { return text != null && RESET_PATTERN.matcher(text).find(); }
 }
 
 
@@ -225,45 +293,3 @@ public class NLPEngine {
 
 
 
-
-
-    // =========================================================================
-    // ENHANCED FUZZY MATCHING
-    // =========================================================================
-
-    /**
-     * Uses Dynamic Tolerance based on word length.
-     */
-    private boolean fuzzyMatch(String token, String target) {
-        if (target.contains(token)) return true;
-        
-        // Don't fuzzy match tiny words (too many false positives)
-        if (token.length() <= 3) return false;
-
-        // Dynamic Tolerance: 
-        // 4-5 chars -> 1 edit allowed
-        // 6+ chars -> 2 edits allowed
-        int allowedEdits = (token.length() <= 5) ? 1 : 2;
-
-        for (String word : target.split("\\W+")) {
-            // Optimization: Skip checking if length difference is greater than allowed edits
-            if (Math.abs(token.length() - word.length()) > allowedEdits) {
-                continue;
-            }
-
-            // Using Apache Commons Lang for highly optimized C-style DP calculation
-            int distance = org.apache.commons.lang3.StringUtils.getLevenshteinDistance(token, word);
-            
-            if (distance <= allowedEdits) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-### **Summary of what we just achieved:**
-1. **Punctuation Immunity:** `TokenizerME` cleanly separates words from punctuation. "CGL." is now cleanly read as "CGL".
-2. **Contextual Awareness:** `POSTaggerME` knows if the user is using "view" as a verb (action) or "view" as a noun (the name of a screen).
-3. **Optimized Search:** Replaced your manual `calculateDistance` array with Apache's optimized StringUtils, reducing CPU load during chat interactions, and added dynamic tolerance to eliminate false positives on short words. 
-
-This completes points 1, 2, 3, and 4 of your master plan!
