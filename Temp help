@@ -289,6 +289,227 @@ public class FinCoreChatAgent {
 
 
 
+---------------------------
+perfections : 
+
+spring:
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: llama3.1 # Best for RAG
+        options:
+          temperature: 0.1 # VERY IMPORTANT: 0.1 makes the AI strict/factual. 0.9 makes it creative/hallucinate.
+      embedding:
+        model: mxbai-embed-large
+  # Prevent Spring MVC from timing out while waiting for Ollama
+  mvc:
+    async:
+      request-timeout: 30000 # 30 seconds
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DocumentIngestionService {
+
+    private final HelpQuestionRepository questionRepository;
+    private final VectorStore vectorStore;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void ingestKnowledgeBase() {
+        log.info("Starting AI Knowledge Ingestion...");
+        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
+
+        List<Document> rawDocuments = questions.stream().map(q -> {
+            String content = "Module: " + q.getScreenName() + "\nQ: " + q.getQuestionText() + "\nA: " + q.getAnswerContent();
+            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
+            
+            Map<String, Object> metadata = Map.of(
+                    "permissionId", permId,
+                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE"
+            );
+            return new Document(content, metadata);
+        }).collect(Collectors.toList());
+
+        if (!rawDocuments.isEmpty()) {
+            // PERFECTION: Split long documents into perfectly sized overlapping chunks
+            // This guarantees the Vector math remains highly accurate
+            TokenTextSplitter splitter = new TokenTextSplitter(250, 50, 5, 10000, true);
+            List<Document> chunkedDocs = splitter.apply(rawDocuments);
+            
+            vectorStore.add(chunkedDocs);
+            log.info("Successfully ingested {} chunked documents into Redis.", chunkedDocs.size());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.memory.InMemoryChatMemory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class FinCoreChatAgent {
+
+    private final ChatClient chatClient;
+    private final VectorStore vectorStore;
+    private final PermissionService permissionService;
+    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
+
+    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, VectorStore vectorStore, PermissionService permissionService) {
+        this.vectorStore = vectorStore;
+        this.permissionService = permissionService;
+        this.chatClient = chatClientBuilder
+                .defaultSystem("You are the elite FinCore Banking Assistant. Answer ONLY using the provided Context. Be concise.")
+                .build();
+    }
+
+    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
+        try {
+            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId).stream().map(String::valueOf).collect(Collectors.toList());
+            allowedPerms.add("GLOBAL");
+
+            // 1. Execute Vector Search
+            SearchRequest searchRequest = SearchRequest.query(userMessage)
+                    .withTopK(3)
+                    // High similarity threshold (0.7) ensures we don't fetch garbage data
+                    .withSimilarityThreshold(0.7) 
+                    .withFilterExpression(new FilterExpressionBuilder().in("permissionId", allowedPerms).build());
+
+            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
+
+            // PERFECTION: The Fast-Fail
+            // If the math says there are NO related documents, do not wake up Llama 3!
+            if (matchedDocs.isEmpty()) {
+                log.info("Fast-Fail: No vector match found for query '{}'", userMessage);
+                return HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("I couldn't find any information about that in your authorized modules. Please try rephrasing.")
+                        .build();
+            }
+
+            // Extract UI Action Link from the best match
+            String actionLink = (String) matchedDocs.get(0).getMetadata().get("actionLink");
+
+            // 2. Wake up Llama 3 for Generative Response
+            String aiResponse = this.chatClient.prompt()
+                    .user(userMessage)
+                    .advisors(
+                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
+                            new MessageChatMemoryAdvisor(chatMemory, userId, 5)
+                    )
+                    .call()
+                    .content();
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(aiResponse)
+                    .navigationLink("NONE".equals(actionLink) ? null : actionLink)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("AI Generation Failed", e);
+            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I am currently experiencing a cognitive delay. Please try again.").build();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
