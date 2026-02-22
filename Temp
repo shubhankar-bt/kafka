@@ -1,254 +1,305 @@
-package com.tcs.fincore.CommonRequestService.service;
+Create the Modelfiles:
+Inside your fincore-ai/local-models/models folder (where the .gguf files are), create two plain text files:
+Create Modelfile-phi3:
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tcs.fincore.CommonRequestService.dto.*;
-import com.tcs.fincore.CommonRequestService.dto.payload.KeyablePayload;
-import com.tcs.fincore.CommonRequestService.exception.ResourceNotFoundException;
-import com.tcs.fincore.CommonRequestService.model.CGLMaster;
-import com.tcs.fincore.CommonRequestService.model.CommonReq;
-import com.tcs.fincore.CommonRequestService.model.enums.ChangeType;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestStatus;
-import com.tcs.fincore.CommonRequestService.model.enums.RequestType;
-import com.tcs.fincore.CommonRequestService.repository.CommonRequestRepository;
-import com.tcs.fincore.CommonRequestService.service.strategy.RequestStrategyFactory;
-import jakarta.transaction.Transactional;
+
+FROM ./Phi-3-mini-4k-instruct-q4.gguf
+
+
+
+
+
+
+Create Modelfile-mxbai:
+
+
+FROM ./mxbai-embed-large-v1-f16.gguf
+
+
+
+
+
+
+version: '3.8'
+services:
+  redis-vector:
+    image: redis/redis-stack-server:latest
+    ports:
+      - "6379:6379"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      # Maps your local laptop folder into the docker container at /models
+      - ./fincore-ai/local-models/models:/models 
+
+
+
+
+
+
+
+spring:
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: phi3-mini
+        options:
+          temperature: 0.1 # Crucial for Phi-3 to remain strictly factual
+      embedding:
+        model: mxbai-embed
+    vectorstore:
+      redis:
+        uri: redis://localhost:6379
+        index: fincore-help-index
+        prefix: "fincore:doc:"
+  mvc:
+    async:
+      request-timeout: 30000 # Prevent timeouts while Phi-3 generates text
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.security.access.AccessDeniedException;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
- * - Handle all requests for different business objects [CGL, SEGMENT, CURRENCY]
- * - Handle creator/executor scenarios
- * - Used strategy design patter to differentiate different business objects
- * - Injected NotificationWriterService and PermissionConfigService for notification
- * - Injected BusinessSecurityService for second level RBAC authentication to check BLOCK/UNBLOCK permissions
- *
- * @author Shubhankar Das [v1018405]
- * @version 1.1
+ * Handles converting Oracle DB text into AI Mathematical Vectors (Embeddings) using Mxbai.
+ * Stores them securely in Redis Stack with RBAC metadata.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class RequestServiceImpl implements RequestService {
+public class DocumentIngestionService {
 
-    private static final String EVENT_SOURCE = "CommonRequestService";
-    private final CommonRequestRepository commonRequestRepository;
-    private final RequestStrategyFactory strategyFactory;
-    private final ObjectMapper objectMapper;
-    private final NotificationWriterService notificationWriterService;
-    private final PermissionConfigService permissionConfigService;
-    private final BusinessSecurityService businessSecurityService;
+    private final HelpQuestionRepository questionRepository;
+    private final VectorStore vectorStore;
 
-    @Override
-    @Transactional(rollbackOn = Exception.class)
-    public CommonReq createRequest(
-            CreateRequestDto dto,
-            String creatorId,
-            String token
-    ) throws JsonProcessingException {
+    @EventListener(ApplicationReadyEvent.class)
+    public void ingestKnowledgeBase() {
+        log.info("Starting AI Knowledge Ingestion to Redis using mxbai-embed...");
 
-        // --- LAYER 2 SECURITY CHECK ---
-        businessSecurityService.validateUserAction(token, dto.getRequestType(), dto.getChangeType());
+        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
 
-        KeyablePayload payload = (KeyablePayload) dto.getPayload();
-
-        // --- PRE CHECKS ---
-        String targetId = payload.getKey();
-        if (targetId == null || targetId.isBlank()) {
-            throw new IllegalArgumentException("Could not determine targetId from payload.");
-        }
-        log.info("Determined targetId for new request as: {}", targetId);
-
-        List<CommonReq> existingRequests = commonRequestRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
-
-        if (!existingRequests.isEmpty()) {
-            log.warn("Attempted to create a duplicate request for targetId {} which already has a {} request.",
-                    targetId, existingRequests.get(0).getReqStatus());
-            throw new DataIntegrityViolationException("An active or pending request for '" + targetId + "' already exists.");
-        }
-        
-        // --- CREATE AND SAVE REQUEST ---
-        CommonReq request = new CommonReq();
-        request.setCreatorId(creatorId);
-        request.setReqType(dto.getRequestType());
-        request.setChangeType(dto.getChangeType());
-        request.setPayload(objectMapper.writeValueAsString(payload));
-        request.setTargetId(targetId);
-        request.setReqStatus(RequestStatus.PENDING);
-        request.setReqDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-        
-        // [NEW FEATURE ADDED]: Map the Creator Remarks directly. Nullable column handles missing data seamlessly.
-        request.setCreatorRemarks(dto.getCreatorRemarks());
-
-        log.info("Saving new, validated request for targetId {}", targetId);
-        CommonReq savedRequest = commonRequestRepository.save(request);
-
-        // --- NOTIFICATION LOGIC ---
-        try {
-            String requestTypeKey = dto.getRequestType().name();
-            NotificationConfigDto config = permissionConfigService.getConfig(requestTypeKey);
-            String action = request.getChangeType().name(); 
-
-            if (request.getChangeType() == ChangeType.BLOCK || request.getChangeType() == ChangeType.UNBLOCK) {
-                CGLMaster payload2 = objectMapper.readValue(request.getPayload(), CGLMaster.class);
-                action = (payload2.getStatus() == 0) ? "BLOCK" : "UNBLOCK";
+        List<Document> rawDocuments = questions.stream().map(q -> {
+            // Combine Question and Answer so the AI has full semantic context
+            String content = "Module: " + (q.getScreenName() != null ? q.getScreenName() : "General") + 
+                             "\nQuestion: " + q.getQuestionText() + 
+                             "\nAnswer: " + q.getAnswerContent();
+                             
+            if (q.getProTip() != null) {
+                content += "\nPro Tip: " + q.getProTip();
             }
-            
-            String message = "New " + action + " request (" + targetId + ") pending for " + dto.getRequestType();
 
-            notificationWriterService.createNotification(
-                    creatorId,                  
-                    config.getTargetRoles(),    
-                    message,
-                    config.getTargetUrl(),      
-                    savedRequest.getId().toString(),
-                    EVENT_SOURCE
+            // Attach Security Metadata (CRITICAL FOR RBAC)
+            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
+            
+            Map<String, Object> metadata = Map.of(
+                    "permissionId", permId,
+                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE",
+                    "actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE"
             );
 
-        } catch (JsonProcessingException e) {
-            // FIX: Catch JSON specific errors
-            log.error("CRITICAL: Failed to parse payload to determine BLOCK/UNBLOCK status for Request ID: {}", savedRequest.getId(), e);
-            throw new IllegalArgumentException("Invalid payload structure for Notification processing", e);
+            return new Document(content, metadata);
+        }).collect(Collectors.toList());
+
+        if (!rawDocuments.isEmpty()) {
+            // Split long documents into perfectly sized chunks for high-accuracy math matching
+            TokenTextSplitter splitter = new TokenTextSplitter(300, 50, 5, 10000, true);
+            List<Document> chunkedDocs = splitter.apply(rawDocuments);
             
-        } catch (DataAccessException e) {
-            // FIX: Catch Spring Database specific errors
-            log.error("CRITICAL: Database error while creating 'pending' notification for Request ID: {}.", savedRequest.getId(), e);
-            throw new IllegalStateException("Database transaction failed during notification creation.", e);
-            
-        } catch (ResourceNotFoundException e) {
-            // FIX: Catch configuration missing errors
-            log.error("CRITICAL: Missing notification configuration for Request Type: {}", dto.getRequestType(), e);
-            throw new IllegalStateException("Notification configuration missing. Cannot proceed.", e);
+            vectorStore.add(chunkedDocs);
+            log.info("Successfully ingested {} chunked documents into Redis Vector Store.", chunkedDocs.size());
         }
-        // Note: We DO NOT catch standard RuntimeExceptions (like NPEs) anymore. They will bubble up and be visible in logs.
-
-        return savedRequest;
-    }
-
-    @Override
-    @Transactional(rollbackOn = Exception.class) 
-    public Optional<CommonReq> updateRequestStatus(
-            ProcessRequestDto dto,
-            String executorId
-    ) throws JsonProcessingException {
-
-        Long requestId = dto.getRequestId();
-        log.info("Attempting to update status for request ID: {} by executor: {}", requestId, executorId);
-
-        CommonReq request = commonRequestRepository.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
-
-        if (executorId.equals(request.getCreatorId())) {
-            log.warn("SECURITY VIOLATION: User {} attempted to approve their own request (ID: {}).", executorId, requestId);
-            throw new IllegalStateException("User cannot approve or reject their own request.");
-        }
-
-        if (request.getReqStatus() != RequestStatus.PENDING) {
-            log.warn("Attempted to modify an already processed request. ID: {}, Current Status: {}", dto.getRequestId(), request.getReqStatus());
-            throw new IllegalStateException("Request has already been processed and cannot be modified.");
-        }
-
-        request.setExecutorId(executorId);
-        request.setExecutorRemarks(dto.getRemarks());
-        request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-        request.setReqStatus(dto.getStatus());
-
-        if (RequestStatus.ACCEPTED.equals(dto.getStatus())) {
-            log.info("Request {} ACCEPTED. Applying strategy for type {}", dto.getRequestId(), request.getReqType());
-            strategyFactory.getStrategy(request.getReqType()).processApproval(request);
-            notificationWriterService.createRequestApprovedNotification(request, executorId);
-            request.setExecutionRemarks("Successfully processed approval.");
-        } else {
-            log.info("Request {} REJECTED.", dto.getRequestId());
-            notificationWriterService.createRequestRejectedNotification(request, executorId, dto.getRemarks());
-            request.setExecutionRemarks("Request rejected by user.");
-        }
-
-        // --- NOTIFICATION 2: CLOSURE ---
-        try {
-            NotificationConfigDto config = permissionConfigService.getConfig(request.getReqType().name());
-            String action = dto.getStatus().equals(RequestStatus.ACCEPTED) ? "Approved" : "Rejected";
-            String closureMessage = "Request " + request.getTargetId() + " was " + action + " by " + executorId;
-
-            notificationWriterService.createNotification(
-                    executorId,                 
-                    config.getTargetRoles(),    
-                    closureMessage,
-                    config.getTargetUrl(),      
-                    request.getId().toString(),
-                    "CommonRequestService"
-            );
-            log.info("Sent closure notification to group for Request ID: {}", requestId);
-
-        } catch (DataAccessException | ResourceNotFoundException e) {
-            // FIX: Narrowed down to specific expected failures.
-            // We still log and suppress this so the Approval doesn't rollback if just the Group Notification fails.
-            log.error("Failed to send closure notification for Request ID: {}. Reason: {}", requestId, e.getMessage());
-        }
-
-        CommonReq updatedRequest = commonRequestRepository.save(request);
-        return Optional.of(updatedRequest);
-    }
-
-    @Override
-    @Transactional(rollbackOn = Exception.class)
-    public CommonReq cancelRequest(CancelRequestDto dto, String userId) {
-
-        Long requestId = dto.getRequestId();
-        log.info("Attempting to cancel request ID: {} by user: {}", requestId, userId);
-
-        CommonReq request = commonRequestRepository.findById(requestId)
-                .orElseThrow(() -> new ResourceNotFoundException("Request with ID " + requestId + " not found."));
-
-        if (!request.getCreatorId().equals(userId)) {
-            log.warn("SECURITY VIOLATION: User {} attempted to cancel request {} owned by {}", userId, requestId, request.getCreatorId());
-            throw new AccessDeniedException("You are not authorized to cancel this request.");
-        }
-
-        if (request.getReqStatus() != RequestStatus.PENDING) {
-            throw new IllegalStateException("Only pending requests can be cancelled. Current status: " + request.getReqStatus());
-        }
-
-        request.setReqStatus(RequestStatus.CANCELLED);
-        request.setExecutorId(userId);
-        request.setExecutionDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
-        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
-
-        CommonReq updatedRequest = commonRequestRepository.save(request);
-        log.info("Request {} successfully cancelled by user.", requestId);
-
-        return updatedRequest;
-    }
-
-    @Override
-    public List<CommonReq> getMyRequests(String userId, RequestType requestType) {
-        if (requestType == null) {
-            throw new IllegalArgumentException("Request type is missing.");
-        }
-        return commonRequestRepository.findByCreatorIdAndReqType(userId, requestType);
-    }
-
-    @Override
-    public List<CommonReq> getPendingRequests(String userId, RequestType requestType) {
-        if (requestType == null) {
-            throw new IllegalArgumentException("Request type is missing.");
-        }
-        return commonRequestRepository.findByCreatorIdNotAndReqStatusAndReqType(userId, RequestStatus.PENDING, requestType);
-    }
-
-    @Override
-    public List<CommonReq> getAllRequests() {
-        return commonRequestRepository.findAll();
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
+import org.springframework.ai.chat.memory.InMemoryChatMemory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * THE RAG ENGINE
+ * Uses Phi-3 to answer questions based purely on Redis Vector Search results.
+ */
+@Service
+@Slf4j
+public class FinCoreChatAgent {
+
+    private final ChatClient chatClient;
+    private final VectorStore vectorStore;
+    private final PermissionService permissionService;
+    private final ChatSessionService sessionService;
+    private final HelpAnalyticsService analyticsService;
+    
+    // In-Memory Chat History for conversational follow-ups
+    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
+
+    // STRICT System Prompt tailored specifically for Phi-3's logic engine
+    private static final String SYSTEM_PROMPT = """
+            You are the elite FinCore Banking Assistant.
+            You must ONLY answer the user's question using the exact Context provided below.
+            
+            RULES:
+            1. If the Context does not contain the answer, you must reply EXACTLY with: 'I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact IT.'
+            2. Do not invent information, guess, or use outside knowledge.
+            3. Keep your answers clear, professional, and concise.
+            4. Format your response using basic HTML tags like <b> or <br/> for UI readability.
+            """;
+
+    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, 
+                            VectorStore vectorStore, 
+                            PermissionService permissionService,
+                            ChatSessionService sessionService,
+                            HelpAnalyticsService analyticsService) {
+        this.vectorStore = vectorStore;
+        this.permissionService = permissionService;
+        this.sessionService = sessionService;
+        this.analyticsService = analyticsService;
+        
+        this.chatClient = chatClientBuilder
+                .defaultSystem(SYSTEM_PROMPT)
+                .build();
+    }
+
+    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
+        try {
+            // 1. ESCALATION CHECK
+            if (sessionService.isEscalationRequired(userId)) {
+                sessionService.resetStrikes(userId);
+                return HelpResponseDTO.builder()
+                        .responseType("ESCALATION_OFFER")
+                        .botReply("I seem to be having trouble helping you. Would you like me to raise an IT Support Ticket with your recent chat history attached?")
+                        .build();
+            }
+
+            // 2. FETCH RBAC PERMISSIONS
+            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
+                    .stream().map(String::valueOf).collect(Collectors.toList());
+            allowedPerms.add("GLOBAL");
+
+            // 3. EXECUTE SECURE VECTOR SEARCH
+            SearchRequest searchRequest = SearchRequest.query(userMessage)
+                    .withTopK(3)
+                    .withSimilarityThreshold(0.65) // Must be a decent match
+                    .withFilterExpression(new FilterExpressionBuilder().in("permissionId", allowedPerms).build());
+
+            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
+
+            // 4. FAST-FAIL (If no relevant docs, save CPU and don't wake up Phi-3)
+            if (matchedDocs.isEmpty()) {
+                sessionService.addStrikes(userId, 1);
+                analyticsService.logChatInteraction(userId, "UNKNOWN", userMessage, "NO_MATCH", 0);
+                return HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("I couldn't find any information about that in your authorized modules. Try rephrasing?")
+                        .build();
+            }
+
+            // Extract UI Action Links from the best match (Gap 2 Solved)
+            String primaryActionLink = (String) matchedDocs.get(0).getMetadata().get("actionLink");
+            String primaryActionLabel = (String) matchedDocs.get(0).getMetadata().get("actionLabel");
+
+            // 5. CALL PHI-3 WITH RAG & MEMORY
+            String aiResponse = this.chatClient.prompt()
+                    .user(userMessage)
+                    .advisors(
+                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
+                            new MessageChatMemoryAdvisor(chatMemory, userId, 5) // Remembers last 5 messages
+                    )
+                    .call()
+                    .content();
+
+            // 6. EVALUATE SUCCESS/STRIKES
+            if (aiResponse.contains("I cannot find this information")) {
+                sessionService.addStrikes(userId, 1);
+            } else {
+                sessionService.resetStrikes(userId);
+            }
+
+            // Log successful generation
+            analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "ANSWERED", 99);
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(aiResponse)
+                    .navigationLink("NONE".equals(primaryActionLink) ? null : primaryActionLink)
+                    .navigationLabel("NONE".equals(primaryActionLabel) ? null : primaryActionLabel)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("AI Generation Failed", e);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
+                    .build();
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 
 
