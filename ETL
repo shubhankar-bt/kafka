@@ -1,9 +1,61 @@
-E:\fincore-ai>docker exec -it ollama ls -la /models
-total 4
-drwxrwxrwx 1 root root    0 Feb 23 12:13 .
-drwxr-xr-x 1 root root 4096 Feb 23 12:22 ..
+package com.fincore.helpservice.config;
 
-E:\fincore-ai>
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.redis.RedisEmbeddingStore;
+import dev.langchain4j.data.segment.TextSegment;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
+
+/**
+ * Enterprise AI Configuration.
+ * Connects the JVM to the offline Docker LLMs and Vector Database.
+ */
+@Configuration
+public class AiConfiguration {
+
+    @Value("${spring.redis.host:localhost}")
+    private String redisHost;
+
+    // The Generative Model (The Talker)
+    @Bean
+    public ChatLanguageModel chatLanguageModel() {
+        return OllamaChatModel.builder()
+                .baseUrl("http://localhost:11434")
+                .modelName("phi3-mini")
+                .temperature(0.1) // Crucial: 0.1 forces Phi-3 to be strictly factual, no hallucinations
+                .timeout(Duration.ofSeconds(60)) // Prevents timeout while Phi-3 thinks
+                .build();
+    }
+
+    // The Embedding Model (The Searcher)
+    @Bean
+    public EmbeddingModel embeddingModel() {
+        return OllamaEmbeddingModel.builder()
+                .baseUrl("http://localhost:11434")
+                .modelName("mxbai-embed")
+                .timeout(Duration.ofSeconds(15))
+                .build();
+    }
+
+    // The Vector Database (Redis Stack on Port 6380)
+    @Bean
+    public EmbeddingStore<TextSegment> embeddingStore() {
+        return RedisEmbeddingStore.builder()
+                .host(redisHost)
+                .port(6380) // Using the decoupled AI Redis port we discussed
+                .dimension(1024) // mxbai-embed-large produces exactly 1024 dimensions
+                .indexName("fincore-help-index")
+                .prefix("fincore:doc:")
+                .build();
+    }
+}
 
 
 
@@ -11,28 +63,285 @@ E:\fincore-ai>
 
 
 
-docker-compose file :
 
-version: '3.8'
-services:
-  # 1. The Vector Database
-  redis-vector:
-    image: redis/redis-stack-server:latest
-    container_name: redis-vector
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis_data:/data
 
-  # 2. The Local AI Engine
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./fincore-ai/local-models/models:/models
 
-volumes:
-  redis_data:
-  ollama_data:
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.document.Metadata;
+import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Handles converting Oracle DB text into AI Mathematical Vectors using LangChain4j.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DocumentIngestionService {
+
+    private final HelpQuestionRepository questionRepository;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> embeddingStore;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void ingestKnowledgeBase() {
+        log.info("[AI-INGEST] Starting Knowledge Ingestion to Redis via mxbai-embed...");
+
+        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
+        List<Document> documents = new ArrayList<>();
+
+        for (HelpQuestionEntity q : questions) {
+            String content = "Module: " + (q.getScreenName() != null ? q.getScreenName() : "General") +
+                    "\nQuestion: " + q.getQuestionText() +
+                    "\nAnswer: " + q.getAnswerContent() +
+                    (q.getProTip() != null ? "\nPro Tip: " + q.getProTip() : "");
+
+            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
+
+            // Attach RBAC and UI metadata
+            Metadata metadata = Metadata.from("permissionId", permId)
+                    .add("actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE")
+                    .add("actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE");
+
+            documents.add(Document.from(content, metadata));
+        }
+
+        if (!documents.isEmpty()) {
+            // 1. Chunking: 300 tokens max, 50 token overlap to preserve context
+            List<TextSegment> segments = DocumentSplitters.recursive(300, 50).splitAll(documents);
+            log.info("[AI-INGEST] Chunked {} raw DB records into {} mathematical segments.", documents.size(), segments.size());
+
+            // 2. Generate Vectors via Ollama
+            List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
+
+            // 3. Save to Redis
+            embeddingStore.addAll(embeddings, segments);
+            log.info("[AI-INGEST] Successfully saved {} vectors to Redis Stack.", segments.size());
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpResponseDTO;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+import dev.langchain4j.store.embedding.EmbeddingSearchResult;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
+
+/**
+ * THE RAG ENGINE (LangChain4j Implementation)
+ * Orchestrates Vector Search, Dynamic Prompting, and Generative AI (Phi-3).
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class FinCoreChatAgent {
+
+    private final ChatLanguageModel chatClient;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> vectorStore;
+    
+    private final PermissionService permissionService;
+    private final ChatSessionService sessionService;
+    private final HelpAnalyticsService analyticsService;
+
+    // Session-based Chat Memory (Remembers the last 5 messages per user)
+    private final Map<String, ChatMemory> userMemories = new ConcurrentHashMap<>();
+
+    private static final String BASE_SYSTEM_PROMPT = """
+            You are the FinCore Smart Assistant, an advanced AI banking bot developed by Shubhankar.
+            
+            RULES:
+            1. You must ONLY answer the user's banking question using the exact Context provided below.
+            2. If the answer is not in the Context, reply EXACTLY with: 'I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact IT.'
+            3. Do not invent information or guess limits/rules.
+            4. Keep answers clear, professional, and use HTML tags like <b> or <br/> for readability.
+            5. If the user asks casual questions ("who built you", "what time is it"), use your identity and dynamic context to answer conversationally.
+            """;
+
+    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
+        log.info("[AI-CHAT] Processing query for User: {}", userId);
+
+        try {
+            // 1. ESCALATION CHECK
+            if (sessionService.isEscalationRequired(userId)) {
+                log.warn("[AI-CHAT] User {} requires IT escalation.", userId);
+                sessionService.resetStrikes(userId);
+                return HelpResponseDTO.builder()
+                        .responseType("ESCALATION_OFFER")
+                        .botReply("I seem to be having trouble helping you today. Would you like me to raise an IT Support Ticket with your chat history attached?")
+                        .build();
+            }
+
+            // 2. FETCH RBAC PERMISSIONS (Capability Visibility Rule)
+            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
+                    .stream().map(String::valueOf).collect(Collectors.toList());
+            allowedPerms.add("GLOBAL");
+            
+            List<String> allowedActionNames = permissionService.getAllowedActionNamesForRole(roleId);
+
+            // 3. EXECUTE SECURE VECTOR SEARCH
+            // Convert user text to vector using mxbai
+            Embedding queryEmbedding = embeddingModel.embed(userMessage).content();
+            
+            // Build Redis Metadata Filter: WHERE permissionId IN (userPerms...)
+            Filter rbacFilter = metadataKey("permissionId").isIn(allowedPerms);
+
+            EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
+                    .queryEmbedding(queryEmbedding)
+                    .maxResults(3)
+                    .minScore(0.65) // Must be a 65%+ mathematical match
+                    .filter(rbacFilter)
+                    .build();
+
+            EmbeddingSearchResult<TextSegment> searchResult = vectorStore.search(searchRequest);
+            List<EmbeddingMatch<TextSegment>> matches = searchResult.matches();
+
+            // 4. FAST-FAIL OPTIMIZATION
+            if (matches.isEmpty()) {
+                log.info("[AI-CHAT] Fast-Fail triggered. No context found for query: '{}'", userMessage);
+                sessionService.addStrikes(userId, 1);
+                analyticsService.logChatInteraction(userId, "UNKNOWN", userMessage, "NO_MATCH", 0);
+                return HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply("I couldn't find any information about that in your authorized modules. Try rephrasing?")
+                        .build();
+            }
+
+            // Extract Context Text and UI Action Links
+            StringBuilder contextBuilder = new StringBuilder();
+            String primaryActionLink = null;
+            String primaryActionLabel = null;
+
+            for (EmbeddingMatch<TextSegment> match : matches) {
+                contextBuilder.append("- ").append(match.embedded().text()).append("\n\n");
+                
+                // Grab the link from the highest confidence document
+                if (primaryActionLink == null) {
+                    String link = match.embedded().metadata().getString("actionLink");
+                    if (!"NONE".equals(link)) {
+                        primaryActionLink = link;
+                        primaryActionLabel = match.embedded().metadata().getString("actionLabel");
+                    }
+                }
+            }
+
+            // 5. DYNAMIC PROMPT INJECTION
+            String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
+            String dynamicPrompt = BASE_SYSTEM_PROMPT +
+                    "\n\n--- DYNAMIC CONTEXT ---" +
+                    "\nCurrent Time: " + currentTime +
+                    "\nUser's Allowed Actions: " + allowedActionNames +
+                    "\nRule: If the user asks 'Can I [action]?', check their Allowed Actions list. If not allowed, politely say so, but explain the concept to them if they ask how it works." +
+                    "\n\n--- BANKING CONTEXT RETRIEVED FROM DATABASE ---" +
+                    "\n" + contextBuilder.toString();
+
+            // 6. MANAGE CHAT MEMORY & CALL PHI-3
+            ChatMemory memory = userMemories.computeIfAbsent(userId, k -> MessageWindowChatMemory.withMaxMessages(5));
+            memory.add(UserMessage.from(userMessage));
+
+            log.info("[AI-CHAT] Sending Prompt to Phi-3 LLM...");
+            
+            // We pass the System Message (Rules + DB Context) and the Chat Memory (History)
+            AiMessage responseMessage = chatClient.generate(
+                    SystemMessage.from(dynamicPrompt),
+                    memory.messages().get(memory.messages().size() - 1) // Pass latest user message
+            ).content();
+
+            String aiResponse = responseMessage.text();
+            memory.add(responseMessage); // Save AI reply to memory
+
+            // 7. EVALUATE SUCCESS / STRIKES
+            if (aiResponse.contains("I cannot find this information")) {
+                log.info("[AI-CHAT] Hallucination Guardrail triggered.");
+                sessionService.addStrikes(userId, 1);
+            } else {
+                sessionService.resetStrikes(userId);
+            }
+
+            analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "ANSWERED", 99);
+
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply(aiResponse)
+                    .navigationLink(primaryActionLink)
+                    .navigationLabel(primaryActionLabel)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("[AI-CHAT] Critical AI Generation Failure", e);
+            return HelpResponseDTO.builder()
+                    .responseType("TEXT_REPLY")
+                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
+                    .build();
+        }
+    }
+}
+
+
