@@ -1,3 +1,140 @@
+        <!-- 1. LangChain4j Core -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j</artifactId>
+            <version>1.0.0-alpha1</version>
+        </dependency>
+
+        <!-- 2. LangChain4j Ollama (To talk to Phi-3 and Mxbai) -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-ollama</artifactId>
+            <version>1.0.0-alpha1</version>
+        </dependency>
+
+        <!-- 3. LangChain4j Redis (Core API only - No Starter to prevent Bean clashes) -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-redis</artifactId>
+            <version>1.0.0-alpha1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.config;
+
+import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.redis.RedisEmbeddingStore;
+import dev.langchain4j.data.segment.TextSegment;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+import java.time.Duration;
+
+/**
+ * Enterprise AI Configuration.
+ * Connects the JVM to the offline Docker LLMs and Vector Database.
+ */
+@Configuration
+public class AiConfiguration {
+
+    @Value("${langchain4j.ollama.base-url}")
+    private String ollamaBaseUrl;
+
+    @Value("${langchain4j.ollama.chat-model.name}")
+    private String chatModelName;
+
+    @Value("${langchain4j.ollama.embedding-model.name}")
+    private String embeddingModelName;
+
+    @Value("${langchain4j.vector-store.redis.host}")
+    private String redisHost;
+
+    @Value("${langchain4j.vector-store.redis.port}")
+    private Integer redisPort;
+
+    @Value("${langchain4j.vector-store.redis.index-name}")
+    private String indexName;
+
+    @Value("${langchain4j.vector-store.redis.prefix}")
+    private String prefix;
+
+    @Value("${langchain4j.vector-store.redis.dimension:1024}")
+    private Integer dimension;
+
+    @Bean
+    @Primary
+    public ChatLanguageModel chatLanguageModel() {
+        return OllamaChatModel.builder()
+                .baseUrl(ollamaBaseUrl)
+                .modelName(chatModelName)
+                .temperature(0.1)
+                .timeout(Duration.ofSeconds(60))
+                .build();
+    }
+
+    @Bean
+    @Primary
+    public EmbeddingModel embeddingModel() {
+        return OllamaEmbeddingModel.builder()
+                .baseUrl(ollamaBaseUrl)
+                .modelName(embeddingModelName)
+                .timeout(Duration.ofSeconds(15))
+                .build();
+    }
+
+    @Bean
+    @Primary
+    public EmbeddingStore<TextSegment> embeddingStore() {
+        return RedisEmbeddingStore.builder()
+                .host(redisHost)
+                .port(redisPort)
+                .dimension(dimension)
+                .indexName(indexName)
+                .prefix(prefix)
+                .build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.helpservice.service;
 
 import com.fincore.helpservice.dto.HelpResponseDTO;
@@ -38,26 +175,17 @@ import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metad
 @Slf4j
 public class FinCoreChatAgent {
 
-    private static final String BASE_SYSTEM_PROMPT = """
-            You are the FinCore Smart Assistant, an advanced AI banking bot developed by Shubhankar.
-            
-            RULES:
-            1. You must ONLY answer the user's banking question using the exact Context provided below.
-            2. If the answer is not in the Context, reply EXACTLY with: 'I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact IT.'
-            3. Do not invent information or guess limits/rules.
-            4. Keep answers clear, professional, and use HTML tags like <b> or <br/> for readability.
-            5. If the user asks casual questions ("who built you", "what time is it"), use your identity and dynamic context to answer conversationally.
-            """;
     private final ChatLanguageModel chatClient;
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> vectorStore;
     private final PermissionService permissionService;
     private final ChatSessionService sessionService;
     private final HelpAnalyticsService analyticsService;
+
     // Session-based Chat Memory (Sessions expire after 30 minutes of inactivity.)
     private final Cache<String, ChatMemory> userMemories = Caffeine.newBuilder()
             .expireAfterAccess(30, TimeUnit.MINUTES)
-            .maximumSize(10000) // Max 10,000 concurrent active chat sessions
+            .maximumSize(10000)
             .build();
 
     public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
@@ -74,7 +202,7 @@ public class FinCoreChatAgent {
                         .build();
             }
 
-            // 2. FETCH RBAC PERMISSIONS (Capability Visibility Rule)
+            // 2. FETCH RBAC PERMISSIONS
             List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
                     .stream().map(String::valueOf).collect(Collectors.toList());
             allowedPerms.add("GLOBAL");
@@ -82,56 +210,42 @@ public class FinCoreChatAgent {
             List<String> allowedActionNames = permissionService.getAllowedActionNamesForRole(roleId);
 
             // 3. EXECUTE SECURE VECTOR SEARCH
-            // Convert user text to vector using mxbai
             Embedding queryEmbedding = embeddingModel.embed(userMessage).content();
-
-            // Build Redis Metadata Filter: WHERE permissionId IN (userPerms...)
             Filter rbacFilter = metadataKey("permissionId").isIn(allowedPerms);
 
             EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
                     .queryEmbedding(queryEmbedding)
                     .maxResults(3)
-                    .minScore(0.65) // Must be a 65%+ mathematical match
+                    .minScore(0.65)
                     .filter(rbacFilter)
                     .build();
 
             EmbeddingSearchResult<TextSegment> searchResult = vectorStore.search(searchRequest);
             List<EmbeddingMatch<TextSegment>> matches = searchResult.matches();
 
-            // 4. FAST-FAIL OPTIMIZATION
-            if (matches.isEmpty()) {
-                log.info("[AI-CHAT] Fast-Fail triggered. No context found for query: '{}'", userMessage);
-                sessionService.addStrikes(userId, 1);
-                Long failLogId = analyticsService.logChatInteraction(userId, "UNKNOWN", userMessage, "NO_MATCH", 0);
-
-                return HelpResponseDTO.builder()
-                        .responseType("NO_MATCH")
-                        .botReply("I couldn't find any information about that in your authorized modules. Try rephrasing?")
-                        .logId(failLogId) // Send it to the UI!
-                        .build();
-            }
-
-            // Extract Context Text and UI Action Links
+            // 4. CONTEXT EXTRACTION (Fluid AI Pre-check)
+            boolean hasBankingContext = !matches.isEmpty();
             StringBuilder contextBuilder = new StringBuilder();
             String primaryActionLink = null;
             String primaryActionLabel = null;
 
-            for (EmbeddingMatch<TextSegment> match : matches) {
-                contextBuilder.append("- ").append(match.embedded().text()).append("\n\n");
-
-                // Grab the link from the highest confidence document
-                if (primaryActionLink == null) {
-                    String link = match.embedded().metadata().getString("actionLink");
-                    if (!"NONE".equals(link)) {
-                        primaryActionLink = link;
-                        primaryActionLabel = match.embedded().metadata().getString("actionLabel");
+            if (hasBankingContext) {
+                for (EmbeddingMatch<TextSegment> match : matches) {
+                    contextBuilder.append("- ").append(match.embedded().text()).append("\n\n");
+                    if (primaryActionLink == null) {
+                        String link = match.embedded().metadata().getString("actionLink");
+                        if (!"NONE".equals(link)) {
+                            primaryActionLink = link;
+                            primaryActionLabel = match.embedded().metadata().getString("actionLabel");
+                        }
                     }
                 }
+            } else {
+                contextBuilder.append("NO_BANKING_CONTEXT_FOUND");
             }
 
             // 5. DYNAMIC PROMPT INJECTION
             String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
-
             String dynamicPrompt = """
                     You are the FinCore Smart Assistant, an advanced AI banking bot developed by Shubhankar.
                     
@@ -152,39 +266,42 @@ public class FinCoreChatAgent {
                 dynamicPrompt += "\nWARNING: The Banking Context is EMPTY. You are ONLY allowed to execute Rule 3 (Small Talk) or Rule 4 (Anti-Abuse). If the user's message is neither of those, you MUST execute Rule 2 (Out of Scope).";
             }
 
-
-            // 6. MANAGE CHAT MEMORY & CALL PHI-3 (Caffeine Cache)
+            // 6. MANAGE CHAT MEMORY & CALL PHI-3
             ChatMemory memory = userMemories.get(userId, k -> MessageWindowChatMemory.withMaxMessages(5));
             memory.add(UserMessage.from(userMessage));
 
             log.info("[AI-CHAT] Sending Prompt to Phi-3 LLM...");
-
-            // We pass the System Message (Rules + DB Context) and the Chat Memory (History)
             AiMessage responseMessage = chatClient.generate(
                     SystemMessage.from(dynamicPrompt),
-                    memory.messages().get(memory.messages().size() - 1) // Pass latest user message
+                    memory.messages().get(memory.messages().size() - 1)
             ).content();
 
             String aiResponse = responseMessage.text();
-            memory.add(responseMessage); // Save AI reply to memory
+            memory.add(responseMessage);
 
             // 7. EVALUATE SUCCESS / STRIKES
             if (aiResponse.contains("I cannot find this information")) {
                 log.info("[AI-CHAT] Hallucination Guardrail triggered.");
                 sessionService.addStrikes(userId, 1);
+                Long failLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "NO_MATCH", 0);
+                
+                return HelpResponseDTO.builder()
+                        .responseType("NO_MATCH")
+                        .botReply(aiResponse)
+                        .logId(failLogId) // Correctly tied to NO_MATCH UI
+                        .build();
             } else {
                 sessionService.resetStrikes(userId);
+                Long successLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "ANSWERED", 99);
+                
+                return HelpResponseDTO.builder()
+                        .responseType("TEXT_REPLY")
+                        .botReply(aiResponse)
+                        .navigationLink(primaryActionLink)
+                        .navigationLabel(primaryActionLabel)
+                        .logId(successLogId)
+                        .build();
             }
-
-            Long generatedLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "ANSWERED", 99);
-
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(aiResponse)
-                    .navigationLink(primaryActionLink)
-                    .navigationLabel(primaryActionLabel)
-                    .logId(generatedLogId)
-                    .build();
 
         } catch (Exception e) {
             log.error("[AI-CHAT] Critical AI Generation Failure", e);
@@ -195,6 +312,8 @@ public class FinCoreChatAgent {
         }
     }
 }
+
+
 
 
 
@@ -229,12 +348,6 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
 
-import static java.util.Collections.singletonList;
-
-/**
- * Handles converting ALL Oracle DB text (Procedural + Conceptual)
- * into AI Mathematical Vectors using LangChain4j and Redis.
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -252,9 +365,7 @@ public class DocumentIngestionService {
 
         List<Document> allDocuments = new ArrayList<>();
 
-        // ---------------------------------------------------------
-        // 1. INGEST PROCEDURAL DATA (Help Questions & UI Buttons)
-        // ---------------------------------------------------------
+        // 1. INGEST PROCEDURAL DATA
         List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
         for (HelpQuestionEntity q : questions) {
             String content = "Module: " + (q.getScreenName() != null ? q.getScreenName() : "General") +
@@ -264,18 +375,16 @@ public class DocumentIngestionService {
 
             String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
 
-            Metadata metadata = Metadata.from("permissionId", permId)
+            Metadata metadata = new Metadata()
+                    .put("permissionId", permId)
                     .put("actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE")
                     .put("actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE")
                     .put("dataType", "PROCEDURAL");
 
-
             allDocuments.add(Document.from(content, metadata));
         }
 
-        // ---------------------------------------------------------
-        // 2. INGEST CONCEPTUAL DATA (Knowledge Base Paragraphs)
-        // ---------------------------------------------------------
+        // 2. INGEST CONCEPTUAL DATA
         List<KnowledgeBaseEntity> knowledgeBase = knowledgeBaseRepository.findByIsActive("Y");
         for (KnowledgeBaseEntity kb : knowledgeBase) {
             String content = "Topic: " + kb.getTopic() +
@@ -283,8 +392,8 @@ public class DocumentIngestionService {
 
             String permId = kb.getPermissionId() != null ? String.valueOf(kb.getPermissionId()) : "GLOBAL";
 
-            // Conceptual data doesn't have UI action buttons, so we default to NONE
-            Metadata metadata = Metadata.from("permissionId", permId)
+            Metadata metadata = new Metadata()
+                    .put("permissionId", permId)
                     .put("actionLink", "NONE")
                     .put("actionLabel", "NONE")
                     .put("dataType", "CONCEPTUAL");
@@ -292,35 +401,23 @@ public class DocumentIngestionService {
             allDocuments.add(Document.from(content, metadata));
         }
 
-        // ---------------------------------------------------------
         // 3. CHUNK AND SAVE TO REDIS
-        // ---------------------------------------------------------
         if (!allDocuments.isEmpty()) {
-            // Split long documents into overlapping 300-token chunks
             List<TextSegment> segments = DocumentSplitters.recursive(300, 50).splitAll(allDocuments);
             log.info("[AI-INGEST] Chunked {} raw DB records into {} mathematical segments.", allDocuments.size(), segments.size());
 
-            // Generate Vectors via Ollama
             List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
 
-            // FIX GAP 1: Deterministic IDs to prevent Redis duplication on restart
             for (int i = 0; i < segments.size(); i++) {
                 TextSegment segment = segments.get(i);
                 Embedding vector = embeddings.get(i);
 
-                // Generate a unique, repeatable ID based on the Data Type and Permission
                 String dataType = segment.metadata().getString("dataType");
                 String perm = segment.metadata().getString("permissionId");
-
-                // Example ID: "PROCEDURAL_5_chunk_0", "CONCEPTUAL_GLOBAL_chunk_1"
                 String deterministicId = dataType + "_" + perm + "_chunk_" + i;
 
-                // Save one by one using the explicit ID
-                embeddingStore.addAll(
-                        singletonList(deterministicId),
-                        singletonList(vector),
-                        singletonList(segment)
-                );
+                // CLEAN FIX: Standard add method (id, vector, segment)
+                embeddingStore.add(deterministicId, vector, segment);
             }
             log.info("[AI-INGEST] Successfully saved/overwritten {} vectors to Redis Stack.", segments.size());
 
@@ -329,846 +426,6 @@ public class DocumentIngestionService {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.config;
-
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.ollama.OllamaChatModel;
-import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.redis.RedisEmbeddingStore;
-import dev.langchain4j.data.segment.TextSegment;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-import java.time.Duration;
-
-/**
- * Enterprise AI Configuration.
- * Connects the JVM to the offline Docker LLMs and Vector Database.
- */
-@Configuration
-public class AiConfiguration {
-
-    @Value("${langchain4j.ollama.base-url}")
-    private String ollamaBaseUrl;
-
-    @Value("${langchain4j.ollama.chat-model.name}")
-    private String chatModelName;
-
-    @Value("${langchain4j.ollama.embedding-model.name}")
-    private String embeddingModelName;
-
-    @Value("${langchain4j.vector-store.redis.host}")
-    private String redisHost;
-
-    @Value("${langchain4j.vector-store.redis.port}")
-    private Integer redisPort;
-
-    @Value("${langchain4j.vector-store.redis.index-name}")
-    private String indexName;
-
-    @Value("${langchain4j.vector-store.redis.prefix}")
-    private String prefix;
-
-    @Value("${langchain4j.vector-store.redis.dimension:1024}")
-    private Integer dimension;
-
-
-    // The Generative Model (The Talker)
-    @Bean
-    public ChatLanguageModel chatLanguageModel() {
-        return OllamaChatModel.builder()
-                .baseUrl(ollamaBaseUrl)
-                .modelName(chatModelName)
-                .temperature(0.1)
-                .timeout(Duration.ofSeconds(60))
-                .build();
-    }
-
-
-    // The Embedding Model (The Searcher)
-    @Bean
-    public EmbeddingModel embeddingModel() {
-        return OllamaEmbeddingModel.builder()
-                .baseUrl(ollamaBaseUrl)
-                .modelName(embeddingModelName)
-                .timeout(Duration.ofSeconds(15))
-                .build();
-    }
-
-    // The Vector Database (Redis Stack on Port 6380)
-    @Bean
-    public EmbeddingStore<TextSegment> embeddingStore() {
-        return RedisEmbeddingStore.builder()
-                .host(redisHost)
-                .port(redisPort)
-                .dimension(dimension)
-                .indexName(indexName)
-                .prefix(prefix)
-                .build();
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-# ==============================================================
-# FIN CORE - HELP SERVICE CONFIGURATION
-# ==============================================================
-spring.application.name=HelpService
-server.port=9099
-
-# --- ORACLE DATABASE ---
-spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
-spring.datasource.username=fincore
-spring.datasource.password=Password#1234
-spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
-
-# --- JPA / HIBERNATE ---
-spring.jpa.show-sql=false
-spring.jpa.hibernate.ddl-auto=validate
-spring.jpa.open-in-view=false
-
-# --- REDIS CACHE ---
-spring.data.redis.host=10.0.17.242
-spring.data.redis.port=6379
-spring.cache.type=redis
-# Cache time-to-live (1 Hour) - Refresh help content every hour
-spring.cache.redis.time-to-live=3600000
-
-# --- LOGGING ---
-logging.level.com.fincore.HelpService=INFO
-
-# --- Security ---
-jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
-
-
-# DB Timeouts: Configuration of connection pooling timeouts in application.properties.
-spring.datasource.hikari.connection-timeout=30000
-spring.datasource.hikari.maximum-pool-size=30
-
-# --- Actuator Base Config ---
-# Enable the endpoints, but control exposure in specific profile files
-management.endpoints.web.base-path=/actuator
-management.endpoint.health.probes.enabled=true
-management.endpoints.web.exposure.include=health, info, prometheus
-management.endpoint.health.show-details=always
-management.metrics.tags.application=${spring.application.name}
-management.info.env.enabled=true
-
-
-# ==============================================================
-# RESILIENCE4J CONFIGURATION (Global Rules)
-# ==============================================================
-# --- 1. RETRY STRATEGY ---
-# A. RETRY ON THESE (Transient / "Blips")
-# 1. Spring's wrapper for DB Timeouts, Deadlocks, Connection Drops
-resilience4j.retry.instances.defaultService.retry-exceptions[0]=org.springframework.dao.TransientDataAccessException
-# 2. Connection failure at start of transaction
-resilience4j.retry.instances.defaultService.retry-exceptions[1]=org.springframework.transaction.CannotCreateTransactionException
-# 3. DB Resource Failure (DB Down)
-resilience4j.retry.instances.defaultService.retry-exceptions[2]=org.springframework.dao.DataAccessResourceFailureException
-# 4. Network I/O errors (for Feign/RestCalls)
-resilience4j.retry.instances.defaultService.retry-exceptions[3]=java.io.IOException
-resilience4j.retry.instances.defaultService.retry-exceptions[4]=java.net.ConnectException
-resilience4j.retry.instances.defaultService.retry-exceptions[5]=java.net.SocketTimeoutException
-
-# B. DO NOT RETRY ON THESE (Logic / Permanent Errors)
-# Even if these happen, we fail immediately so GlobalExceptionHandler can return 400/409
-resilience4j.retry.instances.defaultService.ignore-exceptions[0]=java.lang.IllegalArgumentException
-resilience4j.retry.instances.defaultService.ignore-exceptions[1]=java.lang.NullPointerException
-resilience4j.retry.instances.defaultService.ignore-exceptions[2]=org.springframework.dao.DataIntegrityViolationException
-resilience4j.retry.instances.defaultService.ignore-exceptions[3]=org.springframework.dao.DuplicateKeyException
-resilience4j.retry.instances.defaultService.ignore-exceptions[4]=org.springframework.web.client.HttpClientErrorException
-
-# --- 2. CIRCUIT BREAKER STRATEGY ---
-# If 50% of requests fail, OPEN the circuit (Fail Fast)
-resilience4j.circuitbreaker.instances.defaultService.failure-rate-threshold=50
-# Wait 10 seconds before trying again (Half-Open state)
-resilience4j.circuitbreaker.instances.defaultService.wait-duration-in-open-state=10s
-# Must have at least 5 calls to calculate failure rate
-resilience4j.circuitbreaker.instances.defaultService.minimum-number-of-calls=5
-# When Half-Open, allow 3 test calls to see if backend is up
-resilience4j.circuitbreaker.instances.defaultService.permitted-number-of-calls-in-half-open-state=3
-# Automatically move from Open to Half-Open
-resilience4j.circuitbreaker.instances.defaultService.automatic-transition-from-open-to-half-open-enabled=true
-
-
-
-
-# ==============================================================
-#                           AI CONFIGS
-# ==============================================================
-#
-## Ollama Configuration
-#spring.ai.ollama.base-url=http://localhost:11434
-#spring.ai.ollama.chat.model=phi3-mini
-#spring.ai.ollama.chat.options.temperature=0.1
-#spring.ai.ollama.embedding.model=mxbai-embed
-#
-## Redis Vector Store Configuration
-#spring.ai.vectorstore.redis.uri=redis://localhost:6380
-#spring.ai.vectorstore.redis.index=fincore-help-index
-#spring.ai.vectorstore.redis.prefix=fincore:doc:
-#
-## Web MVC Async Settings - 30 SEC LATER
-#spring.mvc.async.request-timeout=90000
-#
-
-
-# Base URL and Model
-# Ollama Connection
-langchain4j.ollama.base-url=http://localhost:11434
-langchain4j.ollama.chat-model.name=phi3-mini
-langchain4j.ollama.chat-model.temperature=0.1
-langchain4j.ollama.embedding-model.name=mxbai-embed
-
-# Redis Vector Store (Port 6380)
-langchain4j.vector-store.redis.host=localhost
-langchain4j.vector-store.redis.port=6380
-langchain4j.vector-store.redis.index-name=fincore-help-index
-langchain4j.vector-store.redis.prefix=fincore:doc:
-langchain4j.vector-store.redis.dimension=1024
-
-
-## Web MVC Async Settings - TODO 30 SEC LATER
-spring.mvc.async.request-timeout=90000
-
-
-
-
-
-
-
-
-
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.0</version>
-        <relativePath/> <!-- lookup parent from repository -->
-    </parent>
-    <groupId>com.fincore</groupId>
-    <artifactId>HelpService</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>HelpService</name>
-    <description>HelpService</description>
-    <url/>
-    <licenses>
-        <license/>
-    </licenses>
-    <developers>
-        <developer/>
-    </developers>
-    <scm>
-        <connection/>
-        <developerConnection/>
-        <tag/>
-        <url/>
-    </scm>
-    <properties>
-        <java.version>21</java.version>
-    </properties>
-
-
-    <dependencies>
-        <!-- Core Web -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-
-        <!-- Persistence -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.oracle.database.jdbc</groupId>
-            <artifactId>ojdbc11</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-
-        <!-- Caching (Redis) -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
-
-        <!-- Tools -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-validation</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>com.fincore</groupId>
-            <artifactId>common-utilities</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
-        </dependency>
-        <dependency>
-            <groupId>net.logstash.logback</groupId>
-            <artifactId>logstash-logback-encoder</artifactId>
-            <version>7.4</version>
-        </dependency>
-
-        <!-- health metrics -->
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-registry-prometheus</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-
-
-        <!-- Apache OpenNLP for POS Tagging & Tokenization -->
-        <dependency>
-            <groupId>org.apache.opennlp</groupId>
-            <artifactId>opennlp-tools</artifactId>
-            <version>2.3.0</version>
-        </dependency>
-
-        <!-- Apache Commons Lang for optimized Levenshtein Distance -->
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-lang3</artifactId>
-            <version>3.18.0</version>
-        </dependency>
-
-        <!-- Source: https://mvnrepository.com/artifact/org.apache.commons/commons-text -->
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-text</artifactId>
-            <version>1.15.0</version>
-        </dependency>
-
-        <dependency>
-            <groupId>commons-codec</groupId>
-            <artifactId>commons-codec</artifactId>
-            <version>1.16.0</version>
-        </dependency>
-
-        <!-- 1. LangChain4j Core -->
-        <!-- Source: https://mvnrepository.com/artifact/dev.langchain4j/langchain4j -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j</artifactId>
-            <version>1.0.0-alpha1</version>
-            <scope>compile</scope>
-        </dependency>
-
-        <!-- 2. LangChain4j Ollama (To talk to Phi-3 and Mxbai) -->
-        <!-- Source: https://mvnrepository.com/artifact/dev.langchain4j/langchain4j-ollama -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-ollama</artifactId>
-            <version>1.0.0-alpha1</version>
-            <scope>compile</scope>
-        </dependency>
-
-        <!-- 3. LangChain4j Redis (To talk to Redis Stack) -->
-        <!-- Source: https://mvnrepository.com/artifact/dev.langchain4j/langchain4j-redis -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-redis</artifactId>
-            <version>1.0.0-alpha1</version>
-            <scope>compile</scope>
-        </dependency>
-
-        <!-- Source: https://mvnrepository.com/artifact/dev.langchain4j/langchain4j-redis-spring-boot-starter -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-redis-spring-boot-starter</artifactId>
-            <version>1.0.0-alpha1</version>
-            <scope>compile</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>com.github.ben-manes.caffeine</groupId>
-            <artifactId>caffeine</artifactId>
-        </dependency>
-
-
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <configuration>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.springframework.boot</groupId>
-                            <artifactId>spring-boot-configuration-processor</artifactId>
-                        </path>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </path>
-                    </annotationProcessorPaths>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-
-</project>
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.controller;
-
-import com.fincore.helpservice.dto.HelpRequestDTO;
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import com.fincore.helpservice.service.FinCoreChatAgent;
-import com.fincore.helpservice.service.HelpAnalyticsService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
-import java.util.Map;
-
-/**
- * Primary REST Controller for the FinCore Help & AI Assistant.
- * Orchestrates Generative AI Chat, Static Module Help, and Global FAQs.
- */
-@RestController
-@RequestMapping("/api/help")
-@RequiredArgsConstructor
-@Slf4j
-public class HelpController {
-
-    // 1. The New AI Brain
-    private final FinCoreChatAgent chatAgent;
-
-    // 2. The Traditional DB Repositories (For fast, non-AI queries)
-    private final HelpQuestionRepository questionRepository;
-
-    // 3. Analytics (For Thumbs Up / Thumbs Down feedback)
-    private final HelpAnalyticsService analyticsService;
-
-    // ========================================================================
-    // 1. THE AI CHAT ENDPOINT (Powered by Phi-3 & Mxbai)
-    // ========================================================================
-    @PostMapping("/chat")
-    public ResponseEntity<HelpResponseDTO> handleChatQuery(
-            @RequestHeader("X-User-Id") String userId,
-            @RequestHeader("X-Role-Id") String roleId,
-            @RequestBody HelpRequestDTO request) {
-
-        log.info("[API] Chat request received from User: {} | Message: '{}'", userId, request.getUserMessage());
-
-        // Route the query through our LangChain4j RAG pipeline
-        HelpResponseDTO response = chatAgent.handleChat(userId, roleId, request.getUserMessage());
-
-        return ResponseEntity.ok(response);
-    }
-
-    // ========================================================================
-    // 2. STATIC MODULE HELP (Powered by fast SQL - No AI required)
-    // ========================================================================
-    @GetMapping("/module")
-    public ResponseEntity<List<HelpQuestionEntity>> getModuleHelp(
-            @RequestHeader("X-Role-Id") String roleId,
-            @RequestParam("screen") String screenName) {
-
-        log.info("[API] Fetching static module help for screen: {}", screenName);
-
-        // NOTE: Replace this with your existing traditional service call if you have one.
-        // Flow: Fetch active questions matching the screenName and the user's roleId permissions.
-        List<HelpQuestionEntity> moduleQuestions = questionRepository.findByScreenNameAndIsActive(screenName, "Y");
-
-        // (Assume filtering by roleId happens in your service layer before returning)
-        return ResponseEntity.ok(moduleQuestions);
-    }
-
-    // ========================================================================
-    // 3. GLOBAL FAQS (Powered by fast SQL - No AI required)
-    // ========================================================================
-    @GetMapping("/faqs")
-    public ResponseEntity<List<HelpQuestionEntity>> getGlobalFaqs() {
-        log.info("[API] Fetching global FAQs");
-
-        // Flow: Fetch predefined global questions (where permission_id is null/GLOBAL)
-        List<HelpQuestionEntity> globalFaqs = questionRepository.findGlobalFaqs();
-
-        return ResponseEntity.ok(globalFaqs);
-    }
-
-    // ========================================================================
-    // 4. CHAT FEEDBACK ENDPOINT (For UI Thumbs Up / Thumbs Down)
-    // ========================================================================
-    @PostMapping("/feedback")
-    public ResponseEntity<Void> submitChatFeedback(
-            @RequestHeader("X-User-Id") String userId,
-            @RequestBody Map<String, Object> feedbackPayload) {
-
-        // Expected payload: { "logId": 12345, "isHelpful": true }
-        Long logId = Long.valueOf(feedbackPayload.get("logId").toString());
-        boolean isHelpful = (Boolean) feedbackPayload.get("isHelpful");
-
-        log.info("[API] Feedback received for Log ID: {} | Helpful: {}", logId, isHelpful);
-
-        // Update the audit trail in Oracle to reflect user satisfaction
-        analyticsService.updateFeedback(logId, isHelpful);
-
-        return ResponseEntity.ok().build();
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import lombok.Data;
-
-@Data
-public class HelpRequestDTO {
-
-    // The actual question typed by the user
-    private String userMessage;
-
-    // Optional: If the frontend knows what screen the user is currently on, 
-    // it can pass it here so you can add it to the AI's context later!
-    private String currentScreen;
-}
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.util.List;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class HelpResponseDTO {
-
-    /**
-     * Dictates the UI State.
-     * Expected values: "TEXT_REPLY", "SUGGESTION", "ESCALATION_OFFER", "NO_MATCH"
-     */
-    private String responseType;
-
-    /**
-     * The actual text generated by Phi-3 (or standard fallback text).
-     * Can contain HTML like <b> or <br/> for the frontend to render.
-     */
-    private String botReply;
-
-    /**
-     * If the AI found a relevant module, this is the URL/Route (e.g., "/cgl-management")
-     */
-    private String navigationLink;
-
-    /**
-     * The text to display on the UI button (e.g., "Go to CGL Management")
-     */
-    private String navigationLabel;
-
-    /**
-     * CRITICAL FOR FEEDBACK:
-     * The Primary Key ID of the log saved in Oracle DB.
-     * The UI needs this so when the user clicks "Thumbs Up", it sends this ID back to the /feedback endpoint.
-     */
-    private Long logId;
-
-    /**
-     * Used ONLY if responseType is "SUGGESTION".
-     * A list of clickable follow-up questions for the user.
-     */
-    private List<String> items;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.repository.PermissionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class PermissionService {
-
-    private final JdbcTemplate jdbcTemplate;
-
-    /**
-     * Used by the Vector Store to filter which documents the user is mathematically allowed to search.
-     * Returns a list of Permission IDs (e.g., ["5", "6", "12"])
-     */
-    public List<String> getAllAllowedPermissionIdsForRole(String roleId) {
-        String sql = """
-            SELECT CAST(p.PERMISSION_ID AS VARCHAR2(50))
-            FROM PERMISSIONS p
-            JOIN ROLE_PERMISSIONS rp ON p.PERMISSION_ID = rp.PERMISSION_ID
-            WHERE rp.ROLE_ID = ? AND p.IS_ACTIVE = 'Y'
-        """;
-
-        return jdbcTemplate.queryForList(sql, String.class, roleId);
-    }
-
-    /**
-     * Used by the Dynamic Prompt Injection so Phi-3 knows what the user is capable of doing.
-     * Returns a list of human-readable action names (e.g., ["Create CGL", "Approve CGL"])
-     */
-    public List<String> getAllowedActionNamesForRole(String roleId) {
-        String sql = """
-            SELECT p.PERMISSION_NAME
-            FROM PERMISSIONS p
-            JOIN ROLE_PERMISSIONS rp ON p.PERMISSION_ID = rp.PERMISSION_ID
-            WHERE rp.ROLE_ID = ? AND p.IS_ACTIVE = 'Y'
-        """;
-
-        return jdbcTemplate.queryForList(sql, String.class, roleId);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-/**
- * Manages the "3-Strike" Escalation Engine.
- * If the AI fails to answer a user's question multiple times in a row,
- * this service triggers the IT Support handoff.
- */
-@Service
-@Slf4j
-public class ChatSessionService {
-
-    // In-memory strike counter mapped by UserId.
-    private final Map<String, Integer> userStrikes = new ConcurrentHashMap<>();
-
-    private static final int MAX_STRIKES = 3;
-
-    public boolean isEscalationRequired(String userId) {
-        int currentStrikes = userStrikes.getOrDefault(userId, 0);
-        return currentStrikes >= MAX_STRIKES;
-    }
-
-    public void addStrikes(String userId, int count) {
-        int newStrikes = userStrikes.getOrDefault(userId, 0) + count;
-        userStrikes.put(userId, newStrikes);
-        log.warn("[SESSION] User {} gained a strike. Current strikes: {}/{}", userId, newStrikes, MAX_STRIKES);
-    }
-
-    public void resetStrikes(String userId) {
-        if (userStrikes.containsKey(userId)) {
-            userStrikes.remove(userId);
-            log.debug("[SESSION] User {} chat strikes reset to 0 due to successful AI response.", userId);
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpInteractionLogEntity;
-import com.fincore.helpservice.repository.HelpInteractionLogRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.LocalDateTime;
-
-/**
- * Handles the Oracle Database Audit Trail.
- * Records every AI interaction and processes the UI Thumbs Up/Down feedback.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class HelpAnalyticsService {
-
-    private final HelpInteractionLogRepository logRepository;
-
-    /**
-     * Logs the chat attempt and returns the DB Primary Key (LogId).
-     * This ID is sent to the frontend so the user can rate this specific answer.
-     */
-    @Transactional
-    public Long logChatInteraction(String userId, String sourceEngine, String userMessage, String responseType, int confidenceScore) {
-        try {
-            HelpInteractionLogEntity logEntity = HelpInteractionLogEntity.builder()
-                    .userId(userId)
-                    .sourceEngine(sourceEngine)
-                    .userMessage(userMessage)
-                    .responseType(responseType)
-                    .confidenceScore(confidenceScore)
-                    .createdAt(LocalDateTime.now())
-                    .build();
-
-            logEntity = logRepository.save(logEntity);
-            log.debug("[ANALYTICS] Saved interaction log for user {} with LogID {}", userId, logEntity.getLogId());
-
-            return logEntity.getLogId();
-
-        } catch (Exception e) {
-            log.error("[ANALYTICS] Failed to save interaction log to Oracle DB.", e);
-            return null; // Don't crash the chat just because logging failed
-        }
-    }
-
-    /**
-     * Called when the user clicks the Thumbs Up or Thumbs Down button in the UI.
-     */
-    @Transactional
-    public void updateFeedback(Long logId, boolean isHelpful) {
-        if (logId == null) return;
-
-        logRepository.findById(logId).ifPresentOrElse(logEntity -> {
-            logEntity.setIsHelpful(isHelpful);
-            logRepository.save(logEntity);
-            log.info("[ANALYTICS] LogID {} marked as helpful: {}", logId, isHelpful);
-        }, () -> log.warn("[ANALYTICS] Received feedback for unknown LogID: {}", logId));
-    }
-}
-
-
-
-
-
-
-
-
-
 
 
 
