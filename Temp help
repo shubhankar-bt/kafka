@@ -1,516 +1,169 @@
-version: '3.8'
-services:
-  # 1. The Vector Database
-  redis-vector:
-    image: redis/redis-stack-server:latest
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
 
-  # 2. The Local AI Engine
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
-volumes:
-  redis_data:
-  ollama_data:
-
-Crucial Setup Command:
-After running docker-compose up -d, your containers will be running, but Ollama is "empty". You must tell Ollama to download the two models we chose. Run these two commands in your terminal:
- * docker exec -it ollama ollama run llama3 (Downloads the conversational brain - ~4.7GB)
- * docker exec -it ollama ollama pull mxbai-embed-large (Downloads the embedding search brain - ~670MB)
-Step 2: Spring Boot Configuration (pom.xml & application.yml)
-Add the official Spring AI dependencies to your pom.xml (Requires Spring Boot 3.2+ and Java 17+):
-<!-- Spring AI BOM (Bill of Materials) -->
-<dependencyManagement>
-    <dependencies>
-        <dependency>
-            <groupId>org.springframework.ai</groupId>
-            <artifactId>spring-ai-bom</artifactId>
-            <version>1.0.0-M1</version> <!-- Use the latest milestone or release -->
-            <type>pom</type>
-            <scope>import</scope>
-        </dependency>
-    </dependencies>
-</dependencyManagement>
-
-<dependencies>
-    <!-- Connects to Ollama -->
-    <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
-    </dependency>
-    <!-- Connects to Redis Vector Store -->
-    <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-redis-spring-boot-starter</artifactId>
-    </dependency>
-</dependencies>
-
-Add this to your application.yml:
-spring:
-  ai:
-    ollama:
-      base-url: http://localhost:11434
-      chat:
-        model: llama3 # The talker
-      embedding:
-        model: mxbai-embed-large # The searcher
-    vectorstore:
-      redis:
-        uri: redis://localhost:6379
-        index: fincore-help-index
-        prefix: "fincore:doc:"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-
-/**
- * Handles converting Oracle DB text into AI Mathematical Vectors (Embeddings)
- * and storing them securely in Redis Stack with RBAC metadata.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DocumentIngestionService {
-
-    private final HelpQuestionRepository questionRepository;
-    private final VectorStore vectorStore; // Spring AI Redis Auto-Configuration
-
-    @EventListener(ApplicationReadyEvent.class)
-    public void ingestKnowledgeBase() {
-        log.info("Starting AI Knowledge Ingestion to Redis...");
-
-        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
-
-        List<Document> documents = questions.stream().map(q -> {
-            // 1. Combine Question and Answer so the AI has full context
-            String content = "Q: " + q.getQuestionText() + "\nA: " + q.getAnswerContent();
-            if (q.getProTip() != null) {
-                content += "\nPro Tip: " + q.getProTip();
-            }
-
-            // 2. Attach Security Metadata (CRITICAL FOR RBAC)
-            // We store the Permission ID as a String for Redis filtering compatibility
-            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
-            
-            Map<String, Object> metadata = Map.of(
-                    "permissionId", permId,
-                    "screenName", q.getScreenName() != null ? q.getScreenName() : "General",
-                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE",
-                    "actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE"
-            );
-
-            // 3. Create Spring AI Document
-            return new Document(content, metadata);
-        }).collect(Collectors.toList());
-
-        // 4. Send to Ollama (Embed) -> Save to Redis (Store)
-        // Note: In production, we would check if docs already exist to avoid re-embedding.
-        if (!documents.isEmpty()) {
-            vectorStore.add(documents);
-            log.info("Successfully ingested {} documents into Redis Vector Store.", documents.size());
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
-import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.memory.InMemoryChatMemory;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.stream.Collectors;
-
-/**
- * THE RAG ENGINE (Retrieval-Augmented Generation)
- * The ultimate fusion of Vector Search, RBAC Security, and LLM Generation.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class FinCoreChatAgent {
-
-    private final ChatClient chatClient; // Configured automatically by Spring AI
-    private final VectorStore vectorStore;
-    private final PermissionService permissionService;
-    
-    // In-Memory Chat History (Conversational Context)
-    // Production: Use RedisChatMemory (custom implementation) for multi-node persistence
-    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
-
-    private static final String SYSTEM_PROMPT = """
-            You are the elite FinCore Banking Assistant. 
-            You must ONLY answer using the EXACT Context provided below. 
-            Do NOT hallucinate, guess, or provide information from outside the Context.
-            If the Context does not contain the answer, reply EXACTLY with: 
-            'I cannot find this information in your currently authorized FinCore manuals. Please check your permissions or contact IT.'
-            Always format your response cleanly using HTML tags like <br/> or <b> for the frontend UI.
-            """;
-
-    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, VectorStore vectorStore, PermissionService permissionService) {
-        this.vectorStore = vectorStore;
-        this.permissionService = permissionService;
-        
-        // Build the core Chat Client with our strict System Guardrails
-        this.chatClient = chatClientBuilder
-                .defaultSystem(SYSTEM_PROMPT)
-                .build();
-    }
-
-    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
-        try {
-            // 1. Get User's Allowed Permissions (e.g., [5, 6, 12, 30])
-            List<String> allowedPermIds = permissionService.getAllAllowedPermissionIdsForRole(roleId)
-                    .stream()
-                    .map(String::valueOf)
-                    .collect(Collectors.toList());
-            allowedPermIds.add("GLOBAL"); // Add global FAQs
-
-            // 2. Build RBAC Vector Search Request
-            // This ensures Redis ONLY returns paragraphs the user is allowed to read!
-            var filterBuilder = new FilterExpressionBuilder();
-            SearchRequest searchRequest = SearchRequest.query(userMessage)
-                    .withTopK(3) // Fetch top 3 matches
-                    .withFilterExpression(filterBuilder.in("permissionId", allowedPermIds).build());
-
-            // 3. Pre-fetch documents to extract UI Action Links (Solving Gap 2)
-            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
-            String primaryActionLink = null;
-            String primaryActionLabel = null;
-            
-            if (!matchedDocs.isEmpty()) {
-                // Grab the link from the highest confidence document
-                Document topDoc = matchedDocs.get(0);
-                if (!"NONE".equals(topDoc.getMetadata().get("actionLink"))) {
-                    primaryActionLink = (String) topDoc.getMetadata().get("actionLink");
-                    primaryActionLabel = (String) topDoc.getMetadata().get("actionLabel");
-                }
-            }
-
-            // 4. Call Llama 3 with Memory and RAG Advisors
-            String aiResponse = this.chatClient.prompt()
-                    .user(userMessage)
-                    .advisors(
-                            // Advisor 1: RAG (I injects the Redis search results into the prompt securely)
-                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
-                            // Advisor 2: Memory (It remembers previous messages using the userId as a session key)
-                            new MessageChatMemoryAdvisor(chatMemory, userId, 5) // Remembers last 5 messages
-                    )
-                    .call()
-                    .content();
-
-            // 5. Construct final DTO to send to frontend
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(aiResponse)
-                    .navigationLink(primaryActionLink)   // Restores the UI button!
-                    .navigationLabel(primaryActionLabel)
-                    .build();
-
-        } catch (Exception e) {
-            log.error("AI Generation Failed", e);
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
-                    .build();
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
----------------------------
-perfections : 
-
-spring:
-  ai:
-    ollama:
-      base-url: http://localhost:11434
-      chat:
-        model: llama3.1 # Best for RAG
-        options:
-          temperature: 0.1 # VERY IMPORTANT: 0.1 makes the AI strict/factual. 0.9 makes it creative/hallucinate.
-      embedding:
-        model: mxbai-embed-large
-  # Prevent Spring MVC from timing out while waiting for Ollama
-  mvc:
-    async:
-      request-timeout: 30000 # 30 seconds
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.transformer.splitter.TokenTextSplitter;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DocumentIngestionService {
-
-    private final HelpQuestionRepository questionRepository;
-    private final VectorStore vectorStore;
-
-    @EventListener(ApplicationReadyEvent.class)
-    public void ingestKnowledgeBase() {
-        log.info("Starting AI Knowledge Ingestion...");
-        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
-
-        List<Document> rawDocuments = questions.stream().map(q -> {
-            String content = "Module: " + q.getScreenName() + "\nQ: " + q.getQuestionText() + "\nA: " + q.getAnswerContent();
-            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
-            
-            Map<String, Object> metadata = Map.of(
-                    "permissionId", permId,
-                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE"
-            );
-            return new Document(content, metadata);
-        }).collect(Collectors.toList());
-
-        if (!rawDocuments.isEmpty()) {
-            // PERFECTION: Split long documents into perfectly sized overlapping chunks
-            // This guarantees the Vector math remains highly accurate
-            TokenTextSplitter splitter = new TokenTextSplitter(250, 50, 5, 10000, true);
-            List<Document> chunkedDocs = splitter.apply(rawDocuments);
-            
-            vectorStore.add(chunkedDocs);
-            log.info("Successfully ingested {} chunked documents into Redis.", chunkedDocs.size());
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
-import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.memory.InMemoryChatMemory;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class FinCoreChatAgent {
-
-    private final ChatClient chatClient;
-    private final VectorStore vectorStore;
-    private final PermissionService permissionService;
-    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
-
-    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, VectorStore vectorStore, PermissionService permissionService) {
-        this.vectorStore = vectorStore;
-        this.permissionService = permissionService;
-        this.chatClient = chatClientBuilder
-                .defaultSystem("You are the elite FinCore Banking Assistant. Answer ONLY using the provided Context. Be concise.")
-                .build();
-    }
-
-    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
-        try {
-            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId).stream().map(String::valueOf).collect(Collectors.toList());
-            allowedPerms.add("GLOBAL");
-
-            // 1. Execute Vector Search
-            SearchRequest searchRequest = SearchRequest.query(userMessage)
-                    .withTopK(3)
-                    // High similarity threshold (0.7) ensures we don't fetch garbage data
-                    .withSimilarityThreshold(0.7) 
-                    .withFilterExpression(new FilterExpressionBuilder().in("permissionId", allowedPerms).build());
-
-            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
-
-            // PERFECTION: The Fast-Fail
-            // If the math says there are NO related documents, do not wake up Llama 3!
-            if (matchedDocs.isEmpty()) {
-                log.info("Fast-Fail: No vector match found for query '{}'", userMessage);
-                return HelpResponseDTO.builder()
-                        .responseType("NO_MATCH")
-                        .botReply("I couldn't find any information about that in your authorized modules. Please try rephrasing.")
-                        .build();
-            }
-
-            // Extract UI Action Link from the best match
-            String actionLink = (String) matchedDocs.get(0).getMetadata().get("actionLink");
-
-            // 2. Wake up Llama 3 for Generative Response
-            String aiResponse = this.chatClient.prompt()
-                    .user(userMessage)
-                    .advisors(
-                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
-                            new MessageChatMemoryAdvisor(chatMemory, userId, 5)
-                    )
-                    .call()
-                    .content();
-
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(aiResponse)
-                    .navigationLink("NONE".equals(actionLink) ? null : actionLink)
-                    .build();
-
-        } catch (Exception e) {
-            log.error("AI Generation Failed", e);
-            return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I am currently experiencing a cognitive delay. Please try again.").build();
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+2026-02-24 18:12:46.964 INFO  [main] c.f.h.s.DocumentIngestionService: [AI-INGEST] Successfully saved/overwritten 53 vectors to Redis Stack. 
+2026-02-24 18:13:21.836 INFO  [http-nio-9099-exec-2] c.f.h.c.HelpController: [API] Chat request received from User: 2488766 | Message: 'Hii. Who are you?' 
+2026-02-24 18:13:21.849 INFO  [http-nio-9099-exec-2] c.f.h.s.FinCoreChatAgent: [AI-CHAT] Processing query for User: 2488766 
+2026-02-24 18:13:22.374 ERROR [http-nio-9099-exec-2] c.f.h.s.FinCoreChatAgent: [AI-CHAT] Critical AI Generation Failure 
+java.lang.UnsupportedOperationException: EmbeddingSearchRequest.Filter is not supported yet.
+	at dev.langchain4j.store.embedding.EmbeddingStore.search(EmbeddingStore.java:148)
+	at com.fincore.helpservice.service.FinCoreChatAgent.handleChat(FinCoreChatAgent.java:139)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:354)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.lambda$applyResilience$0(GlobalResilienceAspect.java:56)
+	at io.github.resilience4j.retry.Retry.lambda$decorateSupplier$5(Retry.java:301)
+	at io.github.resilience4j.circuitbreaker.CircuitBreaker.lambda$decorateSupplier$5(CircuitBreaker.java:194)
+	at com.fincore.commonutilities.aspect.GlobalResilienceAspect.applyResilience(GlobalResilienceAspect.java:75)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:637)
+	at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:627)
+	at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)
+	at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)
+	at org.springframework.aop.framework.CglibAopProxy$CglibMethodInvocation.proceed(CglibAopProxy.java:768)
+	at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:720)
+	at com.fincore.helpservice.service.FinCoreChatAgent$$SpringCGLIB$$0.handleChat(<generated>)
+	at com.fincore.helpservice.controller.HelpController.handleChatQuery(HelpController.java:51)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:255)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:188)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.invokeHandlerMethod(RequestMappingHandlerAdapter.java:926)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:831)
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979)
+	at org.springframework.web.servlet.FrameworkServlet.processRequest(FrameworkServlet.java:1014)
+	at org.springframework.web.servlet.FrameworkServlet.doPost(FrameworkServlet.java:914)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:590)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:658)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.tomcat.websocket.server.WsFilter.doFilter(WsFilter.java:51)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:108)
+	at org.springframework.security.web.FilterChainProxy.lambda$doFilterInternal$3(FilterChainProxy.java:231)
+	at org.springframework.security.web.ObservationFilterChainDecorator$FilterObservation$SimpleFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:479)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$1(ObservationFilterChainDecorator.java:340)
+	at org.springframework.security.web.ObservationFilterChainDecorator.lambda$wrapSecured$0(ObservationFilterChainDecorator.java:82)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:128)
+	at org.springframework.security.web.access.intercept.AuthorizationFilter.doFilter(AuthorizationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:126)
+	at org.springframework.security.web.access.ExceptionTranslationFilter.doFilter(ExceptionTranslationFilter.java:120)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:131)
+	at org.springframework.security.web.session.SessionManagementFilter.doFilter(SessionManagementFilter.java:85)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.AnonymousAuthenticationFilter.doFilter(AnonymousAuthenticationFilter.java:100)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter.doFilter(SecurityContextHolderAwareRequestFilter.java:179)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.savedrequest.RequestCacheAwareFilter.doFilter(RequestCacheAwareFilter.java:63)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at com.fincore.commonutilities.security.ContextRbacFilter.doFilterInternal(ContextRbacFilter.java:145)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at com.fincore.commonutilities.logging.MdcLoggingFilter.doFilterInternal(MdcLoggingFilter.java:66)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:107)
+	at org.springframework.security.web.authentication.logout.LogoutFilter.doFilter(LogoutFilter.java:93)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.web.filter.CorsFilter.doFilterInternal(CorsFilter.java:91)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.header.HeaderWriterFilter.doHeadersAfter(HeaderWriterFilter.java:90)
+	at org.springframework.security.web.header.HeaderWriterFilter.doFilterInternal(HeaderWriterFilter.java:75)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:82)
+	at org.springframework.security.web.context.SecurityContextHolderFilter.doFilter(SecurityContextHolderFilter.java:69)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter.doFilterInternal(WebAsyncManagerIntegrationFilter.java:62)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:227)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.session.DisableEncodeUrlFilter.doFilterInternal(DisableEncodeUrlFilter.java:42)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.wrapFilter(ObservationFilterChainDecorator.java:240)
+	at org.springframework.security.web.ObservationFilterChainDecorator$AroundFilterObservation$SimpleAroundFilterObservation.lambda$wrap$0(ObservationFilterChainDecorator.java:323)
+	at org.springframework.security.web.ObservationFilterChainDecorator$ObservationFilter.doFilter(ObservationFilterChainDecorator.java:224)
+	at org.springframework.security.web.ObservationFilterChainDecorator$VirtualFilterChain.doFilter(ObservationFilterChainDecorator.java:137)
+	at org.springframework.security.web.FilterChainProxy.doFilterInternal(FilterChainProxy.java:233)
+	at org.springframework.security.web.FilterChainProxy.doFilter(FilterChainProxy.java:191)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.servlet.handler.HandlerMappingIntrospector.lambda$createCacheFilter$3(HandlerMappingIntrospector.java:195)
+	at org.springframework.web.filter.CompositeFilter$VirtualFilterChain.doFilter(CompositeFilter.java:113)
+	at org.springframework.web.filter.CompositeFilter.doFilter(CompositeFilter.java:74)
+	at org.springframework.security.config.annotation.web.configuration.WebMvcSecurityConfiguration$CompositeFilterChainProxy.doFilter(WebMvcSecurityConfiguration.java:230)
+	at org.springframework.web.filter.DelegatingFilterProxy.invokeDelegate(DelegatingFilterProxy.java:352)
+	at org.springframework.web.filter.DelegatingFilterProxy.doFilter(DelegatingFilterProxy.java:268)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.FormContentFilter.doFilterInternal(FormContentFilter.java:93)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.ServerHttpObservationFilter.doFilterInternal(ServerHttpObservationFilter.java:109)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:164)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167)
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
+	at org.apache.catalina.authenticator.AuthenticatorBase.invoke(AuthenticatorBase.java:482)
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115)
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
+	at org.apache.catalina.core.StandardEngineValve.invoke(StandardEngineValve.java:74)
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344)
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:389)
+	at org.apache.coyote.AbstractProcessorLight.process(AbstractProcessorLight.java:63)
+	at org.apache.coyote.AbstractProtocol$ConnectionHandler.process(AbstractProtocol.java:896)
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1741)
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:659)
+	at org.apache.tomcat.util.threads.TaskThread$WrappingRunnable.run(TaskThread.java:63)
+	at java.base/java.lang.Thread.run(Thread.java:1570)
