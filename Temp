@@ -1,295 +1,125 @@
-Create the Modelfiles:
-Inside your fincore-ai/local-models/models folder (where the .gguf files are), create two plain text files:
-Create Modelfile-phi3:
-
-
-FROM ./Phi-3-mini-4k-instruct-q4.gguf
-
-
-
-
-
-
-Create Modelfile-mxbai:
-
-
-FROM ./mxbai-embed-large-v1-f16.gguf
-
-
-
-
-
-
-version: '3.8'
-services:
-  redis-vector:
-    image: redis/redis-stack-server:latest
-    ports:
-      - "6379:6379"
-
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      # Maps your local laptop folder into the docker container at /models
-      - ./fincore-ai/local-models/models:/models 
-
-
-
-
-
-
-
-spring:
-  ai:
-    ollama:
-      base-url: http://localhost:11434
-      chat:
-        model: phi3-mini
-        options:
-          temperature: 0.1 # Crucial for Phi-3 to remain strictly factual
-      embedding:
-        model: mxbai-embed
-    vectorstore:
-      redis:
-        uri: redis://localhost:6379
-        index: fincore-help-index
-        prefix: "fincore:doc:"
-  mvc:
-    async:
-      request-timeout: 30000 # Prevent timeouts while Phi-3 generates text
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.transformer.splitter.TokenTextSplitter;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-
-/**
- * Handles converting Oracle DB text into AI Mathematical Vectors (Embeddings) using Mxbai.
- * Stores them securely in Redis Stack with RBAC metadata.
- */
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DocumentIngestionService {
-
-    private final HelpQuestionRepository questionRepository;
-    private final VectorStore vectorStore;
-
-    @EventListener(ApplicationReadyEvent.class)
-    public void ingestKnowledgeBase() {
-        log.info("Starting AI Knowledge Ingestion to Redis using mxbai-embed...");
-
-        List<HelpQuestionEntity> questions = questionRepository.findByIsActive("Y");
-
-        List<Document> rawDocuments = questions.stream().map(q -> {
-            // Combine Question and Answer so the AI has full semantic context
-            String content = "Module: " + (q.getScreenName() != null ? q.getScreenName() : "General") + 
-                             "\nQuestion: " + q.getQuestionText() + 
-                             "\nAnswer: " + q.getAnswerContent();
-                             
-            if (q.getProTip() != null) {
-                content += "\nPro Tip: " + q.getProTip();
-            }
-
-            // Attach Security Metadata (CRITICAL FOR RBAC)
-            String permId = q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL";
-            
-            Map<String, Object> metadata = Map.of(
-                    "permissionId", permId,
-                    "actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE",
-                    "actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE"
-            );
-
-            return new Document(content, metadata);
-        }).collect(Collectors.toList());
-
-        if (!rawDocuments.isEmpty()) {
-            // Split long documents into perfectly sized chunks for high-accuracy math matching
-            TokenTextSplitter splitter = new TokenTextSplitter(300, 50, 5, 10000, true);
-            List<Document> chunkedDocs = splitter.apply(rawDocuments);
-            
-            vectorStore.add(chunkedDocs);
-            log.info("Successfully ingested {} chunked documents into Redis Vector Store.", chunkedDocs.size());
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
-import org.springframework.ai.chat.client.advisor.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.memory.InMemoryChatMemory;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import org.springframework.stereotype.Service;
-
-import java.util.List;
-import java.util.stream.Collectors;
-
-/**
- * THE RAG ENGINE
- * Uses Phi-3 to answer questions based purely on Redis Vector Search results.
- */
-@Service
-@Slf4j
-public class FinCoreChatAgent {
-
-    private final ChatClient chatClient;
-    private final VectorStore vectorStore;
-    private final PermissionService permissionService;
-    private final ChatSessionService sessionService;
-    private final HelpAnalyticsService analyticsService;
-    
-    // In-Memory Chat History for conversational follow-ups
-    private final InMemoryChatMemory chatMemory = new InMemoryChatMemory();
-
-    // STRICT System Prompt tailored specifically for Phi-3's logic engine
-    private static final String SYSTEM_PROMPT = """
-            You are the elite FinCore Banking Assistant.
-            You must ONLY answer the user's question using the exact Context provided below.
-            
-            RULES:
-            1. If the Context does not contain the answer, you must reply EXACTLY with: 'I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact IT.'
-            2. Do not invent information, guess, or use outside knowledge.
-            3. Keep your answers clear, professional, and concise.
-            4. Format your response using basic HTML tags like <b> or <br/> for UI readability.
-            """;
-
-    public FinCoreChatAgent(ChatClient.Builder chatClientBuilder, 
-                            VectorStore vectorStore, 
-                            PermissionService permissionService,
-                            ChatSessionService sessionService,
-                            HelpAnalyticsService analyticsService) {
-        this.vectorStore = vectorStore;
-        this.permissionService = permissionService;
-        this.sessionService = sessionService;
-        this.analyticsService = analyticsService;
-        
-        this.chatClient = chatClientBuilder
-                .defaultSystem(SYSTEM_PROMPT)
-                .build();
-    }
-
-    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage) {
+    /**
+     * Fetches the live ETL Date dynamically so the AI never gives stale data.
+     */
+    public String getLiveEtlDate() {
         try {
-            // 1. ESCALATION CHECK
-            if (sessionService.isEscalationRequired(userId)) {
-                sessionService.resetStrikes(userId);
-                return HelpResponseDTO.builder()
-                        .responseType("ESCALATION_OFFER")
-                        .botReply("I seem to be having trouble helping you. Would you like me to raise an IT Support Ticket with your recent chat history attached?")
-                        .build();
-            }
-
-            // 2. FETCH RBAC PERMISSIONS
-            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
-                    .stream().map(String::valueOf).collect(Collectors.toList());
-            allowedPerms.add("GLOBAL");
-
-            // 3. EXECUTE SECURE VECTOR SEARCH
-            SearchRequest searchRequest = SearchRequest.query(userMessage)
-                    .withTopK(3)
-                    .withSimilarityThreshold(0.65) // Must be a decent match
-                    .withFilterExpression(new FilterExpressionBuilder().in("permissionId", allowedPerms).build());
-
-            List<Document> matchedDocs = vectorStore.similaritySearch(searchRequest);
-
-            // 4. FAST-FAIL (If no relevant docs, save CPU and don't wake up Phi-3)
-            if (matchedDocs.isEmpty()) {
-                sessionService.addStrikes(userId, 1);
-                analyticsService.logChatInteraction(userId, "UNKNOWN", userMessage, "NO_MATCH", 0);
-                return HelpResponseDTO.builder()
-                        .responseType("NO_MATCH")
-                        .botReply("I couldn't find any information about that in your authorized modules. Try rephrasing?")
-                        .build();
-            }
-
-            // Extract UI Action Links from the best match (Gap 2 Solved)
-            String primaryActionLink = (String) matchedDocs.get(0).getMetadata().get("actionLink");
-            String primaryActionLabel = (String) matchedDocs.get(0).getMetadata().get("actionLabel");
-
-            // 5. CALL PHI-3 WITH RAG & MEMORY
-            String aiResponse = this.chatClient.prompt()
-                    .user(userMessage)
-                    .advisors(
-                            new QuestionAnswerAdvisor(vectorStore, searchRequest),
-                            new MessageChatMemoryAdvisor(chatMemory, userId, 5) // Remembers last 5 messages
-                    )
-                    .call()
-                    .content();
-
-            // 6. EVALUATE SUCCESS/STRIKES
-            if (aiResponse.contains("I cannot find this information")) {
-                sessionService.addStrikes(userId, 1);
-            } else {
-                sessionService.resetStrikes(userId);
-            }
-
-            // Log successful generation
-            analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "ANSWERED", 99);
-
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(aiResponse)
-                    .navigationLink("NONE".equals(primaryActionLink) ? null : primaryActionLink)
-                    .navigationLabel("NONE".equals(primaryActionLabel) ? null : primaryActionLabel)
-                    .build();
-
+            String sql = "SELECT TO_CHAR(ETL_DATE, 'DD-Mon-YYYY') FROM FINCORE_DATE FETCH FIRST 1 ROWS ONLY";
+            return jdbcTemplate.queryForObject(sql, String.class);
         } catch (Exception e) {
-            log.error("AI Generation Failed", e);
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
-                    .build();
+            log.warn("Could not fetch ETL Date", e);
+            return "System Date Unavailable";
         }
     }
-}
+
+
+
+
+
+
+
+            // Fetch the live ETL date in milliseconds!
+            String liveEtlDate = permissionService.getLiveEtlDate();
+            String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
+            
+            String dynamicPrompt = """
+                    You are the FinCore Smart Assistant, an advanced AI banking bot developed by Shubhankar.
+                    
+                    Current Time: %s
+                    Current ETL Date: %s
+                    User's Allowed Actions: %s
+                    ...
+                    """.formatted(currentTime, liveEtlDate, allowedActionNames);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- This auto-generates procedural baseline knowledge for EVERY screen in your system instantly!
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT 
+    MENU_SUBMENU,
+    'What is the purpose of the ' || MENU_SUBMENU || ' screen and what can I do there?',
+    MENU_DESCRIPTION || '. On this screen, you have the ability to: ' || REPLACE(MENU_ACTION, '|', ', ') || '.',
+    MENU_ID,
+    MENU_URL,
+    'Go to ' || MENU_SUBMENU,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_URL IS NOT NULL AND MENU_DESCRIPTION IS NOT NULL;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- MAKER QUESTIONS (Only users with Role mapping to Permission 5 can search this)
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, PRO_TIP)
+VALUES (
+    'Manage CGLs', 
+    'How do I create a new Central General Ledger (CGL)?', 
+    'Navigate to the Manage CGLs screen. Click the Add New button, fill in the Segment mapping, and click Submit. Your request will enter a Pending state.', 
+    5, -- CRITICAL: Maps to MENU_ID 5
+    '/cgl-management', 
+    'Go to Manage CGLs',
+    'Ensure you verify the Segment Code before submitting.'
+);
+
+-- CHECKER QUESTIONS (Only users with Role mapping to Permission 6 can search this)
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, PRO_TIP)
+VALUES (
+    'CGL Requests', 
+    'How do I approve or reject a pending CGL request?', 
+    'Navigate to the CGL Requests screen. Locate the pending CGL in the grid, click to review the details, and select either Approve or Reject.', 
+    6, -- CRITICAL: Maps to MENU_ID 6
+    '/cgl-requests', 
+    'Review CGL Requests',
+    'You cannot approve a CGL that you created yourself.'
+);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+INSERT INTO KNOWLEDGE_BASE_MASTER (TOPIC, CONTENT_PARAGRAPH, PERMISSION_ID, IS_ACTIVE)
+VALUES (
+    'CGL Maker-Checker Lifecycle', 
+    'In the FinCore system, Central General Ledgers (CGLs) are governed by a strict Maker-Checker protocol. A user with "Manage CGLs" access (The Maker) can create or modify a CGL. However, the CGL does not become active immediately. It must be reviewed by a different user with "CGL Requests" access (The Checker). The Checker can either approve or reject the modification.', 
+    NULL, -- CRITICAL: NULL means GLOBAL. Anyone can learn this concept.
+    'Y'
+);
 
 
 
