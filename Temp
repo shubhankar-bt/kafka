@@ -9,254 +9,6 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.message.AiMessage;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.UserMessage;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.memory.ChatMemory;
-import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class FinCoreChatAgent {
-
-    private static final String FAILURE_MSG = "I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact IT.";
-
-    private final ChatLanguageModel chatClient;
-    private final EmbeddingModel embeddingModel;
-    private final EmbeddingStore<TextSegment> vectorStore;
-    private final PermissionService permissionService;
-    private final ChatSessionService sessionService;
-    private final HelpAnalyticsService analyticsService;
-    private final HelpQuestionRepository questionRepository;
-    private final HelpFaqRepository faqRepository;
-
-    private final Cache<String, ChatMemory> userMemories = Caffeine.newBuilder()
-            .expireAfterAccess(30, TimeUnit.MINUTES)
-            .maximumSize(10000)
-            .build();
-
-    public HelpResponseDTO handleChat(String userId, String roleId, String userMessage, String currentScreen) {
-        log.info("==================================================================");
-        log.info("[AI-STEP-1: INIT] Processing query. User: {} | Role: {} | Msg: '{}'", userId, roleId, userMessage);
-
-        try {
-            // ========================================================================
-            // GUIDED MENUS (Fast DB Fetch)
-            // ========================================================================
-            if ("/action faq".equalsIgnoreCase(userMessage.trim())) {
-                log.info("[AI-STEP-2: COMMAND] Executing FAQ Quick Action.");
-                List<String> faqQuestions = faqRepository.findTop10ByIsActiveOrderByViewCountDesc("Y")
-                        .stream().map(HelpFaqEntity::getQuestionText).collect(Collectors.toList());
-                return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few frequently asked questions:").items(faqQuestions).build();
-            }
-
-            if (userMessage.trim().startsWith("/action module")) {
-                String requestedScreen = userMessage.replace("/action module", "").trim();
-                log.info("[AI-STEP-2: COMMAND] Executing Module Quick Action for: {}", requestedScreen);
-                List<String> moduleQuestions = questionRepository.findByScreenNameAndIsActive(requestedScreen, "Y")
-                        .stream().map(HelpQuestionEntity::getQuestionText).collect(Collectors.toList());
-                
-                if (moduleQuestions.isEmpty()) {
-                    return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I don't have predefined questions for " + requestedScreen + ", but feel free to ask me anything about it!").build();
-                }
-                return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few common questions for " + requestedScreen + ":").items(moduleQuestions).build();
-            }
-
-            // ========================================================================
-            // ESCALATION CHECK
-            // ========================================================================
-            if (sessionService.isEscalationRequired(userId)) {
-                log.warn("[AI-STEP-3: ESCALATION] User hit max failures. Offering IT Support.");
-                sessionService.resetStrikes(userId);
-                return HelpResponseDTO.builder()
-                        .responseType("ESCALATION_OFFER")
-                        .botReply("I seem to be having trouble helping you today. Would you like me to raise an IT Support Ticket with your chat history attached?")
-                        .build();
-            }
-
-            // ========================================================================
-            // VECTOR DB FETCH & RBAC FILTERING
-            // ========================================================================
-            List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
-                    .stream().map(String::valueOf).collect(Collectors.toList());
-            allowedPerms.add("GLOBAL");
-            log.info("[AI-STEP-4: RBAC] User allowed permissions: {}", allowedPerms);
-
-            Embedding queryEmbedding = embeddingModel.embed(userMessage).content();
-
-            // We use a low 0.50 threshold to ensure short queries (like "what is cgl?") are not accidentally dropped.
-            EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(queryEmbedding)
-                    .maxResults(30)
-                    .minScore(0.50) 
-                    .build();
-
-            EmbeddingSearchResult<TextSegment> searchResult = vectorStore.search(searchRequest);
-            log.info("[AI-STEP-5: REDIS] Found {} raw matches before RBAC filtering.", searchResult.matches().size());
-
-            // Filter ONLY what the user is allowed to see
-            List<EmbeddingMatch<TextSegment>> matches = searchResult.matches().stream()
-                    .filter(match -> {
-                        String docPerm = match.embedded().metadata().getString("permissionId");
-                        return docPerm != null && allowedPerms.contains(docPerm);
-                    })
-                    .limit(3)
-                    .collect(Collectors.toList());
-
-            double highestScore = matches.isEmpty() ? 0.0 : matches.get(0).score();
-            log.info("[AI-STEP-6: FILTER] Safe contexts after RBAC: {}. Highest Score: {}", matches.size(), highestScore);
-
-            // ========================================================================
-            // CONTEXT BUILDER
-            // ========================================================================
-            StringBuilder contextBuilder = new StringBuilder();
-            String primaryActionLink = null;
-            String primaryActionLabel = null;
-
-            if (!matches.isEmpty()) {
-                for (EmbeddingMatch<TextSegment> match : matches) {
-                    contextBuilder.append("- ").append(match.embedded().text()).append("\n\n");
-                    if (primaryActionLink == null) {
-                        String link = match.embedded().metadata().getString("actionLink");
-                        if (link != null && !"NONE".equals(link)) {
-                            primaryActionLink = link;
-                            primaryActionLabel = match.embedded().metadata().getString("actionLabel");
-                        }
-                    }
-                }
-            } else {
-                contextBuilder.append("NO BANKING CONTEXT FOUND. Either the user lacks permission, or the knowledge does not exist in the database.");
-            }
-
-            // ========================================================================
-            // THE MASTER AI PROMPT (XML Structured for Phi-3 optimization)
-            // ========================================================================
-            String liveEtlDate = permissionService.getLiveEtlDate();
-            String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
-            String currentScreenContext = (currentScreen != null && !currentScreen.isEmpty()) ? currentScreen : "Unknown";
-
-            String dynamicPrompt = """
-                    You are the FinCore Smart Assistant, an advanced, highly capable AI banking bot.
-                    Current Time: %s
-                    System ETL Date: %s
-                    User's Current Screen: %s
-                    
-                    <INSTRUCTIONS>
-                    1. CASUAL CONVERSATION: If the user message is a casual greeting, gratitude, or small talk (e.g., "hi", "thanks", "who are you", "whats up"), respond naturally, warmly, and dynamically. Do not mention banking manuals for small talk.
-                    2. BANKING QUERIES: For ANY FinCore platform questions, banking processes, or acronyms, you MUST consult the <AUTHORIZED_CONTEXT> below.
-                    3. STRICT ADHERENCE: If the <AUTHORIZED_CONTEXT> contains the answer, synthesize it professionally. Use HTML tags like <b> for bolding, and <ul><li> for lists to make it readable.
-                    4. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does NOT clearly answer the user's banking query, or if it says "NO BANKING CONTEXT FOUND", you MUST reply with the EXACT following phrase and nothing else:
-                       %s
-                    5. NO HALLUCINATION: Never invent rules, guess procedures, or use outside knowledge.
-                    </INSTRUCTIONS>
-                    
-                    <AUTHORIZED_CONTEXT>
-                    %s
-                    </AUTHORIZED_CONTEXT>
-                    """.formatted(currentTime, liveEtlDate, currentScreenContext, FAILURE_MSG, contextBuilder.toString());
-
-            // ========================================================================
-            // CALL PHI-3 (The Brain)
-            // ========================================================================
-            ChatMemory memory = userMemories.get(userId, k -> MessageWindowChatMemory.withMaxMessages(5));
-            memory.add(UserMessage.from(userMessage));
-
-            log.info("[AI-STEP-7: LLM] Sending instructions and context to Phi-3...");
-            AiMessage responseMessage = chatClient.generate(
-                    SystemMessage.from(dynamicPrompt),
-                    memory.messages().get(memory.messages().size() - 1)
-            ).content();
-
-            String aiResponse = responseMessage.text();
-            log.info("[AI-STEP-8: RESPONSE] Raw LLM Reply: '{}'", aiResponse.replace("\n", " "));
-
-            // ========================================================================
-            // OUTPUT SANITIZATION & LOGGING
-            // ========================================================================
-            if (aiResponse.contains("I cannot find this information") || aiResponse.contains(FAILURE_MSG)) {
-                log.warn("[AI-STEP-9: SANITIZE] LLM decided context was insufficient. Applying Failure Message.");
-                sessionService.addStrikes(userId, 1);
-                
-                Long failLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "NO_MATCH", (int) (highestScore * 100));
-                memory.add(AiMessage.from(FAILURE_MSG)); // Prevent AI from remembering any hallucinated apologies
-                
-                return HelpResponseDTO.builder().responseType("NO_MATCH").botReply(FAILURE_MSG).logId(failLogId).build();
-            }
-
-            log.info("[AI-STEP-9: SUCCESS] Valid answer generated!");
-            sessionService.resetStrikes(userId);
-            memory.add(responseMessage);
-
-            Long successLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, matches.isEmpty() ? "SMALL_TALK" : "ANSWERED", (int) (highestScore * 100));
-
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply(aiResponse.trim())
-                    .navigationLink(primaryActionLink)
-                    .navigationLabel(primaryActionLabel)
-                    .logId(successLogId)
-                    .build();
-
-        } catch (Exception e) {
-            log.error("[AI-STEP-ERROR] Critical AI Generation Failure", e);
-            return HelpResponseDTO.builder()
-                    .responseType("TEXT_REPLY")
-                    .botReply("I am currently experiencing a cognitive delay. Please try again in a moment.")
-                    .build();
-        }
-    }
-
-    public void incrementFaqPopularity(String questionText) {
-        faqRepository.findByQuestionTextAndIsActive(questionText, "Y").ifPresent(faq -> {
-            faq.setViewCount(faq.getViewCount() + 1);
-            faqRepository.save(faq);
-        });
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.service;
-
-import com.fincore.helpservice.dto.HelpResponseDTO;
-import com.fincore.helpservice.model.HelpFaqEntity;
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.repository.HelpFaqRepository;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -323,9 +75,9 @@ public class FinCoreChatAgent {
                         .stream().map(HelpQuestionEntity::getQuestionText).collect(Collectors.toList());
                 
                 if (moduleQuestions.isEmpty()) {
-                    return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I don't have predefined questions for " + requestedScreen + ", but feel free to ask me anything about it!").build();
+                    return HelpResponseDTO.builder().responseType("TEXT_REPLY").botReply("I don't have predefined questions for " + requestedScreen + " right now, but feel free to ask me anything about it!").build();
                 }
-                return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few common questions for " + requestedScreen + ":").items(moduleQuestions).build();
+                return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few common questions for the " + requestedScreen + " screen:").items(moduleQuestions).build();
             }
 
             // ========================================================================
@@ -394,7 +146,7 @@ public class FinCoreChatAgent {
             }
 
             // ========================================================================
-            // THE MASTER AI PROMPT
+            // THE LLaMA 3 MASTER AI PROMPT
             // ========================================================================
             String liveEtlDate = permissionService.getLiveEtlDate();
             String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
@@ -407,12 +159,13 @@ public class FinCoreChatAgent {
                     User's Current Screen: %s
                     
                     <INSTRUCTIONS>
-                    1. CASUAL CONVERSATION: If the user message is a casual greeting, gratitude, or small talk (e.g., "hi", "thanks", "who are you", "whats up"), respond naturally, warmly, and dynamically. Do not mention banking manuals for small talk.
-                    2. BANKING QUERIES: For ANY FinCore platform questions, banking processes, or acronyms, you MUST consult the <AUTHORIZED_CONTEXT> below.
-                    3. STRICT ADHERENCE: If the <AUTHORIZED_CONTEXT> contains the answer, synthesize it professionally. Use HTML tags like <b> for bolding, and <ul><li> for lists to make it readable.
-                    4. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does NOT clearly answer the user's banking query, or if it says "NO BANKING CONTEXT FOUND", you MUST reply with the EXACT following phrase and nothing else:
+                    1. CASUAL CONVERSATION: If the user message is a greeting, gratitude, or small talk, respond warmly and dynamically. Do NOT mention banking context.
+                    2. BANKING QUERIES: For FinCore questions, you MUST rely EXCLUSIVELY on the <AUTHORIZED_CONTEXT> below.
+                    3. HTML FORMATTING: You must format your response using standard HTML tags (<b> for bold, <ul><li> for lists, <br> for breaks). DO NOT use Markdown (like **). 
+                    4. DIRECT ANSWERS: Answer immediately. Do NOT use conversational preambles like "Here is the information" or "Sure, I can help".
+                    5. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does not clearly answer the question, or says "NO BANKING CONTEXT FOUND", you MUST output the exact phrase below and NOTHING else (No apologies, no explanations):
                        %s
-                    5. NO HALLUCINATION: Never invent rules, guess procedures, or use outside knowledge.
+                    6. NO HALLUCINATION: Never invent rules or guess.
                     </INSTRUCTIONS>
                     
                     <AUTHORIZED_CONTEXT>
@@ -421,17 +174,16 @@ public class FinCoreChatAgent {
                     """.formatted(currentTime, liveEtlDate, currentScreenContext, FAILURE_MSG, contextBuilder.toString());
 
             // ========================================================================
-            // CALL PHI-3 (The Brain) WITH FULL MEMORY
+            // CALL LLAMA-3 WITH FULL MEMORY
             // ========================================================================
             ChatMemory memory = userMemories.get(userId, k -> MessageWindowChatMemory.withMaxMessages(5));
             memory.add(UserMessage.from(userMessage));
 
-            // FIX: Combine System Prompt with FULL Conversation History
             List<ChatMessage> fullConversation = new ArrayList<>();
             fullConversation.add(SystemMessage.from(dynamicPrompt));
             fullConversation.addAll(memory.messages());
 
-            log.info("[AI-STEP-7: LLM] Sending instructions, {} history messages, and context to Phi-3...", memory.messages().size());
+            log.info("[AI-STEP-7: LLM] Sending instructions, {} history messages, and context to LLaMA-3...", memory.messages().size());
             AiMessage responseMessage = chatClient.generate(fullConversation).content();
 
             String aiResponse = responseMessage.text();
@@ -480,94 +232,5 @@ public class FinCoreChatAgent {
         });
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.helpservice.config;
-
-import dev.langchain4j.model.chat.ChatLanguageModel;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.ollama.OllamaChatModel;
-import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.redis.RedisEmbeddingStore;
-import dev.langchain4j.data.segment.TextSegment;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-import java.time.Duration;
-import java.util.Arrays;
-
-@Configuration
-public class AiConfiguration {
-
-    @Value("${langchain4j.ollama.base-url}")
-    private String ollamaBaseUrl;
-
-    @Value("${langchain4j.ollama.chat-model.name}")
-    private String chatModelName;
-
-    @Value("${langchain4j.ollama.embedding-model.name}")
-    private String embeddingModelName;
-
-    @Value("${langchain4j.vector-store.redis.host}")
-    private String redisHost;
-
-    @Value("${langchain4j.vector-store.redis.port}")
-    private Integer redisPort;
-
-    @Value("${langchain4j.vector-store.redis.index-name}")
-    private String indexName;
-
-    @Value("${langchain4j.vector-store.redis.prefix}")
-    private String prefix;
-
-    @Value("${langchain4j.vector-store.redis.dimension:1024}")
-    private Integer dimension;
-
-    @Bean
-    public ChatLanguageModel chatLanguageModel() {
-        return OllamaChatModel.builder()
-                .baseUrl(ollamaBaseUrl)
-                .modelName(chatModelName)
-                .temperature(0.1)
-                .timeout(Duration.ofSeconds(60))
-                .build();
-    }
-
-    @Bean
-    public EmbeddingModel embeddingModel() {
-        return OllamaEmbeddingModel.builder()
-                .baseUrl(ollamaBaseUrl)
-                .modelName(embeddingModelName)
-                .timeout(Duration.ofSeconds(15))
-                .build();
-    }
-
-    @Bean
-    public EmbeddingStore<TextSegment> embeddingStore() {
-        return RedisEmbeddingStore.builder()
-                .host(redisHost)
-                .port(redisPort)
-                .dimension(dimension)
-                .indexName(indexName)
-                .prefix(prefix)
-                // CRITICAL FIX: Tell Redis to actually return the metadata!
-                .metadataKeys(Arrays.asList("permissionId", "actionLink", "actionLabel", "dataType"))
-                .build();
-    }
-}
-
-
 
 
