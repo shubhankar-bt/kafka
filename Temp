@@ -59,10 +59,9 @@ public class FinCoreChatAgent {
 
         try {
             // ========================================================================
-            // GUIDED MENUS (Fast DB Fetch)
+            // GUIDED MENUS
             // ========================================================================
             if ("/action faq".equalsIgnoreCase(userMessage.trim())) {
-                log.info("[AI-STEP-2: COMMAND] Executing FAQ Quick Action.");
                 List<String> faqQuestions = faqRepository.findTop10ByIsActiveOrderByViewCountDesc("Y")
                         .stream().map(HelpFaqEntity::getQuestionText).collect(Collectors.toList());
                 return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few frequently asked questions:").items(faqQuestions).build();
@@ -70,7 +69,6 @@ public class FinCoreChatAgent {
 
             if (userMessage.trim().startsWith("/action module")) {
                 String requestedScreen = userMessage.replace("/action module", "").trim();
-                log.info("[AI-STEP-2: COMMAND] Executing Module Quick Action for: {}", requestedScreen);
                 List<String> moduleQuestions = questionRepository.findByScreenNameAndIsActive(requestedScreen, "Y")
                         .stream().map(HelpQuestionEntity::getQuestionText).collect(Collectors.toList());
                 
@@ -80,11 +78,7 @@ public class FinCoreChatAgent {
                 return HelpResponseDTO.builder().responseType("SUGGESTION").botReply("Here are a few common questions for the " + requestedScreen + " screen:").items(moduleQuestions).build();
             }
 
-            // ========================================================================
-            // ESCALATION CHECK
-            // ========================================================================
             if (sessionService.isEscalationRequired(userId)) {
-                log.warn("[AI-STEP-3: ESCALATION] User hit max failures. Offering IT Support.");
                 sessionService.resetStrikes(userId);
                 return HelpResponseDTO.builder()
                         .responseType("ESCALATION_OFFER")
@@ -93,25 +87,18 @@ public class FinCoreChatAgent {
             }
 
             // ========================================================================
-            // VECTOR DB FETCH & RBAC FILTERING
+            // VECTOR DB FETCH & RBAC
             // ========================================================================
             List<String> allowedPerms = permissionService.getAllAllowedPermissionIdsForRole(roleId)
                     .stream().map(String::valueOf).collect(Collectors.toList());
             allowedPerms.add("GLOBAL");
-            log.info("[AI-STEP-4: RBAC] User allowed permissions: {}", allowedPerms);
 
             Embedding queryEmbedding = embeddingModel.embed(userMessage).content();
-
             EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(queryEmbedding)
-                    .maxResults(30)
-                    .minScore(0.50) 
-                    .build();
+                    .queryEmbedding(queryEmbedding).maxResults(30).minScore(0.40).build();
 
             EmbeddingSearchResult<TextSegment> searchResult = vectorStore.search(searchRequest);
-            log.info("[AI-STEP-5: REDIS] Found {} raw matches before RBAC filtering.", searchResult.matches().size());
 
-            // Filter ONLY what the user is allowed to see
             List<EmbeddingMatch<TextSegment>> matches = searchResult.matches().stream()
                     .filter(match -> {
                         String docPerm = match.embedded().metadata().getString("permissionId");
@@ -121,10 +108,10 @@ public class FinCoreChatAgent {
                     .collect(Collectors.toList());
 
             double highestScore = matches.isEmpty() ? 0.0 : matches.get(0).score();
-            log.info("[AI-STEP-6: FILTER] Safe contexts after RBAC: {}. Highest Score: {}", matches.size(), highestScore);
+            log.info("[AI-STEP-2: RBAC/REDIS] Safe contexts: {}. Highest Score: {}", matches.size(), highestScore);
 
             // ========================================================================
-            // CONTEXT BUILDER
+            // CONFIDENCE-BASED LINK ROUTING (Replaces hacky AI tagging)
             // ========================================================================
             StringBuilder contextBuilder = new StringBuilder();
             String primaryActionLink = null;
@@ -133,7 +120,10 @@ public class FinCoreChatAgent {
             if (!matches.isEmpty()) {
                 for (EmbeddingMatch<TextSegment> match : matches) {
                     contextBuilder.append("- ").append(match.embedded().text()).append("\n\n");
-                    if (primaryActionLink == null) {
+                    
+                    // Only attach navigation links if the mathematical match is strong (> 0.65)
+                    // If it's a weak match (like "How are you?"), the UI gets no buttons.
+                    if (primaryActionLink == null && highestScore >= 0.65) {
                         String link = match.embedded().metadata().getString("actionLink");
                         if (link != null && !"NONE".equals(link)) {
                             primaryActionLink = link;
@@ -142,11 +132,11 @@ public class FinCoreChatAgent {
                     }
                 }
             } else {
-                contextBuilder.append("NO BANKING CONTEXT FOUND. Either the user lacks permission, or the knowledge does not exist in the database.");
+                contextBuilder.append("NO BANKING CONTEXT FOUND.");
             }
 
             // ========================================================================
-            // THE LLaMA 3 MASTER AI PROMPT
+            // THE LLaMA-3 MASTER PROMPT (Pure, Clean, Markdown-Native)
             // ========================================================================
             String liveEtlDate = permissionService.getLiveEtlDate();
             String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
@@ -159,13 +149,13 @@ public class FinCoreChatAgent {
                     User's Current Screen: %s
                     
                     <INSTRUCTIONS>
-                    1. CASUAL CONVERSATION: If the user message is a greeting, gratitude, or small talk, respond warmly and dynamically. Do NOT mention banking context.
-                    2. BANKING QUERIES: For FinCore questions, you MUST rely EXCLUSIVELY on the <AUTHORIZED_CONTEXT> below.
-                    3. HTML FORMATTING: You must format your response using standard HTML tags (<b> for bold, <ul><li> for lists, <br> for breaks). DO NOT use Markdown (like **). 
-                    4. DIRECT ANSWERS: Answer immediately. Do NOT use conversational preambles like "Here is the information" or "Sure, I can help".
-                    5. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does not clearly answer the question, or says "NO BANKING CONTEXT FOUND", you MUST output the exact phrase below and NOTHING else (No apologies, no explanations):
+                    1. CASUAL CONVERSATION: If the user message is a greeting or small talk, respond warmly and dynamically.
+                    2. BANKING QUERIES: For FinCore questions, rely EXCLUSIVELY on the <AUTHORIZED_CONTEXT> below.
+                    3. DIRECT ANSWERS: Answer immediately. Do NOT use conversational preambles like "Here is the information".
+                    4. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does not clearly answer the question, or says "NO BANKING CONTEXT FOUND", you MUST output the exact phrase below and NOTHING else (No apologies, no explanations):
                        %s
-                    6. NO HALLUCINATION: Never invent rules or guess.
+                    5. NO HALLUCINATION: Never invent rules or guess.
+                    6. FORMATTING: Use standard Markdown formatting (**bold**, bullet points) for readability.
                     </INSTRUCTIONS>
                     
                     <AUTHORIZED_CONTEXT>
@@ -183,34 +173,38 @@ public class FinCoreChatAgent {
             fullConversation.add(SystemMessage.from(dynamicPrompt));
             fullConversation.addAll(memory.messages());
 
-            log.info("[AI-STEP-7: LLM] Sending instructions, {} history messages, and context to LLaMA-3...", memory.messages().size());
+            log.info("[AI-STEP-3: LLM] Sending instructions and history to LLaMA-3...");
             AiMessage responseMessage = chatClient.generate(fullConversation).content();
-
-            String aiResponse = responseMessage.text();
-            log.info("[AI-STEP-8: RESPONSE] Raw LLM Reply: '{}'", aiResponse.replace("\n", " "));
+            
+            String aiResponse = responseMessage.text().trim();
+            log.info("[AI-STEP-4: RAW RESPONSE] '{}'", aiResponse.replace("\n", " "));
 
             // ========================================================================
-            // OUTPUT SANITIZATION & LOGGING
+            // OUTPUT GUARDRAILS & LOGGING (No Regex Tag Stripping!)
             // ========================================================================
             if (aiResponse.contains("I cannot find this information") || aiResponse.contains(FAILURE_MSG)) {
-                log.warn("[AI-STEP-9: SANITIZE] LLM decided context was insufficient. Applying Failure Message.");
+                log.warn("[AI-STEP-5: SANITIZE] LLM context insufficient. Applying strict Failure Message.");
                 sessionService.addStrikes(userId, 1);
                 
                 Long failLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, "NO_MATCH", (int) (highestScore * 100));
-                memory.add(AiMessage.from(FAILURE_MSG)); 
+                memory.add(AiMessage.from(FAILURE_MSG)); // Save clean text to memory
                 
                 return HelpResponseDTO.builder().responseType("NO_MATCH").botReply(FAILURE_MSG).logId(failLogId).build();
             }
 
-            log.info("[AI-STEP-9: SUCCESS] Valid answer generated!");
+            log.info("[AI-STEP-6: SUCCESS] Valid answer generated.");
             sessionService.resetStrikes(userId);
+            
+            // Pure, unpolluted memory addition
             memory.add(responseMessage);
 
-            Long successLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, matches.isEmpty() ? "SMALL_TALK" : "ANSWERED", (int) (highestScore * 100));
+            // If score was low, we classify it as Small Talk in analytics
+            String intentLog = (highestScore < 0.65) ? "SMALL_TALK" : "ANSWERED";
+            Long successLogId = analyticsService.logChatInteraction(userId, "AI_RAG", userMessage, intentLog, (int) (highestScore * 100));
 
             return HelpResponseDTO.builder()
                     .responseType("TEXT_REPLY")
-                    .botReply(aiResponse.trim())
+                    .botReply(aiResponse)
                     .navigationLink(primaryActionLink)
                     .navigationLabel(primaryActionLabel)
                     .logId(successLogId)
