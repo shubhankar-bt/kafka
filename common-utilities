@@ -1,3 +1,130 @@
+package com.fincore.commonutilities.annotation;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+/**
+ * Mark any Service method with this annotation to BYPASS the global retry logic.
+ * Use this for non-idempotent operations (Sending Notifications, Amount Calculations, File Stream Uploads etc.).
+ */
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface NoRetry {
+}
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.aspect;
+
+import com.fincore.commonutilities.annotation.NoRetry;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryRegistry;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Method;
+import java.util.function.Supplier;
+
+/**
+ * Resilience Aspect.
+ * * Responsibilities:
+ * 1. Wraps ALL @Service methods with Retry & Circuit Breaker logic.
+ * 2. Respects @NoRetry annotation for safety.
+ * 3. Runs with HIGHEST_PRECEDENCE to ensure retries happen outside the Transaction boundary.
+ */
+@Aspect
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE) // ensures run before @Transactional
+@RequiredArgsConstructor
+@Slf4j
+public class GlobalResilienceAspect {
+
+    private final RetryRegistry retryRegistry;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private static final String SERVICE_NAME = "defaultService";
+
+    @Around("within(@org.springframework.stereotype.Service *)")
+    public Object applyResilience(ProceedingJoinPoint joinPoint) throws Throwable {
+
+        // 1. Check - Skip if @NoRetry is present
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method method = signature.getMethod();
+        if (method.isAnnotationPresent(NoRetry.class)) {
+            return joinPoint.proceed();
+        }
+
+        // 2. Get Resilience Instances
+        Retry retry = retryRegistry.retry(SERVICE_NAME);
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(SERVICE_NAME);
+
+        // 3. backend call wrapper
+        Supplier<Object> backendCall = () -> {
+            try {
+                return joinPoint.proceed();
+            } catch (Throwable e) {
+                throw new RuntimeExceptionWrapper(e);
+            }
+        };
+
+        // 4. Manual Decoration
+        // Logic: CircuitBreaker( Retry( Function ) )
+        // If Circuit is Open, we fail FAST. We do NOT want to Retry against an Open circuit.
+        // If Circuit is Open -> Fails Fast.
+        // If Closed -> Tries Retry Logic.
+
+        // Inner Layer: Retry
+        Supplier<Object> retryableSupplier = Retry.decorateSupplier(retry, backendCall);
+        // Outer Layer: Circuit Breaker
+        Supplier<Object> resilientSupplier = CircuitBreaker.decorateSupplier(circuitBreaker, retryableSupplier);
+
+        // 5. Execute
+        try {
+            return resilientSupplier.get();
+        } catch (RuntimeExceptionWrapper e) {
+            // Unwrap original exception for the caller
+            throw e.getCause();
+        } catch (Exception e) {
+            // Throw other exceptions as it is
+            throw e;
+        }
+    }
+
+    /**
+     * Internal wrapper to transport checked exceptions through the Supplier lambda.
+     */
+    private static class RuntimeExceptionWrapper extends RuntimeException {
+        public RuntimeExceptionWrapper(Throwable cause) {
+            super(cause);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.commonutilities.buisnessobject;
 
 import java.time.LocalDate;
@@ -17,6 +144,8 @@ public class ControlDatesDto {
         return etlDate;
     }
 }
+
+
 
 
 
@@ -56,7 +185,6 @@ public class ControlDateService {
         );
     }
 }
-
 
 
 
@@ -166,6 +294,7 @@ public class CommonSecurityConfig {
 
 
 
+
 package com.fincore.commonutilities.config;
 
 
@@ -188,6 +317,34 @@ public class RedisConfig {
         return new StringRedisTemplate(connectionFactory);
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.config;
+
+import com.fincore.commonutilities.aspect.GlobalResilienceAspect;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
+
+@Configuration
+@EnableAspectJAutoProxy // Enables AOP
+@Import(GlobalResilienceAspect.class) // Loads the Aspect
+public class ResilienceConfig {
+    // This config initializes the Aspect and AOP support.
+    // Services just need to @Import(ResilienceConfig.class)
+}
+
 
 
 
@@ -441,6 +598,10 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
 
 
 
+
+
+
+
 package com.fincore.commonutilities.security;
 
 import com.fincore.commonutilities.jwt.JwtUtil;
@@ -483,7 +644,7 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
     private static final Set<String> WHITELIST = Set.of(
             "/api/auth/**", "/actuator/**", "/error", "/swagger-ui/**", "/v3/api-docs/**", "/api/login",
-            "/api/auth/login", "/api/auth/logout", "/api/auth/check-user"
+            "/api/auth/login", "/api/auth/logout", "/api/auth/check-user", "/swagger-ui.html"
     );
 
     private final StringRedisTemplate redisTemplate;
@@ -706,92 +867,170 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
 
 
+package com.fincore.commonutilities.util;
 
-spring.application.name=CommonUtilities
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
+public class MaskingUtil {
 
+    private static final ObjectMapper mapper = new ObjectMapper();
 
+    /**
+     * Masks PII fields inside a JSON String.
+     */
+    public static String maskJsonString(String jsonInput) {
+        if (jsonInput == null || jsonInput.isEmpty()) return "{}";
+        try {
+            JsonNode root = mapper.readTree(jsonInput);
+            maskSensitiveFields(root);
+            return root.toString();
+        } catch (JsonProcessingException e) {
+            return "Error parsing JSON payload";
+        }
+    }
 
+    private static void maskSensitiveFields(JsonNode node) {
+        if (node.isObject()) {
+            ObjectNode objectNode = (ObjectNode) node;
+            objectNode.fieldNames().forEachRemaining(fieldName -> {
+                JsonNode value = objectNode.get(fieldName);
+                if (isSensitive(fieldName)) {
+                    objectNode.put(fieldName, "****");
+                } else {
+                    maskSensitiveFields(value); // Recurse
+                }
+            });
+        } else if (node.isArray()) {
+            node.forEach(MaskingUtil::maskSensitiveFields);
+        }
+    }
 
-
-
-
-
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.0</version>
-        <relativePath />
-    </parent>
-    <groupId>com.fincore</groupId>
-    <artifactId>common-utilities</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>common-utilities</name>
-    <description>Common utilities used across the application.</description>
-
-    <properties>
-        <java.version>22</java.version>
-        <jjwt.version>0.12.5</jjwt.version>
-    </properties>
-
-    <dependencies>
-        <!-- CORE SPRING BOOT -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-security</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
-
-        <!-- UTILS -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
-        </dependency>
-
-        <!-- JWT SECURITY (JJWT) -->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>${jjwt.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>${jjwt.version}</version>
-            <scope>runtime</scope>
-        </dependency>
+    private static boolean isSensitive(String fieldName) {
+        String lower = fieldName.toLowerCase();
+        return lower.contains("email") ||
+                lower.contains("mobile") ||
+                lower.contains("phone") ||
+                lower.contains("password") ||
+                lower.contains("pan") ||
+                lower.contains("account");
+    }
+}
 
 
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-    </dependencies>
-</project>
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+security config in common request serrvice which imports common-utilities :
+
+package com.tcs.fincore.CommonRequestService.config;
+
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.config.ResilienceConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.logging.MdcLoggingFilter;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+
+/**
+ * Common Security Configuration.
+ * * Aligned with the "Distributed Gateway" architecture.
+ * It uses the ContextRbacFilter from Common Utilities to enforce:
+ * 1. Token Validity
+ * 2. Single Session (Redis check)
+ * 3. RBAC Permissions
+ * Enforces Centralised Mdc Logging Filter, RESILIENCE4J Retry and Circuit Breaker
+ */
+@Configuration
+@EnableWebSecurity
+@Import({
+        RedisConfig.class,
+        JwtUtil.class,
+        CommonSecurityConfig.class,
+        ResilienceConfig.class
+})
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig;
+
+    // --- 1. Define Filters as Beans (Explicitly) ---
+
+    @Bean
+    public MdcLoggingFilter mdcLoggingFilter() {
+        return new MdcLoggingFilter(jwtUtil);
+    }
+
+    @Bean
+    public ContextRbacFilter contextRbacFilter() {
+        return new ContextRbacFilter(redisTemplate, jwtUtil);
+    }
+
+    // --- 2. Prevent Global Registration ---
+    // This stops "The Filter class ... does not have a registered order" error
+
+    @Bean
+    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
+        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
+    }
+
+    @Bean
+    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
+        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(authz -> authz
+                        .requestMatchers("/actuator/**", "/api/auth/**", "/error", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                        .anyRequest().permitAll()
+                )
+                // Add Filters using the BEAN references (methods above)
+                .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
+
+        return http.build();
+    }
+}
