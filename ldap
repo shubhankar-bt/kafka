@@ -26,115 +26,71 @@ Intranet	Web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Disabled Browse
 
 
 
-openssl genrsa -out private.pem 2048
-openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in private.pem -out private_pkcs8.pem
-
-
-
-
-
-
-
-
-
-
-
-
-
-openssl rsa -in private.pem -pubout -out public.pem
-
-
-
-
-
-
-
-
-
-security:
-  payload:
-    rsa-private: |
-      -----BEGIN PRIVATE KEY-----
-      MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDh...
-      -----END PRIVATE KEY-----
-    rsa-public: |
-      -----BEGIN PUBLIC KEY-----
-      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4...
-      -----END PUBLIC KEY-----
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package com.fincore.gateway.Config;
 
-import java.nio.charset.StandardCharsets;
-import java.security.KeyFactory;
-import java.security.NoSuchAlgorithmException;
-import java.security.PrivateKey;
-import java.security.spec.InvalidKeySpecException;
-import java.security.spec.PKCS8EncodedKeySpec;
-import java.util.Base64;
-import javax.crypto.Cipher;
-import lombok.extern.slf4j.Slf4j;
+// ... your existing imports ...
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.reactive.CorsConfigurationSource;
+import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
+import org.springframework.security.web.server.header.XFrameOptionsServerHttpHeadersWriter;
+import org.springframework.security.web.server.header.ReferrerPolicyServerHttpHeadersWriter;
+import org.springframework.security.web.server.header.XssProtectionServerHttpHeadersWriter;
+import java.util.Arrays;
 
-@Slf4j
-public class KeyUtils {
+@Configuration
+public class SecurityConfig {
 
-    /**
-     * Parses a PKCS#8 PEM formatted private key.
-     */
-    public static PrivateKey parseRsaPrivateKey(String pem) {
-        try {
-            String clean = pem.replace("-----BEGIN PRIVATE KEY-----", "")
-                              .replace("-----END PRIVATE KEY-----", "")
-                              .replaceAll("\\s", "");
-            byte[] decoded = Base64.getDecoder().decode(clean);
-            PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(decoded);
-            KeyFactory kf = KeyFactory.getInstance("RSA");
-            return kf.generatePrivate(spec);
-        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
-            log.error("Failed to parse RSA Private Key. Check configuration format.");
-            throw new IllegalArgumentException("Invalid RSA private key", e);
-        }
+    private final TokenSessionValidator tokenSessionValidator;
+
+    public SecurityConfig(TokenSessionValidator tokenSessionValidator) {
+        this.tokenSessionValidator = tokenSessionValidator;
+    }
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+                .csrf(ServerHttpSecurity.CsrfSpec::disable)
+                // 1. Enables Access-Control-Allow-Origin properly
+                .cors(Customizer.withDefaults()) 
+                
+                // 2. Inject Missing AppSec Headers
+                .headers(headers -> headers
+                        // Fixes Clickjacking (Finding 3)
+                        .frameOptions(frame -> frame.mode(XFrameOptionsServerHttpHeadersWriter.Mode.DENY))
+                        // Fixes Missing Headers (Finding 2)
+                        .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
+                        .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyServerHttpHeadersWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+                        // Fixes Disabled XSS (Finding 5)
+                        .xssProtection(xss -> xss.headerValue(XssProtectionServerHttpHeadersWriter.HeaderValue.ENABLED_MODE_BLOCK))
+                )
+                
+                .authorizeExchange(exchanges -> exchanges
+                        .pathMatchers("/auth/**", "/actuator/**").permitAll()
+                        .anyExchange().authenticated()
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+                .addFilterBefore(redisValidationFilter(), SecurityWebFiltersOrder.AUTHORIZATION)
+                .build();
     }
 
     /**
-     * Decrypts the Base64 encoded RSA ciphertext.
+     * strict CORS configuration for Access-Control-Allow-Origin
      */
-    public static String decryptRsaPassword(String encryptedBase64, String privateKeyPem) {
-        if (encryptedBase64 == null || encryptedBase64.isBlank()) {
-            return "";
-        }
-        try {
-            PrivateKey privateKey = parseRsaPrivateKey(privateKeyPem);
-            // PKCS1Padding aligns with standard frontend JSEncrypt libraries
-            Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
-            cipher.init(Cipher.DECRYPT_MODE, privateKey);
-            
-            byte[] decodedBytes = Base64.getDecoder().decode(encryptedBase64);
-            byte[] decryptedBytes = cipher.doFinal(decodedBytes);
-            
-            return new String(decryptedBytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            // PROD SECURITY: Never log the exact cryptographic failure reason to prevent Padding Oracle attacks.
-            log.warn("Payload decryption failed. Invalid ciphertext provided.");
-            throw new SecurityException("Invalid encrypted payload");
-        }
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        // BANK STANDARD: Do NOT use "*". Explicitly list your UI URLs.
+        configuration.setAllowedOrigins(Arrays.asList("https://fincore-uat.sbi", "http://localhost:4200"));
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(Arrays.asList("Authorization", "Content-Type", "X-Request-Type"));
+        configuration.setAllowCredentials(true); // Required if UI sends cookies (like the Refresh Token)
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
     }
+    
+    // ... existing redisValidationFilter() ...
 }
 
 
@@ -154,198 +110,74 @@ public class KeyUtils {
 
 
 
-    // ... inside AuthController.java ...
 
-    @Value("${security.payload.rsa-public:}")
-    private String rsaPublicPem;
+
+
+
+package com.fincore.commonutilities.config;
+
+// ... your existing imports ...
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import org.springframework.beans.factory.BeanInitializationException;
+import java.util.Arrays;
+
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) {
+        try {
+            http
+                .csrf(csrf -> csrf.disable())
+                // 1. Enables Access-Control-Allow-Origin properly
+                .cors(Customizer.withDefaults()) 
+                
+                // 2. Inject Missing AppSec Headers
+                .headers(headers -> headers
+                    // Fixes Clickjacking (Finding 3)
+                    .frameOptions(frame -> frame.deny())
+                    // Fixes Missing Headers (Finding 2)
+                    .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
+                    .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+                    // Fixes Disabled XSS (Finding 5)
+                    .xssProtection(xss -> xss.headerValue(org.springframework.security.web.header.writers.XXssProtectionHeaderWriter.HeaderValue.ENABLED_MODE_BLOCK))
+                )
+                
+                .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth
+                    .requestMatchers("/actuator/**", "/internal/**").permitAll()
+                    .anyRequest().authenticated()
+                );
+                // .addFilterBefore(...)
+
+            return http.build();
+        } catch (Exception e) {
+            throw new BeanInitializationException("Failed to initialize Microservice Security Config", e);
+        }
+    }
 
     /**
-     * Exposes the RSA Public Key for frontend payload encryption.
-     * This endpoint is public (whitelisted in SecurityConfig).
+     * Strict CORS configuration for Microservices
      */
-    @GetMapping(value = "/public-key", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<Map<String, String>>> getPublicKey() {
-        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
-            return Mono.just(ApiResponse.error("Public key not configured", "CONFIG_ERROR"));
-        }
-        return Mono.just(ApiResponse.success(Map.of("publicKey", rsaPublicPem), "Public Key fetched successfully"));
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        // Only allow traffic originating from your trusted UI frontend
+        configuration.setAllowedOrigins(Arrays.asList("https://fincore-uat.sbi"));
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(Arrays.asList("Authorization", "Content-Type", "X-Request-Type", "X-Internal-Signature"));
+        configuration.setAllowCredentials(true);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // ... inside LoginServiceImpl.java ...
-
-    @Value("${security.payload.rsa-private:}")
-    private String rsaPrivatePem;
-
-    @Transactional
-    @Override
-    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
-        final String userId = userCredentials.getUserId();
-        final String encryptedPassword = userCredentials.getPassword(); // This is now RSA Encrypted
-        
-        // ... standard user fetching logic ...
-
-        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
-            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                try {
-                    // --- APPSEC FIX: Decrypt RSA Payload ---
-                    String rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-                    
-                    // Proceed with standard BCrypt checking
-                    passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-                } catch (SecurityException e) {
-                    log.error("Login rejected for user {}: Payload decryption failed", userId);
-                    result.setValidCredentials(false);
-                    result.setMessage("Security Error: Invalid encrypted payload");
-                    attempt.setFailureReason("Payload Decryption Failed (Possible MITM or invalid format)");
-                    loginAttemptRepository.save(attempt);
-                    return result;
-                }
-            } else {
-                result.setValidCredentials(false);
-                attempt.setFailureReason("Password login is disabled for this user.");
-            }
-        } 
-        // ... SSO logic ...
-    }
-
-
-    @Transactional
-    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
-        String userId = userCredentials.getUserId();
-        String encryptedPassword = userCredentials.getPassword();
-
-        userCredentials.setUpdateFlag(false);
-        userCredentials.setPassword(""); // Sanitize output
-        userCredentials.setOtp("");
-
-        try {
-            User user = userRepository.findByUserId(userId);
-            if (user == null) {
-                userCredentials.setMessage("Invalid user id");
-                return userCredentials;
-            }
-
-            // --- APPSEC FIX: Decrypt RSA Payload ---
-            String rawPassword;
-            try {
-                rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-            } catch (SecurityException e) {
-                log.error("Update password rejected for user {}: Payload decryption failed", userId);
-                userCredentials.setMessage("Security Error: Invalid encrypted payload");
-                return userCredentials;
-            }
-
-            String passwordHash = encoder.encode(rawPassword);
-            user.setPasswordHash(passwordHash);
-            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
-            userRepository.save(user);
-
-            userCredentials.setMessage("User password successfully updated");
-            userCredentials.setUpdateFlag(true);
-        } catch (Exception e) {
-            // ... existing exception handling ...
-        }
-        return userCredentials;
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// 1. Install via npm: npm install jsencrypt
-import JSEncrypt from 'jsencrypt';
-
-async function performLogin(userId, rawPassword) {
-    // 2. Fetch the public key from the backend
-    const pubKeyResponse = await fetch('https://fincore-uat.sbi/auth/public-key');
-    const pubKeyData = await pubKeyResponse.json();
-    const publicKey = pubKeyData.data.publicKey;
-
-    // 3. Encrypt the password
-    const encryptor = new JSEncrypt();
-    encryptor.setPublicKey(publicKey);
-    const encryptedPassword = encryptor.encrypt(rawPassword);
-
-    if (!encryptedPassword) {
-        console.error("Encryption failed");
-        return;
-    }
-
-    // 4. Send the payload to the login API
-    const loginPayload = {
-        userId: userId,
-        password: encryptedPassword // Sending Base64 ciphertext, NO PLAINTEXT
-    };
-
-    return fetch('https://fincore-uat.sbi/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(loginPayload)
-    });
 }
 
----
 
-### What to Reply to AppSec to Close the Finding
-
-Once you implement this, copy and paste this exact response to the AppSec team. They will immediately close the vulnerability.
-
-> **Subject:** Closure of Finding: Credentials Transmitted in Plaintext (HIGH)
->
-> **Hi AppSec Team,**
->
-> We have successfully remediated the vulnerability regarding credentials transmitted in plaintext. To align with banking security standards and ensure defense-in-depth against SSL Termination logging or WAF interception, we have implemented **Application-Level Encryption (ALE)** using Asymmetric Cryptography (RSA).
->
-> **Implementation Details:**
-> 1. **Key Pair Generation:** A dedicated 2048-bit RSA key pair has been generated and securely stored via the backend infrastructure.
-> 2. **Frontend Encryption:** The client application retrieves the Public Key dynamically and encrypts the user's password using RSA/ECB/PKCS1Padding prior to JSON serialization.
-> 3. **Backend Decryption:** The Spring Boot backend receives the Base64 ciphertext. The raw password is decrypted strictly in the volatile JVM memory using the Private Key, completely bypassing any network logging mechanisms, before being securely passed to the BCrypt algorithm.
-> 
-> The password is no longer transmitted in plaintext over the HTTP body at any stage. The fix is deployed to UAT and ready for validation.
->
-> **Status:** Fixed.
 
 
 
