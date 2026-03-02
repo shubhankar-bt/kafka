@@ -1,96 +1,59 @@
-Intranet	web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Credentials Transmitted in Plaintext	The application sends username and password values in a readable format within the HTTP request during transmission. This indicates that credentials are not adequately protected in transit (e.g., no HTTPS enforcement or improper encryption handling).	HIGH	Attackers who intercept network traffic (e.g., via man-in-the-middle attacks, insecure Wi-Fi, or proxy interception) can capture user credentials, leading to unauthorized account access, data compromise, and potential privilege escalation.	Enforce secure transmission by implementing HTTPS across the entire application and redirecting all HTTP traffic to HTTPS. Ensure valid TLS configuration, avoid sending credentials in plaintext parameters, and consider additional protections such as secure authentication tokens and multi-factor authentication.	NA	Open
-Intranet	web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Missing HTTP headers	During the assessment, we observed that During the assessment, we observed that the necessary HTTP rensponse headers are missing. 	Low	An attacker may use this information to gather further data and carry out planned attack to gain access to the network	"
-It is recommended that following security headers need to set:
-1. Content Security Policy
-2.Access-Control-Allow-Origin
-3.Referrer-Policy"	NA	Open
-Intranet	Web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Clickjacking	"Clickjacking is a UI-redressing attack where an attacker tricks a user into clicking on a hidden or disguised element embedded inside a malicious webpage. This is typically done by loading the legitimate site inside an invisible iframe and overlaying fake content (e.g., a “Play” button).
-The user believes they are clicking something harmless, but they are actually performing unintended actions on another site where they are authenticated."	Medium	Clickjacking can allow attackers to trick authenticated users into performing unintended actions without their knowledge, such as changing account settings, authorizing transactions, submitting forms, or granting permissions. This can lead to unauthorized operations, privilege misuse, and potential exposure of sensitive information. The risk increases significantly when critical functionalities (e.g., payments, password changes, or administrative actions) are affected.	Protect the application from being embedded in unauthorized frames by implementing anti-clickjacking controls. Configure the X-Frame-Options header with DENY or SAMEORIGIN, or preferably use the Content-Security-Policy header with the frame-ancestors directive to restrict framing to trusted sources. Additionally, enforce strong protection for sensitive actions through re-authentication, CSRF defenses, and explicit user confirmation mechanisms to reduce the risk of unauthorized operations	NA	Open
-Intranet	Web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Missing Server-Side Input Validation	"
-The application fails to properly validate user-supplied input on the server side. Although client-side validation may be present, it can be bypassed by attackers using crafted requests (e.g., modifying parameters, intercepting traffic, or sending direct API calls). Without robust server-side validation, the application processes untrusted data, which can lead to unintended behavior or exploitation."	Medium	Lack of server-side validation allows attackers to manipulate input data to bypass business rules and security controls. This may result in unauthorized access to functionality, data tampering, execution of malicious input (such as injection attacks), or corruption of application logic. In severe cases, it can compromise data integrity, confidentiality, and system stability.	Implement strict server-side validation for all user inputs regardless of client-side controls. Validate input against expected formats, data types, length limits, and allowed values using a whitelist approach. Reject or sanitize invalid data before processing, and enforce validation consistently across all endpoints, including APIs. Additionally, apply contextual encoding, parameterized queries, and proper error handling to minimize the risk of injection and logic bypass attacks.	NA	Open
-Intranet	Web	https://fincore-uat.sbi/	NA	NA	NA	NA	NA	NA	NA	NA	NA	Disabled Browser XSS Protection	The response header X-XSS-Protection is set to 0, which explicitly disables the browser’s built-in Cross-Site Scripting (XSS) filter. While this behavior aligns with modern browser deprecation of legacy XSS filters, no Content-Security-Policy header is present to provide an alternative client-side mitigation.	Low	Disabling the browser XSS filter removes a client-side protection layer, increasing reliance on server-side defenses. Without a Content Security Policy, successful script injection vulnerabilities may have a higher chance of execution in the user’s browser.	Implement a strong Content Security Policy to control script execution and resource loading, and maintain proper input validation and output encoding. Enable legacy XSS protection only if older browser support is required.	NA	Open
-												ss						
+package com.fincore.commonutilities.config;
 
-
-
-
-
-
-
-
-
-
-
-
--------------
-
-
-
-package com.fincore.gateway.Config;
-
-// ... your existing imports ...
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.reactive.CorsConfigurationSource;
-import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
-import org.springframework.security.web.server.header.XFrameOptionsServerHttpHeadersWriter;
-import org.springframework.security.web.server.header.ReferrerPolicyServerHttpHeadersWriter;
-import org.springframework.security.web.server.header.XssProtectionServerHttpHeadersWriter;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
 import java.util.Arrays;
+import java.util.List;
 
+/**
+ * Centralized Security Configuration Bean provider.
+ * Microservices should Import this class to ensure consistent CORS policies.
+ */
 @Configuration
-public class SecurityConfig {
+public class CommonSecurityConfig {
 
-    private final TokenSessionValidator tokenSessionValidator;
-
-    public SecurityConfig(TokenSessionValidator tokenSessionValidator) {
-        this.tokenSessionValidator = tokenSessionValidator;
-    }
-
-    @Bean
-    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
-        return http
-                .csrf(ServerHttpSecurity.CsrfSpec::disable)
-                // 1. Enables Access-Control-Allow-Origin properly
-                .cors(Customizer.withDefaults()) 
-                
-                // 2. Inject Missing AppSec Headers
-                .headers(headers -> headers
-                        // Fixes Clickjacking (Finding 3)
-                        .frameOptions(frame -> frame.mode(XFrameOptionsServerHttpHeadersWriter.Mode.DENY))
-                        // Fixes Missing Headers (Finding 2)
-                        .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
-                        .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyServerHttpHeadersWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
-                        // Fixes Disabled XSS (Finding 5)
-                        .xssProtection(xss -> xss.headerValue(XssProtectionServerHttpHeadersWriter.HeaderValue.ENABLED_MODE_BLOCK))
-                )
-                
-                .authorizeExchange(exchanges -> exchanges
-                        .pathMatchers("/auth/**", "/actuator/**").permitAll()
-                        .anyExchange().authenticated()
-                )
-                .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
-                .addFilterBefore(redisValidationFilter(), SecurityWebFiltersOrder.AUTHORIZATION)
-                .build();
-    }
-
-    /**
-     * strict CORS configuration for Access-Control-Allow-Origin
-     */
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
-        // BANK STANDARD: Do NOT use "*". Explicitly list your UI URLs.
-        configuration.setAllowedOrigins(Arrays.asList("https://fincore-uat.sbi", "http://localhost:4200"));
-        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
-        configuration.setAllowedHeaders(Arrays.asList("Authorization", "Content-Type", "X-Request-Type"));
-        configuration.setAllowCredentials(true); // Required if UI sends cookies (like the Refresh Token)
+
+        // 1. Allowed Origins - APPSEC FIX: Removed wildcard "*"
+        // Explicitly whitelist UI domains. Bank standards prohibit "*" for authenticated APIs.
+        configuration.setAllowedOrigins(List.of(
+                "http://localhost:1000", 
+                "http://localhost:4200", 
+                "https://fincore-uat.sbi",
+                "https://fincore.sbi"
+        ));
+
+        // 2. Allowed Methods
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+
+        // 3. Allowed Headers
+        configuration.setAllowedHeaders(Arrays.asList(
+                "Authorization",
+                "Content-Type",
+                "X-Request-Type",
+                "X-Forwarded-For",
+                "Accept",
+                "X-Correlation-ID"
+        ));
+
+        // 4. Expose Headers
+        configuration.setExposedHeaders(List.of("Authorization"));
+
+        // 5. Allow Credentials - APPSEC FIX: Set to true for secure authenticated requests.
+        // (This is only allowed by browsers if Origins does NOT contain "*")
+        configuration.setAllowCredentials(true);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);
+
         return source;
     }
-    
-    // ... existing redisValidationFilter() ...
 }
 
 
@@ -112,70 +75,113 @@ public class SecurityConfig {
 
 
 
+package com.tcs.fincore.CommonRequestService.config;
 
-
-package com.fincore.commonutilities.config;
-
-// ... your existing imports ...
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
-import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.config.ResilienceConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.logging.MdcLoggingFilter;
+import com.fincore.commonutilities.security.ContextRbacFilter;
 import org.springframework.beans.factory.BeanInitializationException;
-import java.util.Arrays;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import org.springframework.security.web.header.writers.XXssProtectionHeaderWriter;
 
 @Configuration
+@EnableWebSecurity
+@Import({
+        RedisConfig.class,
+        JwtUtil.class,
+        CommonSecurityConfig.class,
+        ResilienceConfig.class
+})
 public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig;
+
+    @Bean
+    public MdcLoggingFilter mdcLoggingFilter() {
+        return new MdcLoggingFilter(jwtUtil);
+    }
+
+    @Bean
+    public ContextRbacFilter contextRbacFilter() {
+        return new ContextRbacFilter(redisTemplate, jwtUtil);
+    }
+
+    @Bean
+    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
+        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    @Bean
+    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
+        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) {
         try {
             http
-                .csrf(csrf -> csrf.disable())
-                // 1. Enables Access-Control-Allow-Origin properly
-                .cors(Customizer.withDefaults()) 
-                
-                // 2. Inject Missing AppSec Headers
-                .headers(headers -> headers
-                    // Fixes Clickjacking (Finding 3)
-                    .frameOptions(frame -> frame.deny())
-                    // Fixes Missing Headers (Finding 2)
-                    .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
-                    .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
-                    // Fixes Disabled XSS (Finding 5)
-                    .xssProtection(xss -> xss.headerValue(org.springframework.security.web.header.writers.XXssProtectionHeaderWriter.HeaderValue.ENABLED_MODE_BLOCK))
-                )
-                
-                .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(auth -> auth
-                    .requestMatchers("/actuator/**", "/internal/**").permitAll()
-                    .anyRequest().authenticated()
-                );
-                // .addFilterBefore(...)
+                    .csrf(csrf -> csrf.disable())
+                    .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+                    
+                    // --- APPSEC FIX: Missing Security Headers ---
+                    .headers(headers -> headers
+                            // Fixes Finding 3: Clickjacking
+                            .frameOptions(frame -> frame.deny())
+                            // Fixes Finding 2: Content-Security-Policy
+                            .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
+                            // Fixes Finding 2: Referrer-Policy
+                            .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+                            // Fixes Finding 5: XSS Protection
+                            .xssProtection(xss -> xss.headerValue(XXssProtectionHeaderWriter.HeaderValue.ENABLED_MODE_BLOCK))
+                    )
+                    // ---------------------------------------------
+                    
+                    .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                    .authorizeHttpRequests(authz -> authz
+                            .requestMatchers("/actuator/**", "/api/auth/**", "/error", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
+                            // Note: Ensure your actual app has specific auth rules here instead of permitAll() for everything!
+                            .anyRequest().permitAll() 
+                    )
+                    .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
+                    .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
 
             return http.build();
         } catch (Exception e) {
-            throw new BeanInitializationException("Failed to initialize Microservice Security Config", e);
+            // Fixes CWE-396 (Throws Generic Exception)
+            throw new BeanInitializationException("Failed to initialize Security Filter Chain", e);
         }
     }
-
-    /**
-     * Strict CORS configuration for Microservices
-     */
-    @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
-        CorsConfiguration configuration = new CorsConfiguration();
-        // Only allow traffic originating from your trusted UI frontend
-        configuration.setAllowedOrigins(Arrays.asList("https://fincore-uat.sbi"));
-        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
-        configuration.setAllowedHeaders(Arrays.asList("Authorization", "Content-Type", "X-Request-Type", "X-Internal-Signature"));
-        configuration.setAllowCredentials(true);
-
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", configuration);
-        return source;
-    }
 }
+
+
+
+
+
 
 
 
