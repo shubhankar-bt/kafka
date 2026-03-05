@@ -1,198 +1,35 @@
-package com.fincore.commonutilities.config;
+Dear Sir\Madam,
 
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+Sample LDAP URL for root server - ldaps://CORP.AD.SBI:636
 
-import java.util.Arrays;
-import java.util.List;
-
-/**
- * Centralized Security Configuration Bean provider.
- * Microservices should Import this class to ensure consistent CORS policies.
- */
-@Configuration
-public class CommonSecurityConfig {
-
-    @Bean
-    public CorsConfigurationSource corsConfigurationSource() {
-        CorsConfiguration configuration = new CorsConfiguration();
-
-        // 1. Allowed Origins - APPSEC FIX: Removed wildcard "*"
-        // Explicitly whitelist UI domains. Bank standards prohibit "*" for authenticated APIs.
-        configuration.setAllowedOrigins(List.of(
-                "http://localhost:1000", 
-                "http://localhost:4200", 
-                "https://fincore-uat.sbi",
-                "https://fincore.sbi"
-        ));
-
-        // 2. Allowed Methods
-        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
-
-        // 3. Allowed Headers
-        configuration.setAllowedHeaders(Arrays.asList(
-                "Authorization",
-                "Content-Type",
-                "X-Request-Type",
-                "X-Forwarded-For",
-                "Accept",
-                "X-Correlation-ID"
-        ));
-
-        // 4. Expose Headers
-        configuration.setExposedHeaders(List.of("Authorization"));
-
-        // 5. Allow Credentials - APPSEC FIX: Set to true for secure authenticated requests.
-        // (This is only allowed by browsers if Origins does NOT contain "*")
-        configuration.setAllowCredentials(true);
-
-        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-        source.registerCorsConfiguration("/**", configuration);
-
-        return source;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.tcs.fincore.CommonRequestService.config;
-
-import com.fincore.commonutilities.config.CommonSecurityConfig;
-import com.fincore.commonutilities.config.RedisConfig;
-import com.fincore.commonutilities.config.ResilienceConfig;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.commonutilities.logging.MdcLoggingFilter;
-import com.fincore.commonutilities.security.ContextRbacFilter;
-import org.springframework.beans.factory.BeanInitializationException;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Import;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
-import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
-import org.springframework.security.web.header.writers.XXssProtectionHeaderWriter;
-
-@Configuration
-@EnableWebSecurity
-@Import({
-        RedisConfig.class,
-        JwtUtil.class,
-        CommonSecurityConfig.class,
-        ResilienceConfig.class
-})
-public class SecurityConfig {
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    @Autowired
-    private JwtUtil jwtUtil;
-
-    @Autowired
-    private CommonSecurityConfig commonSecurityConfig;
-
-    @Bean
-    public MdcLoggingFilter mdcLoggingFilter() {
-        return new MdcLoggingFilter(jwtUtil);
-    }
-
-    @Bean
-    public ContextRbacFilter contextRbacFilter() {
-        return new ContextRbacFilter(redisTemplate, jwtUtil);
-    }
-
-    @Bean
-    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
-        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
-        registration.setEnabled(false);
-        return registration;
-    }
-
-    @Bean
-    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
-        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
-        registration.setEnabled(false);
-        return registration;
-    }
-
-    @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) {
-        try {
-            http
-                    .csrf(csrf -> csrf.disable())
-                    .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
-                    
-                    // --- APPSEC FIX: Missing Security Headers ---
-                    .headers(headers -> headers
-                            // Fixes Finding 3: Clickjacking
-                            .frameOptions(frame -> frame.deny())
-                            // Fixes Finding 2: Content-Security-Policy
-                            .contentSecurityPolicy(csp -> csp.policyDirectives("default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"))
-                            // Fixes Finding 2: Referrer-Policy
-                            .referrerPolicy(referrer -> referrer.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
-                            // Fixes Finding 5: XSS Protection
-                            .xssProtection(xss -> xss.headerValue(XXssProtectionHeaderWriter.HeaderValue.ENABLED_MODE_BLOCK))
-                    )
-                    // ---------------------------------------------
-                    
-                    .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                    .authorizeHttpRequests(authz -> authz
-                            .requestMatchers("/actuator/**", "/api/auth/**", "/error", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
-                            // Note: Ensure your actual app has specific auth rules here instead of permitAll() for everything!
-                            .anyRequest().permitAll() 
-                    )
-                    .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
-                    .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
-
-            return http.build();
-        } catch (Exception e) {
-            // Fixes CWE-396 (Throws Generic Exception)
-            throw new BeanInitializationException("Failed to initialize Security Filter Chain", e);
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+LDAP Port - 636
+Please find below CORP server details along with certificate.
+Kindly rename certificate from .txt to .cer
+Find below Corp server details.
+IP Address
+Host Name
+Site
+10.176.53.145
+CORPDCMDGBL01.CORP.AD.SBI
+GBL
+10.176.54.30
+CORPDCMDGBL02.CORP.AD.SBI
+GBL
+10.176.54.31
+CORPDCMDGBL03.CORP.AD.SBI
+GBL
+10.176.54.32
+CORPDCMDGBL04.CORP.AD.SBI
+GBL
+10.189.37.135
+CORPDCMDRBL01.CORP.AD.SBI
+RBL
+10.189.37.136
+CORPDCMDRBL02.CORP.AD.SBI
+RBL
+10.189.37.137
+CORPDCMDRBL03.CORP.AD.SBI
+RBL
+10.189.37.138
+CORPDCMDRBL04.CORP.AD.SBI
+RBL
