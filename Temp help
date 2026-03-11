@@ -1,13 +1,77 @@
+package com.tcs.userservice.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class RolePayloadDto {
+
+    @NotBlank(message = "Role Name is required.")
+    @Pattern(regexp = "^[a-zA-Z0-9 ,()&/\\-]{3,20}$", 
+            message = "Invalid Role Name. Allowed 3-20 characters (alphabets, numbers, spaces and ,()&/- are allowed).")
+    private String roleName;
+
+    @NotBlank(message = "Description is required.")
+    @Pattern(regexp = "^(?!.* {2})[a-zA-Z0-9 ,()&/\\-]{5,200}$", 
+            message = "Invalid Description. Allowed 5-200 characters (single spaces only between words) and ,()&/- are allowed.")
+    private String description;
+
+    @NotBlank(message = "Role Status is required.")
+    @Pattern(regexp = "^(ACTIVE|INACTIVE)$", message = "Role status must be ACTIVE or INACTIVE.")
+    private String roleStatus;
+
+    @NotEmpty(message = "At least one permission must be selected.")
+    @Valid // Cascades validation to the items inside the list
+    private List<PermissionDto> permissions;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class PermissionDto {
+        @NotNull(message = "Permission ID is required.")
+        private Integer id;
+        
+        @NotBlank(message = "Permission Title is required.")
+        @Pattern(regexp = "^[a-zA-Z0-9 ,()&/\\-]{3,50}$", message = "Invalid Permission Title format.")
+        private String title;
+        
+        private Integer order;
+        private String icon;
+        private String description;
+        private String menuSubmenu;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 package com.tcs.userservice.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.dto.RolePayloadDto;
 import com.tcs.userservice.dto.RoleRequestCreateDto;
 import com.tcs.userservice.model.Role;
 import com.tcs.userservice.model.RoleRequest;
 import com.tcs.userservice.utils.Constant;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
@@ -16,15 +80,18 @@ import org.springframework.transaction.annotation.Transactional;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.List;
-import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @Service
 public class RoleRequestServiceImpl {
 
-    // ... your autowired repositories and services ...
+    // ... your other autowired repositories ...
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // Inject the standard Spring Validator
+    @Autowired
+    private Validator validator;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -38,36 +105,35 @@ public class RoleRequestServiceImpl {
         roleRequest.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
         String finalJsonPayload;
-        Map<String, Object> payloadMap;
+        RolePayloadDto payloadDto;
+
         try {
+            // 1. Handle the String vs Object scenario cleanly
             if (dto.getRequestPayload() instanceof String) {
                 finalJsonPayload = (String) dto.getRequestPayload();
-                payloadMap = objectMapper.readValue(finalJsonPayload, new TypeReference<Map<String, Object>>() {});
             } else {
-                payloadMap = (Map<String, Object>) dto.getRequestPayload();
-                finalJsonPayload = objectMapper.writeValueAsString(payloadMap);
+                finalJsonPayload = objectMapper.writeValueAsString(dto.getRequestPayload());
             }
+            
+            // 2. Parse directly into our Strongly Typed DTO
+            payloadDto = objectMapper.readValue(finalJsonPayload, RolePayloadDto.class);
             roleRequest.setRequestPayload(finalJsonPayload);
+
         } catch (JsonProcessingException e) {
             log.error("JSON Parsing Error", e);
             throw new IllegalArgumentException("Malformed JSON structure in request payload");
-        } catch (ClassCastException e) {
-            log.error("Payload Cast Error", e);
-            throw new IllegalArgumentException("Payload must be a valid JSON object or stringified JSON");
         }
 
-        boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
-        
         // ==========================================
-        // NEW: STRICT PAYLOAD VALIDATION (XSS/SQLi Prevention)
+        // DOUBLE CHECK: LAYER 1 (DTO @Valid Annotations)
         // ==========================================
-        validatePayloadContent(payloadMap, isCreate);
-        // ==========================================
+        validateDtoProgrammatically(payloadDto);
 
-        String roleName = (String) payloadMap.get("roleName");
-        
-        // Existing DB Conflict Validation
-        validateRequest(isCreate, dto.getTargetRoleId(), roleName);
+        // ==========================================
+        // DOUBLE CHECK: LAYER 2 (Manual Business Logic)
+        // ==========================================
+        boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
+        validateBusinessRules(isCreate, dto.getTargetRoleId(), payloadDto.getRoleName());
 
         if (isCreate) {
             roleRequest.setTargetRoleId(roleRequestRepository.getNewRoleIdOnCreation());
@@ -97,52 +163,27 @@ public class RoleRequestServiceImpl {
     }
 
     /**
-     * Strictly validates the payload content to prevent XSS, SQLi, and enforce business rules.
+     * Executes the @Valid, @Pattern, and @NotBlank annotations defined in RolePayloadDto.
+     * This completely prevents XSS and SQLi by enforcing strict regex on all fields.
      */
-    private void validatePayloadContent(Map<String, Object> payloadMap, boolean isCreate) {
-        String roleName = (String) payloadMap.get("roleName");
-        String description = (String) payloadMap.get("description");
-        Object permissionsObj = payloadMap.get("permissions");
-
-        // 1. Role Name Validation
-        if (roleName == null || roleName.trim().isEmpty()) {
-            throw new IllegalArgumentException("Role Name is required.");
-        }
-        // Allows 3-20 chars: alphabets, numbers, spaces, and ,()&/-
-        if (!roleName.matches("^[a-zA-Z0-9 ,()&/\\-]{3,20}$")) {
-            throw new IllegalArgumentException("Invalid Role Name. Allowed 3-20 characters (alphabets, numbers, spaces and ,()&/- are allowed).");
-        }
-
-        // 2. Description Validation
-        if (description == null || description.trim().isEmpty()) {
-            throw new IllegalArgumentException("Description is required.");
-        }
-        // Allows 5-200 chars. (?!.* {2}) ensures NO double spaces. Allows alphabets, numbers, ,()&/-
-        if (!description.matches("^(?!.* {2})[a-zA-Z0-9 ,()&/\\-]{5,200}$")) {
-            throw new IllegalArgumentException("Invalid Description. Allowed 5-200 characters (single spaces only between words) and ,()&/- are allowed.");
-        }
-
-        // 3. Permissions Validation (Must be an array/list and not empty)
-        if (permissionsObj == null) {
-            throw new IllegalArgumentException("Permissions selection is required.");
-        }
-        if (!(permissionsObj instanceof List)) {
-            throw new IllegalArgumentException("Permissions must be a valid list.");
-        }
-        List<?> permissions = (List<?>) permissionsObj;
-        if (permissions.isEmpty()) {
-            throw new IllegalArgumentException("At least one permission must be selected.");
+    private void validateDtoProgrammatically(RolePayloadDto payloadDto) {
+        Set<ConstraintViolation<RolePayloadDto>> violations = validator.validate(payloadDto);
+        if (!violations.isEmpty()) {
+            // Get the message from the first violation found (e.g., "Invalid Role Name.")
+            String errorMessage = violations.iterator().next().getMessage();
+            throw new IllegalArgumentException(errorMessage);
         }
     }
 
-    private void validateRequest(boolean isCreate, int roleId, String roleName) {
-        // 1. Validate ID conflict
+    /**
+     * Executes Database-dependent business validations (Conflicts, existences, etc.)
+     */
+    private void validateBusinessRules(boolean isCreate, int roleId, String roleName) {
         if (isCreate) {
             Role existingRole = roleRepository.findRoleByRoleId(roleId);
             if (existingRole != null) {
                 throw new IllegalArgumentException("Role ID " + roleId + " already exists in the system.");
             }
-            // 2. Validate Name Conflict (Master Table) - Case Insensitive, Trimmed
             // Check Master Table
             if (roleRepository.existsByRoleNameIgnoreCase(roleName.trim())) {
                 throw new IllegalArgumentException("Role Name '" + roleName + "' already exists. Please choose a different name.");
@@ -159,4 +200,5 @@ public class RoleRequestServiceImpl {
         }
     }
 }
+
 
