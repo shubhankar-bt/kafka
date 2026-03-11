@@ -1,133 +1,153 @@
-general:
 
-Request URL
-https://fincore-uat.sbi/api/auth/check-user
-Request Method
-POST
-Status Code
-200 OK
-Remote Address
-10.177.107.105:443
-Referrer Policy
-strict-origin-when-cross-origin
+    @PostMapping("/create-role-request")
+    public ResponseEntity createNewRequest(@RequestBody RoleRequestCreateDto request,
+                                           @RequestHeader("Authorization") String token) {
+        log.info("Received request to create role : {}", request);
+        String userId = jwtUtil.getUserIdFromToken(token);
+        return roleRequestService.createNewRoleRequest(request, userId);
+    }
 
-response headers :
+this is the controller,
 
-HTTP/1.1 200
-Content-Type: application/json
-Content-Length: 753
-Connection: keep-alive
-Vary: Origin
-Vary: Access-Control-Request-Method
-Vary: Access-Control-Request-Headers
-Cache-Control: no-cache, no-store, max-age=0, must-revalidate
-Pragma: no-cache
-Expires: 0
-X-Content-Type-Options: nosniff
-Date: Tue, 10 Mar 2026 07:38:09 GMT
-X-Xss-Protection: 1; mode=block
-X-Frame-Options: DENY
-Strict-Transport-Security: max-age=31536000; includeSubDomains
-Access-Control-Allow-Credentials: true
-Referrer-Policy: strict-origin-when-cross-origin
-Access-Control-Allow-Origin: https://fincore-uat.sbi
-Content-Security-Policy: default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';
+package com.tcs.userservice.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.Data;
+import java.util.Map;
 
-request headers:
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import lombok.Data;
 
-POST /api/auth/check-user HTTP/1.1
-Accept: application/json, text/plain, */*
-Accept-Encoding: gzip, deflate, br, zstd
-Accept-Language: en-US,en;q=0.9
-Connection: keep-alive
-Content-Length: 20
-Content-Type: application/json
-Host: fincore-uat.sbi
-Origin: https://fincore-uat.sbi
-Referer: https://fincore-uat.sbi/
-Sec-Fetch-Dest: empty
-Sec-Fetch-Mode: cors
-Sec-Fetch-Site: same-origin
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36
-sec-ch-ua: "Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"
-sec-ch-ua-mobile: ?0
-sec-ch-ua-platform: "Windows"
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class RoleRequestCreateDto {
 
+    private String requestType; // CREATE, MODIFY, DELETE
 
+    private int targetRoleId;
+
+    private String requestorUserId;
+
+    // Object allows receiving either a String "..." or a Map {...}
+    private Object requestPayload;
+}
+
+this is the dto
+
+i want standard validations for the fields,
+
+in frontend screen this is written in the field role name  : Allowed 3-20 characters (alphabets, numbers, spaces and ,()&/- are allowed!)
+
+description field name  :  Allowed 5-200 characters (alphabets, numbers, spaces(single spaces only between words) and ,()&/- are allowed!)
+
+and there is role permission select dropdown, where one or more requests can be selected, one permissions selection is must. 
+
+below is the payload for create request :
+
+requestPayload
+: 
+"{\"roleId\":\"\",\"roleName\":\"qwdwdwdw\",\"description\":\"ddwdwdwdwdw\",\"roleStatus\":\"ACTIVE\",\"permissions\":[{\"id\":1,\"title\":\"Circle Management\",\"order\":1,\"icon\":\"AccountTree\",\"description\":\"To manage circles and view status of self request\",\"menuSubmenu\":\"Circle Management\"},{\"id\":2,\"title\":\"Circle Management\",\"order\":2,\"icon\":\"Ballot\",\"description\":\"To review/approve pending requests for circles created by other user\",\"menuSubmenu\":\"Circle Requests\"}]}"
+requestType
+: 
+"CREATE"
+targetRoleId
+: 
+""
 
 
+now i want a strict validation to validate these fields correctly in server side. I want to ensure no sql injection, no <script>alert('hack')</script> this fields injections.
 
+below is my service impl code check that also.
 
+  @Override
+    @Transactional(rollbackFor = Exception.class)
+    public ResponseEntity<ResponseVO<RoleRequest>> createNewRoleRequest(RoleRequestCreateDto dto, String userId) {
 
+        RoleRequest roleRequest = new RoleRequest();
+        roleRequest.setRequestType(dto.getRequestType());
+        roleRequest.setTargetRoleId(dto.getTargetRoleId());
+        roleRequest.setRequestorUserId(userId);
+        roleRequest.setRequestStatus(Constant.PENDING);
+        roleRequest.setRequestDate(LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
 
+        String finalJsonPayload;
+        Map<String, Object> payloadMap;
+        try {
+            if (dto.getRequestPayload() instanceof String) {
+                // Case 1: Frontend sent a Stringified JSON "{\"roleName\":...}"
+                finalJsonPayload = (String) dto.getRequestPayload();
+                payloadMap = objectMapper.readValue(finalJsonPayload, Map.class);
+            } else {
+                // Case 2: Frontend sent a real JSON Object {"roleName":...}
+                payloadMap = (Map<String, Object>) dto.getRequestPayload();
+                finalJsonPayload = objectMapper.writeValueAsString(payloadMap);
+            }
+            roleRequest.setRequestPayload(finalJsonPayload);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Malformed JSON structure in request payload", e);
+        } catch (ClassCastException e) {
+            throw new IllegalArgumentException("Payload must be a valid JSON object or stringified JSON", e);
+        }
 
+        boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
+        String roleName = (String) payloadMap.get("roleName");
 
-generel :
+        validateRequest(isCreate, dto.getTargetRoleId(), roleName);
 
-Request URL
-https://fincore-uat.sbi/api/my-requests
-Request Method
-POST
-Status Code
-200 OK
-Remote Address
-10.177.107.105:443
-Referrer Policy
-strict-origin-when-cross-origin
+        if (isCreate) {
+            roleRequest.setTargetRoleId(roleRequestRepository.getNewRoleIdOnCreation());
+        }
 
+        RoleRequest saved = roleRequestRepository.save(roleRequest);
 
-response headers :
+        // 1. Notification (To Approvers)
+        // Msg: "New Role Request (ID: 55) for Role 51 (MODIFY) is pending approval."
+        String notifMsg = String.format("New Role Request (ID: %s) for Role %s (%s) is pending approval.",
+                saved.getRequestId(), saved.getTargetRoleId(), saved.getRequestType());
 
-HTTP/1.1 200
-Content-Type: application/json
-Transfer-Encoding: chunked
-Connection: keep-alive
-Vary: Origin
-Vary: Access-Control-Request-Method
-Vary: Access-Control-Request-Headers
-X-Correlation-ID: 78391c49-615d-4184-bf7a-c4df6e307fc7
-X-Content-Type-Options: nosniff
-Cache-Control: no-cache, no-store, max-age=0, must-revalidate
-Pragma: no-cache
-Expires: 0
-Date: Tue, 10 Mar 2026 07:39:20 GMT
-X-Xss-Protection: 1; mode=block
-X-Frame-Options: DENY
-Strict-Transport-Security: max-age=31536000; includeSubDomains
-Access-Control-Allow-Credentials: true
-Referrer-Policy: strict-origin-when-cross-origin
-Access-Control-Allow-Origin: https://fincore-uat.sbi
-Content-Security-Policy: default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';
+        NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
 
+        createNotification(
+                saved.getRequestorUserId(), // creator exclusion
+                config.getTargetRoles(),
+                config.getTargetUrl(),
+                notifMsg,
+                String.valueOf(saved.getRequestId()));
 
-request headers :
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ResponseVO.<RoleRequest>builder()
+                        .statusCode(HttpStatus.CREATED)
+                        .message("Request Created")
+                        .result(saved)
+                        .build());
+    }
 
-POST /api/common-master/cgls HTTP/1.1
-Accept: application/json, text/plain, */*
-Accept-Encoding: gzip, deflate, br, zstd
-Accept-Language: en-US,en;q=0.9
-Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiIxMDAwMDAxIiwicm9sZSI6MTEsInJvbGVOYW1lIjoiRjEvQk9HICIsImZpcnN0TmFtZSI6IkYxIEJPRyAiLCJsYXN0TmFtZSI6IlVzZXIxIiwicGhvbmVOdW1iZXIiOiI1MDEyMzQ2Nzg5IiwiZW1haWwiOiJmMWJvZ3VzZXIxQHNiaS5jby5pbiIsImJyYW5jaCI6ODAxNTAsInN1YiI6IjEwMDAwMDEiLCJqdGkiOiJkZGFkZjJhNS1lMzE1LTQzZWMtODg1MC02ZDk5MTQ5MDA1ZWQiLCJpYXQiOjE3NzMxMjgzNTUsImV4cCI6MTc3MzEyOTI1NX0.dDEwgsf_ZbPxL6L98jXEPyNuDrR87Gq9uhnCPp59J3I
-Connection: keep-alive
-Content-Length: 75
-Content-Type: application/json
-Cookie: refresh_token=eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoicmVmcmVzaCIsInN1YiI6IjEwMDAwMDEiLCJqdGkiOiIyMGYyMzQ0MC0zNDc4LTRmNzUtYTczOC01NGJhMGU1ZTQ2ZDkiLCJpYXQiOjE3NzMxMjgzNTUsImV4cCI6MTc3MzE3MTU1NX0.ypbZ94YxHuY6Qz0A7G-imtdSZjsgIom35jvDgkbP0TI
-Host: fincore-uat.sbi
-Origin: https://fincore-uat.sbi
-Referer: https://fincore-uat.sbi/manage-cgls
-Sec-Fetch-Dest: empty
-Sec-Fetch-Mode: cors
-Sec-Fetch-Site: same-origin
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36
-X-Request-Type: CGL_CODE
-sec-ch-ua: "Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"
-sec-ch-ua-mobile: ?0
-sec-ch-ua-platform: "Windows"
-
-
-
-
-
-
-
-
+    private void validateRequest(boolean isCreate, int roleId, String roleName) {
+        // 1. Validate ID conflict
+        if (isCreate) {
+            Role existingRole = roleRepository.findRoleByRoleId(roleId);
+            if (existingRole != null) {
+                throw new IllegalArgumentException("Role ID " + roleId + " already exists in the system.");
+            }
+            // 2. Validate Name Conflict (Master Table) - Case Insensitive, Trimmed
+            if (roleName != null && !roleName.trim().isEmpty()) {
+                // Check Master Table (e.g. F1/BOG vs f1/bog)
+                if (roleRepository.existsByRoleNameIgnoreCase(roleName.trim())) {
+                    throw new IllegalArgumentException(
+                            "Role Name '" + roleName + "' already exists. Please choose a different name.");
+                }
+                // Check Pending Requests
+                if (roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.trim().toLowerCase()) > 0) {
+                    throw new IllegalArgumentException(
+                            "The request for Role Name " + roleName + " is already pending approval.");
+                }
+            } else {
+                throw new IllegalArgumentException("Role Name cannot be empty.");
+            }
+        } else {
+            // Modification Validation
+            if (roleRequestRepository.countPendingRoleRequests(roleId) > 0) {
+                throw new IllegalArgumentException("A pending request already exists for Role ID " + roleId);
+            }
+        }
+    }
