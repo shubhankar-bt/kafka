@@ -1,65 +1,32 @@
+package com.tcs.userservice.service;
 
-    @PostMapping("/create-role-request")
-    public ResponseEntity createNewRequest(@RequestBody RoleRequestCreateDto request,
-                                           @RequestHeader("Authorization") String token) {
-        log.info("Received request to create role : {}", request);
-        String userId = jwtUtil.getUserIdFromToken(token);
-        return roleRequestService.createNewRoleRequest(request, userId);
-    }
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tcs.userservice.dto.RoleRequestCreateDto;
+import com.tcs.userservice.model.Role;
+import com.tcs.userservice.model.RoleRequest;
+import com.tcs.userservice.utils.Constant;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
-this is the controller,
-
-package com.tcs.userservice.dto;
-
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import lombok.Data;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
 import java.util.Map;
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import lombok.Data;
+@Slf4j
+@Service
+public class RoleRequestServiceImpl {
 
-@Data
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class RoleRequestCreateDto {
+    // ... your autowired repositories and services ...
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private String requestType; // CREATE, MODIFY, DELETE
-
-    private int targetRoleId;
-
-    private String requestorUserId;
-
-    // Object allows receiving either a String "..." or a Map {...}
-    private Object requestPayload;
-}
-
-this is the dto
-
-i want standard validations for the fields,
-
-in frontend screen this is written in the field role name  : Allowed 3-20 characters (alphabets, numbers, spaces and ,()&/- are allowed!)
-
-description field name  :  Allowed 5-200 characters (alphabets, numbers, spaces(single spaces only between words) and ,()&/- are allowed!)
-
-and there is role permission select dropdown, where one or more requests can be selected, one permissions selection is must. 
-
-below is the payload for create request :
-
-requestPayload
-: 
-"{\"roleId\":\"\",\"roleName\":\"qwdwdwdw\",\"description\":\"ddwdwdwdwdw\",\"roleStatus\":\"ACTIVE\",\"permissions\":[{\"id\":1,\"title\":\"Circle Management\",\"order\":1,\"icon\":\"AccountTree\",\"description\":\"To manage circles and view status of self request\",\"menuSubmenu\":\"Circle Management\"},{\"id\":2,\"title\":\"Circle Management\",\"order\":2,\"icon\":\"Ballot\",\"description\":\"To review/approve pending requests for circles created by other user\",\"menuSubmenu\":\"Circle Requests\"}]}"
-requestType
-: 
-"CREATE"
-targetRoleId
-: 
-""
-
-
-now i want a strict validation to validate these fields correctly in server side. I want to ensure no sql injection, no <script>alert('hack')</script> this fields injections.
-
-below is my service impl code check that also.
-
-  @Override
+    @Override
     @Transactional(rollbackFor = Exception.class)
     public ResponseEntity<ResponseVO<RoleRequest>> createNewRoleRequest(RoleRequestCreateDto dto, String userId) {
 
@@ -74,24 +41,32 @@ below is my service impl code check that also.
         Map<String, Object> payloadMap;
         try {
             if (dto.getRequestPayload() instanceof String) {
-                // Case 1: Frontend sent a Stringified JSON "{\"roleName\":...}"
                 finalJsonPayload = (String) dto.getRequestPayload();
-                payloadMap = objectMapper.readValue(finalJsonPayload, Map.class);
+                payloadMap = objectMapper.readValue(finalJsonPayload, new TypeReference<Map<String, Object>>() {});
             } else {
-                // Case 2: Frontend sent a real JSON Object {"roleName":...}
                 payloadMap = (Map<String, Object>) dto.getRequestPayload();
                 finalJsonPayload = objectMapper.writeValueAsString(payloadMap);
             }
             roleRequest.setRequestPayload(finalJsonPayload);
         } catch (JsonProcessingException e) {
-            throw new IllegalArgumentException("Malformed JSON structure in request payload", e);
+            log.error("JSON Parsing Error", e);
+            throw new IllegalArgumentException("Malformed JSON structure in request payload");
         } catch (ClassCastException e) {
-            throw new IllegalArgumentException("Payload must be a valid JSON object or stringified JSON", e);
+            log.error("Payload Cast Error", e);
+            throw new IllegalArgumentException("Payload must be a valid JSON object or stringified JSON");
         }
 
         boolean isCreate = Constant.CREATE.equalsIgnoreCase(dto.getRequestType());
-        String roleName = (String) payloadMap.get("roleName");
+        
+        // ==========================================
+        // NEW: STRICT PAYLOAD VALIDATION (XSS/SQLi Prevention)
+        // ==========================================
+        validatePayloadContent(payloadMap, isCreate);
+        // ==========================================
 
+        String roleName = (String) payloadMap.get("roleName");
+        
+        // Existing DB Conflict Validation
         validateRequest(isCreate, dto.getTargetRoleId(), roleName);
 
         if (isCreate) {
@@ -100,15 +75,14 @@ below is my service impl code check that also.
 
         RoleRequest saved = roleRequestRepository.save(roleRequest);
 
-        // 1. Notification (To Approvers)
-        // Msg: "New Role Request (ID: 55) for Role 51 (MODIFY) is pending approval."
+        // Notification Logic
         String notifMsg = String.format("New Role Request (ID: %s) for Role %s (%s) is pending approval.",
                 saved.getRequestId(), saved.getTargetRoleId(), saved.getRequestType());
 
         NotificationConfigDto config = permissionConfigService.getConfig(REQUEST_TYPE_KEY);
 
         createNotification(
-                saved.getRequestorUserId(), // creator exclusion
+                saved.getRequestorUserId(),
                 config.getTargetRoles(),
                 config.getTargetUrl(),
                 notifMsg,
@@ -117,9 +91,48 @@ below is my service impl code check that also.
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ResponseVO.<RoleRequest>builder()
                         .statusCode(HttpStatus.CREATED)
-                        .message("Request Created")
+                        .message("Request Created Successfully")
                         .result(saved)
                         .build());
+    }
+
+    /**
+     * Strictly validates the payload content to prevent XSS, SQLi, and enforce business rules.
+     */
+    private void validatePayloadContent(Map<String, Object> payloadMap, boolean isCreate) {
+        String roleName = (String) payloadMap.get("roleName");
+        String description = (String) payloadMap.get("description");
+        Object permissionsObj = payloadMap.get("permissions");
+
+        // 1. Role Name Validation
+        if (roleName == null || roleName.trim().isEmpty()) {
+            throw new IllegalArgumentException("Role Name is required.");
+        }
+        // Allows 3-20 chars: alphabets, numbers, spaces, and ,()&/-
+        if (!roleName.matches("^[a-zA-Z0-9 ,()&/\\-]{3,20}$")) {
+            throw new IllegalArgumentException("Invalid Role Name. Allowed 3-20 characters (alphabets, numbers, spaces and ,()&/- are allowed).");
+        }
+
+        // 2. Description Validation
+        if (description == null || description.trim().isEmpty()) {
+            throw new IllegalArgumentException("Description is required.");
+        }
+        // Allows 5-200 chars. (?!.* {2}) ensures NO double spaces. Allows alphabets, numbers, ,()&/-
+        if (!description.matches("^(?!.* {2})[a-zA-Z0-9 ,()&/\\-]{5,200}$")) {
+            throw new IllegalArgumentException("Invalid Description. Allowed 5-200 characters (single spaces only between words) and ,()&/- are allowed.");
+        }
+
+        // 3. Permissions Validation (Must be an array/list and not empty)
+        if (permissionsObj == null) {
+            throw new IllegalArgumentException("Permissions selection is required.");
+        }
+        if (!(permissionsObj instanceof List)) {
+            throw new IllegalArgumentException("Permissions must be a valid list.");
+        }
+        List<?> permissions = (List<?>) permissionsObj;
+        if (permissions.isEmpty()) {
+            throw new IllegalArgumentException("At least one permission must be selected.");
+        }
     }
 
     private void validateRequest(boolean isCreate, int roleId, String roleName) {
@@ -130,19 +143,13 @@ below is my service impl code check that also.
                 throw new IllegalArgumentException("Role ID " + roleId + " already exists in the system.");
             }
             // 2. Validate Name Conflict (Master Table) - Case Insensitive, Trimmed
-            if (roleName != null && !roleName.trim().isEmpty()) {
-                // Check Master Table (e.g. F1/BOG vs f1/bog)
-                if (roleRepository.existsByRoleNameIgnoreCase(roleName.trim())) {
-                    throw new IllegalArgumentException(
-                            "Role Name '" + roleName + "' already exists. Please choose a different name.");
-                }
-                // Check Pending Requests
-                if (roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.trim().toLowerCase()) > 0) {
-                    throw new IllegalArgumentException(
-                            "The request for Role Name " + roleName + " is already pending approval.");
-                }
-            } else {
-                throw new IllegalArgumentException("Role Name cannot be empty.");
+            // Check Master Table
+            if (roleRepository.existsByRoleNameIgnoreCase(roleName.trim())) {
+                throw new IllegalArgumentException("Role Name '" + roleName + "' already exists. Please choose a different name.");
+            }
+            // Check Pending Requests
+            if (roleRequestRepository.countPendingRoleRequestsByRoleName(roleName.trim().toLowerCase()) > 0) {
+                throw new IllegalArgumentException("The request for Role Name '" + roleName + "' is already pending approval.");
             }
         } else {
             // Modification Validation
@@ -151,3 +158,5 @@ below is my service impl code check that also.
             }
         }
     }
+}
+
