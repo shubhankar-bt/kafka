@@ -1,10 +1,30 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+} from "react";
 import { useSelector } from "react-redux";
-import { 
-  Box, Fab, IconButton, Tooltip, Button, Fade, Typography, Stack, Chip, 
-  CircularProgress, useTheme, GlobalStyles 
+import {
+  Box,
+  Fab,
+  IconButton,
+  Tooltip,
+  Button,
+  Fade,
+  Typography,
+  Stack,
+  Chip,
+  CircularProgress,
+  useTheme,
+  GlobalStyles,
+  Drawer,
+  Paper,
+  InputAdornment,
+  LinearProgress,
 } from "@mui/material";
-import { alpha } from "@mui/material/styles";
+import { alpha, keyframes } from "@mui/material/styles";
 
 // Icons
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
@@ -30,6 +50,7 @@ import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import BoltIcon from "@mui/icons-material/Bolt";
 import PsychologyIcon from "@mui/icons-material/Psychology";
 import ButtonBase from "@mui/material/ButtonBase";
+import StopIcon from "@mui/icons-material/Stop";
 
 // Markdown
 import ReactMarkdown from "react-markdown";
@@ -37,16 +58,25 @@ import remarkGfm from "remark-gfm";
 
 // API & External Dependencies
 import { fetchEventSource } from "@microsoft/fetch-event-source";
-import api from "../config/axiosConfig";
-import { resolveConfig } from "../config/EnvironmentConfig";
+import api from "../../../config/axiosConfig";
+import { resolveConfig } from "../../../config/EnvironmentConfig";
+import FinCoreIcon from "./FinCoreIcon";
+import { StyledTextField } from "../../../features/auth/components/LoginStyles";
+
+// ========================== get the time ====================================
+const formatTime = (date) =>
+  date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
 // ============================================================================
 // 1. API & SSE SERVICES
 // ============================================================================
 
 const getApiBase = () => {
-  try { return resolveConfig("/HS") || "/HS"; } 
-  catch { return "/HS"; }
+  try {
+    return resolveConfig("/HS") || "/HS";
+  } catch {
+    return "/HS";
+  }
 };
 
 let messageCounter = 0;
@@ -55,7 +85,10 @@ const generateId = () => `msg-${Date.now()}-${++messageCounter}`;
 const submitFeedback = async (logId, type) => {
   if (!logId) return;
   try {
-    await api.post(`${getApiBase()}/api/help/feedback`, { logId, isHelpful: type === "up" });
+    await api.post(`${getApiBase()}/help/feedback`, {
+      logId,
+      isHelpful: type === "up",
+    });
   } catch (err) {
     console.error("[Feedback] Failed:", err);
   }
@@ -64,32 +97,56 @@ const submitFeedback = async (logId, type) => {
 const trackFaqClick = async (questionText) => {
   if (!questionText) return;
   try {
-    await api.post(`${getApiBase()}/api/help/faqs/track`, { questionText });
+    await api.post(`${getApiBase()}/help/faqs/track`, { questionText });
   } catch (err) {
     console.error("[FAQ Track] Failed:", err);
   }
 };
 
-const sendMessageSSE = async ({ userMessage, currentScreen, token }, handlers, abortController) => {
-  const API_URL = `${getApiBase()}/api/help/chat`;
+const sendMessageSSE = async (
+  { userMessage, currentScreen, token },
+  handlers,
+  abortController,
+) => {
+  const API_URL = `${getApiBase()}/help/chat`;
   await fetchEventSource(API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
     body: JSON.stringify({ userMessage, currentScreen }),
     signal: abortController?.signal,
     openWhenHidden: true, // PREVENTS CONNECTION DROP ON TAB SWITCH
-    onopen(response) { if (!response.ok) throw new Error(`Server error: ${response.status}`); },
+    onopen(response) {
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+    },
     onmessage(event) {
       const parse = () => JSON.parse(event.data);
       switch (event.event) {
-        case "start": handlers.onStart?.(); break;
-        case "token": handlers.onToken?.(parse().token); break;
-        case "end": handlers.onEnd?.(parse()); break;
-        case "suggestion": handlers.onSuggestion?.(parse()); break;
-        case "escalation": handlers.onEscalation?.(parse()); break;
-        case "error": handlers.onError?.(parse().botReply || "An error occurred"); break;
-        case "text_reply": handlers.onTextReply?.(parse()); break;
-        default: break;
+        case "start":
+          handlers.onStart?.();
+          break;
+        case "token":
+          handlers.onToken?.(parse().token);
+          break;
+        case "end":
+          handlers.onEnd?.(parse());
+          break;
+        case "suggestion":
+          handlers.onSuggestion?.(parse());
+          break;
+        case "escalation":
+          handlers.onEscalation?.(parse());
+          break;
+        case "error":
+          handlers.onError?.(parse().botReply || "An error occurred");
+          break;
+        case "text_reply":
+          handlers.onTextReply?.(parse());
+          break;
+        default:
+          break;
       }
     },
     onerror(err) {
@@ -106,154 +163,293 @@ const sendMessageSSE = async ({ userMessage, currentScreen, token }, handlers, a
 const ChatAnimations = () => {
   const theme = useTheme();
   const primaryColor = theme.palette.primary.main;
-  const pulseShadow = alpha(primaryColor, 0.4);
+  const pulseShadow = alpha(primaryColor, 0.5);
 
   return (
     <GlobalStyles
       styles={`
-        @keyframes chat-slide-up { from { opacity: 0; transform: translateY(20px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
-        @keyframes chat-slide-down { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(16px) scale(0.96); } }
-        .animate-chat-open { animation: chat-slide-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-        .animate-chat-close { animation: chat-slide-down 0.2s cubic-bezier(0.4, 0, 1, 1) forwards; }
+
+        .animate-chat-open { 
+          animation: drawer-slide-in 0.4s cubic-bezier(0.075, 0.82, 0.165, 1) forwards; 
+        }
+
+        .animate-chat-close { 
+          animation: drawer-slide-out 0.3s cubic-bezier(0.6, 0.04, 0.98, 0.33) forwards; 
+        }
+
+        /* Keep your existing utility animations */
         @keyframes slide-in-left { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
         @keyframes slide-in-right { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
         .animate-slide-in-left { animation: slide-in-left 0.3s ease-out forwards; }
         .animate-slide-in-right { animation: slide-in-right 0.3s ease-out forwards; }
         @keyframes fab-pulse { 0%, 100% { box-shadow: 0 0 0 0 ${pulseShadow}; } 50% { box-shadow: 0 0 0 14px rgba(0,0,0,0); } }
         .fab-pulse { animation: fab-pulse 2.5s ease-in-out infinite; }
-        @keyframes icon-glow-pulse { 0%, 100% { filter: drop-shadow(0 0 4px ${primaryColor}); } 50% { filter: drop-shadow(0 0 12px ${primaryColor}); } }
-        @keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
         @keyframes typing-bounce { 0%, 44%, 100% { transform: translateY(0); opacity: 0.4; } 22% { transform: translateY(-6px); opacity: 1; } }
         .chat-scrollbar::-webkit-scrollbar { width: 6px; }
         .chat-scrollbar::-webkit-scrollbar-track { background: transparent; }
         .chat-scrollbar::-webkit-scrollbar-thumb { background: ${alpha(theme.palette.text.primary, 0.2)}; border-radius: 3px; }
-        .chat-scrollbar::-webkit-scrollbar-thumb:hover { background: ${alpha(theme.palette.text.primary, 0.4)}; }
       `}
     />
   );
 };
 
-// ============================================================================
-// 3. UI COMPONENTS
-// ============================================================================
-
-const FinCoreIcon = ({ size = 24, className = "", glow = false, animated = false, variant = "full", active = false }) => {
-  const id = `fc-${size}-${Math.random().toString(36).slice(2, 6)}`;
-  if (variant === "mini") {
-    return (
-      <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }} className={active ? "thinking-icon-active" : ""}>
-        {active && (
-          <>
-            <div style={{ position: 'absolute', inset: -4, borderRadius: '50%', border: '2px solid hsl(217, 71%, 53%)', opacity: 0.7 }} className="animate-spin-slow" />
-            <div style={{ position: 'absolute', inset: -3, borderRadius: '50%', background: 'hsla(217, 71%, 45%, 0.2)', animation: 'icon-glow-pulse 1.5s ease-in-out infinite' }} />
-          </>
-        )}
-        <svg width={active ? size * 1.1 : size} height={active ? size * 1.1 : size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className} style={{ transition: 'all 0.3s', filter: active ? 'drop-shadow(0 0 8px hsl(217,71%,53%))' : 'none' }}>
-          <defs>
-            <linearGradient id={`${id}-mini-bg`} x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="hsl(217, 71%, 53%)" /><stop offset="100%" stopColor="hsl(260, 85%, 38%)" /></linearGradient>
-            <linearGradient id={`${id}-mini-spark`} x1="8" y1="4" x2="16" y2="20" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="white" /><stop offset="100%" stopColor="hsl(210, 80%, 88%)" /></linearGradient>
-          </defs>
-          <circle cx="12" cy="12" r="11" fill={`url(#${id}-mini-bg)`} />
-          <path d="M12 4 L13.2 10.5 L12 20 L10.8 10.5 Z" fill={`url(#${id}-mini-spark)`} fillOpacity="0.9" />
-          <path d="M4 12 L10.5 10.8 L20 12 L10.5 13.2 Z" fill={`url(#${id}-mini-spark)`} fillOpacity="0.8" />
-          <circle cx="12" cy="12" r="2.2" fill="white" fillOpacity="0.95" />
-        </svg>
-      </div>
-    );
-  }
-  return (
-    <svg width={size} height={size} viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
-      <defs>
-        <linearGradient id={`${id}-bg`} x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="hsl(217, 71%, 53%)" /><stop offset="50%" stopColor="hsl(230, 80%, 42%)" /><stop offset="100%" stopColor="hsl(260, 85%, 38%)" /></linearGradient>
-        <linearGradient id={`${id}-spark`} x1="12" y1="8" x2="28" y2="34" gradientUnits="userSpaceOnUse"><stop offset="0%" stopColor="white" /><stop offset="100%" stopColor="hsl(210, 80%, 88%)" /></linearGradient>
-      </defs>
-      <circle cx="20" cy="20" r="19" fill={`url(#${id}-bg)`} />
-      <path d="M20 11 L22.2 18 L20 30 L17.8 18 Z" fill={`url(#${id}-spark)`} fillOpacity="0.9" />
-      <path d="M11 20 L18 17.8 L29 20 L18 22.2 Z" fill={`url(#${id}-spark)`} fillOpacity="0.8" />
-      <circle cx="20" cy="20" r="3.2" fill="white" fillOpacity="0.95" />
-    </svg>
-  );
-};
-
 const ChatHeader = ({ onMinimize, onClearChat }) => (
-  <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ px: 2, py: 1.5, borderBottom: "1px solid", borderColor: "divider", bgcolor: "background.paper" }}>
-    <Stack direction="row" alignItems="center" spacing={1.5}>
-      <FinCoreIcon size={34} glow animated />
+  <Stack
+    direction="row"
+    alignItems="center"
+    justifyContent="space-between"
+    sx={{
+      px: 2,
+      py: 2,
+      borderBottom: "1px solid",
+      borderColor: "divider",
+      bgcolor: "background.paper",
+    }}
+  >
+    <Stack direction="row" alignItems="center" spacing={2}>
+      <FinCoreIcon size={40} glow animated />
       <Box>
-        <Stack direction="row" alignItems="center" spacing={1}>
-          <Typography variant="subtitle2" sx={{ color: "text.primary", fontWeight: 600 }}>FinCore AI</Typography>
-          <Chip icon={<AutoAwesomeIcon sx={{ fontSize: 10 }} />} label="Beta" size="small" sx={{ height: 18, fontSize: "9px", fontWeight: 700, bgcolor: "primary.main", color: "primary.contrastText" }} />
+        <Stack>
+          <Stack direction="row" alignItems="center" spacing={1.5}>
+            <Typography
+              variant="h6"
+              sx={{
+                fontWeight: 700,
+                letterSpacing: "-0.5px",
+                // 1. Softer gradient: Using more transparent or similar shades for a "lighter" touch
+                background: (theme) =>
+                  `linear-gradient(120deg, ${theme.palette.primary.dark} 40%, rgba(255, 255, 255, 0.7) 50%, ${theme.palette.primary.dark} 60%)`,
+                backgroundSize: "200% auto",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+                // 2. Slowed down from 5s to 8s (or 10s for very subtle)
+                animation: "shine 8s linear infinite",
+                "@keyframes shine": {
+                  "0%": { backgroundPosition: "200% center" },
+                  "100%": { backgroundPosition: "-200% center" },
+                },
+              }}
+            >
+              FinCore AI
+            </Typography>
+
+            <Chip
+              icon={
+                <AutoAwesomeIcon sx={{ fontSize: 10, color: "primary.main" }} />
+              }
+              label="Beta"
+              size="small"
+              sx={{
+                height: 18,
+                fontSize: "10px",
+                fontWeight: 700,
+                bgcolor: "transparent", // Makes it transparent
+                color: "primary.main", // Or a specific deep hex like "#4A148C"
+                border: "1px solid",
+                borderColor: "primary.main", // Uses your theme's primary deep color
+                "& .MuiChip-label": { px: 1 },
+              }}
+            />
+          </Stack>
+
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              display: "flex",
+              alignItems: "center",
+              gap: 0.5,
+              fontSize: "11px",
+              fontWeight: 500,
+              opacity: 0.9,
+            }}
+          >
+            Powered by{" "}
+            <span style={{ fontWeight: 700, color: "text.primary" }}>
+              Llama 3
+            </span>
+          </Typography>
         </Stack>
-        <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "11px" }}>Powered by RAG</Typography>
       </Box>
     </Stack>
-    <Stack direction="row" spacing={0.25}>
-      <IconButton onClick={onClearChat} size="small" title="New chat" sx={{ color: "text.secondary" }}><AddCommentOutlinedIcon sx={{ fontSize: 18 }} /></IconButton>
-      <IconButton onClick={onMinimize} size="small" title="Minimize" sx={{ color: "text.secondary" }}><RemoveIcon sx={{ fontSize: 18 }} /></IconButton>
+    <Stack direction="row" spacing={1}>
+      <IconButton
+        onClick={onClearChat}
+        size="small"
+        title="New chat"
+        sx={{ color: "text.primary" }}
+      >
+        <AddCommentOutlinedIcon sx={{ fontSize: 20 }} />
+      </IconButton>
+      <IconButton
+        onClick={onMinimize}
+        size="small"
+        title="Minimize"
+        sx={{ color: "text.primary" }}
+      >
+        <RemoveIcon sx={{ fontSize: 20 }} />
+      </IconButton>
     </Stack>
   </Stack>
 );
 
-const ChatInput = ({ onSend, isLoading }) => {
+const ChatInput = ({ onSend, onStop, isLoading }) => {
   const [value, setValue] = useState("");
   const textareaRef = useRef(null);
-  const theme = useTheme();
 
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 120) + "px";
+      textareaRef.current.style.height =
+        Math.min(textareaRef.current.scrollHeight, 120) + "px";
     }
   }, [value]);
 
   const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendInternal(); }
+    // Only send on Enter if NOT loading
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (!isLoading) {
+        handleSendInternal();
+      }
+    }
   };
 
   const handleSendInternal = () => {
+    // If loading, clicking the button should trigger the stop function
+    if (isLoading) {
+      onStop?.();
+      return;
+    }
+
     const trimmed = value.trim();
-    if (!trimmed || isLoading || trimmed.length > 500) return;
+    if (!trimmed || trimmed.length > 500) return;
     onSend(trimmed);
     setValue("");
   };
 
   return (
-    <Box sx={{ borderTop: "1px solid", borderColor: "divider", bgcolor: "background.paper", px: 1.5, py: 1.5 }}>
-      <Box sx={{ display: "flex", alignItems: "flex-end", gap: 1, bgcolor: theme.palette.mode === 'dark' ? alpha(theme.palette.background.default, 0.5) : alpha(theme.palette.primary.light, 0.1), borderRadius: 2, px: 2, py: 1.25, border: "1px solid", borderColor: "divider", "&:focus-within": { borderColor: "primary.main" } }}>
-        <textarea
-          ref={textareaRef} value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={handleKeyDown} placeholder="Ask me anything..." rows={1}
-          style={{ flex: 1, background: "transparent", color: theme.palette.text.primary, fontSize: "14px", resize: "none", outline: "none", border: "none", maxHeight: 100, fontFamily: "inherit" }}
-        />
-        <IconButton onClick={handleSendInternal} disabled={!value.trim() || isLoading} size="small" sx={{ width: 32, height: 32, borderRadius: 2, bgcolor: "primary.main", color: "primary.contrastText", "&:disabled": { opacity: 0.5, bgcolor: "divider" }, "&:hover": { bgcolor: "primary.dark" } }}>
-          {isLoading ? <CircularProgress size={16} color="inherit" /> : <SendIcon sx={{ fontSize: 16 }} />}
-        </IconButton>
-      </Box>
-    </Box>
+    <StyledTextField
+      fullWidth
+      multiline
+      maxRows={3} // Prevents the input from growing infinitely
+      size="medium"
+      placeholder="Ask me anything..."
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onKeyDown={handleKeyDown}
+      variant="outlined"
+      margin="none"
+      sx={{
+        // 1. Target the border container specifically to fix the radius
+        "& .MuiOutlinedInput-root": {
+          borderRadius: "12px",
+          // paddingY: "6px", // 2. Manually control the "between small and medium" height
+          paddingRight: "8px",
+          "& fieldset": {
+            borderRadius: "12px",
+          },
+        },
+        // 3. Adjust internal text padding for vertical centering
+        "& .MuiInputBase-input": {
+          // paddingY: "6px !important",
+          marginLeft: "8px",
+        },
+      }}
+      InputProps={{
+        endAdornment: (
+          <InputAdornment position="end">
+            <IconButton
+              onClick={handleSendInternal}
+              disabled={!value.trim() && !isLoading}
+              color="primary"
+              sx={{
+                // Subtle UX: Change color based on state
+                bgcolor: isLoading ? "error.light" : "primary.main",
+                color: "white",
+                "&:hover": {
+                  bgcolor: isLoading ? "error.main" : "primary.dark",
+                },
+                width: 30,
+                height: 30,
+              }}
+            >
+              {isLoading ? (
+                <StopIcon sx={{ fontSize: "1.1rem" }} />
+              ) : (
+                <SendIcon sx={{ fontSize: "1.1rem" }} />
+              )}
+            </IconButton>
+          </InputAdornment>
+        ),
+      }}
+    />
   );
 };
 
+const blink = keyframes`
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+`;
+
 const TypingIndicator = () => {
   const [stageIdx, setStageIdx] = useState(0);
-  const stages = [{ text: "Thinking", icon: "🧠" }, { text: "Searching knowledge base", icon: "🔍" }, { text: "Generating response", icon: "✨" }];
-  
+  const stages = ["THINKING", "SEARCHING", "PROCESSING"];
+
   useEffect(() => {
-    const interval = setInterval(() => setStageIdx((prev) => (prev + 1) % stages.length), 2000);
+    const interval = setInterval(
+      () => setStageIdx((p) => (p + 1) % stages.length),
+      3000,
+    );
     return () => clearInterval(interval);
   }, []);
 
   return (
-    <Box className="animate-slide-in-left" sx={{ display: "flex", mb: 1.5, gap: 1.25 }}>
-      <Box sx={{ flexShrink: 0, mt: 0.5 }}><FinCoreIcon size={28} variant="mini" animated active /></Box>
-      <Box sx={{ px: 2, py: 1.5, borderRadius: "16px 16px 16px 4px", bgcolor: "background.paper", boxShadow: 1, border: "1px solid", borderColor: "divider", minWidth: 180 }}>
-        <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.75 }}>
-          <span>{stages[stageIdx].icon}</span>
-          <Typography sx={{ fontSize: "12px", color: "text.secondary", fontWeight: 600, fontFamily: "monospace" }}>
-            {stages[stageIdx].text}
-            <Box component="span" sx={{ display: "inline-block", width: 2, height: 12, bgcolor: "primary.main", ml: "2px", animation: "cursor-blink 0.8s step-end infinite" }} />
-          </Typography>
-        </Box>
-        <Box sx={{ display: "flex", gap: 0.75 }}>
-          {[0, 200, 400].map((d, i) => <Box key={i} sx={{ width: 6, height: 6, borderRadius: "50%", bgcolor: "primary.main", animation: `typing-bounce 1.4s ease-in-out infinite ${d}ms` }} />)}
+    <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2, pl: 1 }}>
+      {/* 1. Static branding icon - No movement, just presence */}
+      <FinCoreIcon size={20} variant="mini" active />
+
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+        {/* 2. Professional status label */}
+        <Typography
+          sx={{
+            fontFamily: '"Roboto Mono", monospace',
+            fontSize: "11px",
+            fontWeight: 600,
+            letterSpacing: "0.15em",
+            color: "text.secondary",
+            textTransform: "uppercase",
+            lineHeight: 1, // Critical for vertical alignment
+            display: "flex",
+            alignItems: "center",
+          }}
+        >
+          {stages[stageIdx]}
+        </Typography>
+
+        {/* 3. High-end, stable "Activity" bar */}
+        <Box
+          sx={{
+            display: "flex",
+            gap: "4px",
+            alignItems: "center",
+            opacity: 0.6,
+          }}
+        >
+          {[0, 1, 2].map((i) => (
+            <Box
+              key={i}
+              sx={{
+                width: "3px",
+                height: "10px",
+                borderRadius: "1px",
+                bgcolor: "black",
+                // Sequential fade rather than bounce
+                animation: `${blink} 1.5s ease-in-out infinite`,
+                animationDelay: `${i * 0.2}s`,
+              }}
+            />
+          ))}
         </Box>
       </Box>
     </Box>
@@ -263,67 +459,287 @@ const TypingIndicator = () => {
 const ChatBubble = ({ message, onSuggestionClick, onFeedback }) => {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === "user";
-  const { response, isStreaming, content } = message;
+  // 1. Destructure 'interrupted' from message
+  const { response, isStreaming, content, interrupted } = message;
+
+  // 2. Adjust showActions: We want to show actions if NOT streaming,
+  // even if it was interrupted.
   const showActions = !isStreaming;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(content.replace(/[*#_~`]/g, ""));
-    setCopied(true); setTimeout(() => setCopied(false), 1500);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
 
   if (isUser) {
     return (
-      <Box className="animate-slide-in-right" sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+      <Box
+        className="animate-slide-in-right"
+        sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}
+      >
         <Box sx={{ maxWidth: "80%" }}>
-          <Box sx={{ px: 2, py: 1.25, borderRadius: "16px 16px 4px 16px", background: "linear-gradient(135deg, hsl(217,71%,45%), hsla(217,71%,45%,0.85))", color: "#fff", fontSize: "14px", lineHeight: 1.6, boxShadow: 2 }}>
+          <Box
+            sx={{
+              px: 2,
+              py: 1.25,
+              borderRadius: "16px 16px 4px 16px",
+              background:
+                "linear-gradient(135deg, hsl(217,71%,45%), hsla(217,71%,45%,0.85))",
+              color: "#fff",
+              fontSize: "14px",
+              lineHeight: 1.6,
+              boxShadow: "0 2px 8px hsla(216, 100%, 82%, 0.50)",
+            }}
+          >
             {content}
           </Box>
+
+          <Typography
+            sx={{
+              fontSize: "10px",
+              color: "text.primary",
+              textAlign: "right",
+              mt: 0.5,
+              mr: 0.5,
+            }}
+          >
+            {formatTime(message.timestamp)}
+          </Typography>
         </Box>
       </Box>
     );
   }
 
   return (
-    <Box className="animate-slide-in-left" sx={{ display: "flex", justifyContent: "flex-start", mb: 2, gap: 1.25 }}>
-      <Box sx={{ flexShrink: 0, mt: 0.5 }}><FinCoreIcon size={26} variant="mini" animated={isStreaming} /></Box>
+    <Box
+      className="animate-slide-in-left"
+      sx={{ display: "flex", justifyContent: "flex-start", mb: 2, gap: 1.25 }}
+    >
+      {/* Temporary Debug Line */}
+      {interrupted && (
+        <div style={{ color: "red", fontWeight: "bold" }}>DEBUG: STOPPED</div>
+      )}
+
+      <Box sx={{ flexShrink: 0, mt: 0.5 }}>
+        <FinCoreIcon size={26} variant="mini" animated={isStreaming} />
+      </Box>
       <Box sx={{ maxWidth: "82%" }}>
-        <Box sx={{ px: 2, py: 1.5, borderRadius: "16px 16px 16px 4px", fontSize: "14px", lineHeight: 1.6, boxShadow: 1, bgcolor: "background.paper", color: "text.primary", border: "1px solid", borderColor: "divider" }}>
-          
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ p: ({ children }) => <Typography component="p" sx={{ fontSize: "14px", mb: 0.5 }}>{children}</Typography>, a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer" style={{ color: "#1976d2" }}>{children}</a> }}>
+        <Box
+          sx={{
+            px: 2,
+            py: 1.5,
+            borderRadius: "16px 16px 16px 4px",
+            fontSize: "14px",
+            lineHeight: 1.6,
+            // boxShadow: 1,
+            // bgcolor: "background.paper",
+            color: "text.primary",
+            border: "1px solid",
+            borderColor: "divider",
+            boxShadow: "0 2px 8px hsla(0, 0%, 63%, 0.50)",
+          }}
+        >
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              p: ({ children }) => (
+                <Typography component="p" sx={{ fontSize: "14px", mb: 0.5 }}>
+                  {children}
+                </Typography>
+              ),
+              a: ({ href, children }) => (
+                <a
+                  href={href}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ color: "#1976d2" }}
+                >
+                  {children}
+                </a>
+              ),
+            }}
+          >
             {content}
           </ReactMarkdown>
 
-          {isStreaming && <Box component="span" sx={{ display: "inline-block", width: 3, height: 14, bgcolor: "primary.main", ml: "2px", animation: "icon-glow-pulse 0.8s ease-in-out infinite" }} />}
+          {/* NEW: INTERRUPTED INDICATOR */}
+          {!isStreaming && interrupted && (
+            <Box
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                gap: 0.5,
+                mt: 1.5,
+                pt: 1,
+                borderTop: "1px dashed",
+                borderColor: "divider",
+                color: "text.secondary",
+                fontSize: "0.7rem",
+                fontStyle: "italic",
+                opacity: 0.8,
+                background: "linear-gradient(transparent, background.paper)",
+              }}
+            >
+              <StopCircleIcon sx={{ fontSize: 14, color: "error.light" }} />
+              Generation stopped.
+            </Box>
+          )}
 
           <Fade in={showActions && !!response?.navigationLink}>
             <Box>
               {showActions && response?.navigationLink && (
-                <Button onClick={() => window.open(response.navigationLink, "_blank")} variant="contained" size="small" startIcon={<OpenInNewIcon sx={{ fontSize: 14 }}/>} fullWidth sx={{ mt: 1.5, borderRadius: 3, textTransform: "none" }}>{response.navigationLabel}</Button>
+                <Button
+                  onClick={() => window.open(response.navigationLink, "_blank")}
+                  variant="contained"
+                  size="small"
+                  startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
+                  fullWidth
+                  sx={{ mt: 1.5, borderRadius: 3, textTransform: "none" }}
+                >
+                  {response.navigationLabel}
+                </Button>
               )}
             </Box>
           </Fade>
 
-          {showActions && response?.responseType === "SUGGESTION" && response.items && (
-            <Box sx={{ mt: 1.5, display: "flex", flexDirection: "column", gap: 0.75 }}>
-              {response.items.map((item, idx) => (
-                <Button key={idx} onClick={() => onSuggestionClick(item)} variant="outlined" size="small" fullWidth sx={{ justifyContent: "flex-start", borderRadius: 3, textTransform: "none", color: "text.primary", textAlign: "left" }}>{item}</Button>
-              ))}
-            </Box>
-          )}
+          {showActions &&
+            response?.responseType === "SUGGESTION" &&
+            response.items && (
+              <Box
+                sx={{
+                  mt: 1.5,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 0.75,
+                }}
+              >
+                {response.items.map((item, idx) => (
+                  <Button
+                    key={idx}
+                    onClick={() => onSuggestionClick(item)}
+                    variant="outlined"
+                    size="small"
+                    fullWidth
+                    sx={{
+                      justifyContent: "flex-start",
+                      borderRadius: 3,
+                      textTransform: "none",
+                      color: "text.primary",
+                      textAlign: "left",
+                    }}
+                  >
+                    {item}
+                  </Button>
+                ))}
+              </Box>
+            )}
 
           {showActions && response?.responseType === "ESCALATION_OFFER" && (
             <Box sx={{ mt: 1.5, display: "flex", gap: 1 }}>
-              <Button onClick={() => onSuggestionClick("Yes, please create a ticket")} variant="contained" color="error" size="small" sx={{ borderRadius: 3, textTransform: "none" }}>Raise Ticket</Button>
-              <Button onClick={() => onSuggestionClick("No, I'll figure it out")} variant="outlined" size="small" sx={{ borderRadius: 3, textTransform: "none" }}>No thanks</Button>
+              <Button
+                onClick={() => onSuggestionClick("Yes, please create a ticket")}
+                variant="contained"
+                color="error"
+                size="small"
+                sx={{ borderRadius: 3, textTransform: "none" }}
+              >
+                Raise a Score Ticket
+              </Button>
+              <Button
+                onClick={() => onSuggestionClick("No, I'll figure it out")}
+                variant="outlined"
+                size="small"
+                sx={{ borderRadius: 3, textTransform: "none" }}
+              >
+                No thanks
+              </Button>
             </Box>
           )}
         </Box>
 
         <Fade in={showActions}>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, mt: 0.75, ml: 1 }}>
-            <IconButton onClick={() => { submitFeedback(response?.logId, "up"); onFeedback(message.id, "up"); }} size="small" sx={{ color: message.feedback === "up" ? "primary.main" : "text.secondary" }}><ThumbUpOutlinedIcon sx={{ fontSize: 14 }} /></IconButton>
-            <IconButton onClick={() => { submitFeedback(response?.logId, "down"); onFeedback(message.id, "down"); }} size="small" sx={{ color: message.feedback === "down" ? "error.main" : "text.secondary" }}><ThumbDownOutlinedIcon sx={{ fontSize: 14 }} /></IconButton>
-            <IconButton onClick={handleCopy} size="small" sx={{ color: "text.secondary" }}>{copied ? <CheckIcon sx={{ fontSize: 14, color: "success.main" }} /> : <ContentCopyIcon sx={{ fontSize: 14 }} />}</IconButton>
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              gap: 0.25,
+              mt: 0.75,
+              ml: 1,
+            }}
+          >
+            <IconButton
+              onClick={() => {
+                submitFeedback(response?.logId, "up");
+                onFeedback(message.id, "up");
+              }}
+              size="small"
+              sx={{
+                fontSize: 14,
+                transition: "all 0.2s",
+                color: message.feedback === "up" ? "#004e34" : "text.secondary",
+                backgroundColor:
+                  message.feedback === "up"
+                    ? "rgba(16, 185, 129, 0.1)"
+                    : "transparent",
+                "&:hover": {
+                  backgroundColor: "rgba(16, 185, 129, 0.15)",
+                  color: "#004e34",
+                },
+              }}
+            >
+              <ThumbUpOutlinedIcon sx={{ fontSize: "inherit" }} />
+            </IconButton>
+            <IconButton
+              onClick={() => {
+                submitFeedback(response?.logId, "down");
+                onFeedback(message.id, "down");
+              }}
+              size="small"
+              sx={{
+                fontSize: 14,
+                transition: "all 0.2s",
+                color:
+                  message.feedback === "down" ? "#c71b38" : "text.secondary",
+                backgroundColor:
+                  message.feedback === "down"
+                    ? "rgba(244, 63, 94, 0.1)"
+                    : "transparent",
+                "&:hover": {
+                  backgroundColor: "rgba(244, 63, 94, 0.15)",
+                  color: "#c71b38",
+                },
+              }}
+            >
+              <ThumbDownOutlinedIcon sx={{ fontSize: "inherit" }} />
+            </IconButton>
+            <IconButton
+              onClick={handleCopy}
+              size="small"
+              sx={{
+                fontSize: 14,
+                transition: "all 0.2s",
+                color: copied ? "#1c89bb" : "text.secondary",
+                backgroundColor: copied
+                  ? "rgba(14, 165, 233, 0.1)"
+                  : "transparent",
+                "&:hover": {
+                  backgroundColor: "rgba(14, 165, 233, 0.1)",
+                  color: "#1c89bb",
+                },
+              }}
+            >
+              {copied ? (
+                <CheckIcon sx={{ fontSize: "inherit" }} />
+              ) : (
+                <ContentCopyIcon sx={{ fontSize: "inherit" }} />
+              )}
+            </IconButton>
+            <Typography
+              sx={{ fontSize: "9px", color: "text.primary", ml: 0.5 }}
+            >
+              {formatTime(message.timestamp)}
+            </Typography>
           </Box>
         </Fade>
       </Box>
@@ -333,35 +749,146 @@ const ChatBubble = ({ message, onSuggestionClick, onFeedback }) => {
 
 const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
   const [text, setText] = useState("");
+
+  const capabilities = [
+    { icon: PsychologyIcon, label: "RAG-Powered" },
+    { icon: BoltIcon, label: "Instant Answers" },
+    { icon: AutoAwesomeIcon, label: "Context-Aware" },
+  ];
+
   useEffect(() => {
-    if (!showTypewriter) { setText("Hi there, I am the FinCore Smart Assistant. How can I help you today?"); return; }
+    const fullText =
+      "Hi there, I am FinCore AI Assistant. How can I help you today?";
+
+    if (!showTypewriter) {
+      setText(fullText);
+      return;
+    }
+
     let i = 0;
-    const interval = setInterval(() => { i++; setText("Hi there, I am the FinCore Smart Assistant. How can I help you today?".slice(0, i)); if (i >= 65) clearInterval(interval); }, 25);
+    const interval = setInterval(() => {
+      i++;
+      setText(fullText.slice(0, i));
+
+      // Use the dynamic length of your string
+      if (i >= fullText.length) clearInterval(interval);
+    }, 45); // Slower speed (higher number = slower)
+
     return () => clearInterval(interval);
   }, [showTypewriter]);
 
   return (
-    <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", px: 3, py: 4 }}>
-      <Box sx={{ position: "relative", mb: 3 }}><FinCoreIcon size={60} glow animated /></Box>
-      <Box sx={{ minHeight: 72, display: "flex", alignItems: "center", justifyContent: "center", mb: 1.5, maxWidth: 310 }}>
-        <Typography sx={{ fontSize: "14px", color: "text.primary", textAlign: "center", lineHeight: 1.7, fontWeight: 500, fontFamily: 'monospace' }}>
+    <Box
+      sx={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+        px: 3,
+        py: 4,
+      }}
+    >
+      <Box sx={{ position: "relative", mb: 3, opacity: 0.9 }}>
+        <FinCoreIcon size={60} glow animated />
+      </Box>
+      <Box
+        sx={{
+          minHeight: 72,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          mb: 1.5,
+          maxWidth: 320,
+        }}
+      >
+        <Typography
+          sx={{
+            // Simple, fat, and creative font styling
+            fontFamily: '"Roboto Mono", "Fira Code", monospace',
+            fontSize: "15px",
+            fontWeight: 700,
+            letterSpacing: "0.12em",
+            lineHeight: 1.8,
+            textAlign: "center",
+            textTransform: "uppercase",
+            color: (theme) => theme.palette.primary.main,
+            opacity: 0.8,
+            textShadow: (theme) =>
+              `0px 0px 12px ${theme.palette.primary.light}40`,
+
+            // maxWidth: "80%",
+            margin: "0 auto",
+          }}
+        >
           {text}
         </Typography>
       </Box>
       <Box sx={{ display: "flex", gap: 1, mb: 3 }}>
-        <Chip icon={<PsychologyIcon sx={{ fontSize: 12 }} />} label="RAG-Powered" size="small" sx={{ fontSize: "10px", color: "text.secondary" }} />
-        <Chip icon={<AutoAwesomeIcon sx={{ fontSize: 12 }} />} label="Context-Aware" size="small" sx={{ fontSize: "10px", color: "text.secondary" }} />
+        {capabilities.map(({ icon: Icon, label }) => (
+          <Chip
+            key={label}
+            icon={<Icon sx={{ fontSize: 12, color: "primary.main" }} />}
+            label={label}
+            size="small"
+            sx={{
+              height: 22,
+              fontSize: "10px",
+              // bgcolor: "hsla(204, 63%, 67%, 0.44)",
+              border: "0.5px solid hsla(276, 64%, 37%, 0.43)",
+              color: "chat.inputPlaceholder",
+              backdropFilter: "blur(10px)",
+              "& .MuiChip-icon": { ml: 0.5 },
+            }}
+          />
+        ))}
       </Box>
       <Box sx={{ width: "100%" }}>
-        <Typography sx={{ fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.2em", color: "text.secondary", fontWeight: 600, mb: 1.25 }}>Quick Access</Typography>
+        <Typography
+          sx={{
+            fontSize: "10px",
+            textTransform: "uppercase",
+            letterSpacing: "0.2em",
+            color: "text.secondary",
+            fontWeight: 600,
+            mb: 1.25,
+          }}
+        >
+          Quick Access
+        </Typography>
         <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
           {[
-            { label: "CGL Management", icon: GridViewIcon, cmd: "/action module" },
-            { label: "User Management", icon: PeopleOutlineIcon, cmd: "/action module" },
-            { label: "Global FAQs", icon: HelpOutlineIcon, cmd: "/action faq" }
+            {
+              label: "CGL Management",
+              icon: GridViewIcon,
+              cmd: "/action module",
+            },
+            {
+              label: "User Management",
+              icon: PeopleOutlineIcon,
+              cmd: "/action module",
+            },
+            { label: "Global FAQs", icon: HelpOutlineIcon, cmd: "/action faq" },
           ].map((a) => (
-            <ButtonBase key={a.label} onClick={() => onQuickAction(a.label, a.cmd)} sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, py: 1, borderRadius: 3, color: "text.primary", fontSize: "13px", border: "1px solid", borderColor: "divider", "&:hover": { borderColor: "primary.main" } }}>
-              <a.icon sx={{ fontSize: 16, opacity: 0.6 }} />{a.label}
+            <ButtonBase
+              key={a.label}
+              onClick={() => onQuickAction(a.label, a.cmd)}
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                gap: 1,
+                px: 1.5,
+                py: 1,
+                borderRadius: 3,
+                color: "text.primary",
+                fontSize: "13px",
+                border: "1px solid",
+                borderColor: "divider",
+                "&:hover": { borderColor: "primary.main" },
+              }}
+            >
+              <a.icon sx={{ fontSize: 16, opacity: 0.6 }} />
+              {a.label}
             </ButtonBase>
           ))}
         </Box>
@@ -374,108 +901,358 @@ const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
 // 4. MAIN WIDGET EXPORT
 // ============================================================================
 
-export default function ChatWidget() {
-  const [isOpen, setIsOpen] = useState(false);
+const ChatWidget = ({ isOpen, setIsOpen, hasLaunched, setHasLaunched }) => {
+  // const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
-  const [hasLaunched, setHasLaunched] = useState(false);
+  // const [hasLaunched, setHasLaunched] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState(null);
   const [isScrolledUp, setIsScrolledUp] = useState(false);
-  
+
   const scrollRef = useRef(null);
   const abortRef = useRef(null);
   const token = useSelector((state) => state.auth.token);
   const selectedMenuItem = useSelector((state) => state.menus.selectedMenuItem);
 
-  const currentScreenName = useMemo(() => selectedMenuItem?.title || "Dashboard", [selectedMenuItem]);
+  const currentScreenName = useMemo(
+    () => selectedMenuItem?.title || "Dashboard",
+    [selectedMenuItem],
+  );
 
   const handleScroll = () => {
     if (!scrollRef.current) return;
-    setIsScrolledUp(scrollRef.current.scrollHeight - scrollRef.current.scrollTop - scrollRef.current.clientHeight > 60);
+    setIsScrolledUp(
+      scrollRef.current.scrollHeight -
+        scrollRef.current.scrollTop -
+        scrollRef.current.clientHeight >
+        60,
+    );
   };
 
-  const scrollToBottom = useCallback((force = false) => {
-    if (scrollRef.current && (force || !isScrolledUp)) {
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-    }
-  }, [isScrolledUp]);
+  const scrollToBottom = useCallback(
+    (force = false) => {
+      if (scrollRef.current && (force || !isScrolledUp)) {
+        scrollRef.current.scrollTo({
+          top: scrollRef.current.scrollHeight,
+          behavior: "smooth",
+        });
+      }
+    },
+    [isScrolledUp],
+  );
 
-  useEffect(() => scrollToBottom(false), [messages, isLoading, streamingMessageId, scrollToBottom]);
+  useEffect(
+    () => scrollToBottom(false),
+    [messages, isLoading, streamingMessageId, scrollToBottom],
+  );
 
-  const handleStreamMessage = useCallback(async (apiMessage, displayMessage) => {
-    setMessages((prev) => [...prev, { id: generateId(), role: "user", content: displayMessage || apiMessage, timestamp: new Date(), feedback: null }]);
-    setIsLoading(true);
-    scrollToBottom(true);
+  const handleStreamMessage = useCallback(
+    async (apiMessage, displayMessage) => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateId(),
+          role: "user",
+          content: displayMessage || apiMessage,
+          timestamp: new Date(),
+          feedback: null,
+        },
+      ]);
+      setIsLoading(true);
+      scrollToBottom(true);
 
-    if (abortRef.current) abortRef.current.abort();
-    abortRef.current = new AbortController();
-    const botId = generateId();
+      if (abortRef.current) abortRef.current.abort();
+      abortRef.current = new AbortController();
+      const botId = generateId();
 
-    const pushOrUpdateBotMessage = (token, isStream, responseData = null) => {
-      setMessages((prev) => {
-        const exists = prev.some((msg) => msg.id === botId);
-        if (exists) return prev.map((msg) => msg.id === botId ? { ...msg, content: msg.content + (token || ""), isStreaming: isStream, response: responseData || msg.response } : msg);
-        return [...prev, { id: botId, role: "bot", content: token || "", timestamp: new Date(), feedback: null, isStreaming: isStream, response: responseData }];
-      });
-    };
+      const pushOrUpdateBotMessage = (token, isStream, responseData = null) => {
+        setMessages((prev) => {
+          const exists = prev.some((msg) => msg.id === botId);
+          if (exists)
+            return prev.map((msg) => {
+              // IMPORTANT: If the message was already stopped/interrupted, DON'T update it
+              if (msg.id === botId && msg.interrupted) return msg;
 
-    const handlers = {
-      onStart: () => {}, 
-      onToken: (token) => { setIsLoading(false); setStreamingMessageId(botId); pushOrUpdateBotMessage(token, true); },
-      onEnd: (data) => { setStreamingMessageId(null); setIsLoading(false); pushOrUpdateBotMessage("", false, { responseType: "TEXT_REPLY", logId: data.logId, navigationLink: data.navigationLink, navigationLabel: data.navigationLabel }); },
-      onSuggestion: (data) => { setIsLoading(false); setStreamingMessageId(null); pushOrUpdateBotMessage(data.botReply, false, { responseType: "SUGGESTION", items: data.items, logId: data.logId }); },
-      onTextReply: (data) => { setIsLoading(false); setStreamingMessageId(null); pushOrUpdateBotMessage(data.botReply, false, { responseType: "TEXT_REPLY", logId: data.logId }); },
-      onEscalation: (data) => { setIsLoading(false); setStreamingMessageId(null); pushOrUpdateBotMessage(data.botReply, false, { responseType: "ESCALATION_OFFER", logId: data.logId }); },
-      onError: (err) => { setIsLoading(false); setStreamingMessageId(null); pushOrUpdateBotMessage(err || "Error connecting.", false); },
-    };
+              return msg.id === botId
+                ? {
+                    ...msg,
+                    content: msg.content + (token || ""),
+                    isStreaming: isStream,
+                    response: responseData || msg.response,
+                  }
+                : msg;
+            });
+          return [
+            ...prev,
+            {
+              id: botId,
+              role: "bot",
+              content: token || "",
+              timestamp: new Date(),
+              feedback: null,
+              isStreaming: isStream,
+              response: responseData,
+            },
+          ];
+        });
+      };
 
-    try {
-      await sendMessageSSE({ userMessage: apiMessage, currentScreen: currentScreenName, token }, handlers, abortRef.current);
-    } catch {}
-  }, [token, scrollToBottom, currentScreenName]);
+      const handlers = {
+        onStart: () => {},
+        onToken: (token) => {
+          setIsLoading(false);
+          setStreamingMessageId(botId);
+          pushOrUpdateBotMessage(token, true);
+        },
+        onEnd: (data) => {
+          setStreamingMessageId(null);
+          setIsLoading(false);
+          pushOrUpdateBotMessage("", false, {
+            responseType: "TEXT_REPLY",
+            logId: data.logId,
+            navigationLink: data.navigationLink,
+            navigationLabel: data.navigationLabel,
+          });
+        },
+        onSuggestion: (data) => {
+          setIsLoading(false);
+          setStreamingMessageId(null);
+          pushOrUpdateBotMessage(data.botReply, false, {
+            responseType: "SUGGESTION",
+            items: data.items,
+            logId: data.logId,
+          });
+        },
+        onTextReply: (data) => {
+          setIsLoading(false);
+          setStreamingMessageId(null);
+          pushOrUpdateBotMessage(data.botReply, false, {
+            responseType: "TEXT_REPLY",
+            logId: data.logId,
+          });
+        },
+        onEscalation: (data) => {
+          setIsLoading(false);
+          setStreamingMessageId(null);
+          pushOrUpdateBotMessage(data.botReply, false, {
+            responseType: "ESCALATION_OFFER",
+            logId: data.logId,
+          });
+        },
+        onError: (err) => {
+          setIsLoading(false);
+          setStreamingMessageId(null);
+          pushOrUpdateBotMessage(err || "Error connecting.", false);
+        },
+      };
+
+      try {
+        await sendMessageSSE(
+          { userMessage: apiMessage, currentScreen: currentScreenName, token },
+          handlers,
+          abortRef.current,
+        );
+      } catch {}
+    },
+    [token, scrollToBottom, currentScreenName],
+  );
 
   const handleQuickAction = (label, slashCommand) => {
     let apiMessage = label;
     if (slashCommand) {
-      if (slashCommand === "/action module") apiMessage = `${slashCommand} ${currentScreenName}`;
+      if (slashCommand === "/action module")
+        apiMessage = `${slashCommand} ${currentScreenName}`;
       else apiMessage = slashCommand;
     }
     if (!slashCommand || slashCommand === "/action faq") trackFaqClick(label);
     handleStreamMessage(apiMessage, label);
   };
 
-  if (!isOpen) {
-    return (
-      <>
-        <ChatAnimations />
-        <Fab onClick={() => { setIsOpen(true); setHasLaunched(true); }} className="fab-pulse" color="primary" sx={{ position: "fixed", bottom: 24, right: 24, zIndex: 50, width: 60, height: 60 }}>
-          <FinCoreIcon size={58} glow animated />
-        </Fab>
-      </>
+  // const handleStopStreaming = () => {
+  //   abortRef.current?.abort();
+  //   setStreamingMessageId(null);
+  //   setIsLoading(false);
+  // };
+
+  const handleStopStreaming = () => {
+    if (abortRef.current) abortRef.current.abort();
+
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === streamingMessageId || (msg.role === "bot" && msg.isStreaming)
+          ? { ...msg, isStreaming: false, interrupted: true }
+          : msg,
+      ),
     );
-  }
+
+    setStreamingMessageId(null);
+    setIsLoading(false);
+  };
 
   return (
     <>
       <ChatAnimations />
-      <Box className={isClosing ? "animate-chat-close" : "animate-chat-open"} sx={{ position: "fixed", bottom: 24, right: 24, zIndex: 50, width: 390, height: 650, display: "flex", flexDirection: "column", borderRadius: 3, overflow: "hidden", boxShadow: (theme) => theme.palette.baseShadow || 24, border: "1px solid", borderColor: "divider", bgcolor: "background.paper", backdropFilter: "blur(20px)" }}>
-        <ChatHeader onMinimize={() => { setIsClosing(true); setTimeout(() => { setIsOpen(false); setIsClosing(false); }, 250); }} onClearChat={() => { abortRef.current?.abort(); setMessages([]); }} />
-        <Box ref={scrollRef} onScroll={handleScroll} className="chat-scrollbar" sx={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", position: "relative" }}>
-          {messages.length === 0 ? <WelcomeScreen onQuickAction={handleQuickAction} showTypewriter={hasLaunched} /> : (
+      <Drawer
+        className={isClosing ? "animate-chat-close" : "animate-chat-open"}
+        anchor="right"
+        open={isOpen}
+        onClose={() => isOpen(false)}
+        sx={{
+          "& .MuiDrawer-paper": {
+            width: 400,
+            p: 0,
+            position: "fixed",
+            display: "flex",
+            flexDirection: "column",
+            // borderRadius: 2,
+            boxShadow: 44,
+            border: "1px solid",
+            borderColor: "divider",
+            bgcolor: "background.paper",
+            backdropFilter: "blur(20px)",
+          },
+        }}
+      >
+        <ChatHeader
+          onMinimize={() => {
+            setIsClosing(true);
+            setTimeout(() => {
+              setIsOpen(false);
+              setIsClosing(false);
+            }, 250);
+          }}
+          onClearChat={() => {
+            abortRef.current?.abort();
+            setMessages([]);
+          }}
+        />
+        <Box
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="chat-scrollbar"
+          sx={{
+            flex: 1,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "flex-start", // Ensures content starts from the top
+            position: "relative",
+          }}
+        >
+          {messages.length === 0 ? (
+            <Box sx={{ width: "100%" }}>
+              <WelcomeScreen
+                onQuickAction={handleQuickAction}
+                showTypewriter={hasLaunched}
+              />
+            </Box>
+          ) : (
             <Box sx={{ px: 2, py: 2, pb: 8 }}>
-              {messages.map((msg) => <ChatBubble key={msg.id} message={msg} onSuggestionClick={handleStreamMessage} onFeedback={(id, f) => setMessages(prev => prev.map(m => m.id === id ? { ...m, feedback: m.feedback === f ? null : f } : m))} />)}
+              {messages.map((msg) => (
+                <ChatBubble
+                  key={msg.id}
+                  message={msg}
+                  onSuggestionClick={handleStreamMessage}
+                  onFeedback={(id, f) =>
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === id
+                          ? { ...m, feedback: m.feedback === f ? null : f }
+                          : m,
+                      ),
+                    )
+                  }
+                />
+              ))}
               {isLoading && <TypingIndicator />}
             </Box>
           )}
-          <Box sx={{ position: "sticky", bottom: 10, left: 0, right: 0, display: "flex", justifyContent: "center", gap: 1, pointerEvents: "none" }}>
-            <Fade in={!!streamingMessageId || isLoading}><Button variant="contained" size="small" color="error" startIcon={<StopCircleIcon />} onClick={() => { abortRef.current?.abort(); setStreamingMessageId(null); setIsLoading(false); }} sx={{ pointerEvents: "auto", borderRadius: 5, boxShadow: 3 }}>Stop</Button></Fade>
-            <Fade in={isScrolledUp}><Tooltip title="Scroll to bottom"><Fab size="small" color="primary" onClick={() => scrollToBottom(true)} sx={{ pointerEvents: "auto", width: 36, height: 36, minHeight: 36 }}><KeyboardArrowDownIcon /></Fab></Tooltip></Fade>
+          <Box
+            sx={{
+              position: "sticky",
+              bottom: 10,
+              left: 0,
+              right: 0,
+              display: "flex",
+              justifyContent: "center",
+              gap: 1,
+              pointerEvents: "none",
+            }}
+          >
+            {/* <Fade in={!!streamingMessageId || isLoading}>
+              <Button
+                variant="contained"
+                size="small"
+                color="error"
+                startIcon={<StopCircleIcon />}
+                onClick={() => {
+                  abortRef.current?.abort();
+                  setStreamingMessageId(null);
+                  setIsLoading(false);
+                }}
+                sx={{ pointerEvents: "auto", borderRadius: 5, boxShadow: 3 }}
+              >
+                Stop
+              </Button>
+            </Fade> */}
+            <Fade in={isScrolledUp}>
+              <Tooltip title="Scroll to bottom">
+                <Fab
+                  size="small"
+                  color="primary"
+                  onClick={() => scrollToBottom(true)}
+                  sx={{
+                    pointerEvents: "auto",
+                    width: 36,
+                    height: 36,
+                    minHeight: 36,
+                  }}
+                >
+                  <KeyboardArrowDownIcon />
+                </Fab>
+              </Tooltip>
+            </Fade>
           </Box>
         </Box>
-        <ChatInput onSend={handleStreamMessage} isLoading={isLoading || !!streamingMessageId} />
-      </Box>
+
+        {/* Main container for Input + Disclaimer */}
+        <Box
+          component={Paper}
+          sx={{
+            background:
+              "linear-gradient(90deg, rgba(162,141,240,0.3), rgba(93,63,211,0.8))",
+            p: 1.5,
+          }}
+        >
+          {/* <ChatInput
+            onSend={handleStreamMessage}
+            isLoading={isLoading || !!streamingMessageId}
+          /> */}
+          <ChatInput
+            onSend={handleStreamMessage}
+            onStop={handleStopStreaming}
+            isLoading={isLoading || !!streamingMessageId}
+          />
+
+          {/* AI Disclaimer Helper Text */}
+          <Typography
+            variant="caption"
+            align="center"
+            display="block"
+            sx={{
+              mt: 1,
+              color: "text.primary",
+              fontSize: "0.75rem",
+              // opacity: 1.0,
+            }}
+          >
+            AI can make mistakes. Verify important info.
+          </Typography>
+        </Box>
+      </Drawer>
     </>
   );
-}
+};
 
+export default ChatWidget;
