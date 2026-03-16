@@ -1,836 +1,69 @@
-export const formatTime = (date) =>
-  date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-let messageCounter = 0;
-export const generateId = () => `msg-${Date.now()}-${++messageCounter}`;
-
-
-
-
-
-
-
-
-
-
-
-import { fetchEventSource } from "@microsoft/fetch-event-source";
-import api from "../../../config/axiosConfig";
-import { resolveConfig } from "../../../config/EnvironmentConfig";
-
-const getApiBase = () => {
-  try {
-    return resolveConfig("/HS") || "/HS";
-  } catch {
-    return "/HS";
-  }
-};
-
-export const submitFeedback = async (logId, type) => {
-  if (!logId) return;
-  try {
-    await api.post(`${getApiBase()}/help/feedback`, {
-      logId,
-      isHelpful: type === "up",
-    });
-  } catch (err) {
-    console.error("[Feedback] Failed:", err);
-  }
-};
-
-export const trackFaqClick = async (questionText) => {
-  if (!questionText) return;
-  try {
-    await api.post(`${getApiBase()}/help/faqs/track`, { questionText });
-  } catch (err) {
-    console.error("[FAQ Track] Failed:", err);
-  }
-};
-
-export const sendMessageSSE = async (
-  { userMessage, currentScreen, token },
-  handlers,
-  abortController,
-) => {
-  const API_URL = `${getApiBase()}/help/chat`;
-  await fetchEventSource(API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ userMessage, currentScreen }),
-    signal: abortController?.signal,
-    openWhenHidden: true, 
-    onopen(response) {
-      if (!response.ok) throw new Error(`Server error: ${response.status}`);
-    },
-    onmessage(event) {
-      const parse = () => JSON.parse(event.data);
-      switch (event.event) {
-        case "start":
-          handlers.onStart?.();
-          break;
-        case "token":
-          handlers.onToken?.(parse().token);
-          break;
-        case "end":
-          handlers.onEnd?.(parse());
-          break;
-        case "suggestion":
-          handlers.onSuggestion?.(parse());
-          break;
-        case "escalation":
-          handlers.onEscalation?.(parse());
-          break;
-        case "error":
-          handlers.onError?.(parse().botReply || "An error occurred");
-          break;
-        case "text_reply":
-          handlers.onTextReply?.(parse());
-          break;
-        default:
-          break;
-      }
-    },
-    onerror(err) {
-      handlers.onError?.(err.message || "Connection lost");
-      throw err;
-    },
-  });
-};
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React from "react";
-import { GlobalStyles, useTheme } from "@mui/material";
-import { alpha } from "@mui/material/styles";
-
-const ChatAnimations = () => {
-  const theme = useTheme();
-  const primaryColor = theme.palette.primary.main;
-  const pulseShadow = alpha(primaryColor, 0.5);
-
-  return (
-    <GlobalStyles
-      styles={`
-        .animate-chat-open { 
-          animation: drawer-slide-in 0.4s cubic-bezier(0.075, 0.82, 0.165, 1) forwards; 
-        }
-
-        .animate-chat-close { 
-          animation: drawer-slide-out 0.3s cubic-bezier(0.6, 0.04, 0.98, 0.33) forwards; 
-        }
-
-        @keyframes slide-in-left { from { opacity: 0; transform: translateX(-12px); } to { opacity: 1; transform: translateX(0); } }
-        @keyframes slide-in-right { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
-        .animate-slide-in-left { animation: slide-in-left 0.3s ease-out forwards; }
-        .animate-slide-in-right { animation: slide-in-right 0.3s ease-out forwards; }
-        @keyframes fab-pulse { 0%, 100% { box-shadow: 0 0 0 0 ${pulseShadow}; } 50% { box-shadow: 0 0 0 14px rgba(0,0,0,0); } }
-        .fab-pulse { animation: fab-pulse 2.5s ease-in-out infinite; }
-        @keyframes typing-bounce { 0%, 44%, 100% { transform: translateY(0); opacity: 0.4; } 22% { transform: translateY(-6px); opacity: 1; } }
-        .chat-scrollbar::-webkit-scrollbar { width: 6px; }
-        .chat-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .chat-scrollbar::-webkit-scrollbar-thumb { background: ${alpha(theme.palette.text.primary, 0.2)}; border-radius: 3px; }
-      `}
-    />
-  );
-};
-
-export default ChatAnimations;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React from "react";
-import { Stack, Box, Typography, Chip, IconButton } from "@mui/material";
-import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
-import AddCommentOutlinedIcon from "@mui/icons-material/AddCommentOutlined";
-import RemoveIcon from "@mui/icons-material/Remove";
-import FinCoreIcon from "./FinCoreIcon";
-
-const ChatHeader = ({ onMinimize, onClearChat }) => (
-  <Stack
-    direction="row"
-    alignItems="center"
-    justifyContent="space-between"
-    sx={{
-      px: 2,
-      py: 2,
-      borderBottom: "1px solid",
-      borderColor: "divider",
-      bgcolor: "background.paper",
-    }}
-  >
-    <Stack direction="row" alignItems="center" spacing={2}>
-      <FinCoreIcon size={40} glow animated />
-      <Box>
-        <Stack>
-          <Stack direction="row" alignItems="center" spacing={1.5}>
-            <Typography
-              variant="h6"
-              sx={{
-                fontWeight: 700,
-                letterSpacing: "-0.5px",
-                background: (theme) =>
-                  `linear-gradient(120deg, ${theme.palette.primary.dark} 40%, rgba(255, 255, 255, 0.7) 50%, ${theme.palette.primary.dark} 60%)`,
-                backgroundSize: "200% auto",
-                WebkitBackgroundClip: "text",
-                WebkitTextFillColor: "transparent",
-                animation: "shine 8s linear infinite",
-                "@keyframes shine": {
-                  "0%": { backgroundPosition: "200% center" },
-                  "100%": { backgroundPosition: "-200% center" },
-                },
-              }}
-            >
-              FinCore AI
-            </Typography>
-
-            <Chip
-              icon={
-                <AutoAwesomeIcon
-                  sx={{
-                    height: 12,
-                    width: 12,
-                    color: "primary.main",
-                  }}
-                />
-              }
-              label="Beta"
-              size="small"
-              sx={{
-                height: 18,
-                fontSize: "10px",
-                fontWeight: 700,
-                bgcolor: "transparent", 
-                color: "primary.main", 
-                border: "1px solid",
-                borderColor: "primary.main", 
-                "& .MuiChip-label": { px: 1 },
-              }}
-            />
-          </Stack>
-
-          <Typography
-            variant="caption"
-            sx={{
-              color: "text.secondary",
-              display: "flex",
-              alignItems: "center",
-              gap: 0.5,
-              fontSize: "11px",
-              opacity: 0.9,
-            }}
-          >
-            Powered by{" "}
-            <span style={{ fontWeight: 700, color: "text.primary" }}>
-              Llama 3
-            </span>
-          </Typography>
-        </Stack>
-      </Box>
-    </Stack>
-    <Stack direction="row" spacing={1}>
-      <IconButton
-        onClick={onClearChat}
-        size="small"
-        title="New chat"
-        sx={{ color: "text.primary" }}
-      >
-        <AddCommentOutlinedIcon sx={{ fontSize: 20 }} />
-      </IconButton>
-      <IconButton
-        onClick={onMinimize}
-        size="small"
-        title="Minimize"
-        sx={{ color: "text.primary" }}
-      >
-        <RemoveIcon sx={{ fontSize: 20 }} />
-      </IconButton>
-    </Stack>
-  </Stack>
-);
-
-export default ChatHeader;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React, { useState, useRef, useEffect } from "react";
-import { IconButton, InputAdornment } from "@mui/material";
-import SendIcon from "@mui/icons-material/Send";
-import StopIcon from "@mui/icons-material/Stop";
-import { StyledTextField } from "../../../features/auth/components/LoginStyles";
-
-const ChatInput = ({ onSend, onStop, isLoading }) => {
-  const [value, setValue] = useState("");
-  const textareaRef = useRef(null);
-
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height =
-        Math.min(textareaRef.current.scrollHeight, 120) + "px";
-    }
-  }, [value]);
-
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (!isLoading) {
-        handleSendInternal();
-      }
-    }
-  };
-
-  const handleSendInternal = () => {
-    if (isLoading) {
-      onStop?.();
-      return;
-    }
-
-    const trimmed = value.trim();
-    if (!trimmed || trimmed.length > 500) return;
-    onSend(trimmed);
-    setValue("");
-  };
-
-  return (
-    <StyledTextField
-      fullWidth
-      multiline
-      maxRows={3} 
-      size="medium"
-      placeholder="Ask me anything..."
-      value={value}
-      onChange={(e) => setValue(e.target.value)}
-      onKeyDown={handleKeyDown}
-      variant="outlined"
-      margin="none"
-      sx={{
-        "& .MuiOutlinedInput-root": {
-          borderRadius: "12px",
-          paddingRight: "8px",
-          "& fieldset": {
-            borderRadius: "12px",
-          },
-        },
-        "& .MuiInputBase-input": {
-          marginLeft: "8px",
-        },
-      }}
-      InputProps={{
-        endAdornment: (
-          <InputAdornment position="end">
-            <IconButton
-              onClick={handleSendInternal}
-              disabled={!value.trim() && !isLoading}
-              color="primary"
-              sx={{
-                bgcolor: isLoading ? "error.light" : "primary.main",
-                color: "white",
-                "&:hover": {
-                  bgcolor: isLoading ? "error.main" : "primary.dark",
-                },
-                width: 30,
-                height: 30,
-              }}
-            >
-              {isLoading ? (
-                <StopIcon sx={{ fontSize: "1.1rem" }} />
-              ) : (
-                <SendIcon sx={{ fontSize: "1.1rem" }} />
-              )}
-            </IconButton>
-          </InputAdornment>
-        ),
-      }}
-    />
-  );
-};
-
-export default ChatInput;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React, { useState, useEffect } from "react";
-import { Box, Typography } from "@mui/material";
-import { keyframes } from "@mui/material/styles";
-import FinCoreIcon from "./FinCoreIcon";
-
-const blink = keyframes`
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-`;
-
-const TypingIndicator = () => {
-  const [stageIdx, setStageIdx] = useState(0);
-  const stages = ["THINKING", "SEARCHING", "PROCESSING"];
-
-  useEffect(() => {
-    const interval = setInterval(
-      () => setStageIdx((p) => (p + 1) % stages.length),
-      3000,
-    );
-    return () => clearInterval(interval);
-  }, []);
-
-  return (
-    <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2, pl: 1 }}>
-      <FinCoreIcon size={20} variant="mini" active />
-
-      <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
-        <Typography
-          sx={{
-            fontFamily: '"Roboto Mono", monospace',
-            fontSize: "11px",
-            fontWeight: 600,
-            letterSpacing: "0.15em",
-            color: "text.secondary",
-            textTransform: "uppercase",
-            lineHeight: 1, 
-            display: "flex",
-            alignItems: "center",
-          }}
-        >
-          {stages[stageIdx]}
-        </Typography>
-
-        <Box
-          sx={{
-            display: "flex",
-            gap: "4px",
-            alignItems: "center",
-            opacity: 0.6,
-          }}
-        >
-          {[0, 1, 2].map((i) => (
-            <Box
-              key={i}
-              sx={{
-                width: "3px",
-                height: "10px",
-                borderRadius: "1px",
-                bgcolor: "black",
-                animation: `${blink} 1.5s ease-in-out infinite`,
-                animationDelay: `${i * 0.2}s`,
-              }}
-            />
-          ))}
-        </Box>
-      </Box>
-    </Box>
-  );
-};
-
-export default TypingIndicator;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React, { useState } from "react";
-import { Box, Typography, Fade, Button, IconButton } from "@mui/material";
-import StopCircleIcon from "@mui/icons-material/StopCircle";
-import OpenInNewIcon from "@mui/icons-material/OpenInNew";
-import ThumbUpOutlinedIcon from "@mui/icons-material/ThumbUpOutlined";
-import ThumbDownOutlinedIcon from "@mui/icons-material/ThumbDownOutlined";
-import ContentCopyIcon from "@mui/icons-material/ContentCopy";
-import CheckIcon from "@mui/icons-material/Check";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-
-import FinCoreIcon from "./FinCoreIcon";
-import { formatTime } from "./chatUtils";
-import { submitFeedback } from "./chatApiService";
-
-const ChatBubble = ({ message, onSuggestionClick, onFeedback }) => {
-  const [copied, setCopied] = useState(false);
-  const isUser = message.role === "user";
-  const { response, isStreaming, content, interrupted } = message;
-
-  const showActions = !isStreaming;
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(content.replace(/[*#_~`]/g, ""));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
-  if (isUser) {
-    return (
-      <Box
-        className="animate-slide-in-right"
-        sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}
-      >
-        <Box sx={{ maxWidth: "80%" }}>
-          <Box
-            sx={{
-              px: 2,
-              py: 1.25,
-              borderRadius: "16px 16px 4px 16px",
-              background:
-                "linear-gradient(135deg, hsl(217,71%,45%), hsla(217,71%,45%,0.85))",
-              color: "#fff",
-              fontSize: "14px",
-              lineHeight: 1.6,
-              boxShadow: "0 2px 8px hsla(216, 100%, 82%, 0.50)",
-            }}
-          >
-            {content}
-          </Box>
-
-          <Typography
-            sx={{
-              fontSize: "10px",
-              color: "text.primary",
-              textAlign: "right",
-              mt: 0.5,
-              mr: 0.5,
-            }}
-          >
-            {formatTime(message.timestamp)}
-          </Typography>
-        </Box>
-      </Box>
-    );
-  }
-
-  return (
-    <Box
-      className="animate-slide-in-left"
-      sx={{ display: "flex", justifyContent: "flex-start", mb: 2, gap: 1.25 }}
-    >
-      {interrupted && (
-        <div style={{ color: "red", fontWeight: "bold" }}>DEBUG: STOPPED</div>
-      )}
-
-      <Box sx={{ flexShrink: 0, mt: 0.5 }}>
-        <FinCoreIcon size={26} variant="mini" animated={isStreaming} />
-      </Box>
-      <Box sx={{ maxWidth: "82%" }}>
-        <Box
-          sx={{
-            px: 2,
-            py: 1.5,
-            borderRadius: "16px 16px 16px 4px",
-            fontSize: "14px",
-            lineHeight: 1.6,
-            color: "text.primary",
-            border: "1px solid",
-            borderColor: "divider",
-            boxShadow: "0 2px 8px hsla(0, 0%, 63%, 0.50)",
-          }}
-        >
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              p: ({ children }) => (
-                <Typography component="p" sx={{ fontSize: "14px", mb: 0.5 }}>
-                  {children}
-                </Typography>
-              ),
-              a: ({ href, children }) => (
-                <a
-                  href={href}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{ color: "#1976d2" }}
-                >
-                  {children}
-                </a>
-              ),
-            }}
-          >
-            {content}
-          </ReactMarkdown>
-
-          {!isStreaming && interrupted && (
-            <Box
-              sx={{
-                display: "flex",
-                alignItems: "center",
-                gap: 0.5,
-                mt: 1.5,
-                pt: 1,
-                borderTop: "1px dashed",
-                borderColor: "divider",
-                color: "text.secondary",
-                fontSize: "0.7rem",
-                fontStyle: "italic",
-                opacity: 0.8,
-                background: "linear-gradient(transparent, background.paper)",
-              }}
-            >
-              <StopCircleIcon sx={{ fontSize: 14, color: "error.light" }} />
-              Generation stopped.
-            </Box>
-          )}
-
-          <Fade in={showActions && !!response?.navigationLink}>
-            <Box>
-              {showActions && response?.navigationLink && (
-                <Button
-                  onClick={() => window.open(response.navigationLink, "_blank")}
-                  variant="contained"
-                  size="small"
-                  startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
-                  fullWidth
-                  sx={{ mt: 1.5, borderRadius: 3, textTransform: "none" }}
-                >
-                  {response.navigationLabel}
-                </Button>
-              )}
-            </Box>
-          </Fade>
-
-          {showActions &&
-            response?.responseType === "SUGGESTION" &&
-            response.items && (
-              <Box
-                sx={{
-                  mt: 1.5,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 0.75,
-                }}
-              >
-                {response.items.map((item, idx) => (
-                  <Button
-                    key={idx}
-                    onClick={() => onSuggestionClick(item)}
-                    variant="outlined"
-                    size="small"
-                    fullWidth
-                    sx={{
-                      justifyContent: "flex-start",
-                      borderRadius: 3,
-                      textTransform: "none",
-                      color: "text.primary",
-                      textAlign: "left",
-                    }}
-                  >
-                    {item}
-                  </Button>
-                ))}
-              </Box>
-            )}
-
-          {showActions && response?.responseType === "ESCALATION_OFFER" && (
-            <Box sx={{ mt: 1.5, display: "flex", gap: 1 }}>
-              <Button
-                onClick={() => onSuggestionClick("Yes, please create a ticket")}
-                variant="contained"
-                color="error"
-                size="small"
-                sx={{ borderRadius: 3, textTransform: "none" }}
-              >
-                Raise a Score Ticket
-              </Button>
-              <Button
-                onClick={() => onSuggestionClick("No, I'll figure it out")}
-                variant="outlined"
-                size="small"
-                sx={{ borderRadius: 3, textTransform: "none" }}
-              >
-                No thanks
-              </Button>
-            </Box>
-          )}
-        </Box>
-
-        <Fade in={showActions}>
-          <Box
-            sx={{
-              display: "flex",
-              alignItems: "center",
-              gap: 0.25,
-              mt: 0.75,
-              ml: 1,
-            }}
-          >
-            <IconButton
-              onClick={() => {
-                submitFeedback(response?.logId, "up");
-                onFeedback(message.id, "up");
-              }}
-              size="small"
-              sx={{
-                fontSize: 14,
-                transition: "all 0.2s",
-                color: message.feedback === "up" ? "#004e34" : "text.secondary",
-                backgroundColor:
-                  message.feedback === "up"
-                    ? "rgba(16, 185, 129, 0.1)"
-                    : "transparent",
-                "&:hover": {
-                  backgroundColor: "rgba(16, 185, 129, 0.15)",
-                  color: "#004e34",
-                },
-              }}
-            >
-              <ThumbUpOutlinedIcon sx={{ fontSize: "inherit" }} />
-            </IconButton>
-            <IconButton
-              onClick={() => {
-                submitFeedback(response?.logId, "down");
-                onFeedback(message.id, "down");
-              }}
-              size="small"
-              sx={{
-                fontSize: 14,
-                transition: "all 0.2s",
-                color:
-                  message.feedback === "down" ? "#c71b38" : "text.secondary",
-                backgroundColor:
-                  message.feedback === "down"
-                    ? "rgba(244, 63, 94, 0.1)"
-                    : "transparent",
-                "&:hover": {
-                  backgroundColor: "rgba(244, 63, 94, 0.15)",
-                  color: "#c71b38",
-                },
-              }}
-            >
-              <ThumbDownOutlinedIcon sx={{ fontSize: "inherit" }} />
-            </IconButton>
-            <IconButton
-              onClick={handleCopy}
-              size="small"
-              sx={{
-                fontSize: 14,
-                transition: "all 0.2s",
-                color: copied ? "#1c89bb" : "text.secondary",
-                backgroundColor: copied
-                  ? "rgba(14, 165, 233, 0.1)"
-                  : "transparent",
-                "&:hover": {
-                  backgroundColor: "rgba(14, 165, 233, 0.1)",
-                  color: "#1c89bb",
-                },
-              }}
-            >
-              {copied ? (
-                <CheckIcon sx={{ fontSize: "inherit" }} />
-              ) : (
-                <ContentCopyIcon sx={{ fontSize: "inherit" }} />
-              )}
-            </IconButton>
-            <Typography
-              sx={{ fontSize: "9px", color: "text.primary", ml: 0.5 }}
-            >
-              {formatTime(message.timestamp)}
-            </Typography>
-          </Box>
-        </Fade>
-      </Box>
-    </Box>
-  );
-};
-
-export default ChatBubble;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
+import { useSelector } from "react-redux";
 import { Box, Typography, Chip, ButtonBase } from "@mui/material";
+
+// Icons
 import PsychologyIcon from "@mui/icons-material/Psychology";
 import BoltIcon from "@mui/icons-material/Bolt";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
-import GridViewIcon from "@mui/icons-material/GridView";
-import PeopleOutlineIcon from "@mui/icons-material/PeopleOutline";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import AutoGraphIcon from "@mui/icons-material/AutoGraph";
+import DynamicFeedIcon from "@mui/icons-material/DynamicFeed"; // Safe generic icon for dynamic menus
+
 import FinCoreIcon from "./FinCoreIcon";
 
 const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
   const [text, setText] = useState("");
+
+  // 1. Fetch data from Redux safely
+  const menus = useSelector((state) => state.menus?.menus) || [];
+  const selectedMenuItem = useSelector((state) => state.menus?.selectedMenuItem);
+  const currentScreenName = selectedMenuItem?.title;
 
   const capabilities = [
     { icon: PsychologyIcon, label: "RAG-Powered" },
     { icon: BoltIcon, label: "Instant Answers" },
     { icon: AutoAwesomeIcon, label: "Context-Aware" },
   ];
+
+  // 2. Build Smart Quick Actions Array
+  const quickActions = useMemo(() => {
+    const actions = [];
+
+    // Prioritize the current screen (if one is active)
+    if (currentScreenName) {
+      actions.push({
+        label: currentScreenName,
+        icon: AutoGraphIcon, // Special icon for current context
+        cmd: "/action module",
+        isCurrent: true, // Used for highlighting
+      });
+    }
+
+    // Grab up to 4 other screens from Redux, excluding the current one
+    const otherMenus = menus
+      .filter((m) => m.title && m.title !== currentScreenName)
+      .slice(0, 4);
+
+    otherMenus.forEach((m) => {
+      actions.push({
+        label: m.title,
+        icon: DynamicFeedIcon, // Using a safe generic icon to prevent string-render crashes
+        cmd: "/action module",
+        isCurrent: false,
+      });
+    });
+
+    // Always keep Global FAQs at the end
+    actions.push({
+      label: "Global FAQs",
+      icon: HelpOutlineIcon,
+      cmd: "/action faq",
+      isCurrent: false,
+    });
+
+    return actions;
+  }, [menus, currentScreenName]);
 
   useEffect(() => {
     const fullText =
@@ -847,7 +80,7 @@ const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
       setText(fullText.slice(0, i));
 
       if (i >= fullText.length) clearInterval(interval);
-    }, 45); 
+    }, 45);
 
     return () => clearInterval(interval);
   }, [showTypewriter]);
@@ -928,19 +161,7 @@ const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
           Quick Access
         </Typography>
         <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
-          {[
-            {
-              label: "CGL Management",
-              icon: GridViewIcon,
-              cmd: "/action module",
-            },
-            {
-              label: "User Management",
-              icon: PeopleOutlineIcon,
-              cmd: "/action module",
-            },
-            { label: "Global FAQs", icon: HelpOutlineIcon, cmd: "/action faq" },
-          ].map((a) => (
+          {quickActions.map((a) => (
             <ButtonBase
               key={a.label}
               onClick={() => onQuickAction(a.label, a.cmd)}
@@ -951,14 +172,25 @@ const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
                 px: 1.5,
                 py: 1,
                 borderRadius: 3,
-                color: "text.primary",
+                // UI Highlight for the screen the user is currently on
+                color: a.isCurrent ? "primary.main" : "text.primary",
+                fontWeight: a.isCurrent ? 600 : 400,
                 fontSize: "13px",
                 border: "1px solid",
-                borderColor: "divider",
-                "&:hover": { borderColor: "primary.main" },
+                borderColor: a.isCurrent ? "primary.main" : "divider",
+                bgcolor: a.isCurrent ? "rgba(93,63,211,0.05)" : "transparent",
+                "&:hover": {
+                  borderColor: "primary.main",
+                  bgcolor: "rgba(93,63,211,0.1)",
+                },
               }}
             >
-              <a.icon sx={{ fontSize: 16, opacity: 0.6 }} />
+              <a.icon
+                sx={{
+                  fontSize: 16,
+                  opacity: a.isCurrent ? 1 : 0.6,
+                }}
+              />
               {a.label}
             </ButtonBase>
           ))}
@@ -969,6 +201,20 @@ const WelcomeScreen = ({ onQuickAction, showTypewriter }) => {
 };
 
 export default WelcomeScreen;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1013,7 +259,7 @@ const ChatWidget = ({ isOpen, setIsOpen, hasLaunched, setHasLaunched }) => {
   const scrollRef = useRef(null);
   const abortRef = useRef(null);
   const token = useSelector((state) => state.auth.token);
-  const selectedMenuItem = useSelector((state) => state.menus.selectedMenuItem);
+  const selectedMenuItem = useSelector((state) => state.menus?.selectedMenuItem);
 
   const currentScreenName = useMemo(
     () => selectedMenuItem?.title || "Dashboard",
@@ -1161,7 +407,8 @@ const ChatWidget = ({ isOpen, setIsOpen, hasLaunched, setHasLaunched }) => {
     let apiMessage = label;
     if (slashCommand) {
       if (slashCommand === "/action module")
-        apiMessage = `${slashCommand} ${currentScreenName}`;
+        // FIXED BUG: Using 'label' which is the target screen, instead of 'currentScreenName'
+        apiMessage = `${slashCommand} ${label}`;
       else apiMessage = slashCommand;
     }
     if (!slashCommand || slashCommand === "/action faq") trackFaqClick(label);
@@ -1325,6 +572,12 @@ const ChatWidget = ({ isOpen, setIsOpen, hasLaunched, setHasLaunched }) => {
 };
 
 export default ChatWidget;
+
+
+
+
+
+
 
 
 
