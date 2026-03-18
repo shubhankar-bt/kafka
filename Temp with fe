@@ -86,3 +86,218 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.repository;
+
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface HelpQuestionRepository extends JpaRepository<HelpQuestionEntity, Long> {
+
+    List<HelpQuestionEntity> findByIsActive(String isActive);
+
+    @Query("SELECT q FROM HelpQuestionEntity q WHERE q.permissionId IS NULL AND q.isActive = 'Y'")
+    List<HelpQuestionEntity> findGlobalFaqs();
+
+    // THE FIX: RBAC for Quick Action Pills!
+    @Query("SELECT q FROM HelpQuestionEntity q WHERE q.screenName = :screenName AND q.isActive = :isActive AND (q.permissionId IN :userPerms OR q.permissionId IS NULL)")
+    List<HelpQuestionEntity> findAllowedQuestions(
+            @Param("screenName") String screenName, 
+            @Param("isActive") String isActive, 
+            @Param("userPerms") List<Long> userPerms);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            // ========================================================================
+            // 1. GUIDED MENUS (Fast DB Fetch - No LLM Needed)
+            // ========================================================================
+            
+            // Get user's permissions as Longs (ignoring "GLOBAL" for the DB query)
+            List<Long> allowedPermIds = permissionService.getAllAllowedPermissionIdsForRole(roleId)
+                    .stream().map(Long::valueOf).collect(Collectors.toList());
+
+            if ("/action faq".equalsIgnoreCase(userMessage.trim())) {
+                List<String> faqQuestions = faqRepository.findTop10ByIsActiveOrderByViewCountDesc("Y")
+                        .stream().map(HelpFaqEntity::getQuestionText).collect(Collectors.toList());
+                emitSuggestionAndClose(emitter, "Here are a few frequently asked questions:", faqQuestions);
+                return emitter;
+            }
+
+            if (userMessage.trim().startsWith("/action module")) {
+                String requestedScreen = userMessage.replace("/action module", "").trim();
+                
+                // THE FIX: Only fetch pills the user is authorized to see!
+                List<String> moduleQuestions = questionRepository.findAllowedQuestions(requestedScreen, "Y", allowedPermIds)
+                        .stream().map(HelpQuestionEntity::getQuestionText).collect(Collectors.toList());
+
+                if (moduleQuestions.isEmpty()) {
+                    emitTextAndClose(emitter, "I don't have predefined questions for " + requestedScreen + " right now, but feel free to ask me anything about it!");
+                } else {
+                    emitSuggestionAndClose(emitter, "Here are a few common questions for the " + requestedScreen + " screen:", moduleQuestions);
+                }
+                return emitter;
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DELETE FROM HELP_QUESTION_MASTER;
+
+-- SCENARIO 1: "What is the purpose?" (Visible to EVERYONE on the screen)
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT DISTINCT 
+    MENU_TITLE,
+    'What is the purpose of ' || MENU_TITLE || '?',
+    'The ' || MENU_TITLE || ' module is designed to manage and view related banking records within FinCore.',
+    NULL, -- GLOBAL
+    NULL,
+    NULL,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_TITLE IS NOT NULL;
+
+
+-- SCENARIO 2: "How to create?" (Visible ONLY if role has 'create' or 'modify')
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT 
+    MENU_TITLE,
+    'How do I create or modify a ' || MENU_TITLE || ' record?',
+    'To create or modify records, use the ' || MENU_SUBMENU || ' screen. Fill out the mandatory fields and submit. **Note:** Your request will go into a pending state and must be authorized by a different user acting as a Checker.',
+    MENU_ID, 
+    MENU_URL,
+    'Open ' || MENU_SUBMENU,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_ACTION LIKE '%create%' OR MENU_ACTION LIKE '%modify%';
+
+
+-- SCENARIO 3: "How to cancel?" (Visible ONLY if role has 'cancel' rights)
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT 
+    MENU_TITLE,
+    'How do I cancel a pending ' || MENU_TITLE || ' request that I created?',
+    'If you initiated a request and need to recall it, navigate to the ' || MENU_SUBMENU || ' screen. You can only cancel requests that are still in a "Pending" state. Once a Checker has approved or rejected the request, it can no longer be cancelled.',
+    MENU_ID, 
+    MENU_URL,
+    'View ' || MENU_SUBMENU,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_ACTION LIKE '%cancel%';
+
+
+-- SCENARIO 4: "How to approve?" (Visible ONLY if role has 'approve' or 'reject')
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT 
+    MENU_TITLE,
+    'How do I approve or reject a ' || MENU_TITLE || ' request?',
+    'Navigate to the ' || MENU_SUBMENU || ' screen to view pending requests submitted by other users. Select a record to review and click Approve or Reject. **Important Business Rule:** FinCore enforces strict Maker-Checker separation. You cannot approve or reject requests that you initiated yourself. Rejections require a mandatory remark.',
+    MENU_ID, 
+    MENU_URL,
+    'Review ' || MENU_SUBMENU,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_ACTION LIKE '%approve%' OR MENU_ACTION LIKE '%reject%';
+
+
+-- SCENARIO 5: "When will it be approved?" (Workflow logic for Makers)
+INSERT INTO HELP_QUESTION_MASTER (SCREEN_NAME, QUESTION_TEXT, ANSWER_CONTENT, PERMISSION_ID, ACTION_LINK, ACTION_LABEL, IS_ACTIVE)
+SELECT 
+    MENU_TITLE,
+    'I submitted a request in ' || MENU_SUBMENU || '. When will it be approved?',
+    'FinCore enforces a strict Maker-Checker policy. You cannot approve your own requests, even if your role has approval rights. Another user with the appropriate authorization must review your submission in their pending queue. Once they approve it, the system will update automatically.',
+    MENU_ID, 
+    NULL,
+    NULL,
+    'Y'
+FROM PERMISSIONS
+WHERE MENU_ACTION LIKE '%create%' OR MENU_ACTION LIKE '%modify%';
+
+COMMIT;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
