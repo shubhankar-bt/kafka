@@ -1,0 +1,5721 @@
+package com.fincore.process_status_service.advice;
+
+import com.fincore.process_status_service.dto.ApiResponse;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.core.MethodParameter;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse; 
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+
+/**
+ * Global API response wrapper using {@link ControllerAdvice} and
+ * {@link ResponseBodyAdvice}.
+ * <p>
+ * This class intercepts the return values of controller methods annotated with
+ * {@link RestController}
+ * and automatically wraps the raw response body in a standardized
+ * {@link ApiResponse} structure.
+ * This ensures consistency across all successful API responses (e.g., adding a
+ * status, message, etc.)
+ * without requiring manual wrapping in every controller method.
+ * </p>
+ */
+@ControllerAdvice
+public class ApiResponseWrapper implements ResponseBodyAdvice<Object> {
+
+    /**
+     * Determines whether this {@link ResponseBodyAdvice} is applicable to the given
+     * method return type
+     * and message converter.
+     *
+     * @param returnType    The return type of the controller method.
+     * @param converterType The class of the message converter selected for
+     *                      rendering the response.
+     * @return {@code true} if this advice should be applied, {@code false}
+     *         otherwise.
+     */
+    @Override
+    public boolean supports(MethodParameter returnType,
+            @NotNull Class<? extends HttpMessageConverter<?>> converterType) {
+        // Apply this advice only to methods within classes annotated with
+        // @RestController.
+        // It specifically excludes methods that already return a ResponseEntity, as
+        // those
+        // responses are manually controlled by the developer and should not be
+        // auto-wrapped.
+        return AnnotatedElementUtils.hasAnnotation(returnType.getContainingClass(), RestController.class) &&
+                !returnType.getParameterType().equals(ResponseEntity.class);
+    }
+
+    /**
+     * Invoked after an {@code HttpMessageConverter} selected by the
+     * {@link RequestMappingHandlerAdapter}
+     * has converted the return value of a controller method to a response body but
+     * before the body
+     * is written to the output stream.
+     *
+     * This method performs the actual wrapping of the response body.
+     *
+     * @param body                  The original response body as returned by the
+     *                              controller method.
+     * @param returnType            The return type of the controller method.
+     * @param selectedContentType   The content type selected by the content
+     *                              negotiation process.
+     * @param selectedConverterType The converter type selected to write the body to
+     *                              the response.
+     * @param request               The current server request.
+     * @param response              The current server response.
+     * @return The potentially modified or wrapped response body (an
+     *         {@link ApiResponse} instance).
+     */
+    @Override
+    public Object beforeBodyWrite(Object body, @NotNull MethodParameter returnType,
+            @NotNull MediaType selectedContentType,
+            @NotNull Class<? extends HttpMessageConverter<?>> selectedConverterType,
+            @NotNull ServerHttpRequest request, @NotNull ServerHttpResponse response) {
+
+        // If the body is already an instance of ApiResponse (meaning the controller
+        // manually returned a wrapped response), return it as is to prevent double
+        // wrapping.
+        if (body instanceof ApiResponse<?>) {
+            return body;
+        }
+
+        // Wrap the original response body in the standard success ApiResponse
+        // structure.
+        return ApiResponse.success(body);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.client;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fincore.commonutilities.annotation.NoRetry;
+import com.fincore.process_status_service.dto.AirflowTriggerRequest;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.service.AirflowAuthService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.*;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.util.UriBuilder;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AirflowRestClient {
+
+
+    private final WebClient airflowApiClient;
+
+    private final AirflowAuthService authService;
+
+
+    public Function<UriBuilder, URI> uri(String path) {
+        return uri(path, null, null);
+    }
+
+    public Function<UriBuilder, URI> uri(String path, Map<String, ?> queryParams) {
+        return uri(path, null, queryParams);
+    }
+
+    public Function<UriBuilder, URI> uri(
+            String path,
+            Map<String, ?> pathVars,
+            Map<String, ?> queryParams
+    ) {
+        return uriBuilder -> {
+            UriBuilder builder = uriBuilder.path(path);
+            if (queryParams != null) {
+                queryParams.forEach(builder::queryParam);
+            }
+            if (pathVars != null && !pathVars.isEmpty()) {
+                return builder.build(pathVars);
+            }
+            return builder.build();
+        };
+    }
+
+
+    //@NoRetry
+    @Retryable(
+            retryFor = WebClientResponseException.Unauthorized.class,
+            maxAttempts = 3
+    )
+    public <T> T execute(
+            HttpMethod method,
+            String path,
+            Object body,
+            Class<T> responseClass
+    ) {
+        try {
+            return doRequest(
+                    method,
+                    uri(path),
+                    body,
+                    responseSpec -> responseSpec.bodyToMono(responseClass)
+            );
+        } catch (WebClientResponseException.Unauthorized ex) {
+            authService.clearToken();
+            throw ex;
+        }
+    }
+
+    private <T> T doRequest(
+            HttpMethod method,
+            Function<UriBuilder, URI> uriFn,
+            Object body,
+            Function<WebClient.ResponseSpec, Mono<T>> decoder
+    ) {
+        String token = authService.getToken();
+        WebClient.ResponseSpec responseSpec =
+                airflowApiClient
+                        .method(method)
+                        .uri(uriFn)
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(body != null ? body : Map.of())
+                        .retrieve()
+                        .onStatus(
+                                HttpStatus.NOT_FOUND::equals,
+                                response -> response.bodyToMono(Map.class)
+                                        .flatMap(airflowBody -> {
+                                            String detail = (String) airflowBody.get("detail");
+                                            return Mono.error(new AirflowIntegrationException(
+                                                    String.valueOf(detail) !=null ? detail : airflowBody.toString() ,
+                                                    HttpStatus.NOT_FOUND
+                                            ));
+                                        })
+                        )
+                        .onStatus(HttpStatus.UNAUTHORIZED::equals, response -> {
+                            log.warn("401 detected in onStatus. Clearing token.");
+                            authService.clearToken();
+                            return response.createException(); // This throws the Unauthorized exception
+                        })
+                        .onStatus(
+                                status -> status.value() >= 400 && status.value() != 401,
+                                resp -> resp.bodyToMono(String.class)
+                                        .map(RuntimeException::new)
+                        )
+                        .onStatus(
+                                status -> status.value() == 500,
+                                resp -> resp.bodyToMono(String.class)
+                                        .map(RuntimeException::new)
+                        )
+
+                ;
+        return decoder.apply(responseSpec).block();
+    }
+
+    @Retryable(
+            retryFor = WebClientResponseException.Unauthorized.class,
+            maxAttempts = 3
+    )
+    public <T> T execute(
+            HttpMethod method,
+            Function<UriBuilder, URI> uriFn,
+            Object body,
+            ParameterizedTypeReference<T> responseType
+    ) {
+        try {
+            return doRequest(
+                    method,
+                    uriFn,
+                    body,
+                    responseSpec -> responseSpec.bodyToMono(responseType)
+            );
+        } catch (WebClientResponseException.Unauthorized ex) {
+            authService.clearToken();
+            throw ex;
+        }
+    }
+
+
+//    @Retryable(
+//            retryFor = WebClientResponseException.Unauthorized.class,
+//            maxAttempts = 3
+//    )
+//    public <T> T execute(
+//            HttpMethod method,
+//            String uri,
+//            Object body,
+//            Class<T> responseClass
+//    ) {
+//        try {
+//            return doRequest(method, uri, body, responseClass);
+//        } catch (WebClientResponseException.Unauthorized ex) {
+//            authService.clearToken();
+//            throw ex;
+//        }
+//    }
+//    @Retryable(
+//            retryFor = WebClientResponseException.Unauthorized.class,
+//            maxAttempts = 3
+//    )
+//    public <T> T execute(
+//            HttpMethod method,
+//            String uri,
+//            Object body,
+//            ParameterizedTypeReference<T> responseType
+//    ) {
+//        try {
+//            return doRequest(method, uri, body, responseType);
+//        } catch (WebClientResponseException.Unauthorized ex) {
+//            authService.clearToken();
+//            throw ex;
+//        }
+//    }
+//
+//
+//
+//    private <T> T doRequest(
+//            HttpMethod method,
+//            String uri,
+//            Object body,
+//            Class<T> responseClass
+//    ) {
+//        String token = authService.getToken();
+//        return airflowApiClient
+//                .method(method)
+//                .uri(uri)
+//                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+//                .contentType(MediaType.APPLICATION_JSON)
+//                .bodyValue(body != null ? body : Map.of())
+//                .retrieve()
+//                .onStatus(
+//                        status -> status.value() >= 400 && status.value() != 401,
+//                        resp -> resp.bodyToMono(String.class)
+//                                .map(RuntimeException::new)
+//                )
+//                .bodyToMono(responseClass)
+//                .block();
+//    }
+//    private <T> T doRequest(
+//            HttpMethod method,
+//            String uri,
+//            Object body,
+//            ParameterizedTypeReference<T> responseType
+//    ) {
+//        String token = authService.getToken();
+//        return airflowApiClient
+//                .method(method)
+//                .uri(uri)
+//                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+//                .contentType(MediaType.APPLICATION_JSON)
+//                .bodyValue(body != null ? body : Map.of())
+//                .retrieve()
+//                .onStatus(
+//                        status -> status.value() >= 400 && status.value() != 401,
+//                        resp -> resp.bodyToMono(String.class)
+//                                .map(RuntimeException::new)
+//                )
+//                .bodyToMono(responseType)
+//                .block();
+//    }
+//
+//
+//
+
+
+//    /**
+//     * Calls Airflow REST API: POST /dags/{dag_id}/dagRuns
+//     */
+//    public Mono<JsonNode> triggerDagRun(AirflowTriggerRequest request) {
+//        String uri = String.format("/dags/%s/dagRuns", request.getDagId());
+//
+//        // Construct the body strictly as Airflow expects
+//        Map<String, Object> body = new HashMap<>();
+//        if (request.getPayload() != null) {
+//            body.put("conf", request.getPayload());
+//        }
+//        if (request.getDagRunId() != null) {
+//            body.put("dag_run_id", request.getDagRunId());
+//        }
+//
+//        log.debug("Sending request to Airflow URI: {} with payload keys: {}", uri, body.keySet());
+//
+//        return airflowWebClient.post()
+//                .uri(uri)
+//                .bodyValue(body)
+//                .retrieve()
+//                .onStatus(HttpStatusCode::is4xxClientError, response ->
+//                        response.bodyToMono(String.class).flatMap(errorBody -> {
+//                            log.error("Airflow Client Error {}: {}", response.statusCode(), errorBody);
+//                            return Mono.error(new AirflowIntegrationException(
+//                                    "Client Error: " + errorBody, (HttpStatus) response.statusCode()));
+//                        })
+//                )
+//                .onStatus(HttpStatusCode::is5xxServerError, response ->
+//                        response.bodyToMono(String.class).flatMap(errorBody -> {
+//                            log.error("Airflow Server Error {}: {}", response.statusCode(), errorBody);
+//                            return Mono.error(new AirflowIntegrationException(
+//                                    "Airflow Server Error", (HttpStatus) response.statusCode()));
+//                        })
+//                )
+//                .bodyToMono(JsonNode.class)
+//                .doOnSuccess(json -> log.debug("Successfully triggered DAG. Airflow State: {}",
+//                        json.path("state").asText()));
+//    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.client;
+
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.service.NiFiAuthService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.*;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.util.UriBuilder;
+import reactor.core.publisher.Mono;
+
+import java.net.URI;
+import java.util.Map;
+import java.util.function.Function;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class NiFiRestClient {
+
+    private final WebClient nifiApiClient;
+    private final NiFiAuthService authService;
+
+    public Function<UriBuilder, URI> uri(String path) {
+        return uriBuilder -> uriBuilder.path(path).build();
+    }
+
+    public Function<UriBuilder, URI> uri(String path, Map<String, ?> queryParams) {
+        return uriBuilder -> {
+            UriBuilder builder = uriBuilder.path(path);
+            if (queryParams != null) {
+                queryParams.forEach(builder::queryParam);
+            }
+            return builder.build();
+        };
+    }
+
+    @Retryable(
+            retryFor = WebClientResponseException.Unauthorized.class,
+            maxAttempts = 3
+    )
+    public <T> T execute(HttpMethod method, String path, Object body, Class<T> responseClass) {
+        try {
+            return doRequest(method, uri(path), body, spec -> spec.bodyToMono(responseClass));
+        } catch (WebClientResponseException.Unauthorized ex) {
+            authService.clearToken();
+            throw ex;
+        }
+    }
+
+    private <T> T doRequest(
+            HttpMethod method,
+            Function<UriBuilder, URI> uriFn,
+            Object body,
+            Function<WebClient.ResponseSpec, Mono<T>> decoder
+    ) {
+        String token = authService.getToken();
+
+        WebClient.ResponseSpec responseSpec = nifiApiClient
+                .method(method)
+                .uri(uriFn)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body != null ? body : Map.of())
+                .retrieve()
+                .onStatus(HttpStatus.UNAUTHORIZED::equals, response -> {
+                    log.warn("NiFi 401 detected. Clearing token cache.");
+                    authService.clearToken();
+                    return response.createException();
+                })
+                .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(), response ->
+                        response.bodyToMono(String.class)
+                                .flatMap(errorBody -> {
+                                    log.error("NiFi API Error: {}", errorBody);
+                                    return Mono.error(new AirflowIntegrationException(
+                                            errorBody,
+                                            (HttpStatus) response.statusCode()
+                                    ));
+                                })
+                );
+
+        return decoder.apply(responseSpec).block();
+    }
+
+    @Retryable(
+            retryFor = WebClientResponseException.Unauthorized.class,
+            maxAttempts = 3
+    )
+    public <T> T execute(
+            HttpMethod method,
+            Function<UriBuilder, URI> uriFn,
+            Object body,
+            ParameterizedTypeReference<T> responseType
+    ) {
+        try {
+            return doRequest(method, uriFn, body, spec -> spec.bodyToMono(responseType));
+        } catch (WebClientResponseException.Unauthorized ex) {
+            authService.clearToken();
+            throw ex;
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.validation.annotation.Validated;
+/**
+ * Airflow Properties :-
+ * Picks airflow related properties from application properties.
+ * @author Sampath [v1017860]
+ * @version 1.0
+ */
+@Data
+@Validated
+@Configuration
+@ConfigurationProperties(prefix = "airflow")
+public class AirflowProperties {
+
+    @NotBlank(message = "Airflow Base URL must be configured")
+    private String baseUrl;
+
+    @NotBlank(message = "Api Version must be configured")
+    private String apiVersion;
+
+    @NotBlank(message = "Airflow Username is required")
+    private String username;
+
+    @NotBlank(message = "Airflow Password is required")
+    private String password;
+
+
+
+    @Positive
+    private int connectTimeout = 5000;
+
+    @Positive
+    private int readTimeout = 10000;
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.annotation.EnableKafka;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.util.backoff.FixedBackOff;
+
+@Configuration
+@EnableKafka
+@Slf4j
+public class KafkaConsumerConfig {
+    @Bean
+    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate) {
+
+        log.info("Inside the DLT Handler Trying to send DLT Message for {}",kafkaTemplate);
+//        DeadLetterPublishingRecoverer recoverer =
+//                new DeadLetterPublishingRecoverer(kafkaTemplate);
+
+        DeadLetterPublishingRecoverer recoverer =
+                new DeadLetterPublishingRecoverer(
+                        kafkaTemplate,
+                        (record, ex) -> new TopicPartition(
+                                record.topic() + "-dlt",
+                                -1)
+                );
+
+
+        DefaultErrorHandler handler =
+                new DefaultErrorHandler(recoverer, new FixedBackOff(0L, 0));
+        handler.addNotRetryableExceptions(
+                org.apache.kafka.common.errors.SerializationException.class,
+                com.fasterxml.jackson.core.JsonParseException.class
+        );
+        return handler;
+    }
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
+            ConsumerFactory<Object, Object> consumerFactory,
+            DefaultErrorHandler kafkaErrorHandler) {
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        factory.setCommonErrorHandler(kafkaErrorHandler);
+//        factory.getContainerProperties().setAckMode(org.springframework.kafka.listener.ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+        return factory;
+    }
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> manualAckKafkaListenerContainerFactory(
+            ConsumerFactory<String, String> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<String, String> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory);
+        factory.getContainerProperties().setAckMode(org.springframework.kafka.listener.ContainerProperties.AckMode.MANUAL);
+        return factory;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.validation.annotation.Validated;
+/**
+ * Nifi Properties :-
+ * Picks Nifi related properties from application properties.
+ * @author Sampath [v1017860]
+ * @version 1.0
+ */
+@Data
+@Validated
+@Configuration
+@ConfigurationProperties(prefix = "nifi")
+public class NifiProperties {
+
+    @NotBlank(message = "NiFi Base URL must be configured")
+    private String baseUrl;
+
+//    @NotBlank(message = "Api Version must be configured")
+//    private String apiVersion;
+
+    @NotBlank(message = "NiFi Username is required")
+    private String username;
+
+    @NotBlank(message = "NiFi Password is required")
+    private String password;
+
+
+
+    @Positive
+    private int connectTimeout = 5000;
+
+    @Positive
+    private int readTimeout = 10000;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+import io.netty.channel.ChannelOption;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+
+
+import javax.net.ssl.SSLException;
+import java.time.Duration;
+
+@Slf4j
+@Configuration
+@RequiredArgsConstructor
+public class NiFiWebClientConfig {
+
+    private final NifiProperties properties;
+
+    @Bean
+    public WebClient nifiAuthClient() {
+        return WebClient.builder()
+                .baseUrl(properties.getBaseUrl()) // Base URL only, suffix in Service
+                .clientConnector(new ReactorClientHttpConnector(createHttpClient()))
+                .build();
+    }
+
+    @Bean
+    public WebClient nifiApiClient() {
+        return WebClient.builder()
+                .baseUrl(properties.getBaseUrl())
+                .defaultHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .clientConnector(new ReactorClientHttpConnector(createHttpClient()))
+                .build();
+    }
+
+
+
+    private HttpClient createHttpClient() {
+        try {
+            // Create an insecure SSL context that trusts all certificates
+            SslContext sslContext = SslContextBuilder
+                    .forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+
+            return HttpClient.create()
+                    .secure(ssl -> ssl.sslContext(sslContext)) // Apply the insecure SSL context
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, properties.getConnectTimeout())
+                    .responseTimeout(Duration.ofMillis(properties.getReadTimeout()));
+
+        } catch (SSLException e) {
+            throw new RuntimeException("Failed to create insecure SSL context for NiFi", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+import com.fincore.commonutilities.buisnessobject.ControlDateService;
+import com.fincore.commonutilities.config.CommonSecurityConfig;
+import com.fincore.commonutilities.config.RedisConfig;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.logging.MdcLoggingFilter;
+import com.fincore.commonutilities.security.ContextRbacFilter;
+import jakarta.servlet.DispatcherType;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+
+/**
+ * Common Security Configuration.
+ * * Aligned with the "Distributed Gateway" architecture.
+ * It uses the ContextRbacFilter from Common Utilities to enforce:
+ * 1. Token Validity
+ * 2. Single Session (Redis check)
+ * 4. Centralised Mdc Logging Filter
+ * 3. RBAC Permissions
+ */
+@Configuration
+@EnableWebSecurity
+@Import({RedisConfig.class, JwtUtil.class, CommonSecurityConfig.class, ControlDateService.class}) // Don't import Filters here if you define them as Beans below
+public class SecurityConfig {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Autowired
+    private CommonSecurityConfig commonSecurityConfig;
+
+    @Value("${app.security.bypass-secret:}")
+    private String bypassSecret;
+
+    // --- 1. Define Filters as Beans (Explicitly) ---
+
+    @Bean
+    public MdcLoggingFilter mdcLoggingFilter() {
+        return new MdcLoggingFilter(jwtUtil);
+    }
+
+    @Bean
+    public ContextRbacFilter contextRbacFilter() {
+        return new ContextRbacFilter(redisTemplate, jwtUtil);
+    }
+
+    // --- 2. Prevent Global Registration ---
+    // This stops "The Filter class ... does not have a registered order" error
+
+    @Bean
+    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
+        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
+    }
+
+    @Bean
+    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
+        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false); // Disable global chain
+        return registration;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(authz -> authz
+                        // Allow Async Dispatches (StreamingResponseBody) to proceed without re-auth checks
+                        .dispatcherTypeMatchers(DispatcherType.ASYNC).permitAll()
+                        .requestMatchers("/actuator/**", "/api/auth/**", "/error").permitAll()
+                        .anyRequest().authenticated()
+                )
+                // Add Filters using the BEAN references (methods above)
+                .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
+
+        return http.build();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.config;
+
+import io.netty.channel.ChannelOption;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+
+import javax.net.ssl.SSLException;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.concurrent.TimeUnit;
+
+@Slf4j
+@Configuration
+@RequiredArgsConstructor
+public class WebClientConfig {
+
+    private final AirflowProperties properties;
+
+    @Bean
+    public WebClient airflowWebClient() {
+        log.info("Configuring Airflow WebClient with Base URL: {}", properties.getBaseUrl());
+
+
+        SslContext sslContext;
+        try {
+            sslContext = SslContextBuilder
+                    .forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (SSLException e) {
+            throw new RuntimeException(e);
+        }
+
+
+        // Configure timeouts
+        HttpClient httpClient = HttpClient.create()
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, properties.getConnectTimeout())
+                .responseTimeout(Duration.ofMillis(properties.getReadTimeout()))
+                .secure(ssl -> ssl.sslContext(sslContext))
+                .doOnConnected(conn ->
+                        conn.addHandlerLast(new ReadTimeoutHandler(properties.getReadTimeout(), TimeUnit.MILLISECONDS))
+                                .addHandlerLast(new WriteTimeoutHandler(properties.getReadTimeout(), TimeUnit.MILLISECONDS)));
+
+        // Configure Basic Auth
+        String basicAuth = "Basic " + Base64.getEncoder().encodeToString(
+                (properties.getUsername() + ":" + properties.getPassword()).getBytes());
+
+        return WebClient.builder()
+                .baseUrl(properties.getBaseUrl())
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .defaultHeader(HttpHeaders.AUTHORIZATION, basicAuth)
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+
+    @Bean
+    public WebClient airflowAuthClient(AirflowProperties props) {
+
+        SslContext sslContext;
+        try {
+            sslContext = SslContextBuilder
+                    .forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (SSLException e) {
+            throw new RuntimeException(e);
+        }
+
+        HttpClient httpClient = HttpClient.create().secure(ssl -> ssl.sslContext(sslContext));
+
+        return WebClient.builder()
+                .baseUrl(props.getBaseUrl())
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .build();
+    }
+
+
+    @Bean
+    public WebClient airflowApiClient(AirflowProperties props) {
+
+
+        SslContext sslContext;
+        try {
+            sslContext = SslContextBuilder
+                    .forClient()
+                    .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                    .build();
+        } catch (SSLException e) {
+            throw new RuntimeException(e);
+        }
+
+        HttpClient httpClient = HttpClient.create().secure(ssl -> ssl.sslContext(sslContext));
+
+        return WebClient.builder()
+                .baseUrl(props.getBaseUrl() + props.getApiVersion())
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import com.fincore.process_status_service.dto.AirflowDagEvent;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class AirflowEventConsumer {
+
+
+    ProcessStatusService processStatusService;
+
+
+    @KafkaListener(
+            topics = "airflow-events",
+            groupId = "Airflow_ETL",
+            properties = {"spring.json.value.default.type=com.fincore.process_status_service.dto.AirflowDagEvent"}
+    )
+    public void consume(AirflowDagEvent dagEvent)  {
+
+        log.info("Received Airflow event: {}", dagEvent);
+        processStatusService.sendProcessStatusUpdates();
+    }
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.TimeUtil;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class NwsaVarianceEventConsumer {
+
+    private final ProcessStatusService processStatusService;
+
+    @KafkaListener(topics = "nwsa-variance-report.started", groupId = "Report-Batch", properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.NwsaVarianceStartedDTO")
+    public void consumeStarted(NwsaVarianceStartedDTO dto) {
+
+        ProcessRunStage stage = processStatusService.getProcessRunStage(
+                dto.getStageId(),
+                Long.valueOf(dto.getProcessRunId()) // processRunId is null
+        );
+
+        if (stage == null) {
+            stage = new ProcessRunStage();
+            stage.setStageId(dto.getStageId());
+        }
+
+        stage.setSource(Constants.SYSTEM);
+        stage.setStatus(Constants.IN_PROGRESS);
+        stage.setSummary(dto.getJobId());
+
+        if (dto.getJobStartTime() != null) {
+            long seconds = dto.getJobStartTime().longValue();
+            stage.setStartTime(
+                    TimeUtil.convertEpoch((double) seconds).toLocalDateTime());
+        }
+
+        stage.setRemarks("NWSA Report Started for date: " + dto.getReportDate());
+
+        processStatusService.upsertProcessRunStage(stage);
+    }
+
+
+    @KafkaListener(topics = "nwsa-variance-report.completed", groupId = "Report-Batch", properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.NwsaVarianceCompletedDTO")
+    public void consumeCompleted(NwsaVarianceCompletedDTO dto) {
+
+        ProcessRunStage stage = processStatusService.getProcessRunStage(
+                dto.getStageId(),
+                Long.valueOf(dto.getProcessRunId()));
+
+        stage.setStatus(Constants.SUCCESS);
+        stage.setEndTime(TimeUtil.getCurrentTimeStamp());
+
+        stage.setRemarks(
+                "Total: " + dto.getTotalReports() +
+                        ", Completed: " + dto.getCompletedReports() +
+                        ", Failed: " + dto.getFailedReports());
+
+        processStatusService.upsertProcessRunStage(stage);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+import com.fincore.process_status_service.dto.FileEvent;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Service;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import org.springframework.kafka.support.Acknowledgment;
+
+
+@Slf4j
+@Service
+public class PysparkKafkaConsumerService {
+//    @Autowired
+//    ProcessStatusService processStatusService;
+
+    private final ProcessStatusService processStatusService;
+
+    public PysparkKafkaConsumerService(ProcessStatusService processStatusService) {
+        this.processStatusService = processStatusService;
+    }
+
+    @KafkaListener(topics = "allfiletodatalake", groupId = "pyspark-kafka-group", containerFactory = "manualAckKafkaListenerContainerFactory", properties = {"spring.json.value.default.type=com.fincore.process_status_service.dto.FileEvent"} )
+    public void consume( Acknowledgment ack, FileEvent fileEvent) {
+
+        log.info("File Received:{}", fileEvent);
+
+        try {
+            processStatusService.updateControllFilemaster(fileEvent.getFile_name(), fileEvent.getValue(), fileEvent.getEtl_date());
+            ack.acknowledge();
+        } catch (DataIntegrityViolationException e) {
+
+            log.error("Failed to update DB : {}", e.getMessage());
+
+
+        }
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import com.fincore.process_status_service.util.TimeUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import com.fincore.process_status_service.util.Constants;
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class ReportBatchEventConsumer {
+
+        private final ProcessStatusService processStatusService;
+
+        // @KafkaListener(topics = "report-builder.batch-mode.trigger", groupId =
+        // "Report-Batch", properties =
+        // "spring.json.value.default.type=com.fincore.process_status_service.dto.ReportBatchTriggerDTO")
+        // public void consumeTrigger(ReportBatchTriggerDTO dto) {
+
+        // ProcessRunStage stage = processStatusService.getProcessRunStage(
+        // dto.getStageId(),
+        // dto.getProcessRunId());
+
+        // log.info("Data:", stage.getStatus());
+        // log.info("Trigger has started!!!");
+        // stage.setStatus(Constants.STARTED);
+        // stage.setStartTime(TimeUtil.getCurrentTimeStamp());
+        // processStatusService.upsertProcessRunStage(stage);
+        // }
+
+        @KafkaListener(topics = "report-builder.batch-mode.started", groupId = "Report-Batch", properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.ReportBatchStartedDTO")
+        public void consumeStarted(ReportBatchStartedDTO dto) {
+
+                ProcessRunStage stage = processStatusService.getProcessRunStage(
+                                dto.getStageId(),
+                                dto.getProcessRunId());
+
+                if(stage == null)
+                {
+                        stage = new ProcessRunStage();
+                        stage.setStageId(dto.getStageId());
+
+
+                }
+                stage.setSource(Constants.SYSTEM);
+                stage.setStatus(Constants.IN_PROGRESS);
+                stage.setSummary(dto.getJobId());
+                if (dto.getJobStartTime() != null) {
+                        long seconds = dto.getJobStartTime().longValue();
+                        stage.setStartTime(TimeUtil.convertEpoch((double) seconds).toLocalDateTime());
+                }
+                stage.setStartTime(TimeUtil.getCurrentTimeStamp());
+                stage.setRemarks("Report Generation Started for " +dto.getReportType() + "with template id : " + dto.getTemplateId());
+
+                processStatusService.upsertProcessRunStage(stage);
+        }
+
+        @KafkaListener(topics = "report-builder.batch-mode.completed", groupId = "Report-Batch", properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.ReportBatchCompletedDTO")
+        public void consumeCompleted(ReportBatchCompletedDTO dto) {
+
+                ProcessRunStage stage = processStatusService.getProcessRunStage(
+                                dto.getStageId(),
+                                Long.valueOf(dto.getProcessRunId()));
+
+                stage.setStatus(Constants.SUCCESS);
+                stage.setEndTime(TimeUtil.getCurrentTimeStamp());
+
+                stage.setRemarks(
+                                "Total: " + dto.getTotalReports() +
+                                                ", Completed: " + dto.getCompletedReports() +
+                                                ", Failed: " + dto.getFailedReports());
+
+                processStatusService.upsertProcessRunStage(stage);
+        }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import com.fincore.process_status_service.dto.ReportServiceEventDTO;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.TimeUtil;
+import jakarta.validation.constraints.NotNull;
+import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.kafka.annotation.DltHandler;
+import org.springframework.kafka.annotation.KafkaHandler;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.annotation.RetryableTopic;
+import org.springframework.kafka.retrytopic.DltStrategy;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.messaging.handler.annotation.Header;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.stereotype.Component;
+
+@Component
+@Slf4j
+@AllArgsConstructor
+public class ReportServiceEventConsumer {
+
+    private final ProcessStatusService processStatusService;
+//
+//    @RetryableTopic(
+//            attempts = "3",
+//            backoff = @Backoff(delay = 2000, multiplier = 2.0),
+//            autoCreateTopics = "true",
+//            // Immediately move to DLT for these non-recoverable database errors
+//            exclude = {
+//                    DataIntegrityViolationException.class,
+//                    ResourceNotFoundException.class
+//            },
+//            // Stops the container if the DLT publish fails, preventing the infinite loop
+//            dltStrategy = DltStrategy.FAIL_ON_ERROR
+//    )
+    @KafkaListener(
+            topics = "report-generation-response",
+            groupId = "Airflow_ETL",
+            properties = {"spring.json.value.default.type=com.fincore.process_status_service.dto.ReportServiceEventDTO"},
+            containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void consume(@NotNull ReportServiceEventDTO reportServiceEventDTO) {
+        log.info("Consuming event for ProcessRunId: {} and StageId: {}",
+                reportServiceEventDTO.getProcessRunId(), reportServiceEventDTO.getStageId());
+
+        // Validate mandatory fields to trigger DLT immediately if null
+        if (reportServiceEventDTO.getProcessRunId() == null || reportServiceEventDTO.getStageId() == null) {
+           log.error("Mandatory IDs are null in incoming Kafka message");
+            throw new DataIntegrityViolationException("Mandatory IDs are null in incoming Kafka message");
+        }
+
+        ProcessRunStage processRunStage = processStatusService.getProcessRunStage(
+                reportServiceEventDTO.getStageId(),
+                reportServiceEventDTO.getProcessRunId()
+        );
+
+        if (processRunStage == null) {
+            processRunStage = new ProcessRunStage();
+            processRunStage.setProcessRunId(reportServiceEventDTO.getProcessRunId());
+            processRunStage.setStageId(reportServiceEventDTO.getStageId());
+            processRunStage.setStartTime(TimeUtil.getCurrentTimeStamp());
+        }
+
+        processRunStage.setEndTime(TimeUtil.getCurrentTimeStamp());
+
+        if (reportServiceEventDTO.getStatus().equalsIgnoreCase(Constants.REPORT_SUCCESS)) {
+            processRunStage.setStatus(Constants.SUCCESS);
+        } else {
+            processRunStage.setStatus(Constants.FAILED);
+        }
+
+        processRunStage.setRemarks(reportServiceEventDTO.getRemark());
+
+        // This call must throw the Exception out of the method for @RetryableTopic to catch it
+        processStatusService.upsertProcessRunStage(processRunStage);
+    }
+
+//    @DltHandler
+//    public void handleDlt(ReportServiceEventDTO data, @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+//        log.error("CRITICAL: Message moved to DLT [Topic: {}]. Manual intervention required for payload: {}", topic, data);
+//    }
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import java.sql.Timestamp;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.fincore.process_status_service.util.TimeUtil;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+import com.fincore.process_status_service.dto.SingleReportCompletedDTO;
+import com.fincore.process_status_service.dto.SingleReportStartedDTO;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import com.fincore.process_status_service.util.Constants;
+
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class SingleReportEventConsumer {
+    private final ProcessStatusService processStatusService;
+    private final Validator validator;
+
+    /**
+     * JOB STARTED EVENT
+     */
+    @KafkaListener(topics = "report-builder.single-mode.started", groupId = "Airflow_ETL",  properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.SingleReportStartedDTO")
+    public void consumeStarted(SingleReportStartedDTO dto) {
+
+        log.info("DtTO Recieved :{}",dto);
+        Set<ConstraintViolation<SingleReportStartedDTO>> violations = validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+
+            String error = violations.stream()
+                    .map(ConstraintViolation::getMessage)
+                    .collect(Collectors.joining(", "));
+
+            log.error("Started Event Validation Failed: {}", error);
+            return;
+        }
+
+        log.info("Received STARTED event {}", dto);
+
+        ProcessRunStage stage = processStatusService.getProcessRunStage(
+                dto.getStageId(),
+                Long.valueOf(dto.getProcessRunId()));
+        if(stage == null)
+        {
+            stage = new ProcessRunStage();
+            stage.setStageId(dto.getStageId());
+            stage.setStartTime(TimeUtil.getCurrentTimeStamp());
+
+        }
+        stage.setStatus(Constants.IN_PROGRESS);
+        stage.setSource(Constants.SYSTEM);
+        stage.setRemarks("Single Mode :: Report Generation Started for " + dto.getReportType() + " with template Id " + dto.getTemplateId());
+
+        stage.setStartTime(convertEpoch(dto.getJobStartTime()).toLocalDateTime());
+
+        processStatusService.upsertProcessRunStage(stage);
+    }
+
+    /**
+     * JOB COMPLETED EVENT
+     */
+    @KafkaListener(topics = "report-builder.single-mode.completed", groupId = "Airflow_ETL" ,  properties = "spring.json.value.default.type=com.fincore.process_status_service.dto.SingleReportCompletedDTO")
+    public void consumeCompleted(SingleReportCompletedDTO dto) {
+
+        Set<ConstraintViolation<SingleReportCompletedDTO>> violations = validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+
+            String error = violations.stream()
+                    .map(ConstraintViolation::getMessage)
+                    .collect(Collectors.joining(", "));
+
+            log.error("Completed Event Validation Failed: {}", error);
+            return;
+        }
+
+        log.info("Received COMPLETED event {}", dto);
+
+        ProcessRunStage stage = processStatusService.getProcessRunStage(
+                dto.getStageId(),
+                Long.valueOf(dto.getProcessRunId()));
+        if(stage == null)
+        {
+            throw new ResourceNotFoundException("Stage Not Found");
+        }
+        stage.setStatus(Constants.SUCCESS);
+
+        stage.setEndTime(convertEpoch(dto.getJobCompletionTime()).toLocalDateTime());
+
+        stage.setRemarks(
+                "Total: " + dto.getTotalReports() +
+                        ", Completed: " + dto.getCompletedReports() +
+                        ", Failed: " + dto.getFailedReports());
+
+        processStatusService.upsertProcessRunStage(stage);
+    }
+
+    private  Timestamp convertEpoch(Double epoch) {
+
+        return TimeUtil.convertEpoch(epoch);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+import com.fincore.process_status_service.dto.SparkEvent;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.service.ProcessStatusService;
+import com.fincore.process_status_service.util.TimeUtil;
+import lombok.AllArgsConstructor;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.http.HttpStatus;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+
+public class SparkEventConsumer {
+
+
+    private final ProcessStatusService processStatusService;
+
+
+    @KafkaListener(
+            topics = "spark-events",
+            groupId = "Airflow_ETL",
+            properties = {"spring.json.value.default.type=com.fincore.process_status_service.dto.SparkEvent"}
+    )
+    public void consume(@NotNull SparkEvent sparkEvent)  {
+
+        log.info("Received Spark Event:{}",sparkEvent);
+
+        if(sparkEvent.isUpdatedRequired())
+        {
+            log.info("Updating DB due to Spark Event");
+            log.info("Process Run Id:{}",sparkEvent.getProcessRunId());
+            log.info("Stage Id:{}",sparkEvent.getStageId());
+
+            ProcessRunStage processRunStage = processStatusService.getProcessRunStage(sparkEvent.getStageId(), sparkEvent.getProcessRunId()) ;
+            if(processRunStage==null ){
+                throw new AirflowIntegrationException("The Entry trying to be updated is not found", HttpStatus.NOT_FOUND);
+            }
+            processRunStage.setStatus(sparkEvent.getStatus());
+            processRunStage.setRemarks(sparkEvent.getRemarks());
+            processRunStage.setEndTime(TimeUtil.getCurrentTimeStamp());
+            processStatusService.upsertProcessRunStage(processRunStage);
+        }
+        processStatusService.sendProcessStatusUpdates();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.consumer;
+
+
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.service.AirflowService;
+import com.fincore.process_status_service.service.ProcessOrchestrationService;
+import lombok.AllArgsConstructor;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.kafka.annotation.DltHandler;
+import org.springframework.kafka.annotation.KafkaHandler;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.annotation.RetryableTopic;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.retrytopic.DltStrategy;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.handler.annotation.Header;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.stereotype.Component;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Component
+@Slf4j
+@AllArgsConstructor
+@RetryableTopic(
+        attempts = "3", // 1 initial try + 2 retries
+        backoff = @Backoff(delay = 2000, multiplier = 2.0), // Exponential backoff
+        autoCreateTopics = "true",
+        exclude = { DataIntegrityViolationException.class } // Immediately DLT these!
+)
+@KafkaListener(
+        topics = "trigger-events",
+        groupId = "Airflow_ETL",
+        properties = {
+                "spring.json.value.default.type=com.fincore.process_status_service.dto.DagRunRequestDTO"
+        }
+)
+
+public class TriggerRequestEventConsumer {
+
+
+    AirflowService airflowService;
+    private final KafkaTemplate<String, TriggerRequestResponse> kafkaTemplate; // Added for publishing
+    private static final String RESPONSE_TOPIC = "trigger-event-responses";
+    private final ProcessOrchestrationService processOrchestrationService;
+
+
+
+    @RetryableTopic(
+            attempts = "3",
+            backoff = @Backoff(delay = 2000, multiplier = 2.0),
+            autoCreateTopics = "true",
+            // Immediately move to DLT for these non-recoverable database errors
+            exclude = {
+                    DataIntegrityViolationException.class,
+                    ResourceNotFoundException.class
+            },
+            // Stops the container if the DLT publish fails, preventing the infinite loop
+            dltStrategy = DltStrategy.FAIL_ON_ERROR
+    )
+
+    @KafkaHandler
+    public void consume(@NotNull DagRunRequestDTO dagRunRequestDTO, @Header(value="requestId",required = false) String requestIdStr) {
+        log.info("Event Received From Common Master Service");
+        TriggerRequestResponse triggerRequestResponse = new TriggerRequestResponse();
+
+        try {
+
+            try {
+                if (requestIdStr != null) {
+                    Long requestId = Long.parseLong(requestIdStr);
+                    triggerRequestResponse.setRequestId(requestId);
+                    if (dagRunRequestDTO == null || dagRunRequestDTO.getProcessId() == null) {
+                        throw new AirflowIntegrationException("Dag Run Request Run is Invalid", HttpStatus.BAD_REQUEST);
+                    }
+                    // Updating Configuration
+                    Map<String,Object> conf = new HashMap<String,Object>();
+                    conf.put("requestId",requestIdStr);
+                    dagRunRequestDTO.setConf(conf);
+
+
+
+
+                    DagRunResponseDTO dagRunResponseDTO = processOrchestrationService.triggerDagIfNoActiveRun(dagRunRequestDTO);
+                    triggerRequestResponse.setTriggerResponse(dagRunResponseDTO);
+                    triggerRequestResponse.setProcessRunId(dagRunResponseDTO.getProcessRunId());
+                    triggerRequestResponse.setMessage("Successfully triggered the pipeline");
+                    triggerRequestResponse.setSuccess(true);
+
+
+
+                } else {
+                    throw new IllegalArgumentException("Invalid Request ID . Request Id is null");
+                }
+
+
+            } catch (AirflowIntegrationException e) {
+                triggerRequestResponse.setMessage(e.getMessage());
+                triggerRequestResponse.setSuccess(false);
+            }
+
+        } catch (IllegalArgumentException e) {
+            triggerRequestResponse.setMessage(e.getMessage());
+            triggerRequestResponse.setSuccess(false);
+        }
+
+
+
+
+            publishResponse(triggerRequestResponse);
+
+
+
+
+
+    }
+
+    /**
+     * Publishes the response to a result topic, preserving the requestId in headers.
+     */
+    public void publishResponse(TriggerRequestResponse response) {
+
+        log.info("Response being published :{}",response);
+      Message<TriggerRequestResponse> message =
+                org.springframework.messaging.support.MessageBuilder
+                        .withPayload(response)
+                        .setHeader(org.springframework.kafka.support.KafkaHeaders.TOPIC, RESPONSE_TOPIC)
+//                        .setHeader("requestId", String.valueOf(requestId)) // Keep the ID linked
+                        .build();
+
+        kafkaTemplate.send(message).whenComplete((result, ex) -> {
+            if (ex == null) {
+                log.info("Successfully published response to {} at offset {}",
+                        RESPONSE_TOPIC, result.getRecordMetadata().offset());
+            } else {
+                log.error("Failed to publish response for Request :{}", ex);
+            }
+        });
+    }
+
+
+    @DltHandler
+    public void handleDlt(TriggerRequestResponse data, @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+        log.error("Event sent to DLT from topic {}: {}", topic, data);
+        // You can save this to a 'failed_events' table for manual fixing
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.controller;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.process_status_service.dto.*;
+
+import com.fincore.process_status_service.service.AirflowService;
+import com.fincore.process_status_service.service.ProcessOrchestrationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/airflow")
+@RequiredArgsConstructor
+public class AirflowController {
+
+    private final AirflowService airflowService;
+
+    private final JwtUtil jwtUtil;
+
+    private final ProcessOrchestrationService processOrchestrationService;
+
+    @PostMapping("/trigger")
+    public DagRunResponseDTO trigger(
+           @Valid @RequestBody DagRunRequestDTO request,
+            @RequestHeader("Authorization") String token
+    ) {
+        log.info("Airflow Trigger controller");
+        request.setTriggeredBy(jwtUtil.getUserIdFromToken(token));
+        return processOrchestrationService.triggerDagIfNoActiveRun(request);
+    }
+
+
+
+    @GetMapping("/health")
+    public Map<String, Object> health() {
+        return airflowService.health();
+    }
+
+    @PostMapping("/stop")
+    public  DagRunResponseDTO stopDag(@RequestBody DagRunRequestDTO request,      @RequestHeader("Authorization") String token)
+    {
+        request.setTriggeredBy(jwtUtil.getUserIdFromToken(token));
+        return  processOrchestrationService.stopPipeline(request);
+        //return  airflowService.stopDag(request);
+    }
+
+    @GetMapping("/running-dags")
+    public Map<String,Object> getAllRunningDags()
+    {
+        return airflowService.getAllRunningDags();
+    }
+
+
+
+
+//
+//
+//
+//    @GetMapping("/xcom")
+//    public XComResponse xcom(
+//            @RequestParam String dagId,
+//            @RequestParam String dagRunId,
+//            @RequestParam String taskId,
+//            @RequestParam String key
+//    ) {
+//        return airflowService.getXCom(dagId, dagRunId, taskId, key);
+//    }
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.controller;
+
+import com.fincore.commonutilities.buisnessobject.ControlDatesDto;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.ComparisonResponseDTO;
+import com.fincore.process_status_service.dto.ControlMatchInfo;
+import com.fincore.process_status_service.dto.FileSummaryDTO;
+import com.fincore.process_status_service.model.FileSummary;
+import com.fincore.process_status_service.model.FileType;
+import com.fincore.process_status_service.model.FincoreDate;
+import com.fincore.process_status_service.model.ProcessStatus;
+import com.fincore.process_status_service.service.FileService;
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.sql.Date;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/file")
+public class FileServiceController {
+
+    @Autowired
+    FileService fileService;
+
+
+    @GetMapping("file-type")
+    public List<FileType> getFileTypes()
+    {
+        return fileService.getFileTypes();
+    }
+
+    @GetMapping("file-summary")
+    public List<Map<String,Object>> getFileSummary(@Valid  @RequestBody FileSummaryDTO fileSummaryDTO)
+    {
+
+        return fileService.getFileSummary(fileSummaryDTO);
+    }
+
+    @GetMapping("fincore-date")
+    public ControlDatesDto getFincoreDate()
+    {
+        return fileService.getFincoreDate();
+    }
+
+    @GetMapping("comparison-file")
+    public ComparisonResponseDTO getComparisonFile(@RequestParam(name = "date") @DateTimeFormat(pattern = "dd-MM-yyyy") LocalDate date , @RequestParam(name="type") String type) {
+
+        if (date == null) {
+             throw  new IllegalArgumentException("Date is required");
+        }
+        if(type==null)
+        {
+            throw  new IllegalArgumentException("Type is required");
+        }
+        log.info("Comparison Request Received for date:  {} for type: {}", date,type);
+        return fileService.getComparisonFile(date,type);
+    }
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.controller;
+
+import com.fincore.process_status_service.service.NiFiService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/nifi")
+@RequiredArgsConstructor
+public class NiFiController {
+
+    private final NiFiService niFiService;
+    @GetMapping("/test")
+    public void testNifi()
+    {
+        niFiService.testConnection();
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.controller;
+
+import java.util.List;
+import java.util.Map;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.process_status_service.dto.ApproveRejectDto;
+import com.fincore.process_status_service.dto.ApproveRejectResponseDTO;
+import com.fincore.process_status_service.model.FincoreProcess;
+import com.fincore.process_status_service.service.ProcessOrchestrationService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.InsertDTO;
+import com.fincore.process_status_service.dto.UpdateDTO;
+import com.fincore.process_status_service.model.ProcessStatus;
+import com.fincore.process_status_service.service.ProcessStatusService;
+
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@RequiredArgsConstructor
+@RestController
+@RequestMapping("/api/process")
+public class ProcessStatusController {
+
+	private final ProcessStatusService processStatusService;
+
+	private final ProcessOrchestrationService processOrchestrationService;
+
+
+	private final JwtUtil jwtUtil;
+
+	@PostMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> insert(
+			@Valid @RequestBody InsertDTO insertDTO) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.insert(insertDTO);
+		return responseEntity;
+	}
+
+	@PatchMapping("/processes")
+	public ResponseEntity<ResponseVO<ProcessStatus>> update(@Valid @RequestBody UpdateDTO updateDTO) {
+		ResponseEntity<ResponseVO<ProcessStatus>> responseEntity = processStatusService.update(updateDTO);
+		return responseEntity;
+	}
+
+	@GetMapping(path = "/processes", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+	public SseEmitter getProcessData() throws JsonProcessingException {
+        log.info("SSE EMiiter returned");
+		return processOrchestrationService.getProcessDataSSE();
+	}
+
+
+
+	@GetMapping(value={"/processes/data","/processes/data/{pathId}"})
+	public ResponseEntity<Map<String, Object>> getCurrentProcessData( @RequestParam(required = false) String etlDate , @RequestParam(required = false)  Integer processId, @PathVariable(required = false) Integer pathId) {
+		return ResponseEntity.ok(processOrchestrationService.getCurrentData(etlDate,pathId != null ? pathId : processId));
+	}
+
+	@GetMapping("/all-pipelines")
+	public List<FincoreProcess> getAllPipelines()
+	{
+		return processOrchestrationService.getAllPipelines();
+	}
+
+
+	@PatchMapping("/approve-reject")
+	public ApproveRejectResponseDTO approveOrRejectProcess(@Valid @RequestBody ApproveRejectDto approveRejectDto , @RequestHeader("Authorization") String token)
+	{
+		approveRejectDto.setUserId(jwtUtil.getUserIdFromToken(token));
+		return  processOrchestrationService.approveOrRejectProcess(approveRejectDto);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.util.Date;
+@Data
+@Entity
+@Table(name = "CONTROLL_FILE_MASTER", schema = "FINCORE")
+public class ControlFileMaster {
+
+    @Id
+    @Column(name = "FILE_NAME")
+    private String fileName;
+
+    @Column(name = "FILE_TYPE")
+    private String fileType;
+
+    @Column(name = "HDFS_ROW_COUNT")
+    private Integer hdfsRowCount;
+
+    @Column(name = "ETL_DATE")
+    private Date etlDate;
+
+    @Column(name = "DATA_LAKE_COUNT")
+    private Integer dataLakeCount;
+
+    @Column(name = "DATA_LAKE_STATUS")
+    private String datalakeStatus;
+
+    public String getFileName() {
+        return fileName;
+    }
+
+    public void setFileName(String fileName) {
+        this.fileName = fileName;
+    }
+
+    public String getFileType() {
+        return fileType;
+    }
+
+    public void setFileType(String fileType) {
+        this.fileType = fileType;
+    }
+
+    public Integer getHdfsRowCount() {
+        return hdfsRowCount;
+    }
+
+    public void setHdfsRowCount(Integer hdfsRowCount) {
+        this.hdfsRowCount = hdfsRowCount;
+    }
+
+
+    public Integer getDataLakeCount() {
+        return dataLakeCount;
+    }
+
+    public void setDataLakeCount(Integer dataLakeCount) {
+        this.dataLakeCount = dataLakeCount;
+    }
+
+    public String getDatalakeStatus() {
+        return datalakeStatus;
+    }
+
+    public void setDatalakeStatus(String datalakeStatus) {
+        this.datalakeStatus = datalakeStatus;
+    }
+
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.sql.Date;
+import java.sql.Timestamp;
+
+@Entity
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Table(name="FILE_INGEST_SUMMARY")
+public class FileSummary {
+    @Id
+    private int runId;
+
+    @Column(name = "RUN_DATE")
+    private Date runDate;
+    @Column(name="FILE_TYPE")
+    private String fileType;
+    @Column(name="FILE_COUNT")
+    private Long fileCount;
+    @Column(name="TOTAL_SIZE")
+    private Long totalSize;
+    @Column(name="SOURCE")
+    private String source;
+    @Column(name="PROCESSED_BY")
+    private String processedBy;
+    @Column(name="RAN_AT")
+    private Timestamp ranAt;
+
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Entity
+@Data
+@Table(name="FILE_TYPE_MASTER")
+public class FileType {
+
+    @Id
+    @Column(name="FILE_ID")
+    private Long fileId;
+    @Column(name="TYPE")
+    private String type;
+    @Column(name="FILE_PATTERN")
+    private String filePattern;
+    @Column(name="STREAM")
+    private char stream;
+    @Column(name="FREQUENCY")
+    private String frequency;
+    @Column(name="INCLUDE")
+    private char includeFile;
+
+}
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Data
+@Entity
+@Table(name = "DAG_MASTER")
+public class FincoreDag {
+
+    @Id
+    @Column(name = "DAG_ID")
+    String dagId;
+    @Column(name = "PIPELINE")
+    String pipelineName;
+    @Column(name = "DESCRIPTION")
+    String description;
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import java.sql.Date;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.ToString;
+
+@Entity
+@Data
+@ToString
+@NoArgsConstructor
+@AllArgsConstructor
+@Table(name = "FINCORE_DATE")
+public class FincoreDate {
+
+    @Id
+    @Column(name = "USERS_DATE", nullable = false)
+    private Date usersDate;
+
+    @Column(name = "ETL_DATE", nullable = false)
+    private Date etlDate;
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+
+
+
+@Data
+@Entity
+@Table(name="PROCESS_MASTER")
+public class FincoreProcess {
+    @Id
+    @Column(name="PROCESS_ID")
+    private Integer processId;
+    @Column(name="PROCESS_NAME")
+    private String processName;
+    @Column(name="PROCESS_DAG_ID")
+    private String dagId;
+    @Column(name="PROCESS_FLAG")
+    private String processFlag;
+    @Column(name="PROCESS_DESCRIPTION")
+    private String processDescription;
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.Data;
+
+@Data
+@Entity
+@Table(name="PROCESS_STAGE_MASTER")
+public class FincoreProcessStage {
+    
+    @Id
+    @Column(name = "STAGE_ID")
+    private String stageId;
+    @Column(name = "TITLE")
+    private String title;
+    @Column(name = "ICON")
+    private String icon;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Data
+@Entity
+@Table(name="PROCESS_RUN")
+public class ProcessRun {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "PROCESS_RUN_SEQ_GEN")
+    @SequenceGenerator(name = "PROCESS_RUN_SEQ_GEN", sequenceName = "SEQ_PROCESS_RUN", allocationSize = 1)
+
+    @Column(name = "PROCESS_RUN_ID")
+    private Long processRunId;
+    @Column(name = "PROCESS_ID")
+    private Integer processId;
+    @Column(name = "ETL_DATE")
+    private LocalDate etlDate;
+    @Column(name = "RUN_ID")
+    private Integer runId;
+
+
+    @Column(name="START_TIME")
+    private LocalDateTime startTime;
+    @Column(name="END_TIME")
+    private LocalDateTime endTime;
+    @Column(name="STATUS")
+    private Integer status;
+    @Column(name="TRIGGERED_BY")
+    private String triggeredBy;
+    @Column(name="AIRFLOW_RUN_ID")
+    private String airflowRunId;
+
+    @Column(name="REMARKS")
+    private String remarks;
+
+    @Column(name="EXECUTION_REMARKS")
+    private String executionRemarks;
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Embeddable;
+
+import java.io.Serializable;
+import java.sql.Date;
+import java.time.LocalDate;
+import java.util.Objects;
+
+@Embeddable
+public class ProcessRunId implements Serializable {
+
+    @Column(name="RUN_ID")
+    private Long runId;
+
+    @Column(name="PROCESS_ID")
+    private Integer processId;
+
+    @Column(name="ETL_DATE")
+    private LocalDate etlDate;
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == null || getClass() != o.getClass()) return false;
+        ProcessRunId that = (ProcessRunId) o;
+        return Objects.equals(runId, that.runId) && Objects.equals(processId, that.processId) && Objects.equals(etlDate, that.etlDate);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(runId, processId, etlDate);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+
+@Data
+@Entity
+@Table(name="PROCESS_RUN_STAGE")
+public class ProcessRunStage {
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "PROCESS_RUN_STAGE_SEQ_GEN")
+    @SequenceGenerator(name = "PROCESS_RUN_STAGE_SEQ_GEN", sequenceName = "SEQ_PROCESS_RUN_STAGE", allocationSize = 1)
+    @Column(name="PROCESS_RUN_STAGE_ID")
+    private Long processRunStageId;
+    @Column(name="PROCESS_RUN_ID")
+    private Long processRunId;
+    @Column(name="STAGE_ID")
+    private String stageId;
+    @Column(name="PARENT_STAGE_ID")
+    private String parentStageId;
+    @Column(name="STATUS")
+    private Integer status;
+    @Column(name="SOURCE")
+    private String source;
+    @Column(name="REMARKS")
+    private String remarks;
+    @Column(name="START_TIME")
+    private LocalDateTime startTime;
+    @Column(name="END_TIME")
+    private LocalDateTime endTime;
+    @Lob
+    @Column(name="SUMMARY")
+    private String summary;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.SequenceGenerator;
+import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
+
+@Entity
+@Getter
+@Setter
+@ToString
+@Table(name = "PROCESS_STAGES")
+public class ProcessStages {
+
+	@Id
+	@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "STAGE_SEQ_GENERATOR")
+	@SequenceGenerator(name = "STAGE_SEQ_GENERATOR", sequenceName = "STAGE_SEQ", allocationSize = 1)
+	@Column(name = "ID", nullable = false, updatable = false)
+	private String id;
+
+	@Column(name = "TITLE", updatable = false)
+	private String title;
+
+	@Column(name = "ICON", updatable = false)
+	private String icon;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.model;
+
+import java.sql.Date;
+import java.time.LocalDateTime;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Lob;
+import jakarta.persistence.SequenceGenerator;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import lombok.ToString;
+
+@Entity
+@Getter
+@Setter
+@ToString
+@NoArgsConstructor
+@AllArgsConstructor
+@Table(name = "PROCESS_STATUS")
+public class ProcessStatus {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "id_generator")
+    @SequenceGenerator(name = "id_generator", sequenceName = "PROCESS_STATUS_SEQ", allocationSize = 1)
+    @Column(name = "ID", nullable = false, updatable = false)
+    private Long id;
+
+    @Column(name = "PROCESS_ID", updatable = false)
+    private Long processId;
+
+    @Column(name = "PROCESS_TYPE", updatable = false)
+    private String type;
+
+    @Column(name = "PROCESS_STAGE")
+    private Long processStage;
+
+    @Column(name = "START_TIME", updatable = false)
+    private LocalDateTime startTimeStamp;
+
+    @Column(name = "END_TIME")
+    private LocalDateTime endTimeStamp;
+
+    @Column(name = "STATUS", nullable = false)
+    private int status;
+
+    @Column(name = "EXECUTION_REMARKS")
+    private String remarks;
+
+    @Column(name = "TRIGGERED_BY")
+    private String triggeredBy;
+
+    @Column(name = "ETL_DATE")
+    private Date executionDate;
+
+    @Lob
+    @Column(name = "DIFFERENCE_SUMMARY")
+    private String differenceSummary;
+
+    @Column(name = "AIRFLOW_RUN_ID", nullable = false)
+    private String airflowRunId;
+
+    @Column(name = "DAG_ID")
+    private String dagId;
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.producer;
+
+import com.fincore.process_status_service.dto.NwsaVarianceTriggerDTO;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NwsaVarianceTriggerProducer {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final Validator validator;
+
+    private static final String TOPIC = "nwsa-variance-report.trigger";
+
+    public void trigger(NwsaVarianceTriggerDTO dto) {
+
+        Set<ConstraintViolation<NwsaVarianceTriggerDTO>> violations = validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+
+            String error = violations.stream()
+                    .map(ConstraintViolation::getMessage)
+                    .collect(Collectors.joining(", "));
+
+            log.error("NWSA Trigger Validation Failed: {}", error);
+            return;
+        }
+
+        log.info("Producing NWSA trigger event: {}", dto);
+
+        kafkaTemplate.send(TOPIC, dto);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.producer;
+
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.util.Process;
+import com.fincore.process_status_service.util.TimeUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class PipelineFailureProducer {
+
+    // Using Object as the value type to match your JsonSerializer config
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    public void sendFailureMessage(ProcessRun processRun, Map<String, Object> airflowConf) {
+        Integer processId = processRun.getProcessId();
+        String topic = getTopicForProcess(processId);
+
+        // 1. Create a new map containing all existing key-value pairs from Airflow
+        Map<String, Object> finalPayload = new HashMap<>(airflowConf);
+
+        // 2. Add NEW specific key-value pairs
+        enrichPayload(finalPayload, processRun);
+
+
+
+        log.info("Producing failure object to topic: {} for ProcessId: {}", topic, processId);
+        kafkaTemplate.send(topic, String.valueOf(processRun.getProcessRunId()), finalPayload);
+    }
+
+    private void enrichPayload(Map<String, Object> payload, ProcessRun processRun) {
+        // Adding metadata to the existing map
+        payload.put("reconciled_at", TimeUtil.getCurrentTimeStamp().toString());
+        payload.put("db_process_run_id", processRun.getProcessRunId());
+        payload.put("execution_remarks", processRun.getExecutionRemarks());
+        payload.put("process_id", processRun.getProcessId());
+
+        // Process-specific tags
+        if (Process.GLIF.equals(processRun.getProcessId())) {
+            payload.put("alert_group", "FINANCE");
+            payload.put("remediation", "MANUAL_CHECK");
+        }
+
+
+//        else if (Process.CBS.equals(processRun.getProcessId())) {
+//            payload.put("alert_group", "IT_OPS");
+//            payload.put("remediation", "RETRIGGER_GLIF");
+//        }
+    }
+
+    private String getTopicForProcess(Integer processId) {
+
+
+
+        // Using if-else to handle Integer object comparison safely
+        if (Objects.equals(processId, Process.YEAR_END_PROFIT_TRANSFER)) {
+            return "year-end-transfer-process-response-event";
+        }
+//        if (Objects.equals(processId, Process.GLIF)) {
+//            return "fincore.failure.glif";
+//        }
+//        if (Objects.equals(processId, Process.CBS)) {
+//            return "fincore.failure.cbs";
+//        }
+
+        return "fincore.failure.general";
+
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.producer;
+
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+import com.fincore.process_status_service.dto.ReportBatchTriggerDTO;
+
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ReportBatchProducer {
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final Validator validator;
+
+    private static final String TOPIC = "report-builder.batch-mode.trigger";
+
+    public void triggerBatchReport(ReportBatchTriggerDTO dto) {
+
+        Set<ConstraintViolation<ReportBatchTriggerDTO>> violations = validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+
+            String error = violations.stream()
+                    .map(ConstraintViolation::getMessage) 
+                    .collect(Collectors.joining(", "));
+
+            log.error("Batch Trigger Validation Failed: {}", error);
+            return;
+        }
+
+        log.info("Producing batch trigger event: {}", dto);
+
+        kafkaTemplate.send(TOPIC, dto);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.producer;
+
+import java.util.Set;
+import java.util.stream.Collectors;
+
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+import com.fincore.process_status_service.dto.SingleReportTriggerDTO;
+
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class SingleReportProducer {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final Validator validator;
+
+    private static final String TOPIC = "report-builder.single-mode.trigger";
+
+    public void triggerReport(SingleReportTriggerDTO dto) {
+
+        Set<ConstraintViolation<SingleReportTriggerDTO>> violations = validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+
+            String error = violations.stream()
+                    .map(ConstraintViolation::getMessage)
+                    .collect(Collectors.joining(", "));
+
+            log.error("Validation Failed for trigger event: {}", error);
+            return;
+        }
+
+        log.info("Producing single mode trigger event: {}", dto);
+
+        kafkaTemplate.send(TOPIC, dto);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+import com.fincore.process_status_service.model.ControlFileMaster;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import io.lettuce.core.dynamic.annotation.Param;
+import org.springframework.stereotype.Repository;
+import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Date;
+@Repository
+public interface ControlFileMasterRepository extends JpaRepository<ControlFileMaster, String> {
+
+    @Modifying
+    @Transactional
+    @Query("UPDATE ControlFileMaster c SET c.dataLakeCount = :value WHERE c.fileName = :fileName AND c.etlDate = :etlDate")
+    int updateDataLakeCount(@Param("fileName") String fileName, @Param("value") Integer value, @Param("etlDate") Date etlDate);
+    ControlFileMaster findByFileNameAndEtlDate(String fileName, Date etlDate);
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.model.FileSummary;
+import io.lettuce.core.dynamic.annotation.Param;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import java.sql.Date;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+@Repository
+public interface FileSummaryRepository extends JpaRepository<FileSummary,Integer> {
+
+    @Query(value = "SELECT\n" +
+            "   t.run_id,\n" +
+
+            "   t.run_date,\n" +
+            "   t.file_type,\n" +
+            "   t.file_count  AS today_file_count,\n" +
+            "   y.file_count AS yesterday_file_count,\n" +
+            "   t.total_size        AS today_total_size,\n" +
+            "   format_bytes(coalesce(t.total_size,0)) as  today_total_size_formatted,\n" +
+            "   y.total_size        AS yesterday_total_size,\n" +
+            "   format_bytes(coalesce(y.total_size,0)) as  yesterday_total_size_formatted,\n" +
+            "   t.source,\n" +
+            "   t.processed_by,\n" +
+            "   t.ran_at\n" +
+            "FROM file_ingest_summary t\n" +
+            "LEFT JOIN file_ingest_summary y\n" +
+            "   ON y.file_type = t.file_type\n" +
+            "  AND y.run_date  = :runDate - 1\n" +
+            "  AND y.run_id    = (\n" +
+            "       SELECT MAX(run_id)\n" +
+            "       FROM file_ingest_summary\n" +
+            "       WHERE run_date = :runDate - 1\n" +
+            "         AND file_type = t.file_type\n" +
+            "  )\n" +
+            "\n" +
+            "WHERE  t.source=:source and t.run_date = :runDate and t.run_id = (\n" +
+            "       SELECT MAX(run_id)\n" +
+            "       FROM file_ingest_summary\n" +
+            "       WHERE run_date = :runDate \n" +
+            "         AND file_type = t.file_type\n" +
+            "  ) ",nativeQuery = true)
+    List<Map<String, Object>> getFileSummaryByRunId(@Param("source") String source, @Param("runDate") LocalDate runDate);
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.model.FileType;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface FileTypeRepository extends JpaRepository<FileType,Long> {
+
+
+
+
+
+}
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.model.FincoreDag;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface FincoreDagRepository extends JpaRepository<FincoreDag,String> {
+    FincoreDag findByDagId(String dagId);
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import java.util.Date;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.process_status_service.model.FincoreDate;
+
+@Repository
+public interface FincoreDateRepository extends JpaRepository<FincoreDate, Date>{
+    
+}
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.model.FincoreProcess;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface FincoreProcessRepository extends JpaRepository<FincoreProcess,Integer> {
+    FincoreProcess findByDagId(String dagId);
+
+    FincoreProcess findByProcessId(Integer processId);
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.dto.ProcessRunInfoProj;
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.model.ProcessRunId;
+
+import io.lettuce.core.dynamic.annotation.Param;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+
+import java.sql.Date;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+public interface ProcessRunRepository extends JpaRepository<ProcessRun, Long> {
+    Optional<ProcessRun> findProcessRunByProcessIdAndRunIdAndEtlDate(long l, int i, LocalDate today);
+
+    @Query(value = "   SELECT MAX(run_id)\n" +
+            "               FROM process_run\n" +
+            "               WHERE process_id = :processId\n" +
+            "                 AND etl_date   = :etlDate", nativeQuery = true)
+    Integer getRunId(@Param("processId") Integer processId, @Param("etlDate") LocalDate etlDate);
+
+
+    ProcessRun findProcessRunByAirflowRunId(String airflowRunId);
+
+
+    @Query(value = """ 
+                        SELECT
+                            prs.process_run_stage_id AS id,
+                            pr.process_run_id,
+                            pr.process_id,
+                            pr.run_id                AS run_id,
+                            pr.remarks               AS process_remarks,
+                            pr.execution_remarks     AS process_execution_remarks,
+                            pr.status                AS process_status,
+                            pm.process_name          AS process_type,
+                            prs.stage_id,
+                            pr.start_time            AS process_start_time,
+                            pr.end_time              AS process_end_time,
+                            prs.status               stage_status,
+                            prs.remarks              AS stage_remarks,
+                            pr.triggered_by,
+                            pr.etl_date,
+                            prs.summary,
+                            prs.start_time           AS stage_start_time,
+                            prs.end_time             AS stage_end_time,
+                            prs.source               AS stage_source,
+                            pr.airflow_run_id,
+                            pm.process_dag_id        AS dag_id,
+                            psm.title                AS stage_title,
+                            psm.icon                 AS stage_icon
+                        FROM
+                                 process_run_stage prs
+                            JOIN process_run          pr ON pr.process_run_id = prs.process_run_id
+                            JOIN process_master       pm ON pm.process_id = pr.process_id
+                            LEFT JOIN process_stage_master psm ON psm.stage_id = prs.stage_id
+                        WHERE
+                            pr.etl_date = :etlDate 
+                              AND (:processId IS NULL OR pr.process_id = :processId)   
+                              AND   pr.status not in (:excludedStatusesList)
+                        ORDER BY  pr.run_id DESC,pr.start_time DESC, prs.start_time ASC
+            """, nativeQuery = true)
+    List<ProcessRunInfoProj> getProcessInfo(@Param("etlDate") LocalDate etlDate, @Param("processId") Integer processId, @Param("excludedStatusesList") List<Integer> excludedStatusesList);
+
+    ProcessRun getProcessRunByProcessRunId(@NotNull(message = "Process Run Id is Mandatory") Long processRunId);
+
+    @Modifying
+    @Query(value = "update process_run set status =:status where process_id=:processId and process_run_id != :processRunId", nativeQuery = true)
+    Integer changeProcessState(@Param("processId") Integer processId, @Param("processRunId") Long processRunId, @Param("status") Integer status);
+
+
+    @Query(value = """
+                    select PROCESS_RUN_ID,
+                    PROCESS_ID,
+                    ETL_DATE,
+                    RUN_ID,
+                    STATUS,
+                    START_TIME,
+                    END_TIME,
+                    TRIGGERED_BY,
+                    AIRFLOW_RUN_ID,
+                    REMARKS,
+                    EXECUTION_REMARKS from process_run p where p.status=1 and p.etl_date=:etlDate
+            """, nativeQuery = true)
+    List<ProcessRun> getRunningProcessesForDate(@Param("etlDate") LocalDate etlDate);
+
+    List<ProcessRun> findProcessRunsByStatusAndEtlDate(Integer waitingForApproval, LocalDate etlDate);
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.model.ProcessRunStage;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+
+import java.lang.annotation.Native;
+
+public interface ProcessRunStageRepository extends JpaRepository<ProcessRunStage,Long> {
+
+    @Modifying
+    @Query(value = "update process_run_stage set status = 2,\n" +
+            "end_time = systimestamp ,\n" +
+            "remarks = :remarks \n" +
+            "where process_run_id = :processRunId and status =1 ",nativeQuery = true)
+    Integer failAllRunningStage(Long processRunId,String remarks);
+
+    ProcessRunStage getByProcessRunStageId(Long processRunStageId);
+
+    ProcessRunStage getByStageIdAndProcessRunId(String stageId, Long processRunId);
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import java.util.Optional;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.process_status_service.model.ProcessStages;
+
+@Repository
+public interface ProcessStagesRepository extends JpaRepository<ProcessStages, Long> {
+
+	@Override
+	Optional<ProcessStages> findById(Long id);
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.repository;
+
+import java.sql.Date;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+
+import com.fincore.process_status_service.model.ProcessStatus;
+
+import io.lettuce.core.dynamic.annotation.Param;
+
+@Repository
+public interface ProcessStatusRepository extends JpaRepository<ProcessStatus, Long> {
+
+	@Query(value = """
+			    SELECT *
+			    FROM process_status ps
+			    WHERE (:etlDate IS NULL
+			           OR (ps.ETL_DATE >= :etlDate AND ps.ETL_DATE < :etlDate + 1))
+			    ORDER BY ps.PROCESS_TYPE, ps.PROCESS_STAGE
+			""", nativeQuery = true)
+	List<Map<String, Object>> getDataByEtlDate(
+			@Param("etlDate") Date etlDate);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.scheduler;
+
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.service.AirflowReconciliationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class AirflowReconciliationScheduler {
+
+
+    private final AirflowReconciliationService reconciliationService;
+//    @Scheduled(fixedDelay = 60000) // every 5 minutes
+    @Scheduled(initialDelayString = "${app.scheduling.initialDelay.in.ms}", fixedRateString = "${app.scheduling.fixedRate.in.ms}")
+    public void reconcile() {
+        try{
+            log.info("Running Airflow reconciliation job");
+            reconciliationService.reconcileRunningPipelines();
+        }
+        catch (AirflowIntegrationException e)
+        {
+            log.error("Action Failed. Cause :{}",e.getMessage());
+        }
+    }
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fincore.process_status_service.config.AirflowProperties;
+import com.fincore.process_status_service.dto.AirflowTokenResponse;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+
+import java.util.Map;
+import java.util.Objects;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AirflowAuthService {
+
+
+    private final WebClient airflowAuthClient;
+
+
+    private final AirflowProperties props;
+
+    private String token;
+
+    public synchronized String getToken() {
+//        if (token != null) {
+//            return token;
+//        }
+        AirflowTokenResponse response =
+                airflowAuthClient.post()
+                        .uri("/auth/token")
+                        .bodyValue(
+                                Map.of(
+                                        "username", props.getUsername(),
+                                        "password", props.getPassword()
+                                )
+                        )
+                        .retrieve()
+                        .bodyToMono(AirflowTokenResponse.class)
+                        .onErrorResume(ex -> {
+                            log.error("Connection failed: {} ", ex.getMessage() );
+
+                            return Mono.error(new AirflowIntegrationException(
+                                    "Failed to connect to Airflow" ,
+                                    HttpStatus.NOT_FOUND
+                            ));
+                        })
+                        .block();
+
+        if (response == null) {
+            throw new AirflowIntegrationException(
+                    "Invalid JWT Token",HttpStatus.NOT_FOUND
+            );
+        }
+        this.token =  response.getAccessToken();
+        return token;
+    }
+
+    public synchronized void clearToken() {
+        this.token = null;
+    }
+}
+
+
+//
+//@Slf4j
+//@Service
+//@RequiredArgsConstructor
+//public class AirflowAuthService {
+//
+//    private final WebClient airflowAuthClient;
+//    private final AirflowProperties props;
+//
+//    // Acts as a thread-safe, reactive cache
+//    private Mono<String> tokenCache;
+//
+//    public Mono<String> getToken() {
+//        return Mono.defer(() -> {
+//            if (tokenCache == null) {
+//                tokenCache = fetchToken().cache(); // cache() keeps the result for subsequent subscribers
+//            }
+//            return tokenCache;
+//        });
+//    }
+//
+//    private Mono<String> fetchToken() {
+//        log.info("Fetching new Airflow JWT token...");
+//        return airflowAuthClient.post()
+//                .uri("/auth/token") // Ensure your base URL doesn't end with /api/v1 for this
+//                .bodyValue(Map.of(
+//                        "username", props.getUsername(),
+//                        "password", props.getPassword()
+//                ))
+//                .retrieve()
+//                .onStatus(HttpStatus::isError, response ->
+//                        Mono.error(new AirflowIntegrationException("Login failed", response.statusCode())))
+//                .bodyToMono(AirflowTokenResponse.class)
+//                .map(AirflowTokenResponse::getAccessToken)
+//                .doOnError(e -> {
+//                    log.error("Airflow connection failed: {}", e.getMessage());
+//                    clearToken(); // Clear cache on failure
+//                });
+//    }
+//
+//    public void clearToken() {
+//        this.tokenCache = null;
+//    }
+//}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+public interface AirflowReconciliationService {
+    void reconcileRunningPipelines();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fincore.commonutilities.buisnessobject.ControlDateService;
+import com.fincore.process_status_service.consumer.TriggerRequestEventConsumer;
+import com.fincore.process_status_service.dto.DagRunRequestDTO;
+import com.fincore.process_status_service.dto.DagRunResponseDTO;
+import com.fincore.process_status_service.dto.TriggerRequestResponse;
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.producer.PipelineFailureProducer;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.Process;
+import com.fincore.process_status_service.util.TimeUtil;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.time.*;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.sql.Timestamp;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AirflowReconciliationServiceImpl implements AirflowReconciliationService {
+
+    @Value("${reconciliation.queued-timeout-minutes:30}")
+    private int queuedTimeoutMinutes;
+
+    private final ProcessStatusService processStatusService;
+    private final AirflowService airflowService;
+    private final ControlDateService controlDateService;
+    private final TriggerRequestEventConsumer triggerRequestEventConsumer;
+    private final PipelineFailureProducer pipelineFailureProducer;
+    public void reconcileRunningPipelines() {
+        LocalDate etlDate = controlDateService.getEtlDate();
+        List<ProcessRun> runningProcesses = processStatusService.getRunningProcessesForDate(etlDate);
+
+        if (runningProcesses.isEmpty()) {
+            log.info("No Running Processes Found for date :{}", etlDate);
+            return;
+        }
+
+        log.info("Running Processes :{}", runningProcesses);
+
+        // The method call returns dags which are in running state or queued state
+        Map<String, Object> airflowRunningDagInfo = airflowService.getAllRunningDags();
+
+        log.info("All Running / Queued Dags Info:{}", airflowRunningDagInfo);
+
+        if (airflowRunningDagInfo == null) {
+            log.warn("No Response from airflow - skipping reconciliation");
+            return;
+        }
+        Integer totalEntries = (Integer) airflowRunningDagInfo.getOrDefault("total_entries", -1);
+        log.info("Total Entries Received from airflow:{}", totalEntries);
+        List<Map<String, Object>> dagRuns = (List<Map<String, Object>>) airflowRunningDagInfo.getOrDefault("dag_runs", Collections.emptyList());
+
+        // Map AirflowRunId -> Map containing state and dag_id
+       int queuedDagCount =0;
+
+        Map<String, Map<String, Object>> airflowActiveRuns = new HashMap<>();
+
+        for (Map<String, Object> dagRun : dagRuns) {
+            Map<String, Object> details = new HashMap<>();
+            String state = Objects.toString(dagRun.get("state"),null);
+
+            if (Constants.AIRFLOW_QUEUED_STATE.equalsIgnoreCase(state)) {
+                queuedDagCount++;
+            }
+
+            String dateToUse = Objects.toString(dagRun.get("start_date"),null);
+            if (dateToUse == null) dateToUse = Objects.toString(dagRun.get("queued_at"),null);
+            if (dateToUse == null) dateToUse = Objects.toString(dagRun.get("logical_date"),null);
+
+            details.put("state", state);
+            details.put("dag_id", dagRun.get("dag_id"));
+            details.put("dag_start_date", dateToUse);
+
+            // CAPTURE CONF MAP
+            details.put("dag_conf", dagRun.getOrDefault("conf", new HashMap<String, Object>()));
+
+            airflowActiveRuns.put((String) dagRun.get("dag_run_id"), details);
+        }
+
+        log.info("Queued Dags Count :{}",queuedDagCount);
+
+        for (ProcessRun processRun : runningProcesses) {
+            String dbAirflowRunId = processRun.getAirflowRunId();
+
+            // The Dag Run Id associated with the Process Run is not found in airflow
+            if (!airflowActiveRuns.containsKey(dbAirflowRunId)) {
+                handleStuckProcess(processRun);
+            }
+            else{
+                Map<String, Object> runDetails = airflowActiveRuns.get(dbAirflowRunId);
+                Map<String, Object> dagConf = (Map<String, Object>) runDetails.get("dag_conf");
+                String state = Objects.toString(runDetails.get("state"),null);
+                String dagId = Objects.toString(runDetails.get("dag_id"),null);
+                String dagStartedAtStr = Objects.toString(runDetails.get("dag_start_date"),null);
+
+
+
+                if (Constants.AIRFLOW_QUEUED_STATE.equalsIgnoreCase(state)
+                        && isTimeLimitExceeded(processRun.getStartTime() , dagStartedAtStr)
+                ) {
+                    // Now we have the dagId to stop it in Airflow
+                    log.warn("Process  with Process Run ID {} is stuck in queued state. Stopping Airflow Dag {} with Dag Run ID {}",processRun.getProcessRunId(),dagId,processRun.getAirflowRunId());
+                    handleProcessStuckInQueue(processRun, dagId,dagConf);
+                }
+
+
+
+            }
+
+
+
+
+
+
+
+
+        }
+
+
+
+
+
+    }
+
+    private Boolean isTimeLimitExceeded(LocalDateTime processStartTime, String dagStartTimeStr) {
+        if (dagStartTimeStr == null || processStartTime == null) return false;
+
+        try {
+            LocalDateTime now = TimeUtil.getCurrentIstLocalDateTime();
+
+            LocalDateTime airflowStart = TimeUtil.parseAirflowUtcToIst(dagStartTimeStr);
+
+            long diffDb = TimeUtil.getMinutesBetween(processStartTime, now);
+            long diffAirflow = TimeUtil.getMinutesBetween(airflowStart, now);
+
+
+
+            log.debug("Diff DB: {} mins, Diff Airflow: {} mins", diffDb, diffAirflow);
+
+            return diffDb > queuedTimeoutMinutes && diffAirflow > queuedTimeoutMinutes;
+
+        } catch (DateTimeParseException e) {
+            log.error("Failed to parse Airflow timestamp: {}", dagStartTimeStr);
+            return false;
+        } catch (DateTimeException e) {
+            log.error("Time conversion error for inputs: {} , {}", processStartTime, dagStartTimeStr);
+            return false;
+        }
+    }
+
+    /**
+     * Will handle cases where the process is queued  in airflow for a long time , but the process is still in PROGRESS state in db
+     *
+     * @param processRun
+     */
+    private void handleProcessStuckInQueue(ProcessRun processRun,String dagId,Map<String,Object> conf) {
+        processRun.setStatus(Constants.FAILED);
+        processRun.setExecutionRemarks("Reconciled: Airflow DAG Was in queue for more than estimated time.");
+
+        // Stop the queued dag
+        DagRunRequestDTO requestDTO = new DagRunRequestDTO();
+        Map<String,Object> requestConf = new HashMap<String , Object>();
+        requestConf.put("reason","queued for a very long time");
+        requestDTO.setConf(requestConf);
+        airflowService.stopFincoreDag(requestDTO,dagId,processRun.getAirflowRunId());
+
+        // Mark the process as failed in
+        processStatusService.endProcess(processRun);
+        publishResponseToDependentConsumers(processRun,conf);
+    }
+
+    /**
+     * Will handle cases where the process is failed in airflow , but the process is still in PROGRESS state in db
+     *
+     * @param processRun
+     */
+    private void handleStuckProcess(ProcessRun processRun) {
+        processRun.setStatus(Constants.FAILED);
+        processRun.setExecutionRemarks("Reconciled: Airflow DAG not running");
+        processStatusService.endProcess(processRun);
+        publishResponseToDependentConsumers(processRun,Collections.emptyMap());
+    }
+
+    private void publishResponseToDependentConsumers(ProcessRun processRun,Map<String,Object> conf) {
+//        TriggerRequestResponse triggerRequestResponse = new TriggerRequestResponse();
+//        DagRunResponseDTO dagRunResponseDTO = new DagRunResponseDTO();
+//        dagRunResponseDTO.setProcessRunId(processRun.getProcessRunId());
+//        dagRunResponseDTO.setProcessId(processRun.getProcessId());
+//        dagRunResponseDTO.setRunId(processRun.getRunId());
+//        dagRunResponseDTO.setEtlDate(processRun.getEtlDate());
+//        triggerRequestResponse.setTriggerResponse(dagRunResponseDTO);
+
+        pipelineFailureProducer.sendFailureMessage(processRun,conf);
+
+//        if (Objects.equals(processRun.getProcessId(), Process.YEAR_END_PROFIT_TRANSFER)) {
+//            triggerRequestEventConsumer.publishResponse(triggerRequestResponse);
+//        }
+
+    }
+
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.model.FincoreProcess;
+import com.fincore.process_status_service.model.ProcessRun;
+
+import java.util.Map;
+
+public interface AirflowService {
+
+
+
+
+
+    Map<String, Object> triggerDag(DagRunRequestDTO request);
+
+    Map<String, Object> health();
+
+//    public DagRunResponseDTO triggerDagIfNoActiveRun(
+//                                                           DagRunRequestDTO request);
+    boolean hasActiveRun(String dagId);
+   // DagRunResponseDTO stopDag(DagRunRequestDTO request);
+    Map<String, Object> stopFincoreDag(DagRunRequestDTO request, String dagId , String dagRunId);
+
+    Map<String,Object> getAllRunningDags();
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fincore.process_status_service.client.AirflowRestClient;
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.model.FincoreProcess;
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.repository.FincoreProcessRepository;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.TimeUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.*;
+import org.springframework.stereotype.Service;
+import java.time.LocalDate;
+import java.util.*;
+
+@Slf4j
+@Service
+
+public class AirflowServiceImpl implements AirflowService {
+
+
+    private final FincoreProcessRepository fincoreProcessRepository;
+    private final FileService fileService;
+
+    private final AirflowRestClient airflowRestClient;
+
+
+    private final ProcessStatusServiceImpl processStatusService;
+
+    public AirflowServiceImpl(FincoreProcessRepository fincoreProcessRepository, FileService fileService, AirflowRestClient airflowRestClient, @Lazy ProcessStatusServiceImpl processStatusService) {
+        this.fincoreProcessRepository = fincoreProcessRepository;
+        this.fileService = fileService;
+        this.airflowRestClient = airflowRestClient;
+        this.processStatusService = processStatusService;
+    }
+
+
+
+    public Map<String, Object> triggerDag(DagRunRequestDTO request) {
+
+
+
+        AirflowDagRunRequest airflowDagRunRequest = new AirflowDagRunRequest();
+//    airflowDagRunRequest.setDagRunId(request.getDagRunId() !=null ? request.getDagRunId() : null);
+        Map<String,Object> conf = new HashMap<>();
+        conf.put("triggered_by","FINCORE_BE");
+        conf.put("user_id",request.getTriggeredBy());
+        if(request.getConf()!=null)
+        {
+            conf.putAll(request.getConf());
+        }
+        airflowDagRunRequest.setConf(conf);
+        request.setLogicalDate(TimeUtil.getCurrentUTCTime());
+        LocalDate etlDate = fileService.getEtlDate();
+        log.info("Request:{}", airflowDagRunRequest);
+
+        try {
+
+            Map<String, Object> airflowResponse =
+                    airflowRestClient.execute(
+                            HttpMethod.POST,
+                            airflowRestClient.uri("/dags/" + request.getDagId() + "/dagRuns"),
+                            airflowDagRunRequest,
+                            new ParameterizedTypeReference<Map<String, Object>>() {
+                            }
+
+
+                    );
+
+
+
+
+
+            return airflowResponse;
+
+        } catch (AirflowIntegrationException ex) {
+
+            throw new AirflowIntegrationException(
+                    "Failed to trigger DAG [" + request.getDagId() + "]: " + ex.getMessage(),
+                    ex.getStatus()
+            );
+        }
+        catch (DataIntegrityViolationException ex)
+        {
+            throw  new DataIntegrityViolationException("Data Violation");
+        }
+
+
+    }
+
+
+    public Map<String, Object> stopFincoreDag(DagRunRequestDTO request, String dagId , String dagRunId) {
+        AirflowDagRunRequest airflowDagRunRequest = new AirflowDagRunRequest();
+        airflowDagRunRequest.setDagRunId(request.getDagRunId() != null ? request.getDagRunId() : null);
+        airflowDagRunRequest.setConf(request.getConf() != null ? request.getConf() : null);
+        request.setLogicalDate(TimeUtil.getCurrentUTCTime());
+        Map<String, Object> airflowStopRequest = new HashMap<>();
+        airflowStopRequest.put("state", "failed");
+        Map<String, Object> airflowResponse = airflowRestClient.execute(HttpMethod.PATCH,
+                airflowRestClient.uri("/dags/" + dagId + "/dagRuns/" + dagRunId),
+                airflowStopRequest,
+                new ParameterizedTypeReference<Map<String, Object>>() {
+                });
+       return airflowResponse;
+
+    }
+
+
+
+//    public DagRunResponseDTO triggerDagIfNoActiveRun(
+//            DagRunRequestDTO request
+//    ) {
+////        log.info("request:{}", request);
+////        FincoreProcess process = processStatusService.verifyDag(request.getProcessId());
+////        request.setDagId(process.getDagId());
+////        if (hasActiveRun(process.getDagId())) {
+////            throw new AirflowIntegrationException(
+////                    "An Dag is already running or queued with that id",
+////                    HttpStatus.CONFLICT
+////            );
+////        }
+//
+//        return triggerDag(request);
+//
+//    }
+//
+//
+//    public Mono<Map<String,Object>> getDags()
+//    {
+//        return authorizedGet(
+//                "/dags",
+//                new ParameterizedTypeReference<Map<String, Object>>() {}
+//
+//        );
+//    }
+//
+//    @Override
+//    public Mono<AirflowDagResponse> getDag(String dagId) {
+//        return authorizedGet("/dags/" + dagId, AirflowDagResponse.class);
+//    }
+//
+//    @Override
+//    public Mono<JsonNode> getDagRuns(String dagId) {
+//        return authorizedGet("/dags/" + dagId + "/dagRuns", JsonNode.class);
+//    }
+//
+
+    /**
+     * Sends an airflow api call to get health status of airflow components
+     * @return
+     */
+    public Map<String, Object> health() {
+
+
+
+        return airflowRestClient.execute(HttpMethod.GET,
+                airflowRestClient.uri("/monitor/health"),
+                null,
+                new ParameterizedTypeReference<Map<String, Object>>() {
+                }
+
+        );
+
+
+    }
+
+    /**
+     * Using the dag Id  sends an api call to get all running or queued dag runs and checks whether any instance is active
+     * @param dagId
+     * @return boolean
+     */
+    public boolean hasActiveRun(String dagId) {
+        Map<String, Object> response =
+                airflowRestClient.execute(
+                        HttpMethod.GET,
+                        airflowRestClient.uri(
+                                "/dags/{dagId}/dagRuns",
+                                Map.of("dagId", dagId),
+                                Map.of("state", "running", "limit", 1)
+                        ),
+                        null,
+                        new ParameterizedTypeReference<Map<String, Object>>() {
+                        }
+                );
+        List<?> dagRuns = (List<?>) response.get("dag_runs");
+        return dagRuns != null && !dagRuns.isEmpty();
+    }
+
+
+//
+//    @Override
+//    public Mono<XComResponse> getXCom(
+//            String dagId,
+//            String dagRunId,
+//            String taskId,
+//            String key
+//    ) {
+//        String uri = String.format(
+//                "/dags/%s/dagRuns/%s/taskInstances/%s/xcomEntries/%s",
+//                dagId, dagRunId, taskId, key
+//        );
+//        return authorizedGet(uri, XComResponse.class);
+//    }
+//
+
+    /**
+     * Pure Airflow Call
+     * @return All Dags That are running or in queued state
+     */
+    public Map<String,Object> getAllRunningDags(){
+
+        List<String> states = Arrays.asList("running", "queued");
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("states", states);
+        Map<String, Object> response =
+                airflowRestClient.execute(
+                        HttpMethod.POST,
+                        airflowRestClient.uri("/dags/~/dagRuns/list"),
+                        requestBody,
+                        new ParameterizedTypeReference<Map<String, Object>>() {
+                        }
+                );
+        return response;
+
+
+    }
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fincore.commonutilities.buisnessobject.ControlDatesDto;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.FileSummaryDTO;
+import com.fincore.process_status_service.model.FileType;
+import org.springframework.http.ResponseEntity;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+public interface FileService {
+
+    List<FileType> getFileTypes( );
+
+
+    List<Map<String, Object>> getFileSummary(FileSummaryDTO fileSummaryDTO);
+
+
+    ControlDatesDto getFincoreDate();
+
+     LocalDate getEtlDate();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+import com.fincore.commonutilities.buisnessobject.ControlDateService;
+import com.fincore.commonutilities.buisnessobject.ControlDatesDto;
+import com.fincore.process_status_service.dto.FileSummaryDTO;
+import com.fincore.process_status_service.model.FileType;
+import com.fincore.process_status_service.repository.FileSummaryRepository;
+import com.fincore.process_status_service.repository.FileTypeRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+
+public class FileServiceImpl  implements FileService{
+
+
+
+    private final FileTypeRepository fileTypeRepository;
+
+   private final ControlDateService controlDateService;
+
+    private final  FileSummaryRepository fileSummaryRepository;
+
+    @Override
+    public List<FileType> getFileTypes( ) {http://localhost:3000/file-summary
+        return fileTypeRepository.findAll(Sort.by("type").and(Sort.by("stream").descending()));
+    }
+
+    @Override
+    public List<Map<String, Object>> getFileSummary(FileSummaryDTO fileSummaryDTO) {
+        //TODO: In case of null date pick etl date
+        LocalDate date =  fileSummaryDTO.getDate();
+        if (date ==null)
+        {
+
+            ControlDatesDto fincoreDates = controlDateService.getControlDates();
+            
+            date = fincoreDates.getEtlDate();
+            log.info("Using Etl Date");
+
+
+        }
+        return fileSummaryRepository.getFileSummaryByRunId(fileSummaryDTO.getSource().toUpperCase(),date);
+    }
+
+   public ControlDatesDto getFincoreDate()
+   {
+       return controlDateService.getControlDates();
+
+   }
+
+   public LocalDate getEtlDate()
+   {
+       ControlDatesDto dates = controlDateService.getControlDates();
+       return dates.getEtlDate();
+   }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+
+
+import com.fincore.process_status_service.config.NifiProperties;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.WebClient;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class NiFiAuthService {
+
+    private final WebClient nifiAuthClient;
+    private final NifiProperties props;
+    private String token;
+
+    public synchronized String getToken() {
+        if (token != null) return token;
+
+        log.info("Fetching new NiFi JWT for user: {}", props.getUsername());
+
+        // NiFi returns the JWT as a raw String in the body
+        String jwt = nifiAuthClient.post()
+                .uri("/access/token")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromFormData("username", props.getUsername())
+                        .with("password", props.getPassword()))
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+
+        this.token = jwt;
+        return jwt;
+    }
+
+    public synchronized void clearToken() {
+        this.token = null;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+
+import org.springframework.stereotype.Service;
+
+@Service
+public interface NiFiService {
+    void testConnection();
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fincore.process_status_service.client.NiFiRestClient;
+import com.fincore.process_status_service.exception.NiFiException;
+import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+
+import java.util.Map;
+
+@Slf4j
+@Service
+@AllArgsConstructor
+public class NiFiServiceImpl  implements  NiFiService{
+
+
+    private final NiFiRestClient nifiRestClient;
+
+    public void testConnection() {
+        try {
+            // NiFi endpoint to get the authenticated user's details
+            JsonNode userDetails = nifiRestClient.execute(
+                    HttpMethod.GET,
+                    "/flow/current-user",
+                    null,
+                    JsonNode.class
+            );
+
+            System.out.println("Success! Connected as: " + userDetails.get("identity").asText());
+        } catch (Exception e) {
+            System.err.println("Connection failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Start/Stop a Process Group using its Name (e.g., "transfer_test")
+     */
+    public JsonNode setProcessGroupStateByName(String groupName, String state) {
+        log.info("Attempting to {} Process Group by name: {}", state, groupName);
+
+        // Step 1: Find the ID using Search
+        String groupId = findGroupIdByName(groupName);
+
+        // Step 2: Use the ID to change state
+        return updateFlowState(groupId, state);
+    }
+
+    private String findGroupIdByName(String groupName) {
+        // NiFi Search API: /flow/search-results?q={query}
+        JsonNode searchResponse = nifiRestClient.execute(
+                HttpMethod.GET,
+                "/flow/search-results?q=" + groupName,
+                null,
+                JsonNode.class
+        );
+
+        // Dig into: searchResults -> processGroupResults (Array)
+        JsonNode groupResults = searchResponse.at("/searchResults/processGroupResults");
+
+        for (JsonNode result : groupResults) {
+            if (groupName.equalsIgnoreCase(result.get("name").asText())) {
+                return result.get("id").asText();
+            }
+        }
+
+        throw new NiFiException(
+                "Could not find a Process Group with name: " + groupName,
+                HttpStatus.NOT_FOUND
+        );
+    }
+
+    private JsonNode updateFlowState(String groupId, String state) {
+        // NiFi Flow API: PUT /flow/process-groups/{id}
+        Map<String, Object> body = Map.of(
+                "id", groupId,
+                "state", state.toUpperCase() // "RUNNING" or "STOPPED"
+        );
+
+        return nifiRestClient.execute(
+                HttpMethod.PUT,
+                "/flow/process-groups/" + groupId,
+                body,
+                JsonNode.class
+        );
+    }
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.dto.ApproveRejectDto;
+import com.fincore.process_status_service.dto.ApproveRejectResponseDTO;
+import com.fincore.process_status_service.dto.DagRunRequestDTO;
+import com.fincore.process_status_service.dto.DagRunResponseDTO;
+import com.fincore.process_status_service.model.FincoreProcess;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.util.List;
+import java.util.Map;
+
+public interface ProcessOrchestrationService {
+     DagRunResponseDTO triggerDagIfNoActiveRun(
+            DagRunRequestDTO request);
+    SseEmitter getProcessDataSSE() throws JsonProcessingException;
+    Map<String, Object> getCurrentData(String etlDate, Integer processId);
+    ApproveRejectResponseDTO approveOrRejectProcess(ApproveRejectDto approveRejectDto);
+    List<FincoreProcess> getAllPipelines();
+    DagRunResponseDTO stopPipeline( DagRunRequestDTO request);
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.dto.ApproveRejectDto;
+import com.fincore.process_status_service.dto.ApproveRejectResponseDTO;
+import com.fincore.process_status_service.dto.DagRunRequestDTO;
+import com.fincore.process_status_service.dto.DagRunResponseDTO;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.model.FincoreProcess;
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.Process;
+import com.fincore.process_status_service.util.TimeUtil;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.time.LocalDate;
+import java.util.*;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ProcessOrchestrationServiceImpl implements ProcessOrchestrationService {
+
+    private final ProcessStatusService processStatusService;
+    private final AirflowService airflowService;
+    private final FileService fileService;
+    private final List<Integer> archiveProcessesList = List.of(Process.YEAR_END_PROFIT_TRANSFER);
+    private final List<Integer> preDifferenceList = List.of(
+            Process.CBS,Process.GLIF,Process.CONTROL_PIPELINE,Process.PRECHECK_PIPELINE,
+            Process.EOD,Process.DIFFERENCE,Process.GLIF_ALL_DATA,Process.GLIF_ALL_DATA);
+    private final List<Integer> differenceDependentList = List.of(Process.REPORT_GENERATION,Process.ETL_PLUS_ONE);
+
+    @Transactional
+    public DagRunResponseDTO triggerDagIfNoActiveRun(
+            DagRunRequestDTO request
+    ) {
+
+        FincoreProcess process = processStatusService.verifyDag(request.getProcessId());
+        request.setDagId(process.getDagId());
+        LocalDate etlDate = fileService.getEtlDate();
+        if (airflowService.hasActiveRun(process.getDagId())) {
+            throw new AirflowIntegrationException(
+                    "An Dag is already running or queued with that id",
+                    HttpStatus.CONFLICT
+            );
+        }
+
+        if(preDifferenceList.contains(process.getProcessId()))
+        {
+            List<ProcessRun> processesWaitingForApproval = processStatusService.getApprovalPendingProcesses(etlDate);
+
+            if(!processesWaitingForApproval.isEmpty())
+            {
+                throw new AirflowIntegrationException(
+                        "Please approve or reject Difference Pipeline before trying to trigger this Dag.",
+                        HttpStatus.CONFLICT
+                );
+            }
+        }
+
+
+
+
+       try{
+           Map<String,Object> airflowResponse = airflowService.triggerDag(request);
+
+
+           if (airflowResponse != null && (
+                   String.valueOf(airflowResponse.get("state")).equalsIgnoreCase("queued") ||
+
+                           String.valueOf(airflowResponse.get("state")).equalsIgnoreCase("running"))) {
+
+
+
+
+
+
+               ProcessRun processRun = new ProcessRun();
+               processRun.setProcessId(request.getProcessId());
+               processRun.setAirflowRunId(String.valueOf(airflowResponse.get("dag_run_id")));
+               processRun.setTriggeredBy(request.getTriggeredBy());
+               processRun.setEtlDate(etlDate);
+               processRun.setStartTime(TimeUtil.getCurrentTimeStamp());
+               processRun.setStatus(Constants.IN_PROGRESS);
+               processRun.setRemarks(request.getRemarks());
+               processRun.setRunId(processStatusService.getNextRunId(processRun.getProcessId(), etlDate));
+
+               ProcessRun newProcessRun = processStatusService.insertProcess(processRun);
+               ProcessRunStage processRunStage = new ProcessRunStage();
+               processRunStage.setStatus(Constants.IN_PROGRESS);
+               processRunStage.setProcessRunId(newProcessRun.getProcessRunId());
+               processRunStage.setSource("system");
+               processRunStage.setStartTime(TimeUtil.getCurrentTimeStamp());
+               processRunStage.setStageId("dag_triggered");
+               processStatusService.upsertProcessRunStage(processRunStage);
+
+               // Creating Trigger Message
+
+
+               String triggerMessage = "DAG triggered successfully by " + newProcessRun.getTriggeredBy() + (
+                       String.valueOf(airflowResponse.get("state")).equalsIgnoreCase("queued") ? " and Dag is in queue." : " and Dag is in running state."
+               );
+
+                // Check if pipeline needs to be Archived
+               if(archiveProcessesList.contains(newProcessRun.getProcessId()))
+               {
+                   processStatusService.archiveProcesses(newProcessRun.getProcessId(),newProcessRun.getProcessRunId());
+               }
+
+
+               // Constructing Response DTO
+               DagRunResponseDTO dto = new DagRunResponseDTO();
+               dto.setAirflowResponse(new HashMap<String, Object>(airflowResponse));
+               dto.setTriggeredBy(newProcessRun.getTriggeredBy());
+               dto.setTriggerMessage(triggerMessage);
+               dto.setEtlDate(etlDate);
+               dto.setProcessId(newProcessRun.getProcessId());
+               dto.setRunId(newProcessRun.getRunId());
+               dto.setProcessRunId(newProcessRun.getProcessRunId());
+
+               return dto;
+           } else {
+               throw new AirflowIntegrationException("Failed to trigger DAG [" + request.getDagId() + "]: ", HttpStatus.EXPECTATION_FAILED);
+           }
+       }
+       catch (AirflowIntegrationException ex) {
+
+           throw new AirflowIntegrationException(
+                   "Failed to trigger DAG [" + request.getDagId() + "]: " + ex.getMessage(),
+                   ex.getStatus()
+           );
+       }
+       catch (DataIntegrityViolationException ex)
+       {
+           throw  new DataIntegrityViolationException("Data Violation");
+       }
+
+    }
+
+    public SseEmitter getProcessDataSSE()
+    {
+        try {
+            return processStatusService.getProcessDataSSE();
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+
+
+    }
+
+    public Map<String, Object> getCurrentData(String etlDate,Integer processId)
+    {
+        return processStatusService.getCurrentData(etlDate,processId);
+    }
+
+    public List<FincoreProcess> getAllPipelines()
+    {
+        return processStatusService.getAllPipelines();
+    }
+
+    @Override
+    public DagRunResponseDTO stopPipeline(DagRunRequestDTO request) {
+
+        FincoreProcess process =  processStatusService.verifyDag(request.getProcessId());
+
+        log.info("request:{}", request);
+        if (!airflowService.hasActiveRun(process.getDagId())) {
+            throw new AirflowIntegrationException(
+                    "No Dag is running with that id",
+                    HttpStatus.CONFLICT
+            );
+        }
+        LocalDate etlDate = fileService.getEtlDate();
+
+
+
+        ProcessRun processRun = processStatusService.getDagRunInstance(request.getDagRunId(),  process.getProcessId());
+        Map<String,Object> airflowResponse = airflowService.stopFincoreDag(request,process.getDagId(),processRun.getAirflowRunId());
+        if (airflowResponse!=null && String.valueOf(airflowResponse.get("state")).equalsIgnoreCase("failed")) {
+            processRun.setStatus(Constants.STOPPED_BY_USER);
+            processRun.setRemarks(request.getRemarks());
+            processRun.setExecutionRemarks("Process is stopped by user " + request.getTriggeredBy());
+            processStatusService.endProcess(processRun);
+            DagRunResponseDTO dto = new DagRunResponseDTO();
+            dto.setAirflowResponse(new HashMap<String, Object>(airflowResponse));
+            dto.setTriggerMessage("DAG stopped successfully");
+            dto.setTriggeredBy(request.getTriggeredBy());
+            dto.setEtlDate(etlDate);
+            return dto;
+        } else {
+            throw new AirflowIntegrationException(
+                    "Failed to stop the process",
+                    HttpStatus.EXPECTATION_FAILED
+            );
+        }
+    }
+
+
+    @Transactional
+    public ApproveRejectResponseDTO approveOrRejectProcess(ApproveRejectDto approveRejectDto)
+    {
+        log.info("Approve Reject DTo:{}",approveRejectDto);
+        String actionFlag = approveRejectDto.getActionFlag();
+        if(!(actionFlag.equalsIgnoreCase(Constants.ACCEPT)) && !(actionFlag.equalsIgnoreCase(Constants.REJECT)))
+        {
+            throw new IllegalArgumentException("Not an Accepted Value");
+        }
+        ProcessRun processRun = processStatusService.getProcessRunByProcessRunId(approveRejectDto.getProcessRunId());
+        if(processRun==null)
+        {
+            throw new ResourceNotFoundException("No process found with process run id " + approveRejectDto.getProcessRunId());
+        }
+        if(!Objects.equals(processRun.getStatus(), Constants.WAITING_FOR_APPROVAL))
+        {
+            throw new ResourceNotFoundException("The Request is not in waiting for approval state");
+        }
+
+
+        ProcessRunStage processRunStage = processStatusService.getByStageIdAndProcessRunId(Constants.WAITING_FOR_APPROVAL_STAGE, approveRejectDto.getProcessRunId());
+        if(processRunStage==null)
+        {
+            throw new ResourceNotFoundException("No Entry found with Stage Waiting For Approval for process run id " + approveRejectDto.getProcessRunId());
+        }
+        processRunStage.setRemarks(approveRejectDto.getRemarks());
+        processRunStage.setEndTime(TimeUtil.getCurrentTimeStamp());
+        processRunStage.setStatus(Constants.SUCCESS);
+
+        // Triggering Report Generation Pipeline:
+        DagRunRequestDTO dagRunRequestDTO = new DagRunRequestDTO();
+        dagRunRequestDTO.setProcessId(Process.REPORT_GENERATION);
+        dagRunRequestDTO.setRemarks(approveRejectDto.getRemarks());
+        dagRunRequestDTO.setAction(Constants.START);
+        dagRunRequestDTO.setTriggeredBy(approveRejectDto.getUserId());
+
+
+        ApproveRejectResponseDTO approveRejectResponseDTO = new ApproveRejectResponseDTO();
+        List<DagRunResponseDTO> dagRunResponses = new ArrayList<DagRunResponseDTO>();
+        if(actionFlag.equalsIgnoreCase(Constants.ACCEPT))
+        {
+//            DagRunResponseDTO dagRunResponseDTO = triggerDagIfNoActiveRun(dagRunRequestDTO);
+            //approveRejectResponseDTO.setDagRun(dagRunResponseDTO);
+            dagRunResponses = triggerDifferenceDependentPipelines(approveRejectDto.getUserId());
+            approveRejectResponseDTO.setDagRuns(dagRunResponses);
+
+
+        }
+
+
+        processStatusService.upsertProcessRunStage(processRunStage);
+
+        processRun.setStatus(actionFlag.equalsIgnoreCase(Constants.ACCEPT) ? Constants.APPROVED_BY_USER
+                : (actionFlag.equalsIgnoreCase(Constants.REJECT) ? Constants.REJECTED_BY_USER : null ));
+        processRun.setEndTime(TimeUtil.getCurrentTimeStamp());
+        processStatusService.insertProcess(processRun);
+
+
+        approveRejectResponseDTO.setProcessRunId(processRun.getProcessRunId());
+        approveRejectResponseDTO.setMessage("Process" + actionFlag.toUpperCase() + "ED" );
+
+        return approveRejectResponseDTO;
+    }
+
+
+    public List<DagRunResponseDTO> triggerDifferenceDependentPipelines(String userId)
+    {
+        List<DagRunResponseDTO> dagRunResponses = new ArrayList<DagRunResponseDTO>();
+        differenceDependentList.forEach(pipelineId ->{
+
+            DagRunRequestDTO dagRunRequestDTO = new DagRunRequestDTO();
+            dagRunRequestDTO.setTriggeredBy(userId);
+            dagRunRequestDTO.setProcessId(pipelineId);
+            DagRunResponseDTO dagRunResponseDTO = triggerDagIfNoActiveRun(dagRunRequestDTO);
+            dagRunResponses.add(dagRunResponseDTO);
+        });
+
+        return dagRunResponses;
+
+    }
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+
+import com.fincore.process_status_service.dto.ApproveRejectDto;
+import com.fincore.process_status_service.dto.ApproveRejectResponseDTO;
+import com.fincore.process_status_service.model.FincoreProcess;
+import com.fincore.process_status_service.model.ProcessRun;
+import com.fincore.process_status_service.model.ProcessRunStage;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.ResponseVO;
+import com.fincore.process_status_service.dto.InsertDTO;
+import com.fincore.process_status_service.dto.UpdateDTO;
+import com.fincore.process_status_service.model.ProcessStatus;
+
+public interface ProcessStatusService {
+
+	ResponseEntity<ResponseVO<ProcessStatus>> insert(
+			InsertDTO insertDTO);
+
+	ResponseEntity<ResponseVO<ProcessStatus>> update(UpdateDTO updateDTO);
+
+	SseEmitter getProcessDataSSE() throws JsonProcessingException;
+
+	Map<String, Object> getCurrentData(String etlDate,Integer processId);
+
+     void sendProcessStatusUpdates();
+
+    ProcessRun getProcessRunByAirfowRunId(String airflowRunId);
+
+    void updateControllFilemaster(String fileName, Integer value,String etl_date);
+
+//	ProcessRunStage getProcessRunStage(Long processRunStageId);
+
+	ProcessRunStage getProcessRunStage(String stageId , Long processRunId);
+
+	 ProcessRunStage upsertProcessRunStage(ProcessRunStage processRunStage);
+
+
+	List<FincoreProcess> getAllPipelines();
+
+	FincoreProcess verifyDag( Integer processId);
+
+	ProcessRun getDagRunInstance(String dagRunId, Integer processId);
+
+	ProcessRun insertProcess(ProcessRun processRun);
+	Integer getNextRunId(Integer processId, LocalDate etlDate);
+
+	Integer archiveProcesses(Integer processId,Long processRunId);
+
+	ProcessRun getProcessRunByProcessRunId(@NotNull(message = "Process Run Id is Mandatory") Long processRunId);
+
+	ProcessRunStage getByStageIdAndProcessRunId(String waitingForApprovalStage, @NotNull(message = "Process Run Id is Mandatory") Long processRunId);
+
+	ProcessRun endProcess(ProcessRun processRun);
+
+	List<ProcessRun> getRunningProcessesForDate(LocalDate etlDate);
+
+	List<ProcessRun> getApprovalPendingProcesses(LocalDate etlDate);
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.service;
+
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.io.Reader;
+import java.sql.SQLException;
+import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fincore.process_status_service.dto.*;
+import com.fincore.process_status_service.exception.AirflowIntegrationException;
+import com.fincore.process_status_service.model.*;
+import com.fincore.process_status_service.repository.*;
+import com.fincore.process_status_service.util.Constants;
+import com.fincore.process_status_service.util.Process;
+import com.fincore.process_status_service.util.TimeUtil;
+import jakarta.transaction.Transactional;
+import org.apache.kafka.common.errors.ResourceNotFoundException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import com.fincore.process_status_service.ResponseVO;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.text.ParseException;
+
+@Slf4j
+@RequiredArgsConstructor
+@Service("ProcessStatusService")
+public class ProcessStatusServiceImpl implements ProcessStatusService {
+
+
+    private final FincoreDateRepository fincoreDateRepository;
+    private final FileService fileService;
+    private final ProcessRunRepository processRunRepository;
+    private final CopyOnWriteArrayList<SseEmitter> processStatusEmitters = new CopyOnWriteArrayList<>();
+    private final ProcessRunStageRepository processRunStageRepository;
+    private final FincoreProcessRepository fincoreProcessRepository;
+    private final ControlFileMasterRepository controlFileMasterRepository;
+
+
+
+    public ProcessRun insertProcess(ProcessRun processRun) {
+        return processRunRepository.save(processRun);
+    }
+
+    @Transactional
+    public ProcessRun endProcess(ProcessRun processRun) {
+
+
+        processRun.setEndTime(TimeUtil.getCurrentTimeStamp());
+
+        Integer processRunStageUpdated = processRunStageRepository.failAllRunningStage(processRun.getProcessRunId(), "Process Failed Forcefully by user ");
+        ProcessRun newProcessRun = processRunRepository.save(processRun);
+
+        return newProcessRun;
+    }
+
+    @Override
+    public List<ProcessRun> getRunningProcessesForDate(LocalDate etlDate) {
+        return processRunRepository.getRunningProcessesForDate(etlDate);
+    }
+
+    @Override
+    public List<ProcessRun> getApprovalPendingProcesses(LocalDate etlDate) {
+        return processRunRepository.findProcessRunsByStatusAndEtlDate(Constants.WAITING_FOR_APPROVAL,etlDate);
+    }
+
+    @Transactional
+    public ProcessRunStage upsertProcessRunStage(ProcessRunStage processRunStage) {
+
+        log.info("Inserting New Stage:{}",processRunStage);
+        return processRunStageRepository.save(processRunStage);
+
+    }
+
+
+    public ProcessRunStage getProcessRunStage(Long processRunStageId) {
+        return processRunStageRepository.getByProcessRunStageId(processRunStageId);
+    }
+
+    public ProcessRunStage getProcessRunStage(String stageId, Long processRunId) {
+
+//        ProcessRunStage processRunStage = processRunStageRepository.getByStageIdAndProcessRunId(stageId, processRunId);
+//        if(processRunStage==null)
+//        {
+//            throw new ResourceNotFoundException("No Process Run Stage exists with process run id" + processRunId + " and stage id " + stageId);
+//        }
+        return processRunStageRepository.getByStageIdAndProcessRunId(stageId, processRunId);
+    }
+
+
+    public Integer getRunId(Integer processId, LocalDate etlDate) {
+        Integer latestRunId = processRunRepository.getRunId(processId, etlDate);
+        return (latestRunId == null) ? 1 : latestRunId;
+    }
+
+    public Integer getNextRunId(Integer processId, LocalDate etlDate) {
+        Integer latestRunId = processRunRepository.getRunId(processId, etlDate);
+        return (latestRunId == null) ? 1 : latestRunId + 1;
+    }
+
+    @Override
+    public Integer archiveProcesses(Integer processId,Long processRunId) {
+        return processRunRepository.changeProcessState(processId,processRunId, Constants.ARCHIVED);
+    }
+
+    @Override
+    public ProcessRun getProcessRunByProcessRunId(Long processRunId) {
+        return processRunRepository.getProcessRunByProcessRunId(processRunId);
+    }
+
+    @Override
+    public ProcessRunStage getByStageIdAndProcessRunId(String stage, Long processRunId) {
+        return processRunStageRepository.getByStageIdAndProcessRunId(stage, processRunId);
+    }
+
+
+    private Map<String, Object> getProcessData(String etlDate, Integer processId) {
+
+        LocalDate etlDateToUse;
+
+        if (StringUtils.hasLength(etlDate)) {
+            try {
+                etlDateToUse = LocalDate.parse(etlDate); // yyyy-MM-dd
+            } catch (DateTimeParseException e) {
+                throw new IllegalArgumentException(
+                        "Invalid etlDate format. Expected yyyy-MM-dd");
+            }
+        } else {
+//            List<FincoreDate> list = fincoreDateRepository.findAll();
+//            if (list.isEmpty()) {
+//                throw new IllegalStateException("FINCORE_DATE table has no data");
+//            }
+//            etlDateToUse = list.get(0).getEtlDate().toLocalDate();
+            etlDateToUse = fileService.getEtlDate();
+        }
+
+
+        Map<String, Object> wrapper = new LinkedHashMap<>();
+
+
+        List<FincoreDate> fincoreList = fincoreDateRepository.findAll();
+        if (!fincoreList.isEmpty()) {
+            FincoreDate fincore = fincoreList.getFirst();
+            Map<String, Object> fincoreJson = new LinkedHashMap<>();
+            fincoreJson.put("usersDate",
+                    formatDate(fincore.getUsersDate()));
+            fincoreJson.put("etlDate",
+                    formatDate(fincore.getEtlDate()));
+            wrapper.put("fincoreDate", fincoreJson);
+        } else {
+            throw new ResourceNotFoundException("FinCore Date is Empty");
+        }
+        log.info("Process Id Recieved :{}", processId);
+
+        List<Integer> excludedStatusesList = List.of(Constants.ARCHIVED);
+
+        List<ProcessRunInfoProj> groupedList = processRunRepository.getProcessInfo(etlDateToUse, processId,excludedStatusesList);
+        if (groupedList == null || groupedList.isEmpty()) {
+            return wrapper;
+        }
+        Map<Long, ProcessRunInfo> map = new LinkedHashMap<>();
+        groupedList.forEach(row -> {
+            ProcessRunInfo process =
+                    map.computeIfAbsent(row.getProcessRunId(), id -> {
+                        ProcessRunInfo p = new ProcessRunInfo();
+                        p.setProcessRunId(row.getProcessRunId());
+                        p.setProcessId(row.getProcessId());
+                        p.setRunId(row.getRunId());
+                        p.setProcessType(row.getProcessType());
+                        p.setProcessStartTime(row.getProcessStartTime());
+                        p.setProcessEndTime(row.getProcessEndTime());
+                        p.setTriggeredBy(row.getTriggeredBy());
+                        p.setEtlDate(row.getEtlDate());
+                        p.setStatus(row.getProcessStatus());
+                        p.setExecutionRemarks(row.getProcessExecutionRemarks());
+                        p.setAirflowRunId(row.getAirflowRunId());
+                        p.setDagId(row.getDagId());
+                        p.setStages(new ArrayList<ProcessRunStageInfo>());
+                        return p;
+                    });
+            ProcessRunStageInfo stage = new ProcessRunStageInfo();
+            stage.setStageId(row.getStageId());
+            stage.setStageStatus(row.getStageStatus());
+            stage.setStageRemarks(row.getStageRemarks());
+            stage.setSummary(clobToString(row.getSummary()));
+            stage.setStageTitle(row.getStageTitle());
+            stage.setStageIcon(row.getStageIcon());
+            stage.setStartTime(row.getStageStartTime());
+            stage.setEndTime(row.getStageEndTime());
+            stage.setStageSource(row.getStageSource());
+            process.getStages().add(stage);
+        });
+
+
+        wrapper.put("initialData", List.copyOf(map.values()));
+        return wrapper;
+    }
+
+
+    /*
+     * Converts Oracle CLOB objects to a normal JAva String.
+     * Handles both java.sql.Clob and oracle.sql.Clob objects.
+     */
+    private String clobToString(Object clobObj) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            if (clobObj == null)
+                return null;
+            if (clobObj instanceof java.sql.Clob clob) {
+                Reader reader = clob.getCharacterStream();
+
+                char[] buffer = new char[2048];
+                int length;
+                while ((length = reader.read(buffer)) != -1) {
+                    sb.append(buffer, 0, length);
+                }
+                return sb.toString();
+            }
+
+            return clobObj.toString();
+        } catch (SQLException | IOException e) {
+            log.error("Unable to process the Payload");
+            return null;
+        }
+    }
+
+    /**
+     * Normalize DB time values to each millis(Timestamp/Date/Long)
+     */
+    private Long toMills(Object time) {
+        if (time == null)
+            return 0L;
+        if (time instanceof java.sql.Timestamp ts)
+            return ts.getTime();
+        if (time instanceof java.sql.Date d)
+            return d.getTime();
+        if (time instanceof Number n)
+            return n.longValue();
+        return 0L;
+    }
+
+    /**
+     * Normalizes Db date/timestamp column values into ISO_8601 (yyyy-mm-dd) String.
+     * Supports java.sql.Date, java.sql.Timestamp and falls back to string
+     * conversion.
+     *
+     * @param date
+     * @return null if value is null.
+     */
+    private String formatDate(Object date) {
+        if (date == null)
+            return null;
+        if (date instanceof java.sql.Timestamp ts)
+            return ts.toLocalDateTime().toLocalDate().toString();
+        if (date instanceof java.sql.Date d)
+            return d.toLocalDate().toString();
+        return String.valueOf(date);
+    }
+
+    /**
+     *
+     */
+    public void sendProcessStatusUpdates() {
+        log.info("Sending Process Update");
+        CompletableFuture.runAsync(() -> {
+            Iterator<SseEmitter> emitters = processStatusEmitters.iterator();
+            Map<String, Object> data = getProcessData(null, null);
+            while (emitters.hasNext()) {
+
+                SseEmitter emitter = emitters.next();
+                try {
+
+                    emitter.send(SseEmitter.event().data(data));
+//                    log.info("Sent Process Update");
+                } catch (IOException e) {
+                    log.warn("Client Disconnected, removing SSE emitter");
+                    emitter.complete();
+                    emitters.remove();
+                }
+            }
+        });
+    }
+
+    /**
+     *
+     * @param airflowRunId
+     * @return
+     */
+    @Override
+    public ProcessRun getProcessRunByAirfowRunId(String airflowRunId) {
+        return processRunRepository.findProcessRunByAirflowRunId(airflowRunId);
+    }
+
+    /**
+     *
+     * @param etlDate
+     * @param processId
+     * @return
+     */
+    @Override
+    public Map<String, Object> getCurrentData(String etlDate, Integer processId) {
+        return getProcessData(etlDate, processId);
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<ProcessStatus>> insert(InsertDTO insertDTO) {
+        return null;
+    }
+
+    @Override
+    public ResponseEntity<ResponseVO<ProcessStatus>> update(UpdateDTO updtateDTO) {
+        return null;
+    }
+
+    @Override
+    public SseEmitter getProcessDataSSE() {
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        processStatusEmitters.add(emitter);
+
+        emitter.onCompletion(() -> processStatusEmitters.remove(emitter));
+        emitter.onTimeout(() -> {
+            processStatusEmitters.remove(emitter);
+            emitter.complete();
+        });
+        emitter.onError(e -> {
+            processStatusEmitters.remove(emitter);
+            emitter.completeWithError(e);
+        });
+
+        // Send initial connection acknowledgement
+        CompletableFuture.runAsync(() -> {
+            try {
+                emitter.send(SseEmitter.event()
+                        .name("connected")
+                        .data("Connection established"));
+            } catch (IOException | IllegalStateException ex) {
+                log.warn("Failed to send initial SSE event: {}", ex.getMessage());
+                processStatusEmitters.remove(emitter);
+                emitter.complete();
+            }
+        });
+
+        return emitter;
+    }
+
+    @Transactional
+    public void updateControllFilemaster(String fileName, Integer value, String etl_date) {
+        try {
+            SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yy");
+            java.util.Date etlDate = sdf.parse(etl_date);
+            int updatedRows = controlFileMasterRepository.updateDataLakeCount(fileName, value, etlDate);
+            if (updatedRows > 0) {
+                // Fetch the updated entity to evaluate condition
+                ControlFileMaster fileMaster = controlFileMasterRepository.findByFileNameAndEtlDate(fileName, etlDate);
+                if (fileMaster != null) {
+                    // Set status based on count comparison
+                    if (fileMaster.getDataLakeCount() != null &&
+                            fileMaster.getHdfsRowCount() != null &&
+                            fileMaster.getDataLakeCount().equals(fileMaster.getHdfsRowCount())) {
+                        fileMaster.setDatalakeStatus("YES");
+                    } else {
+                        fileMaster.setDatalakeStatus("NO");
+                    }
+
+                }
+            }
+        } catch (ParseException e) {
+            log.error("Error in Parsing the payload");
+        }
+
+
+    }
+
+
+//    @Transactional
+//    public ApproveRejectResponseDTO approveOrRejectProcess(ApproveRejectDto approveRejectDto)
+//    {
+//        log.info("Approve Reject DTo:{}",approveRejectDto);
+//        String actionFlag = approveRejectDto.getActionFlag();
+//        if(!(actionFlag.equalsIgnoreCase(Constants.ACCEPT)) && !(actionFlag.equalsIgnoreCase(Constants.REJECT)))
+//        {
+//            throw new IllegalArgumentException("Not an Accepted Value");
+//        }
+//        ProcessRun processRun = processRunRepository.getProcessRunByProcessRunId(approveRejectDto.getProcessRunId());
+//        if(processRun==null)
+//        {
+//            throw new ResourceNotFoundException("No process found with process run id " + approveRejectDto.getProcessRunId());
+//        }
+//        if(!Objects.equals(processRun.getStatus(), Constants.WAITING_FOR_APPROVAL))
+//        {
+//            throw new ResourceNotFoundException("The Request is not in waiting for approval state");
+//        }
+//
+//
+//        ProcessRunStage processRunStage = processRunStageRepository.getByStageIdAndProcessRunId(Constants.WAITING_FOR_APPROVAL_STAGE, approveRejectDto.getProcessRunId());
+//        if(processRunStage==null)
+//        {
+//            throw new ResourceNotFoundException("No Entry found with Stage Waiting For Approval for process run id " + approveRejectDto.getProcessRunId());
+//        }
+//        processRunStage.setRemarks(approveRejectDto.getRemarks());
+//        processRunStage.setEndTime(TimeUtil.getCurrentTimeStamp());
+//        processRunStage.setStatus(Constants.SUCCESS);
+//
+//        // Triggering Report Generation Pipeline:
+//        DagRunRequestDTO dagRunRequestDTO = new DagRunRequestDTO();
+//        dagRunRequestDTO.setProcessId(Process.REPORT_GENERATION);
+//        dagRunRequestDTO.setRemarks(approveRejectDto.getRemarks());
+//        dagRunRequestDTO.setAction(Constants.START);
+//        dagRunRequestDTO.setTriggeredBy(approveRejectDto.getUserId());
+//
+//        DagRunResponseDTO dagRunResponseDTO = airflowService.triggerDagIfNoActiveRun(dagRunRequestDTO);
+//
+//        upsertProcessRunStage(processRunStage);
+//
+//        processRun.setStatus(actionFlag.equalsIgnoreCase(Constants.ACCEPT) ? Constants.APPROVED_BY_USER
+//                : (actionFlag.equalsIgnoreCase(Constants.REJECT) ? Constants.REJECTED_BY_USER : null ));
+//        processRun.setEndTime(TimeUtil.getCurrentTimeStamp());
+//        processRunRepository.save(processRun);
+//
+//        ApproveRejectResponseDTO approveRejectResponseDTO = new ApproveRejectResponseDTO();
+//        approveRejectResponseDTO.setProcessRunId(processRun.getProcessRunId());
+//        approveRejectResponseDTO.setMessage("Process" + actionFlag.toUpperCase() + "ED" );
+//        approveRejectResponseDTO.setDagRun(dagRunResponseDTO);
+//        return approveRejectResponseDTO;
+//    }
+
+
+    public List<FincoreProcess> getAllPipelines() {
+        return fincoreProcessRepository.findAll();
+    }
+
+
+    public FincoreProcess verifyDag(Integer processId) {
+        FincoreProcess fincoreProcess = fincoreProcessRepository.findByProcessId(processId);
+        if (fincoreProcess == null) {
+            throw new AirflowIntegrationException(
+                    "No Dag Found for Process Id" + processId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+//        if (!Objects.equals(fincoreProcess.getProcessId(), processId)) {
+//            throw new AirflowIntegrationException(
+//                    "Invalid Dag ID " + dagId + "& Process ID " + processId + "Combination",
+//                    HttpStatus.NOT_FOUND
+//            );
+//        }
+        return fincoreProcess;
+    }
+
+    public ProcessRun getDagRunInstance(String dagRunId, Integer processId) {
+        if (dagRunId == null) {
+            throw new AirflowIntegrationException(
+                    "Invalid Dag Run ID " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+        log.info("Trying to fetch Process Run with Dag Run ID - {} and Process Id - {}", dagRunId, processId);
+        ProcessRun processRun = getProcessRunByAirfowRunId(dagRunId);
+
+        if (processRun == null) {
+            throw new AirflowIntegrationException(
+                    "Dag Run Id is not found " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+        }
+
+        if (!processRun.getProcessId().equals(processId)) {
+
+            throw new AirflowIntegrationException(
+                    "Dag Run Id is not associated with any process " + dagRunId,
+                    HttpStatus.NOT_FOUND
+            );
+
+        }
+        return processRun;
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.util;
+
+public class Constants {
+
+   public static Integer STARTED =1;
+   public static Integer IN_PROGRESS =1;
+   public static Integer SUCCESS = 2;
+    public static Integer FAILED=3;
+   public static Integer ERROR=3;
+   public static Integer SKIPPED=4;
+   public static Integer STOPPED_BY_USER=4;
+   public static Integer WAITING_FOR_APPROVAL=5;
+   public static Integer APPROVED_BY_USER=2;
+   public static Integer REJECTED_BY_USER=6;
+   public static Integer ARCHIVED=7;
+
+   public static String REPORT_SUCCESS="SUCCESS";
+   public static  String REPORT_PARTIAL_SUCCESS="PARTIAL_SUCCESS";
+   public static  String REPORT_FAILED="FAILED";
+   public static String WAITING_FOR_APPROVAL_STAGE="waiting_for_approval";
+   public static String ACCEPT="ACCEPT";
+   public static String REJECT="REJECT";
+   public static String START="START";
+
+   public static String AIRFLOW_QUEUED_STATE = "queued";
+   public static String SYSTEM = "system";
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.util;
+
+public class Process {
+	public static final Integer EOD = 0;
+	public static final Integer CBS = 1;
+	public static final Integer GLIF = 2;
+	public static final Integer DIFFERENCE = 3;
+	public static final Integer BRANCH = 4;
+	public static final Integer CURRENCY_CHANGE = 5;
+	public static final Integer REPORT_GENERATION = 6;
+	public static final Integer YEAR_END_PROFIT_TRANSFER = 7;
+	public static final Integer PRECHECK_PIPELINE = 8;
+	public static final Integer CONTROL_PIPELINE = 9;
+	public static final Integer CBS_ALL_DATA = 10;
+	public static final Integer GLIF_ALL_DATA = 11;
+	public static final Integer POSTING_TRANSFER = 12;
+	public static final Integer ETL_PLUS_ONE = 13;
+
+
+}
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service.util;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
+
+@Slf4j
+public class TimeUtil {
+
+    private static final ZoneId IST_ZONE = ZoneId.of("Asia/Kolkata");
+
+    public static String getCurrentUTCTime() {
+        String utcTimestamp = Instant.now()
+                .truncatedTo(ChronoUnit.SECONDS)
+                .toString();
+        log.info("TIME:{}", utcTimestamp);
+        return utcTimestamp;
+    }
+
+    public static LocalDateTime getCurrentTimeStamp() {
+        ZonedDateTime zdt = ZonedDateTime.now(ZoneId.of("Asia/Kolkata"));
+
+        //return Timestamp.valueOf(zdt.toLocalDateTime());
+        return LocalDateTime.now(ZoneId.of("Asia/Kolkata"));
+    }
+
+    public static Instant convertToISTInstant(Timestamp time) {
+        if (time == null) return null;
+        return time.toLocalDateTime()
+                .atZone(IST_ZONE)
+                .toInstant();
+    }
+
+    /**
+     * Converts an Airflow UTC String to an IST LocalDateTime
+     */
+    public static LocalDateTime parseAirflowUtcToIst(String dagStartTimeStr) throws DateTimeParseException {
+        return ZonedDateTime.parse(dagStartTimeStr)
+                .withZoneSameInstant(IST_ZONE)
+                .toLocalDateTime();
+    }
+
+    /**
+     * Calculates minutes between two IST LocalDateTime points
+     */
+    public static long getMinutesBetween(LocalDateTime start, LocalDateTime end) {
+        if (start == null || end == null) return 0;
+        return java.time.Duration.between(start, end).toMinutes();
+    }
+
+    /**
+     * Gets current IST time as LocalDateTime for comparison
+     */
+    public static LocalDateTime getCurrentIstLocalDateTime() {
+        return LocalDateTime.now(IST_ZONE);
+    }
+
+
+    public static   Timestamp convertEpoch(Double epoch) {
+
+        long seconds = epoch.longValue();
+
+        return new Timestamp(seconds * 1000);
+    }
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.retry.annotation.EnableRetry;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@EnableRetry
+@EnableScheduling
+@SpringBootApplication
+public class ProcessStatusApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(ProcessStatusApplication.class, args);
+	}
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.process_status_service;
+
+import java.time.LocalDateTime;
+
+import org.springframework.http.HttpStatus;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class ResponseVO<T> {
+
+	private HttpStatus status;
+	private T data;
+	private String message;
+	private LocalDateTime LocalDatetime;
+}
+
+
+
+
+
+
+package com.fincore.process_status_service;
+
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.servlet.support.SpringBootServletInitializer;
+
+public class ServletInitializer extends SpringBootServletInitializer {
+
+	@Override
+	protected SpringApplicationBuilder configure(SpringApplicationBuilder application) {
+		return application.sources(ProcessStatusApplication.class);
+	}
+}
+
+
+
+
+
+
+
+
+
+
+spring.application.name=ProcessStatusService
+spring.profiles.active=local
+server.port=9006
+
+# --- Kafka Consumer Configuration ---
+# We connect to Kafka on the EXTERNAL listener
+spring.kafka.consumer.group-id=Airflow_ETL
+spring.kafka.consumer.auto-offset-reset=earliest
+
+# --- Debezium JSON Deserialization ---
+# This tells Spring Kafka to parse the incoming JSON into our Java objects (DTOs)
+#spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+#spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+#spring.kafka.consumer.properties.spring.json.trusted.packages=*
+#spring.kafka.consumer.properties.spring.json.use.type.headers=false
+#spring.kafka.consumer.properties.spring.json.value.default.type=com.fincore.process_status_service.dto.AirflowDagEvent
+
+
+
+# LOGIN SERVICE KEY
+jwt.secret=bWV0aGlvbnlsdGhyZW9ueWx0aHJlb255bGdsdXRhbWlueWxhbGFueWw=
+
+# --- Redis Configuration ---
+spring.data.redis.host=10.0.17.242
+spring.data.redis.port=6379
+spring.cache.type=redis
+
+
+
+
+# Airflow API Base URL
+#airflow.base-url=http://airflow-api-server.cbops.svc.cluster.local:8080
+
+# Airflow API Version
+airflow.api-version=/api/v2
+
+# Authentication (use environment variables in production)
+airflow.username=admin
+airflow.password=admin
+
+# HTTP Client Timeouts (in milliseconds)
+http.connect-timeout=5000
+http.read-timeout=10000
+
+# Logging Levels
+logging.level.com.example.process=DEBUG
+logging.level.org.springframework.web.reactive.function.client=INFO
+
+# DB Timeouts: Configuration of connection pooling timeouts in application.properties.
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.maximum-pool-size=30
+
+
+# --- Actuator Base Config ---
+# Enable the endpoints, but control exposure in specific profile files
+management.endpoints.web.base-path=/actuator
+management.endpoint.health.probes.enabled=true
+management.endpoints.web.exposure.include=health, info, prometheus
+management.endpoint.health.show-details=always
+management.metrics.tags.application=${spring.application.name}
+management.info.env.enabled=true
+
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer
+#
+## Optional: Ensures type information is handled correctly in the DLT
+#spring.kafka.producer.properties.spring.json.add.type.headers=true
+
+
+spring.kafka.consumer.key-deserializer=org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+spring.kafka.consumer.properties.spring.deserializer.key.delegate.class=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.properties.spring.deserializer.value.delegate.class=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.trusted.packages=*
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+spring.kafka.consumer.enable-auto-commit=false
+spring.kafka.listener.ack-mode = manual
+
+# ==============================================================
+# JACKSON CONFIGURATION
+# ==============================================================
+#spring.jackson.date-format=dd/MM/yyyy
+spring.jackson.time-zone=Asia/Kolkata
+# Ensure dates are Strings (e.g. "2023-10-01 13:30"), not timestamps (169000...)
+spring.jackson.serialization.write-dates-as-timestamps=false
+
+
+# Time in milliseconds
+#30 Seconds
+app.scheduling.fixedRate.in.ms=300000
+app.scheduling.initialDelay.in.ms=600000
+
+
+#NiFi
+nifi.username=fincore
+nifi.password=Password#1234
+nifi.base-url=https://10.177.177.93:443/nifi-api
+
+reconciliation.queued-timeout-minutes=30
+
+
+
+
+
+
+
+
+
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+#spring.kafka.consumer.bootstrap-servers=localhost:29092
+spring.kafka.consumer.bootstrap-servers=kafka-0.kafka.be-test.svc.cluster.local:9092
+spring.kafka.producer.bootstrap-servers=kafka-0.kafka.be-test.svc.cluster.local:9092
+
+airflow.base-url=http://airflow-api-server.cbops.svc.cluster.local:8080/airflow
+
+
+
+
+#
+#
+# @author:Sampath [v1017860]
+#
+#
+
+spring.datasource.url=jdbc:oracle:thin:@10.177.103.192:1523/fincorepdb1
+#spring.datasource.url=jdbc:oracle:thin:@10.177.179.46:1523/fincorepdb1
+spring.datasource.username=fincore
+spring.datasource.password=Password#1234
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+
+#spring.kafka.consumer.bootstrap-servers=localhost:29092
+spring.kafka.consumer.bootstrap-servers=10.0.19.123:9092
+spring.kafka.producer.bootstrap-servers=10.0.19.123:9092
+
+#airflow.base-url=http://localhost:1234/airflow
+airflow.base-url=https://fincoreuat.sbi/airflow
+#airflow.base-url=https://fincorest.sbi/airflow
+
+
+# Time in milliseconds
+#30 Seconds
+app.scheduling.fixedRate.in.ms=9000
+app.scheduling.initialDelay.in.ms=8000
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
