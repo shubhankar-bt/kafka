@@ -1,4 +1,167 @@
 ```java
+package com.fincore.process_status_service.repository;
+
+import com.fincore.process_status_service.dto.ProcessRunInfoProj;
+import com.fincore.process_status_service.model.ProcessRun;
+
+import io.lettuce.core.dynamic.annotation.Param;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+
+public interface ProcessRunRepository extends JpaRepository<ProcessRun, Long> {
+    Optional<ProcessRun> findProcessRunByProcessIdAndRunIdAndEtlDate(long l, int i, LocalDate today);
+
+    @Query(value = "   SELECT MAX(run_id)\n" +
+            "               FROM process_run\n" +
+            "               WHERE process_id = :processId\n" +
+            "                 AND etl_date   = :etlDate", nativeQuery = true)
+    Integer getRunId(@Param("processId") Integer processId, @Param("etlDate") LocalDate etlDate);
+
+    ProcessRun findProcessRunByAirflowRunId(String airflowRunId);
+
+    // CHANGED: Implemented Dual-Column logic for the summary CLOB
+    @Query(value = """ 
+                        SELECT
+                            prs.process_run_stage_id AS id,
+                            pr.process_run_id,
+                            pr.process_id,
+                            pr.run_id                AS run_id,
+                            pr.remarks               AS process_remarks,
+                            pr.execution_remarks     AS process_execution_remarks,
+                            pr.status                AS process_status,
+                            pm.process_name          AS process_type,
+                            prs.stage_id,
+                            pr.start_time            AS process_start_time,
+                            pr.end_time              AS process_end_time,
+                            prs.status               stage_status,
+                            prs.remarks              AS stage_remarks,
+                            pr.triggered_by,
+                            pr.etl_date,
+                            CASE WHEN DBMS_LOB.GETLENGTH(prs.summary) <= 4000 THEN DBMS_LOB.SUBSTR(prs.summary, 4000, 1) ELSE NULL END AS summary_short,
+                            CASE WHEN DBMS_LOB.GETLENGTH(prs.summary) > 4000 THEN prs.summary ELSE NULL END AS summary_clob,
+                            prs.start_time           AS stage_start_time,
+                            prs.end_time             AS stage_end_time,
+                            prs.source               AS stage_source,
+                            pr.airflow_run_id,
+                            pm.process_dag_id        AS dag_id,
+                            psm.title                AS stage_title,
+                            psm.icon                 AS stage_icon
+                        FROM
+                                 process_run_stage prs
+                            JOIN process_run          pr ON pr.process_run_id = prs.process_run_id
+                            JOIN process_master       pm ON pm.process_id = pr.process_id
+                            LEFT JOIN process_stage_master psm ON psm.stage_id = prs.stage_id
+                        WHERE
+                            pr.etl_date = :etlDate 
+                              AND (:processId IS NULL OR pr.process_id = :processId)   
+                              AND   pr.status not in (:excludedStatusesList)
+                        ORDER BY  pr.run_id DESC,pr.start_time DESC, prs.start_time ASC
+            """, nativeQuery = true)
+    List<ProcessRunInfoProj> getProcessInfo(@Param("etlDate") LocalDate etlDate, @Param("processId") Integer processId, @Param("excludedStatusesList") List<Integer> excludedStatusesList);
+
+    ProcessRun getProcessRunByProcessRunId(@NotNull(message = "Process Run Id is Mandatory") Long processRunId);
+
+    @Modifying
+    @Query(value = "update process_run set status =:status where process_id=:processId and process_run_id != :processRunId", nativeQuery = true)
+    Integer changeProcessState(@Param("processId") Integer processId, @Param("processRunId") Long processRunId, @Param("status") Integer status);
+
+    @Query(value = """
+                    select PROCESS_RUN_ID,
+                    PROCESS_ID,
+                    ETL_DATE,
+                    RUN_ID,
+                    STATUS,
+                    START_TIME,
+                    END_TIME,
+                    TRIGGERED_BY,
+                    AIRFLOW_RUN_ID,
+                    REMARKS,
+                    EXECUTION_REMARKS from process_run p where p.status=1 and p.etl_date=:etlDate
+            """, nativeQuery = true)
+    List<ProcessRun> getRunningProcessesForDate(@Param("etlDate") LocalDate etlDate);
+
+    List<ProcessRun> findProcessRunsByStatusAndEtlDate(Integer waitingForApproval, LocalDate etlDate);
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.process_status_service.dto;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+/**
+ * Projection interface for the Native Query in ProcessRunRepository.
+ * Note: Add these two new summary getters and remove the old 'getSummary()' if it exists here.
+ */
+public interface ProcessRunInfoProj {
+    Long getId();
+    Long getProcessRunId();
+    Integer getProcessId();
+    Integer getRunId();
+    String getProcessRemarks();
+    String getProcessExecutionRemarks();
+    Integer getProcessStatus();
+    String getProcessType();
+    String getStageId();
+    LocalDateTime getProcessStartTime();
+    LocalDateTime getProcessEndTime();
+    Integer getStageStatus();
+    String getStageRemarks();
+    String getTriggeredBy();
+    LocalDate getEtlDate();
+    
+    // CHANGED: Dual-column mapping for the summary
+    String getSummaryShort();
+    Object getSummaryClob();
+    
+    LocalDateTime getStageStartTime();
+    LocalDateTime getStageEndTime();
+    String getStageSource();
+    String getAirflowRunId();
+    String getDagId();
+    String getStageTitle();
+    String getStageIcon();
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
 package com.fincore.process_status_service.service;
 
 import java.io.IOException;
@@ -19,8 +182,8 @@ import com.fincore.process_status_service.exception.AirflowIntegrationException;
 import com.fincore.process_status_service.model.*;
 import com.fincore.process_status_service.repository.*;
 import com.fincore.process_status_service.util.Constants;
-import com.fincore.process_status_service.util.Process;
 import com.fincore.process_status_service.util.TimeUtil;
+import com.fincore.commonutilities.buisnessobject.ControlDatesDto;
 import jakarta.transaction.Transactional;
 import org.apache.kafka.common.errors.ResourceNotFoundException;
 import org.springframework.http.HttpStatus;
@@ -109,46 +272,40 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
 
     private Map<String, Object> getProcessData(String etlDate, Integer processId) {
 
-        // 1. Fetch dates ONCE to prevent redundant DB roundtrips
-        List<FincoreDate> fincoreList = fincoreDateRepository.findAll();
-        if (fincoreList.isEmpty()) {
-            throw new ResourceNotFoundException("FinCore Date is Empty");
+        ControlDatesDto controlDates = fileService.getFincoreDate();
+        if (controlDates == null) {
+             throw new ResourceNotFoundException("FinCore Date is Empty");
         }
-        FincoreDate fincore = fincoreList.getFirst();
 
         LocalDate etlDateToUse;
         if (StringUtils.hasLength(etlDate)) {
             try {
-                etlDateToUse = LocalDate.parse(etlDate); // yyyy-MM-dd
+                etlDateToUse = LocalDate.parse(etlDate);
             } catch (DateTimeParseException e) {
                 throw new IllegalArgumentException("Invalid etlDate format. Expected yyyy-MM-dd");
             }
         } else {
-            // Extracted directly from our single DB fetch
-            etlDateToUse = fincore.getEtlDate().toLocalDate();
+            etlDateToUse = controlDates.getEtlDate();
         }
 
-        Map<String, Object> wrapper = new LinkedHashMap<>();
-        Map<String, Object> fincoreJson = new LinkedHashMap<>();
-        fincoreJson.put("usersDate", formatDate(fincore.getUsersDate()));
-        fincoreJson.put("etlDate", formatDate(fincore.getEtlDate()));
+        Map<String, Object> wrapper = new HashMap<>(); 
+        Map<String, Object> fincoreJson = Map.of(
+                "usersDate", formatDate(controlDates.getUsersDate()),
+                "etlDate", formatDate(controlDates.getEtlDate())
+        );
         wrapper.put("fincoreDate", fincoreJson);
-
-        log.info("Process Id Received :{}", processId);
 
         List<Integer> excludedStatusesList = List.of(Constants.ARCHIVED);
 
         List<ProcessRunInfoProj> groupedList = processRunRepository.getProcessInfo(etlDateToUse, processId, excludedStatusesList);
+        
         if (groupedList == null || groupedList.isEmpty()) {
             wrapper.put("initialData", Collections.emptyList());
             return wrapper;
         }
 
-        // 2. Pre-allocate map capacity to avoid expensive resizing thresholds
-        int initialCapacity = Math.max((int) (groupedList.size() / 0.75f) + 1, 16);
-        Map<Long, ProcessRunInfo> map = new LinkedHashMap<>(initialCapacity);
+        Map<Long, ProcessRunInfo> map = new LinkedHashMap<>(groupedList.size());
         
-        // 3. Replaced slow forEach lambda with a fast, allocation-free loop
         for (ProcessRunInfoProj row : groupedList) {
             ProcessRunInfo process = map.computeIfAbsent(row.getProcessRunId(), id -> {
                 ProcessRunInfo p = new ProcessRunInfo();
@@ -164,15 +321,24 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
                 p.setExecutionRemarks(row.getProcessExecutionRemarks());
                 p.setAirflowRunId(row.getAirflowRunId());
                 p.setDagId(row.getDagId());
-                p.setStages(new ArrayList<>());
+                p.setStages(new ArrayList<>()); 
                 return p;
             });
-            
+
             ProcessRunStageInfo stage = new ProcessRunStageInfo();
             stage.setStageId(row.getStageId());
             stage.setStageStatus(row.getStageStatus());
             stage.setStageRemarks(row.getStageRemarks());
-            stage.setSummary(clobToString(row.getSummary()));
+            
+            // CHANGED: Dual-Column mapping logic
+            String finalSummary;
+            if (row.getSummaryShort() != null) {
+                finalSummary = row.getSummaryShort(); // Fast route for <= 4000
+            } else {
+                finalSummary = clobToString(row.getSummaryClob()); // Safe stream for > 4000
+            }
+            stage.setSummary(finalSummary);
+            
             stage.setStageTitle(row.getStageTitle());
             stage.setStageIcon(row.getStageIcon());
             stage.setStartTime(row.getStageStartTime());
@@ -186,46 +352,27 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
         return wrapper;
     }
 
-    /**
-     * Converts Oracle CLOB objects to a normal Java String.
-     * FIX: Fixed critical memory/cursor leak using try-with-resources.
-     * PERF: Utilized JVM optimized Reader.transferTo for extreme speed improvements.
-     */
     private String clobToString(Object clobObj) {
-        if (clobObj == null) {
-            return null;
-        }
+        if (clobObj == null) return null;
         
-        try {
-            if (clobObj instanceof java.sql.Clob clob) {
-                // try-with-resources automatically closes the reader, fixing Oracle DB cursor leaks
-                try (Reader reader = clob.getCharacterStream();
-                     StringWriter writer = new StringWriter()) {
-                    
-                    // Native IO optimization, bypasses Java heap buffering
-                    reader.transferTo(writer); 
-                    return writer.toString();
-                }
+        if (clobObj instanceof java.sql.Clob clob) {
+            try (Reader reader = clob.getCharacterStream();
+                 StringWriter writer = new StringWriter()) {
+                reader.transferTo(writer); 
+                return writer.toString();
+            } catch (SQLException | IOException e) {
+                log.error("Unable to process the Clob Payload", e);
+                return null;
             }
-            return clobObj.toString();
-        } catch (SQLException | IOException e) {
-            log.error("Unable to process the Payload", e);
-            return null;
         }
-    }
-
-    private Long toMills(Object time) {
-        if (time == null) return 0L;
-        if (time instanceof java.sql.Timestamp ts) return ts.getTime();
-        if (time instanceof java.sql.Date d) return d.getTime();
-        if (time instanceof Number n) return n.longValue();
-        return 0L;
+        return clobObj.toString();
     }
 
     private String formatDate(Object date) {
         if (date == null) return null;
         if (date instanceof java.sql.Timestamp ts) return ts.toLocalDateTime().toLocalDate().toString();
         if (date instanceof java.sql.Date d) return d.toLocalDate().toString();
+        if (date instanceof java.time.LocalDate ld) return ld.toString();
         return String.valueOf(date);
     }
 
@@ -233,10 +380,8 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
         log.info("Sending Process Update");
         CompletableFuture.runAsync(() -> {
             Iterator<SseEmitter> emitters = processStatusEmitters.iterator();
-            
-            // Only generate data once per broadcast to save DB hits
-            Map<String, Object> data = null;
-            if(emitters.hasNext()){
+            Map<String, Object> data = null; 
+            if(emitters.hasNext()) {
                 data = getProcessData(null, null);
             }
             
@@ -288,7 +433,6 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
             emitter.completeWithError(e);
         });
 
-        // Send initial connection acknowledgement
         CompletableFuture.runAsync(() -> {
             try {
                 emitter.send(SseEmitter.event()
@@ -360,7 +504,6 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
     }
 }
 
-
 ```
 
 
@@ -375,7 +518,4 @@ public class ProcessStatusServiceImpl implements ProcessStatusService {
 
 
 
-
-
-DBMS_LOB.SUBSTR(prs.summary, 4000, 1) AS summary,
 
