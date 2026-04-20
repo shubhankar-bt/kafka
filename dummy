@@ -1,3 +1,594 @@
-server.compression.enabled=true
-server.compression.mime-types=application/json,text/event-stream
-server.compression.min-response-size=1024
+{{baseUrl}}/api/template-config/template-requests/my-requests
+
+
+
+
+
+
+
+
+package com.fincore.TemplateConfigurationService.requests.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.TemplateConfigurationService.dto.FilterRuleDto;
+import com.fincore.TemplateConfigurationService.dto.TemplatePayload;
+import com.fincore.TemplateConfigurationService.dto.VariantDto;
+import com.fincore.TemplateConfigurationService.dto.VariantParamDto;
+import com.fincore.TemplateConfigurationService.entity.FilterRule;
+import com.fincore.TemplateConfigurationService.entity.ReportTemplate;
+import com.fincore.TemplateConfigurationService.entity.ReportTemplateHistory;
+import com.fincore.TemplateConfigurationService.entity.ReportVariant;
+import com.fincore.TemplateConfigurationService.entity.VariantParamDef;
+import com.fincore.TemplateConfigurationService.exception.BadRequestException;
+import com.fincore.TemplateConfigurationService.exception.TemplateNotFoundException;
+import com.fincore.TemplateConfigurationService.repository.FilterRuleRepository;
+import com.fincore.TemplateConfigurationService.repository.ReportTemplateHistoryRepository;
+import com.fincore.TemplateConfigurationService.repository.ReportTemplateRepository;
+import com.fincore.TemplateConfigurationService.repository.ReportVariantRepository;
+import com.fincore.TemplateConfigurationService.repository.VariantParamDefRepository;
+import com.fincore.TemplateConfigurationService.requests.dto.CancelTemplateRequestDto;
+import com.fincore.TemplateConfigurationService.requests.dto.CreateTemplateRequestDto;
+import com.fincore.TemplateConfigurationService.requests.dto.ProcessTemplateRequestDto;
+import com.fincore.TemplateConfigurationService.requests.dto.TemplateRequestSummaryDto;
+import com.fincore.TemplateConfigurationService.requests.entity.TemplateRequest;
+import com.fincore.TemplateConfigurationService.requests.enums.ChangeType;
+import com.fincore.TemplateConfigurationService.requests.enums.RequestStatus;
+import com.fincore.TemplateConfigurationService.requests.repository.TemplateRequestRepository;
+import com.fincore.TemplateConfigurationService.requests.validation.TemplateRequestValidationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class TemplateRequestServiceImpl implements TemplateRequestService {
+
+    private static final ZoneId IST_ZONE = ZoneId.of("Asia/Kolkata");
+
+    private final TemplateRequestRepository templateRequestRepository;
+    private final ReportTemplateRepository reportTemplateRepository;
+    private final ReportTemplateHistoryRepository reportTemplateHistoryRepository;
+    private final ReportVariantRepository variantRepository;
+    private final VariantParamDefRepository paramRepository;
+    private final FilterRuleRepository filterRuleRepository;
+    private final TemplateRequestValidationService templateRequestValidationService;
+    private final BusinessSecurityService businessSecurityService;
+    private final ObjectMapper objectMapper;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public TemplateRequest createRequest(CreateTemplateRequestDto dto, String creatorId, String token)
+            throws JsonProcessingException {
+        businessSecurityService.validateUserAction(token, dto.getChangeType());
+        templateRequestValidationService.validate(dto);
+
+        String targetId = dto.getPayload().getTemplate().getReportMeta().getReportId();
+        if (!StringUtils.hasText(targetId)) {
+            throw new BadRequestException("reportId is required");
+        }
+
+        List<TemplateRequest> duplicates = templateRequestRepository.findByTargetIdAndReqStatus(targetId, RequestStatus.PENDING);
+        if (!duplicates.isEmpty()) {
+            throw new DataIntegrityViolationException("A pending request for this template already exists");
+        }
+
+        TemplateRequest request = TemplateRequest.builder()
+                .creatorId(creatorId)
+                .changeType(dto.getChangeType())
+                .reqStatus(RequestStatus.PENDING)
+                .reqDate(LocalDateTime.now(IST_ZONE))
+                .payload(objectMapper.writeValueAsString(dto.getPayload()))
+                .targetId(targetId)
+                .remarks(dto.getRemarks())
+                .build();
+
+        return templateRequestRepository.save(request);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public TemplateRequest processRequest(ProcessTemplateRequestDto dto, String executorId)
+            throws JsonProcessingException {
+        TemplateRequest request = templateRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new TemplateNotFoundException("Request not found: " + dto.getRequestId()));
+
+        if (executorId.equals(request.getCreatorId())) {
+            throw new IllegalStateException("Self-approval is not allowed");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Request already processed");
+        }
+
+        if (dto.getStatus() != RequestStatus.ACCEPTED && dto.getStatus() != RequestStatus.REJECTED) {
+            throw new IllegalArgumentException("Only ACCEPTED or REJECTED is allowed for processing");
+        }
+
+        request.setExecutorId(executorId);
+        request.setExecutorRemarks(dto.getRemarks());
+        request.setExecutionDate(LocalDateTime.now(IST_ZONE));
+        request.setReqStatus(dto.getStatus());
+
+        if (dto.getStatus() == RequestStatus.ACCEPTED) {
+            TemplatePayload payload = objectMapper.readValue(request.getPayload(), TemplatePayload.class);
+            switch (request.getChangeType()) {
+                case ADD -> handleCreate(request, payload);
+                case UPDATE -> handleUpdate(request, payload);
+                case DELETE -> handleDelete(request);
+                default -> throw new UnsupportedOperationException("Unsupported changeType: " + request.getChangeType());
+            }
+            request.setExecutionRemarks("Successfully processed approval.");
+        } else {
+            request.setExecutionRemarks("Request rejected.");
+        }
+
+        return templateRequestRepository.save(request);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public TemplateRequest cancelRequest(CancelTemplateRequestDto dto, String userId) {
+        TemplateRequest request = templateRequestRepository.findById(dto.getRequestId())
+                .orElseThrow(() -> new TemplateNotFoundException("Request not found: " + dto.getRequestId()));
+
+        if (!request.getCreatorId().equals(userId)) {
+            throw new AccessDeniedException("You can only cancel your own requests");
+        }
+
+        if (request.getReqStatus() != RequestStatus.PENDING) {
+            throw new IllegalStateException("Only pending requests can be cancelled");
+        }
+
+        request.setReqStatus(RequestStatus.CANCELLED);
+        request.setExecutorId(userId);
+        request.setExecutionDate(LocalDateTime.now(IST_ZONE));
+        request.setExecutorRemarks("CANCELLED BY USER: " + (dto.getRemarks() != null ? dto.getRemarks() : "No remarks"));
+        return templateRequestRepository.save(request);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TemplateRequestSummaryDto> getMyRequests(String userId) {
+        return templateRequestRepository.findByCreatorId(userId)
+                .stream()
+                .map(this::mapToSummaryDto)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TemplateRequestSummaryDto> getPendingRequests(String userId) {
+        return templateRequestRepository.findByCreatorIdNotAndReqStatus(userId, RequestStatus.PENDING)
+                .stream()
+                .map(this::mapToSummaryDto)
+                .toList();
+    }
+
+    private void handleCreate(TemplateRequest request, TemplatePayload payload) {
+        LocalDateTime now = LocalDateTime.now(IST_ZONE);
+        String reportId = payload.getTemplate().getReportMeta().getReportId();
+        int incomingVersion = parseVersion(payload.getTemplate().getTemplateMeta().getVersion());
+        String templateJson = serialize(payload.getTemplate());
+
+        reportTemplateRepository.findFirstByReportIdAndStatus(reportId, "ACTIVE")
+                .ifPresent(existing -> {
+                    archiveTemplate(existing, request.getExecutorId(), now);
+                    deleteVariants(existing.getTemplateId());
+                    reportTemplateRepository.delete(existing);
+                });
+
+        ReportTemplate template = ReportTemplate.builder()
+                .reportId(reportId)
+                .templateName(payload.getTemplate().getReportMeta().getReportName())
+                .description(payload.getTemplate().getTemplateMeta().getDescription())
+                .versionNo(incomingVersion)
+                .status("ACTIVE")
+                .templateJson(templateJson)
+                .createdAt(now)
+                .createdBy(request.getCreatorId())
+                .updatedAt(now)
+                .updatedBy(request.getExecutorId())
+                .remarks(request.getRemarks())
+                .build();
+
+        ReportTemplate saved = reportTemplateRepository.save(template);
+        saveVariants(payload, saved, request, now);
+    }
+
+    private void handleUpdate(TemplateRequest request, TemplatePayload payload) {
+        String targetId = request.getTargetId();
+        if (!StringUtils.hasText(targetId)) {
+            throw new BadRequestException("targetId required for UPDATE");
+        }
+
+        LocalDateTime now = LocalDateTime.now(IST_ZONE);
+
+        ReportTemplate template = reportTemplateRepository.findFirstByReportId(targetId)
+                .orElseThrow(() -> new TemplateNotFoundException("Template not found for reportId: " + targetId));
+
+        archiveTemplate(template, request.getExecutorId(), now);
+
+        int newVersion = template.getVersionNo() == null ? 1 : template.getVersionNo() + 1;
+        payload.getTemplate().getTemplateMeta().setVersion(String.valueOf(newVersion));
+
+        template.setReportId(payload.getTemplate().getReportMeta().getReportId());
+        template.setTemplateName(payload.getTemplate().getReportMeta().getReportName());
+        template.setDescription(payload.getTemplate().getTemplateMeta().getDescription());
+        template.setRemarks(request.getRemarks());
+        template.setTemplateJson(serialize(payload.getTemplate()));
+        template.setVersionNo(newVersion);
+        template.setUpdatedAt(now);
+        template.setUpdatedBy(request.getExecutorId());
+
+        ReportTemplate savedTemplate = reportTemplateRepository.save(template);
+        deleteVariants(savedTemplate.getTemplateId());
+        saveVariants(payload, savedTemplate, request, now);
+    }
+
+    private void handleDelete(TemplateRequest request) {
+        String targetId = request.getTargetId();
+        if (!StringUtils.hasText(targetId)) {
+            throw new BadRequestException("targetId required for DELETE");
+        }
+
+        LocalDateTime now = LocalDateTime.now(IST_ZONE);
+        ReportTemplate template = reportTemplateRepository.findFirstByReportId(targetId)
+                .orElseThrow(() -> new TemplateNotFoundException("Template not found for reportId: " + targetId));
+
+        archiveTemplate(template, request.getExecutorId(), now);
+        deleteVariants(template.getTemplateId());
+        reportTemplateRepository.delete(template);
+    }
+
+    private void archiveTemplate(ReportTemplate template, String archivedBy, LocalDateTime archivedAt) {
+        String variantsSnapshot = fetchVariantsAsJson(template.getTemplateId());
+
+        ReportTemplateHistory history = ReportTemplateHistory.builder()
+                .templateId(template.getTemplateId())
+                .versionNo(template.getVersionNo())
+                .reportId(template.getReportId())
+                .templateName(template.getTemplateName())
+                .description(template.getDescription())
+                .status("INACTIVE")
+                .templateJson(template.getTemplateJson())
+                .variantsJson(variantsSnapshot)
+                .createdBy(template.getCreatedBy())
+                .createdAt(template.getCreatedAt())
+                .archivedBy(archivedBy)
+                .archivedAt(archivedAt)
+                .remarks(template.getRemarks())
+                .build();
+
+        reportTemplateHistoryRepository.save(history);
+    }
+
+    private String fetchVariantsAsJson(String templateId) {
+        try {
+            List<ReportVariant> variants = variantRepository.findByTemplateId(templateId);
+            List<VariantDto> dtos = new ArrayList<>();
+            for (ReportVariant variant : variants) {
+                List<VariantParamDef> params = paramRepository.findByVariantIdIn(List.of(variant.getVariantId()));
+                List<FilterRule> rules = filterRuleRepository.findByVariantIdIn(List.of(variant.getVariantId()));
+
+                VariantDto dto = VariantDto.builder()
+                        .variantCode(variant.getVariantCode())
+                        .variantName(variant.getVariantName())
+                        .description(variant.getDescription())
+                        .status(variant.getStatus())
+                        .params(params.stream().map(p -> VariantParamDto.builder()
+                                .paramName(p.getParamName())
+                                .label(p.getLabel())
+                                .paramType(p.getParamType())
+                                .required("Y".equalsIgnoreCase(p.getRequired()))
+                                .multiValued("Y".equalsIgnoreCase(p.getMultiVal()))
+                                .uiHint(p.getUiHint())
+                                .validation(p.getValidation())
+                                .build()).toList())
+                        .filterRules(rules.stream().map(r -> FilterRuleDto.builder()
+                                .dbColumn(r.getDbColumn())
+                                .operator(r.getOperator())
+                                .paramName(r.getParamName())
+                                .scopeType(r.getScopeType())
+                                .scopeValue(r.getScopeValue())
+                                .build()).toList())
+                        .build();
+                dtos.add(dto);
+            }
+            return objectMapper.writeValueAsString(dtos);
+        } catch (Exception ex) {
+            log.error("Failed to fetch variants snapshot for templateId={}", templateId, ex);
+            return "[]";
+        }
+    }
+
+    private void saveVariants(TemplatePayload payload, ReportTemplate template, TemplateRequest request, LocalDateTime now) {
+        if (payload.getVariants() == null) {
+            return;
+        }
+
+        for (VariantDto variantDto : payload.getVariants()) {
+            ReportVariant variant = ReportVariant.builder()
+                    .templateId(template.getTemplateId())
+                    .variantCode(variantDto.getVariantCode())
+                    .variantName(variantDto.getVariantName())
+                    .description(variantDto.getDescription())
+                    .status(variantDto.getStatus())
+                    .createdAt(now)
+                    .createdBy(request.getCreatorId())
+                    .updatedAt(now)
+                    .updatedBy(request.getExecutorId())
+                    .build();
+
+            ReportVariant savedVariant = variantRepository.save(variant);
+
+            if (variantDto.getParams() != null) {
+                for (VariantParamDto paramDto : variantDto.getParams()) {
+                    VariantParamDef param = VariantParamDef.builder()
+                            .reportVariant(savedVariant)
+                            .paramName(paramDto.getParamName())
+                            .label(paramDto.getLabel())
+                            .paramType(paramDto.getParamType())
+                            .required(paramDto.isRequired() ? "Y" : "N")
+                            .multiVal(paramDto.isMultiValued() ? "Y" : "N")
+                            .uiHint(paramDto.getUiHint())
+                            .validation(paramDto.getValidation())
+                            .createdAt(now)
+                            .build();
+                    paramRepository.save(param);
+                }
+            }
+
+            if (variantDto.getFilterRules() != null) {
+                for (FilterRuleDto ruleDto : variantDto.getFilterRules()) {
+                    FilterRule filterRule = FilterRule.builder()
+                            .reportVariant(savedVariant)
+                            .dbColumn(ruleDto.getDbColumn())
+                            .operator(ruleDto.getOperator())
+                            .paramName(ruleDto.getParamName())
+                            .scopeType(ruleDto.getScopeType())
+                            .scopeValue(ruleDto.getScopeValue())
+                            .createdAt(now)
+                            .build();
+                    filterRuleRepository.save(filterRule);
+                }
+            }
+        }
+    }
+
+    private void deleteVariants(String templateId) {
+        List<ReportVariant> variants = variantRepository.findByTemplateId(templateId);
+        if (variants.isEmpty()) {
+            return;
+        }
+
+        for (ReportVariant variant : variants) {
+            Long variantId = variant.getVariantId();
+            paramRepository.deleteByVariantId(variantId);
+            filterRuleRepository.deleteByVariantId(variantId);
+            variantRepository.delete(variant);
+        }
+
+        paramRepository.flush();
+        filterRuleRepository.flush();
+        variantRepository.flush();
+    }
+
+    private String serialize(Object obj) {
+        try {
+            return objectMapper.writeValueAsString(obj);
+        } catch (JsonProcessingException e) {
+            throw new BadRequestException("Failed to serialize template json");
+        }
+    }
+
+    private TemplateRequestSummaryDto mapToSummaryDto(TemplateRequest request) {
+        Map<String, String> summary = new HashMap<>();
+        try {
+            JsonNode root = objectMapper.readTree(request.getPayload());
+            JsonNode templateMeta = root.path("template").path("templateMeta");
+            JsonNode reportMeta = root.path("template").path("reportMeta");
+            summary.put("templateId", text(templateMeta, "templateId"));
+            summary.put("reportId", text(reportMeta, "reportId"));
+            summary.put("version", text(templateMeta, "version"));
+            summary.put("reportName", text(reportMeta, "reportName"));
+            summary.put("remarks", text(root, "remarks"));
+        } catch (Exception e) {
+            log.warn("Unable to parse request payload for summary. reqId={}", request.getReqId(), e);
+            summary = Map.of();
+        }
+
+        return TemplateRequestSummaryDto.builder()
+                .id(request.getReqId())
+                .changeType(request.getChangeType())
+                .reqStatus(request.getReqStatus())
+                .reqDate(request.getReqDate())
+                .creatorId(request.getCreatorId())
+                .targetId(request.getTargetId())
+                .remarks(request.getRemarks())
+                .executionDate(request.getExecutionDate())
+                .executorId(request.getExecutorId())
+                .executorRemarks(request.getExecutorRemarks())
+                .summary(summary)
+                .build();
+    }
+
+    private int parseVersion(String version) {
+        if (!StringUtils.hasText(version)) {
+            return 1;
+        }
+        try {
+            return Integer.parseInt(version.trim());
+        } catch (NumberFormatException ex) {
+            return 1;
+        }
+    }
+
+    private String text(JsonNode node, String field) {
+        JsonNode val = node.path(field);
+        return val.isMissingNode() || val.isNull() ? "" : val.asText("");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.TemplateConfigurationService.requests.repository;
+
+import com.fincore.TemplateConfigurationService.requests.entity.TemplateRequest;
+import com.fincore.TemplateConfigurationService.requests.enums.RequestStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.List;
+
+public interface TemplateRequestRepository extends JpaRepository<TemplateRequest, Long> {
+
+    List<TemplateRequest> findByCreatorId(String creatorId);
+
+    List<TemplateRequest> findByCreatorIdNotAndReqStatus(String creatorId, RequestStatus status);
+
+    List<TemplateRequest> findByTargetIdAndReqStatus(String targetId, RequestStatus status);
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.TemplateConfigurationService.requests.entity;
+
+import com.fasterxml.jackson.annotation.JsonRawValue;
+import com.fincore.TemplateConfigurationService.requests.enums.ChangeType;
+import com.fincore.TemplateConfigurationService.requests.enums.RequestStatus;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Lob;
+import jakarta.persistence.SequenceGenerator;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "RB_TEMPLATE_REQUEST")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class TemplateRequest {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "rb_template_request_seq_gen")
+    @SequenceGenerator(name = "rb_template_request_seq_gen", sequenceName = "RB_TEMPLATE_REQUEST_SEQ", allocationSize = 1)
+    @Column(name = "REQ_ID", nullable = false)
+    private Long reqId;
+
+    @Column(name = "CHANGE_TYPE", nullable = false, length = 2)
+    private ChangeType changeType;
+
+    @Column(name = "REQ_STATUS", nullable = false, length = 2)
+    private RequestStatus reqStatus;
+
+    @Column(name = "REQ_DATE", nullable = false)
+    private LocalDateTime reqDate;
+
+    @Column(name = "CREATOR_ID", nullable = false, length = 12)
+    private String creatorId;
+
+    @Column(name = "EXECUTION_DATE")
+    private LocalDateTime executionDate;
+
+    @Lob
+    @Column(name = "EXECUTION_REMARKS")
+    private String executionRemarks;
+
+    @Column(name = "EXECUTOR_ID", length = 12)
+    private String executorId;
+
+    @Column(name = "EXECUTOR_REMARKS", length = 500)
+    private String executorRemarks;
+
+    @Lob
+    @Column(name = "PAYLOAD", nullable = false)
+    private String payload;
+
+    @Column(name = "TARGET_ID", length = 4000)
+    private String targetId;
+
+    @Column(name = "REMARKS", length = 500)
+    private String remarks;
+
+    @JsonRawValue
+    public String getPayload() {
+        return payload;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+rb_template_request :
+
+REQ_ID	NUMBER(19,0)	No		1	
+CHANGE_TYPE	VARCHAR2(2 CHAR)	No		2	
+REQ_STATUS	VARCHAR2(2 CHAR)	No		3	
+REQ_DATE	TIMESTAMP(6)	No		4	
+CREATOR_ID	VARCHAR2(12 CHAR)	No		5	
+EXECUTION_DATE	TIMESTAMP(6)	Yes		6	
+EXECUTION_REMARKS	CLOB	Yes		7	
+EXECUTOR_ID	VARCHAR2(12 CHAR)	Yes		8	
+EXECUTOR_REMARKS	VARCHAR2(500 CHAR)	Yes		9	
+PAYLOAD	CLOB	No		10	
+TARGET_ID	VARCHAR2(4000 CHAR)	Yes		11	
+REMARKS	VARCHAR2(500 CHAR)	Yes		12	
+
+
+
+
+
+
+
+
+
