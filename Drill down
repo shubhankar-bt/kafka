@@ -1,0 +1,596 @@
+```xml
+        <!-- Spring Boot Web for REST APIs -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Spring Boot Validation for secure DTOs (Regex validation) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- Redis Caching -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```properties
+spring.application.name=analytics-service
+
+# 1. Enable Virtual Threads for high-concurrency non-blocking I/O (Java 21+)
+spring.threads.virtual.enabled=true
+
+# 2. Apache Druid Connection configs
+druid.router.url=http://localhost:8888
+druid.datasource.name=financial_data
+
+# 3. Redis Configuration
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+
+```
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.config;
+
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
+
+@Configuration
+@EnableCaching
+public class RedisConfig {
+
+    @Bean
+    public RedisCacheConfiguration cacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(30)) // Adjust TTL based on your data freshness SLA
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(new GenericJackson2JsonRedisSerializer()));
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.dto;
+
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import java.util.List;
+import java.util.Map;
+
+public class DrillDownDtos {
+
+    // --- REQUEST DTOs ---
+    
+    public record DrillDownRequest(
+        @NotEmpty(message = "At least one dimension is required")
+        List<@Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Invalid dimension name format") String> dimensions,
+        
+        @NotEmpty(message = "At least one metric is required")
+        List<@Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Invalid metric name format") String> metrics,
+        
+        @NotEmpty(message = "Hierarchy array is required to determine leaf nodes dynamically")
+        List<@Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Invalid hierarchy name format") String> hierarchy,
+        
+        @NotNull(message = "Filters array cannot be null")
+        List<FilterDto> filters
+    ) {}
+
+    public record FilterDto(
+        @NotEmpty(message = "Filter field is required")
+        @Pattern(regexp = "^[a-zA-Z0-9_]+$", message = "Invalid filter field format") 
+        String field,
+        
+        @NotEmpty(message = "Filter operator is required") 
+        String operator, 
+        
+        @NotNull(message = "Filter value cannot be null") 
+        Object value
+    ) {}
+
+    // --- RESPONSE DTOs ---
+
+    public record DrillDownResponse(
+        Meta meta,
+        List<Map<String, Object>> data
+    ) {}
+
+    public record Meta(
+        String status,
+        String level,
+        int rowCount,
+        long executionTimeMs
+    ) {}
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.client;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class DruidRestClient {
+
+    private static final Logger log = LoggerFactory.getLogger(DruidRestClient.class);
+    private final RestClient restClient;
+
+    public DruidRestClient(
+            RestClient.Builder restClientBuilder,
+            @Value("${druid.router.url:http://localhost:8888}") String druidUrl) {
+        
+        this.restClient = restClientBuilder
+                .baseUrl(druidUrl)
+                .defaultHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    /**
+     * Executes a parameterized SQL query against Druid securely.
+     */
+    public List<Map<String, Object>> executeQuery(Map<String, Object> druidSqlPayload) {
+        log.debug("Executing Druid Query payload: {}", druidSqlPayload);
+
+        return restClient.post()
+                .uri("/druid/v2/sql")
+                .body(druidSqlPayload)
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.component;
+
+import com.app.analytics.dto.DrillDownDtos.DrillDownRequest;
+import com.app.analytics.dto.DrillDownDtos.FilterDto;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class DruidQueryBuilder {
+
+    private static final Logger log = LoggerFactory.getLogger(DruidQueryBuilder.class);
+
+    @Value("${druid.datasource.name:financial_data}")
+    private String datasourceName;
+
+    /**
+     * Dynamically builds a secure Druid SQL query mapping frontend dimensions/metrics.
+     */
+    public Map<String, Object> buildSqlPayload(DrillDownRequest request, String targetDimension) {
+        StringBuilder sql = new StringBuilder("SELECT ");
+        
+        // 1. Target Dimension
+        sql.append("\"").append(targetDimension).append("\" AS \"name\"");
+        
+        // 2. Aggregate Metrics securely
+        for (String metric : request.metrics()) {
+            sql.append(", SUM(\"").append(metric).append("\") AS \"").append(metric).append("\"");
+        }
+        
+        sql.append(" FROM \"").append(datasourceName).append("\" ");
+
+        // 3. Apply Filters using parameterized SQL values (protects against SQLi)
+        List<Map<String, String>> parameters = new ArrayList<>();
+        if (request.filters() != null && !request.filters().isEmpty()) {
+            sql.append("WHERE 1=1 ");
+            for (FilterDto filter : request.filters()) {
+                appendFilterCondition(sql, parameters, filter);
+            }
+        }
+        
+        // 4. Group By the target dimension explicitly
+        sql.append(" GROUP BY \"").append(targetDimension).append("\"");
+
+        return Map.of(
+            "query", sql.toString(),
+            "parameters", parameters
+        );
+    }
+
+    private void appendFilterCondition(StringBuilder sql, List<Map<String, String>> parameters, FilterDto filter) {
+        switch (filter.operator().toUpperCase()) {
+            case "EQUALS" -> {
+                sql.append(" AND \"").append(filter.field()).append("\" = ? ");
+                parameters.add(Map.of("type", "VARCHAR", "value", String.valueOf(filter.value())));
+            }
+            case "NOT_EQUALS" -> {
+                sql.append(" AND \"").append(filter.field()).append("\" <> ? ");
+                parameters.add(Map.of("type", "VARCHAR", "value", String.valueOf(filter.value())));
+            }
+            // Future extensibility for other operators like IN, LIKE, etc.
+            default -> {
+                log.warn("Unsupported filter operator requested: {}", filter.operator());
+                throw new IllegalArgumentException("Unsupported filter operator: " + filter.operator());
+            }
+        }
+    }
+}
+
+
+```
+
+
+
+
+
+```java
+package com.app.analytics.service;
+
+import com.app.analytics.client.DruidRestClient;
+import com.app.analytics.component.DruidQueryBuilder;
+import com.app.analytics.dto.DrillDownDtos.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+
+import java.util.*;
+
+@Service
+public class DruidAnalyticsServiceImpl {
+
+    private static final Logger log = LoggerFactory.getLogger(DruidAnalyticsServiceImpl.class);
+
+    private final DruidRestClient druidRestClient;
+    private final DruidQueryBuilder queryBuilder;
+
+    public DruidAnalyticsServiceImpl(DruidRestClient druidRestClient, DruidQueryBuilder queryBuilder) {
+        this.druidRestClient = druidRestClient;
+        this.queryBuilder = queryBuilder;
+    }
+
+    // Cache key built safely to distinguish distinct JSON queries in Redis
+    @Cacheable(value = "drillDownData", key = "T(java.lang.String).valueOf(#request.hashCode())")
+    public DrillDownResponse getDrillDownData(DrillDownRequest request) {
+        long startTime = System.currentTimeMillis();
+        String targetDimension = request.dimensions().get(0);
+        
+        log.info("Initiating drill-down for dimension: [{}] with {} metrics and {} filters", 
+                 targetDimension, request.metrics().size(), request.filters().size());
+
+        // 1. Build & Execute
+        Map<String, Object> druidPayload = queryBuilder.buildSqlPayload(request, targetDimension);
+        List<Map<String, Object>> rawDruidData = druidRestClient.executeQuery(druidPayload);
+
+        // Edge Case: No data returned
+        if (CollectionUtils.isEmpty(rawDruidData)) {
+            log.info("Druid returned empty result set for dimension: [{}]", targetDimension);
+            return new DrillDownResponse(new Meta("SUCCESS", targetDimension, 0, System.currentTimeMillis() - startTime), Collections.emptyList());
+        }
+
+        // 2. Resolve hierarchy position
+        boolean hasChildren = determineIfHasChildren(targetDimension, request.hierarchy());
+
+        // 3. Format Response to Contract
+        List<Map<String, Object>> formattedData = formatResponseData(rawDruidData, targetDimension, hasChildren);
+
+        long executionTime = System.currentTimeMillis() - startTime;
+        log.info("Drill-down for [{}] completed successfully in {} ms with {} rows", targetDimension, executionTime, formattedData.size());
+
+        return new DrillDownResponse(new Meta("SUCCESS", targetDimension, formattedData.size(), executionTime), formattedData);
+    }
+
+    private boolean determineIfHasChildren(String targetDimension, List<String> hierarchy) {
+        int currentIndex = hierarchy.indexOf(targetDimension);
+        if (currentIndex == -1) {
+            log.warn("Dimension [{}] not found in provided hierarchy array. Defaulting hasChildren to false.", targetDimension);
+            return false;
+        }
+        return currentIndex < hierarchy.size() - 1;
+    }
+
+    private List<Map<String, Object>> formatResponseData(List<Map<String, Object>> rawData, String dimension, boolean hasChildren) {
+        String dimensionPrefix = dimension.toLowerCase().split("_")[0];
+        List<Map<String, Object>> formattedList = new ArrayList<>(rawData.size());
+
+        for (Map<String, Object> row : rawData) {
+            Map<String, Object> formattedRow = new LinkedHashMap<>();
+            
+            // Handle null/empty group-by strings from Druid gracefully
+            Object rawName = row.get("name");
+            String nameValue = (rawName != null && !rawName.toString().isBlank()) ? rawName.toString() : "Unassigned";
+            
+            // Create deterministic ID for React Rendering (e.g. branch_mumbai_south)
+            String generatedId = dimensionPrefix + "_" + nameValue.toLowerCase().replaceAll("[^a-z0-9]", "_");
+
+            formattedRow.put("id", generatedId);
+            formattedRow.put("name", nameValue);
+            
+            // Map metrics safely
+            for (Map.Entry<String, Object> entry : row.entrySet()) {
+                if (!entry.getKey().equals("name")) {
+                    formattedRow.put(entry.getKey(), entry.getValue() == null ? 0.0 : entry.getValue());
+                }
+            }
+            
+            formattedRow.put("hasChildren", hasChildren);
+            formattedList.add(formattedRow);
+        }
+
+        return formattedList;
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.controller;
+
+import com.app.analytics.dto.DrillDownDtos.DrillDownRequest;
+import com.app.analytics.dto.DrillDownDtos.DrillDownResponse;
+import com.app.analytics.service.DruidAnalyticsServiceImpl;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/reports")
+@CrossOrigin(origins = "*") // Configure based on UI host security requirements
+public class AnalyticsController {
+
+    private final DruidAnalyticsServiceImpl analyticsService;
+
+    public AnalyticsController(DruidAnalyticsServiceImpl analyticsService) {
+        this.analyticsService = analyticsService;
+    }
+
+    /**
+     * POST /api/reports/drill-down
+     * RBAC Note: Protect this endpoint using @PreAuthorize if Spring Security is enabled.
+     */
+    @PostMapping("/drill-down")
+    public ResponseEntity<DrillDownResponse> getDrillDownReport(
+            @Valid @RequestBody DrillDownRequest request) {
+        
+        DrillDownResponse response = analyticsService.getDrillDownData(request);
+        return ResponseEntity.ok(response);
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.app.analytics.exception;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.client.RestClientResponseException;
+import org.springframework.web.client.ResourceAccessException;
+
+import java.net.URI;
+import java.util.stream.Collectors;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    // 1. DTO Validation Failures (SQL Injection Regex blocks, empty lists)
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail handleValidationExceptions(MethodArgumentNotValidException ex) {
+        String errors = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining("; "));
+        
+        log.warn("Payload validation failed: {}", errors);
+
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, errors);
+        problemDetail.setTitle("Invalid Request Payload");
+        problemDetail.setType(URI.create("https://api.yourdomain.com/errors/invalid-request"));
+        return problemDetail;
+    }
+
+    // 2. Business/Logic Exceptions
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ProblemDetail handleIllegalArgument(IllegalArgumentException ex) {
+        log.warn("Invalid business argument provided: {}", ex.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    // 3. Druid Engine HTTP Errors (Bad SQL query, Engine timeouts)
+    @ExceptionHandler(RestClientResponseException.class)
+    public ProblemDetail handleDruidHttpErrors(RestClientResponseException ex) {
+        log.error("Druid API Error - Status: {}, Body: {}", ex.getStatusCode(), ex.getResponseBodyAsString());
+        
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_GATEWAY, 
+            "The Analytics engine encountered an error while processing the query.");
+        problemDetail.setTitle("Analytics Query Failed");
+        return problemDetail;
+    }
+
+    // 4. Druid Network Unreachable
+    @ExceptionHandler(ResourceAccessException.class)
+    public ProblemDetail handleDruidNetworkIssues(ResourceAccessException ex) {
+        log.error("Network error reaching Druid cluster: {}", ex.getMessage());
+        
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, 
+            "The Analytics engine is currently unreachable. Please try again later.");
+        problemDetail.setTitle("Analytics Engine Unreachable");
+        return problemDetail;
+    }
+    
+    // 5. Generic Fallback
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleGenericException(Exception ex) {
+        log.error("Unhandled Exception occurred: ", ex);
+        
+        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, 
+            "An unexpected server error occurred.");
+        problemDetail.setTitle("Internal Server Error");
+        return problemDetail;
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
