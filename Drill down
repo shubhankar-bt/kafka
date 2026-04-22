@@ -1,302 +1,53 @@
-```properties
-spring.application.name=analytics-service
-
-# --- 1. Virtual Threads ---
-spring.threads.virtual.enabled=true
-
-# --- 2. Druid Configuration ---
-druid.router.url=http://localhost:8888
-druid.datasource.name=financial_data
-
-# Set this to true to generate fake data locally. Set to false when Druid is ready!
-druid.mock.enabled=true
-
-# --- 3. Redis Configuration ---
-spring.data.redis.host=localhost
-spring.data.redis.port=6379
-
-
-```
-
-
-
-
-
-
-
-
-
-```java
-package com.app.analytics;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
-import org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration;
-
-// Exclude standard Database auto-configurations since we use Druid REST and Redis
-@SpringBootApplication(exclude = {DataSourceAutoConfiguration.class, HibernateJpaAutoConfiguration.class})
-public class AnalyticsServiceApplication {
-
-    public static void main(String[] args) {
-        SpringApplication.run(AnalyticsServiceApplication.class, args);
-    }
-
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.app.analytics.client;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.ParameterizedTypeReference;
-import org.springframework.http.MediaType;
-import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestClient;
-
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-
-@Component
-public class DruidRestClient {
-
-    private static final Logger log = LoggerFactory.getLogger(DruidRestClient.class);
-    private final RestClient restClient;
-    private final boolean mockEnabled;
-
-    public DruidRestClient(
-            RestClient.Builder restClientBuilder,
-            @Value("${druid.router.url:http://localhost:8888}") String druidUrl,
-            @Value("${druid.mock.enabled:false}") boolean mockEnabled) {
-        
-        this.mockEnabled = mockEnabled;
-        this.restClient = restClientBuilder
-                .baseUrl(druidUrl)
-                .defaultHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
-                .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
-                .build();
-    }
-
-    /**
-     * Executes the query or returns Mock Data if mock mode is enabled.
-     * We pass targetDimension and metrics purely to help generate realistic mock data.
-     */
-    public List<Map<String, Object>> executeQuery(Map<String, Object> druidSqlPayload, String targetDimension, List<String> metrics) {
-        if (mockEnabled) {
-            log.info("MOCK MODE ENABLED: Generating fake Druid response for dimension [{}]", targetDimension);
-            return generateMockDruidResponse(targetDimension, metrics);
-        }
-
-        log.debug("Executing REAL Druid Query payload: {}", druidSqlPayload);
-
-        return restClient.post()
-                .uri("/druid/v2/sql")
-                .body(druidSqlPayload)
-                .retrieve()
-                .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
-    }
-
-    /**
-     * Generates dummy data that perfectly mimics how Druid groups and returns JSON.
-     */
-    private List<Map<String, Object>> generateMockDruidResponse(String targetDimension, List<String> metrics) {
-        List<Map<String, Object>> mockData = new ArrayList<>();
-        Random random = new Random();
-        
-        // Generate 3 to 6 mock rows
-        int rowCount = random.nextInt(4) + 3; 
-
-        // e.g., if targetDimension is "Branch_name", cleanName becomes "Branch"
-        String cleanName = targetDimension.split("_")[0];
-        // Capitalize first letter
-        cleanName = cleanName.substring(0, 1).toUpperCase() + cleanName.substring(1);
-
-        String[] regions = {"North", "South", "East", "West", "Central", "Main"};
-
-        for (int i = 0; i < rowCount; i++) {
-            Map<String, Object> row = new LinkedHashMap<>();
-            
-            // Druid always returns the grouped column mapped to whatever AS alias we gave it.
-            // Our query builder aliases the target dimension AS "name"
-            row.put("name", cleanName + " " + regions[i % regions.length] + " " + (i + 1));
-
-            // Generate a random number for each requested metric (e.g., jan, feb, mar)
-            for (String metric : metrics) {
-                // Generate a realistic financial amount between 50,000 and 250,000
-                double randomAmount = 50000 + (200000 * random.nextDouble());
-                // Round to 2 decimal places to mimic actual currency data
-                row.put(metric, Math.round(randomAmount * 100.0) / 100.0);
-            }
-
-            mockData.add(row);
-        }
-        
-        // Simulate network delay of 200ms to 600ms so the frontend UI spinners actually show up!
-        try { Thread.sleep(random.nextInt(400) + 200); } catch (InterruptedException ignored) {}
-
-        return mockData;
-    }
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.app.analytics.service;
-
-import com.app.analytics.client.DruidRestClient;
-import com.app.analytics.component.DruidQueryBuilder;
-import com.app.analytics.dto.DrillDownDtos.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.stereotype.Service;
-import org.springframework.util.CollectionUtils;
-
-import java.util.*;
-
-@Service
-public class DruidAnalyticsServiceImpl {
-
-    private static final Logger log = LoggerFactory.getLogger(DruidAnalyticsServiceImpl.class);
-
-    private final DruidRestClient druidRestClient;
-    private final DruidQueryBuilder queryBuilder;
-
-    public DruidAnalyticsServiceImpl(DruidRestClient druidRestClient, DruidQueryBuilder queryBuilder) {
-        this.druidRestClient = druidRestClient;
-        this.queryBuilder = queryBuilder;
-    }
-
-    // Cache key built safely to distinguish distinct JSON queries in Redis
-    @Cacheable(value = "drillDownData", key = "T(java.lang.String).valueOf(#request.hashCode())")
-    public DrillDownResponse getDrillDownData(DrillDownRequest request) {
-        long startTime = System.currentTimeMillis();
-        String targetDimension = request.dimensions().get(0);
-        
-        log.info("Initiating drill-down for dimension: [{}] with {} metrics and {} filters", 
-                 targetDimension, request.metrics().size(), request.filters().size());
-
-        // 1. Build Query Payload
-        Map<String, Object> druidPayload = queryBuilder.buildSqlPayload(request, targetDimension);
-        
-        // 2. Execute (Will use mock data if druid.mock.enabled=true)
-        List<Map<String, Object>> rawDruidData = druidRestClient.executeQuery(druidPayload, targetDimension, request.metrics());
-
-        // Edge Case: No data returned
-        if (CollectionUtils.isEmpty(rawDruidData)) {
-            log.info("Druid returned empty result set for dimension: [{}]", targetDimension);
-            return new DrillDownResponse(new Meta("SUCCESS", targetDimension, 0, System.currentTimeMillis() - startTime), Collections.emptyList());
-        }
-
-        // 3. Resolve hierarchy position dynamically
-        boolean hasChildren = determineIfHasChildren(targetDimension, request.hierarchy());
-
-        // 4. Format Response to Contract
-        List<Map<String, Object>> formattedData = formatResponseData(rawDruidData, targetDimension, hasChildren);
-
-        long executionTime = System.currentTimeMillis() - startTime;
-        log.info("Drill-down for [{}] completed successfully in {} ms with {} rows", targetDimension, executionTime, formattedData.size());
-
-        return new DrillDownResponse(new Meta("SUCCESS", targetDimension, formattedData.size(), executionTime), formattedData);
-    }
-
-    private boolean determineIfHasChildren(String targetDimension, List<String> hierarchy) {
-        int currentIndex = hierarchy.indexOf(targetDimension);
-        if (currentIndex == -1) {
-            log.warn("Dimension [{}] not found in provided hierarchy array. Defaulting hasChildren to false.", targetDimension);
-            return false;
-        }
-        return currentIndex < hierarchy.size() - 1;
-    }
-
-    private List<Map<String, Object>> formatResponseData(List<Map<String, Object>> rawData, String dimension, boolean hasChildren) {
-        String dimensionPrefix = dimension.toLowerCase().split("_")[0];
-        List<Map<String, Object>> formattedList = new ArrayList<>(rawData.size());
-
-        for (Map<String, Object> row : rawData) {
-            Map<String, Object> formattedRow = new LinkedHashMap<>();
-            
-            // Handle null/empty group-by strings gracefully
-            Object rawName = row.get("name");
-            String nameValue = (rawName != null && !rawName.toString().isBlank()) ? rawName.toString() : "Unassigned";
-            
-            // Create deterministic ID for React Rendering (e.g. branch_north_1)
-            String generatedId = dimensionPrefix + "_" + nameValue.toLowerCase().replaceAll("[^a-z0-9]", "_");
-
-            formattedRow.put("id", generatedId);
-            formattedRow.put("name", nameValue);
-            
-            // Map metrics safely
-            for (Map.Entry<String, Object> entry : row.entrySet()) {
-                if (!entry.getKey().equals("name")) {
-                    formattedRow.put(entry.getKey(), entry.getValue() == null ? 0.0 : entry.getValue());
-                }
-            }
-            
-            formattedRow.put("hasChildren", hasChildren);
-            formattedList.add(formattedRow);
-        }
-
-        return formattedList;
-    }
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
 {
   "dimensions": ["Branch_name"],
   "metrics": ["jan", "feb", "mar"],
   "hierarchy": ["Circle_name", "Branch_name", "comp_code", "CGL_Number"],
   "filters": []
 }
-You will get a beautifully formatted response populated with mock financial data that the React frontend can consume immediately!
 
 
+
+response :
+
+{
+    "meta": {
+        "status": "SUCCESS",
+        "level": "Branch_name",
+        "rowCount": 4,
+        "executionTimeMs": 317
+    },
+    "data": [
+        {
+            "id": "branch_branch_north_1",
+            "name": "Branch North 1",
+            "jan": 180954.57,
+            "feb": 78850.41,
+            "mar": 183664.09,
+            "hasChildren": true
+        },
+        {
+            "id": "branch_branch_south_2",
+            "name": "Branch South 2",
+            "jan": 146313.36,
+            "feb": 164962.3,
+            "mar": 192135.69,
+            "hasChildren": true
+        },
+        {
+            "id": "branch_branch_east_3",
+            "name": "Branch East 3",
+            "jan": 201380.62,
+            "feb": 116091.54,
+            "mar": 62540.14,
+            "hasChildren": true
+        },
+        {
+            "id": "branch_branch_west_4",
+            "name": "Branch West 4",
+            "jan": 120428.81,
+            "feb": 193845.02,
+            "mar": 140579.18,
+            "hasChildren": true
+        }
+    ]
+}
