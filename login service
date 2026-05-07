@@ -2,6 +2,7 @@ package com.fincore.gateway.Controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LaunchService;
 import com.fincore.gateway.Service.LoginService;
 import com.fincore.gateway.Service.TokenSessionValidator;
 import com.fincore.gateway.dto.*;
@@ -42,7 +43,7 @@ import java.util.Map;
  */
 @Slf4j
 @RestController
-@RequestMapping("/auth")
+@RequestMapping("/api/auth")
 @RequiredArgsConstructor
 public class AuthController {
 
@@ -52,6 +53,7 @@ public class AuthController {
     private final ReactiveStringRedisTemplate redisTemplate;
     private final LoginService loginService;
     private final ObjectMapper mapper;
+    private final LaunchService launchService;
 
     @Value("${security.jwt.hmac-base64-secret:}")
     private String hmacSecret;
@@ -64,6 +66,9 @@ public class AuthController {
 
     @Value("${security.login.blocked-ips:}")
     private String blockedIpsConfig;
+
+    @Value("${security.payload.rsa-public:}")
+    private String rsaPublicPem;
 
     // =================================================================================================
     //                                              HELPERS
@@ -102,7 +107,7 @@ public class AuthController {
                 .secure(true) // Set to true in PROD
                 .path("/")
                 .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Lax")
+                .sameSite("Strict")
                 .build();
     }
 
@@ -112,10 +117,35 @@ public class AuthController {
     private ResponseCookie createEmptyCookie() {
         return ResponseCookie.from("refresh_token", "")
                 .httpOnly(true)
+                .secure(true) // Set to true in PROD
                 .path("/")
                 .maxAge(0)
+                .sameSite("Strict")
                 .build();
     }
+
+//    private ResponseCookie createRefreshTokenCookie(String token) {
+//        return ResponseCookie.from("refresh_token", token)
+//                .httpOnly(true)
+//                .secure(true) // Set to true in PROD
+//                .path("/auth/refresh-token")
+//                .maxAge(Duration.ofSeconds(refreshTokenTtl))
+//                .sameSite("Lax")
+//                .build();
+//    }
+//
+//    /**
+//     * Creates an empty cookie to clear the refresh token on logout.
+//     */
+//    private ResponseCookie createEmptyCookie() {
+//        return ResponseCookie.from("refresh_token", "")
+//                .httpOnly(true)
+//                .secure(true)
+//                .path("/")
+//                .maxAge(0)
+//                .sameSite("Lax")
+//                .build();
+//    }
 
     private Claims extractClaims(String token) {
         byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
@@ -134,13 +164,14 @@ public class AuthController {
     public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
     {
         final String rawClientIp = LoginUtility.getClientIp(request);
-        log.info("Check-User info user id: {} , ip : {}", body.get("userId"), rawClientIp);
+        String userId = body.get("userId");
+        log.info("Check-User info user id: {} , ip : {}", userId, rawClientIp);
 
         // 1. IP BLOCK CHECK
         if (isIpBlocked(rawClientIp)) {
             log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
             VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
-                    .userId(body.get("userId"))
+                    .userId(userId)
                     .message("Access denied: Your IP address is blocked.")
                     .userStatus(Constants.RESTRICTED)
                     .build();
@@ -148,9 +179,19 @@ public class AuthController {
             return Mono.just(ApiResponse.success(blockedResponse, "Access Restricted"));
         }
 
-        return Mono.fromCallable(() -> loginService.checkUser(body.get("userId")))
+        // 2. CONFIGURATION VALIDATION
+        // Check if key is null or empty before proceeding
+        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
+            return Mono.just(ApiResponse.error("Public key not configured on server", "CONFIG_ERROR"));
+        }
+
+        // 3. FETCH USER AND APPEND PUBLIC KEY
+        return Mono.fromCallable(() -> loginService.checkUser(userId))
                 .subscribeOn(Schedulers.boundedElastic())
-                .map(dto -> ApiResponse.success(dto, "User check completed"));
+                .map(dto -> {
+                    dto.setPublicKey(rsaPublicPem);
+                    return ApiResponse.success(dto, "User check completed");
+                });
     }
 
 
@@ -194,8 +235,10 @@ public class AuthController {
                                 .error(user.getMessage())
                                 .build();
 
-                        // Determine status code: 403 if Locked, 401 if just wrong password
-                        HttpStatus status = (user.getAttemptsLeft() == 0 || "INACTIVE".equals(user.getPasswordLoginStatus()))
+                        // decide Status Code:
+                        // If attempts are 0 OR status is INACTIVE -> 403 Forbidden (Locked)
+                        // Otherwise -> 401 Unauthorized (Try again)
+                        HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
                                 ? HttpStatus.FORBIDDEN
                                 : HttpStatus.UNAUTHORIZED;
 
@@ -453,8 +496,26 @@ public class AuthController {
                 .subscribeOn(Schedulers.boundedElastic())
                 .map(result -> ApiResponse.success(result, result.getMessage()));
     }
-}
 
+    /**
+     * Exposes the RSA Public Key for frontend payload encryption.
+     * This endpoint is public (whitelisted in SecurityConfig).
+     */
+    @GetMapping(value = "/public-key", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ApiResponse<Map<String, String>>> getPublicKey() {
+        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
+            return Mono.just(ApiResponse.error("Public key not configured", "CONFIG_ERROR"));
+        }
+        return Mono.just(ApiResponse.success(Map.of("publicKey", rsaPublicPem), "Public Key fetched successfully"));
+    }
+
+
+    @GetMapping("/start-prod")
+    public ResponseEntity<LaunchResponse> getLaunchData() {
+        return ResponseEntity.ok(launchService.getLaunchDetails());
+    }
+
+}
 
 
 
@@ -699,10 +760,10 @@ public interface LoginService {
 
 
 
-
 package com.fincore.gateway.Service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.Config.KeyUtils;
 import com.fincore.gateway.JwtUtil.HmacJwtUtil;
 import com.fincore.gateway.dto.*;
 import com.fincore.gateway.model.LoginAttempt;
@@ -718,6 +779,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.orm.jpa.JpaSystemException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -755,17 +818,18 @@ public class LoginServiceImpl implements LoginService {
      * Prefer injecting a singleton bean; retained local instance for compatibility.
      */
     private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
-
-
     // ======= Config =======
     private final UserRepository userRepository;
     private final LoginAttemptRepository loginAttemptRepository;
-
     // ======= Dependencies =======
     private final LoginParamRepository loginParamRepository;
     private final RolePermissionsRepository rolePermissionsRepository;
     private final MenuService menuService;
     private final ObjectMapper mapper;
+    // LDAP Service
+    private final AdAuthenticationService adAuthenticationService;
+    @Value("${security.payload.rsa-private:}")
+    private String rsaPrivatePem;
     /**
      * Base64-encoded HMAC secret used to sign HS256 JWTs.
      */
@@ -816,33 +880,34 @@ public class LoginServiceImpl implements LoginService {
     public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
 
         final String userId = userCredentials.getUserId();
-        final String rawPassword = userCredentials.getPassword();
+        final String encryptedPassword = userCredentials.getPassword(); // This is now RSA Encrypted
 
         UserDto result = new UserDto();
-        User user = userRepository.findByUserId(userId);
 
+        // 1. AUTHORIZATION CHECK (Must exist in Local DB)
+        User user = userRepository.findByUserId(userId);
         if (user == null) {
             result.setValidCredentials(false);
             result.setUserStatus(Constants.INVALID);
-            log.info("Login attempt for invalid userId: {}", userId);
+            log.warn("Login blocked: User {} not found in local DB.", userId);
             return result;
         }
 
         LoginParam loginParam = loginParamRepository.getLoginParam();
+        char activeMode = loginParam.getActiveLoginMode();
+
+        // Prepare Audit Log
         LoginAttempt attempt = new LoginAttempt();
-        attempt.setLoginMethod(loginParam.getActiveLoginMode() == 'P'
-                ? Constants.PASSWORD_BASED_LOGIN
-                : Constants.SSO_BASED_LOGIN);
+        attempt.setLoginMethod(determineMethodString(activeMode));
         attempt.setSuccess("N");
         attempt.setIpAddress(clientIp);
         attempt.setUserId(userId);
 
-        result.setLoginMethod(loginParam.getActiveLoginMode());
+        result.setLoginMethod(activeMode);
         result.setUserId(user.getUserId());
-
         UserRoles userRole = userRepository.getUserRole(userId);
 
-        // Status checks: role & user
+        // 2. STATUS CHECKS
         result.setRoleStatus(userRole.getRoleStatus());
         result.setUserStatus(user.getAccountStatus());
         result.setPasswordLoginStatus(user.getPasswordLogin());
@@ -861,53 +926,58 @@ public class LoginServiceImpl implements LoginService {
             return result;
         }
 
-        // Proceed by login mode
-        if (loginParam.getActiveLoginMode() == Constants.PASSWORD) {
-            // Password-based login allowed?
-            if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-            } else {
-                result.setValidCredentials(false);
-                attempt.setFailureReason("Password login is disabled for this user.");
+        try {
+            // Decrypt RSA Payload
+            String rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
+
+            // 3. AUTHENTICATION LOGIC BASED ON MODE
+            if (activeMode == Constants.LDAP) {
+                // --- MODE: LDAP ---
+                log.info("Processing LDAP Login for user: {}", userId);
+                try {
+                    boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+                    if (ldapSuccess) {
+                        // Success: Generate Token
+                        handleSuccess(attempt, result, user, userRole);
+                    } else {
+                        // Failure: Wrong Password -> Count it against limits
+                        handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
+                    }
+                } catch (RuntimeException e) {
+                    log.error("LDAP Server Error for user {}: {}", userId, e.getMessage());
+                    // NOT incrementing wrong password count (It's not the user's fault)
+                    attempt.setSuccess("N");
+                    attempt.setFailureReason("LDAP Server Down / Connectivity Issue");
+                    result.setValidCredentials(false);
+                    result.setMessage("System Error: Unable to connect to Authentication Server. Please try again later.");
+                    // We do NOT save the attempt or lock the user here
+                    return result;
+                }
+
+            } else if (activeMode == Constants.PASSWORD) {
+                // MODE: LOCAL PASSWORD
+                // Check if Password Login is explicitly disabled for this specific user
+                if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                    passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
+                } else {
+                    // Account is Locked or Disabled
+                    handleAccountLocked(attempt, result, user);
+                }
+
             }
-        } else {
-            // SSO-based login
-            attempt.setSuccess("Y");
-            attempt.setFailureReason("SUCCESS");
-            result.setValidCredentials(true);
-
-            // If password-login was disabled, re-enable it on successful SSO per your original logic
-            if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                user.setPasswordLogin(Constants.ACTIVE);
-                userRepository.save(user);
-            }
-        }
-
-        // On success, mint token and populate token data
-        if (result.isValidCredentials()) {
-            log.info("Credentials validated. Issuing token for userId={}", userId);
-
-            UserDto safeClaims = new UserDto();
-            safeClaims.setUserId(user.getUserId());
-            safeClaims.setUserrole(userRole.getRole());
-
-            @SuppressWarnings("unchecked")
-            String accessToken = HmacJwtUtil.generate(
-                    hmacSecret,
-                    user.getUserId(),
-                    ttlSeconds,
-                    mapper.convertValue(safeClaims, Map.class)
-            );
-
-            UserTokenDataDto tokenData = initializeTokenData(user, userRole);
-            result.setAccessToken(accessToken);
-            result.setUser(tokenData);
+        } catch (SecurityException e) {
+            log.error("Login rejected for user {}: Payload decryption failed", userId);
+            result.setValidCredentials(false);
+            result.setMessage("Security Error: Invalid encrypted payload");
+            attempt.setFailureReason("Payload Decryption Failed (Possible MITM or invalid format)");
+            return result;
         }
 
         loginAttemptRepository.save(attempt);
         log.debug("verifyUserCredentials result={}", result);
         return result;
     }
+
 
     /**
      * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
@@ -926,76 +996,19 @@ public class LoginServiceImpl implements LoginService {
     public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
         log.info("Password-based login for userId={}", user.getUserId());
 
-        int currentFailedCount = user.getUserWrongPasswordCount();
-        int maxAllowed = loginParam.getWrongPasswordAttempts();
-
-        // 1. Check if ALREADY locked (Double safety, though verifyUserCredentials checks status earlier)
         if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            loginAttempt.setFailureReason("Account Locked");
-            userInfo.setValidCredentials(false);
-            userInfo.setMessage("Your account is locked. Please reset password or contact admin.");
-            userInfo.setAttemptsLeft(0);
+            handleAccountLocked(loginAttempt, userInfo, user);
             return;
         }
 
-        // 2. Validate Password
         if (encoder.matches(password, user.getPasswordHash())) {
-            // --- SUCCESS CASE ---
-            loginAttempt.setSuccess("Y");
-            loginAttempt.setFailureReason("Success");
-            userInfo.setValidCredentials(true);
-            userInfo.setMessage("Login Successful");
-
-            // Reset count on success
-            user.setUserWrongPasswordCount(0);
-            userRepository.save(user);
-            return;
-        }
-
-        // --- FAILURE CASE ---
-        log.warn("Password mismatch for user {}", user.getUserId());
-
-        // Increment the count immediately
-        int newFailedCount = currentFailedCount + 1;
-        user.setUserWrongPasswordCount(newFailedCount);
-        loginAttempt.setSuccess("N");
-
-        // Mark credentials invalid
-        userInfo.setValidCredentials(false);
-
-        // If max attempts reached → LOCK ACCOUNT
-        if (newFailedCount >= maxAllowed) {
-            user.setPasswordLogin(Constants.INACTIVE);
-            user.setAccountStatus(Constants.LOCKED);
-            loginAttempt.setFailureReason("Account Locked: Maximum Login Attempts Reached");
-            userInfo.setMessage(
-                    "Your account has been locked due to multiple unsuccessful login attempts. "
-                            + "Please reset your password or contact support."
-            );
-            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
-            userInfo.setAttemptsLeft(0);
+            UserRoles userRole = userRepository.getUserRole(user.getUserId());
+            handleSuccess(loginAttempt, userInfo, user, userRole);
         } else {
-            int remaining = maxAllowed - newFailedCount;
-            loginAttempt.setFailureReason("Wrong Password");
-            // Conditional professional messages
-            if (remaining > 1) {
-                // First & second wrong attempt
-                userInfo.setMessage(
-                        "Incorrect password. Please check your credentials and try again."
-                );
-            } else {
-                // Last attempt warning
-                userInfo.setMessage(
-                        "Incorrect password. ⚠️ This is your final attempt. "
-                                + "One more failed login will lock your account."
-                );
-            }
-            userInfo.setAttemptsLeft(remaining);
+            handleFailure(loginAttempt, userInfo, user, loginParam, "Wrong Password");
         }
-
-        // Persist user state
-        userRepository.save(user);
     }
+
 
     /**
      * Produces a human-readable message describing a blocked login due to {@code status} of a given {@code type}.
@@ -1008,7 +1021,6 @@ public class LoginServiceImpl implements LoginService {
     public String generateStatusMessage(String status, String type) {
         return String.format("Trying to login with a %s %s", status, type);
     }
-
 
     /**
      * Checks the status and requirements for a user attempting to log in (without performing login).
@@ -1026,38 +1038,43 @@ public class LoginServiceImpl implements LoginService {
         out.setLoginMethod(loginParam.getActiveLoginMode());
 
         if (user == null) {
-            // Invalid user
             out.setUserCheck(false);
             out.setUserStatus(Constants.INVALID);
             out.setMessage("Invalid User");
             return out;
         }
 
-        // Existing user
         if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            // Password validity window based on tempPasswordSetAt (guard nulls)
             Timestamp setAt = user.getTempPasswordSetAt();
             boolean isPasswordValid = false;
-            if (setAt != null) {
+
+            // Validate password expiration only for Password Mode
+            if (loginParam.getActiveLoginMode() == Constants.PASSWORD && setAt != null) {
                 LocalDateTime lastUpdate = setAt.toLocalDateTime();
                 isPasswordValid = LocalDateTime.now()
                         .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+            } else {
+                // For LDAP/SSO, we rely on their policies, so treat local validity as true
+                isPasswordValid = true;
             }
 
             UserRoles userRole = userRepository.getUserRole(userId);
             out.setRoleStatus(userRole.getRoleStatus());
-            out.setUpdatePassword(user.getPasswordHash() == null || !isPasswordValid);
+
+            // Logic: Update Password only needed if Mode is Password AND (Password is null OR Expired)
+            boolean updateNeeded = (loginParam.getActiveLoginMode() == Constants.PASSWORD)
+                    && (user.getPasswordHash() == null || !isPasswordValid);
+
+            out.setUpdatePassword(updateNeeded);
             out.setUserStatus(Constants.ACTIVE);
             out.setMessage(Constants.ACTIVE_USER);
             out.setPasswordLoginStatus(user.getPasswordLogin());
         } else {
-            // Inactive, Locked, Pending_Verification
             String accountStatus = user.getAccountStatus();
             out.setUserCheck(true);
             out.setUserStatus(accountStatus);
-//            out.setPasswordLoginStatus(user.getPasswordLogin());
             out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please reset password or contact admin."
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact support."
                             : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
             );
         }
@@ -1075,7 +1092,7 @@ public class LoginServiceImpl implements LoginService {
     @Transactional
     public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
         String userId = userCredentials.getUserId();
-        String password = userCredentials.getPassword();
+        String encryptedPassword = userCredentials.getPassword();
 
         // Always sanitize outbound fields
         userCredentials.setUpdateFlag(false);
@@ -1089,19 +1106,32 @@ public class LoginServiceImpl implements LoginService {
                 return userCredentials;
             }
 
-            String passwordHash = encoder.encode(password);
+            String rawPassword;
+            try {
+                rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
+            } catch (SecurityException e) {
+                log.error("Update password rejected for user {}: Payload decryption failed", userId);
+                userCredentials.setMessage("Security Error: Invalid encrypted payload");
+                return userCredentials;
+            }
+
+            String passwordHash = encoder.encode(rawPassword);
             user.setPasswordHash(passwordHash);
             user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
             userRepository.save(user);
 
             userCredentials.setMessage("User password successfully updated");
             userCredentials.setUpdateFlag(true);
+
         } catch (DataIntegrityViolationException e) {
             log.warn("Data integrity violation while updating password for userId={}", userId, e);
             userCredentials.setMessage("Failed to change password, please try again");
-        } catch (Exception e) {
-            log.error("Unexpected error while updating password for userId={}", userId, e);
-            userCredentials.setMessage("Unexpected error while changing password");
+        } catch (ObjectOptimisticLockingFailureException e) {
+            log.warn("Optimistic locking failure while updating password for userId={}", userId, e);
+            userCredentials.setMessage("The user data was modified by another process, please retry");
+        } catch (JpaSystemException e) {
+            log.error("JPA system error while updating password for userId={}", userId, e);
+            userCredentials.setMessage("A database error occurred, please try again later");
         }
 
         return userCredentials;
@@ -1151,6 +1181,176 @@ public class LoginServiceImpl implements LoginService {
         userDto.setUser(initializeTokenData(user, userRole));
         return userDto;
     }
+
+
+    // ============================= Helper Methods ============================
+
+    private String determineMethodString(char mode) {
+        if (mode == Constants.LDAP) return "LDAP";
+        if (mode == Constants.PASSWORD) return Constants.PASSWORD_BASED_LOGIN;
+        return Constants.SSO_BASED_LOGIN;
+    }
+
+    private void handleAccountLocked(LoginAttempt attempt, UserDto result, User user) {
+        result.setValidCredentials(false);
+        result.setPasswordLoginStatus(user.getPasswordLogin());
+        result.setMessage("Your account is locked due to multiple failed attempts.");
+
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            result.setAttemptsLeft(0);
+            attempt.setFailureReason("Account Locked (Pre-check)");
+        } else {
+            result.setMessage("Password login is disabled.");
+            attempt.setFailureReason("Password login disabled");
+        }
+    }
+
+    private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
+        attempt.setSuccess("Y");
+        attempt.setFailureReason("Success");
+        result.setValidCredentials(true);
+        result.setMessage("Login Successful");
+
+        // Reset wrong password count on successful login
+        if (user.getUserWrongPasswordCount() > 0) {
+            user.setUserWrongPasswordCount(0);
+            userRepository.save(user);
+        }
+
+        // Generate Token
+        log.info("Credentials validated. Issuing token for userId={}", user.getUserId());
+        UserDto safeClaims = new UserDto();
+        safeClaims.setUserId(user.getUserId());
+        safeClaims.setUserrole(userRole.getRole());
+
+        @SuppressWarnings("unchecked")
+        String accessToken = HmacJwtUtil.generate(
+                hmacSecret,
+                user.getUserId(),
+                ttlSeconds,
+                mapper.convertValue(safeClaims, Map.class)
+        );
+
+        UserTokenDataDto tokenData = initializeTokenData(user, userRole);
+        result.setAccessToken(accessToken);
+        result.setUser(tokenData);
+    }
+
+    private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
+        log.warn("Login failed for user {}: {}", user.getUserId(), reason);
+        attempt.setSuccess("N");
+
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
+        int newFailedCount = currentFailedCount + 1;
+
+        user.setUserWrongPasswordCount(newFailedCount);
+        userInfo.setValidCredentials(false);
+
+        if (newFailedCount >= maxAllowed) {
+            user.setPasswordLogin(Constants.INACTIVE);
+            // user.setAccountStatus(Constants.LOCKED); // Optional: Depending on business rule
+            attempt.setFailureReason(reason + " -> Account Locked");
+            userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
+        } else {
+            int remaining = maxAllowed - newFailedCount;
+            attempt.setFailureReason(reason);
+            if (remaining > 1) {
+                userInfo.setMessage("Incorrect credentials. Please check and try again.");
+            } else {
+                userInfo.setMessage("Incorrect credentials. Final attempt before lock.");
+            }
+            userInfo.setAttemptsLeft(remaining);
+        }
+        userRepository.save(user);
+    }
+
+}
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.ldap.CommunicationException;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.stereotype.Service;
+
+/**
+ * Service responsible for interacting with Active Directory.
+ * Handles the "Bind" operation to verify credentials.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AdAuthenticationService {
+
+    private final LdapTemplate ldapTemplate;
+
+    @Value("${spring.ldap.domain:UATAD.SBI}")
+    private String adDomain;
+
+    /**
+     * Authenticate against Active Directory by attempting a Bind.
+     * * @param username The sAMAccountName (e.g., "7378051")
+     *
+     * @param password The raw password
+     * @return true if credentials are valid, false otherwise.
+     */
+    public boolean authenticate(String username, String password) {
+        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+            log.warn("LDAP Auth failed: Empty username or password");
+            return false;
+        }
+
+        try {
+            // AD usually requires "user@domain.com" or "DOMAIN/user" for binding.
+            // Using the UPN (User Principal Name) format is standard.
+            // Logic: username + "@" + "UATAD.SBI"
+            String principalName = username + "@" + adDomain;
+
+            log.info("Attempting LDAP Bind for principal: {}", principalName);
+
+            // The authenticate method handles the opening of connection and binding.
+            // Filter: (sAMAccountName=username) checks if the user exists.
+            // Password: The credential to verify.
+            boolean authenticated = ldapTemplate.authenticate(
+                    "",                                  // Base DN is already set in config
+                    "(sAMAccountName=" + username + ")", // Filter to locate the user
+                    password                             // Password to verify
+            );
+
+            if (authenticated) {
+                log.info("LDAP Authentication SUCCESS for user: {}", username);
+                return true;
+            } else {
+                log.warn("LDAP Authentication FAILED for user: {} (Invalid Credentials)", username);
+                return false;
+            }
+
+        } catch (CommunicationException e) {
+            // Server is down or SSL failed.
+            log.error("LDAP CONNECTION ERROR: {}", e.getMessage());
+            // Throwing exception allows LoginService to know it wasn't a wrong password
+            throw new RuntimeException("LDAP Server Down");
+        } catch (Exception e) {
+            // CRITICAL: Handle Server Down or Network issues
+            log.error("LDAP Generic Error during auth for user: {}. Error: {}", username, e.getMessage());
+            // In a production app, you might want to throw a specific custom exception
+            // if you want to differentiate between "Wrong Password" and "Server Down".
+            return false;
+        }
+    }
 }
 
 
@@ -1162,6 +1362,68 @@ public class LoginServiceImpl implements LoginService {
 
 
 
+
+
+package com.fincore.gateway.Service;
+
+import com.fincore.gateway.dto.LaunchResponse;
+
+public interface LaunchService {
+    LaunchResponse getLaunchDetails();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+
+import com.fincore.gateway.dto.LaunchResponse;
+import com.fincore.gateway.model.LaunchConfig;
+import com.fincore.gateway.repository.LaunchConfigRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+@Service
+@RequiredArgsConstructor
+public class LaunchServiceImpl implements LaunchService {
+
+    private final LaunchConfigRepository launchConfigRepository;
+
+    @Override
+    public LaunchResponse getLaunchDetails() {
+        LaunchConfig config = launchConfigRepository.findTopByOrderByIdDesc()
+                .orElseThrow(() -> new RuntimeException("Launch configuration not found in DB"));
+
+        // explicitly set the timezone to IST
+        ZonedDateTime istLaunchTime = config.getLaunchTimestamp().atZone(ZoneId.of("Asia/Kolkata"));
+
+        DateTimeFormatter dateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        DateTimeFormatter timeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+        return new LaunchResponse(
+                istLaunchTime.format(dateFormatter),
+                istLaunchTime.format(timeFormatter),
+                "IST", // Updated to reflect the correct timezone
+                config.getAppVersion(),
+                config.getAppName()
+        );
+    }
+}
 
 
 
@@ -3204,6 +3466,88 @@ public class ScreenDetails {
      */
     private String description;
 }
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.repository;
+
+import com.fincore.gateway.model.LaunchConfig;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+
+@Repository
+public interface LaunchConfigRepository extends JpaRepository<LaunchConfig, Long> {
+    // Fetches the most recently added configuration
+    Optional<LaunchConfig> findTopByOrderByIdDesc();
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.model;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.Instant;
+
+@Entity
+@Table(name = "LAUNCH_CONFIG")
+@Data
+public class LaunchConfig {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY) // Or SEQUENCE for Oracle
+    @Column(name = "ID")
+    private Long id;
+
+    @Column(name = "APP_NAME")
+    private String appName;
+
+    @Column(name = "APP_VERSION")
+    private String appVersion;
+
+    // Instant automatically represents a specific moment on the UTC timeline
+    @Column(name = "LAUNCH_TIMESTAMP", columnDefinition = "TIMESTAMP WITH TIME ZONE")
+    private Instant launchTimestamp;
+}
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.dto;
+
+public record LaunchResponse(
+        String prodDate,
+        String launchTime,
+        String timezone,
+        String version,
+        String appName
+) {}
+
+
+
+
 
 
 
