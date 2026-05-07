@@ -1,187 +1,147 @@
-package com.fincore.helpservice.service;
+circle_master :
 
-import com.fincore.helpservice.model.HelpFaqEntity;
-import com.fincore.helpservice.model.HelpQuestionEntity;
-import com.fincore.helpservice.model.KnowledgeBaseEntity;
-import com.fincore.helpservice.repository.HelpFaqRepository;
-import com.fincore.helpservice.repository.HelpQuestionRepository;
-import com.fincore.helpservice.repository.KnowledgeBaseRepository;
-import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.document.splitter.DocumentSplitters;
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
 
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
+CIRCLE_CODE	VARCHAR2(3 BYTE)	No		1	3 digit circle code.
+CIRCLE_NAME	VARCHAR2(150 BYTE)	No		2	name of the circle
+ZONE_CODE	VARCHAR2(3 BYTE)	No		3	Foreign key of ZONE_MASTER table
+CREATED_DATE	DATE	Yes	sysdate	4	date at the time of creation
+BRANCH_CODE	VARCHAR2(5 BYTE)	Yes		5	Branch of the circle
+SHORT_NAME	VARCHAR2(10 BYTE)	Yes		6	Alias Name for Circles
 
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class DocumentIngestionService {
 
-    private final HelpQuestionRepository questionRepository;
-    private final KnowledgeBaseRepository knowledgeBaseRepository;
-    private final HelpFaqRepository faqRepository;
+data :
 
-    private final EmbeddingModel embeddingModel;
-    private final EmbeddingStore<TextSegment> embeddingStore;
-    private final StringRedisTemplate redisTemplate;
+015	CAG	6	18-03-26	04030	
+016	CCG	6	18-03-26	04425	
+018	CAO - I	6	18-03-26	01999	
+020	CAO - II	6	18-03-26	03999	
+053	CSD	6	18-03-26	07999	
+051	IBG	7	18-03-26	13761	
+001	KOLKATA	1	18-03-26	03970	
+002	MAHARASHTRA	1	18-03-26	03971	
+003	CHENNAI	1	18-03-26	03972	
+004	NEW DELHI	1	18-03-26	03973	
+005	LUCKNOW	1	18-03-26	03974	
+006	AHMEDABAD	1	18-03-26	03975	
+007	HYDERABAD	1	18-03-26	03976	
+008	BHOPAL	1	18-03-26	03977	
+009	PATNA	1	18-03-26	03978	
+010	CHANDIGARH	1	18-03-26	05788	
+011	BHUBANESHWAR	1	18-03-26	03980	
+012	GUWAHATI	1	18-03-26	06939	
+013	BENGALURU	1	18-03-26	07704	
+014	THIRUVANANTHAPURAM	1	18-03-26	04282	
+023	JAIPUR	1	18-03-26	31331	
+024	AMARAVATI	1	18-03-26	61020	
+027	MUMBAI ( METRO )	1	18-03-26	61263	
+017	SAMG	6	18-03-26	04454	
+052	GMU	5	18-03-26	04343	
+099	VIRTUAL CIRCLE	1	18-03-26	99966	
 
-    // Safe batch size to prevent Ollama Timeouts / OOM
-    private static final int BATCH_SIZE = 50;
-    
-    // Distributed Lock Key to prevent multi-pod collision
-    private static final String INGESTION_LOCK_KEY = "fincore:ai:ingestion_lock";
 
-    @EventListener(ApplicationReadyEvent.class)
-    public void triggerIngestionOnStartup() {
-        // EDGE CASE FIX 2: Distributed Lock for Kubernetes Multi-Pod setups
-        // Attempts to set a lock for 10 minutes. 
-        Boolean acquiredLock = redisTemplate.opsForValue().setIfAbsent(INGESTION_LOCK_KEY, "LOCKED", Duration.ofMinutes(10));
 
-        if (Boolean.TRUE.equals(acquiredLock)) {
-            log.info("[AI-INGEST] Lock acquired. Triggering async data ingestion on a Java 21 Virtual Thread...");
-            
-            // EDGE CASE FIX 4 (The 100% Fix): True fire-and-forget Virtual Thread.
-            // This will NOT block the Spring Boot startup sequence.
-            Thread.startVirtualThread(this::performRobustIngestion);
-            
-        } else {
-            log.info("[AI-INGEST] Ingestion lock found. Another instance is already syncing vectors. Skipping.");
-        }
-    }
 
-    private void performRobustIngestion() {
-        long startTime = System.currentTimeMillis();
-        try {
-            // =========================================================================
-            // EDGE CASE FIX 1: THE "GHOST VECTOR" CLEANUP
-            // Fetch INACTIVE records and explicitly tell Redis to delete them
-            // =========================================================================
-            log.info("[AI-INGEST] Step 1: Cleaning up Ghost Vectors (Deactivated records)...");
-            List<String> vectorsToDelete = new ArrayList<>();
 
-            questionRepository.findByIsActive("N").forEach(q -> vectorsToDelete.add("PROCEDURAL_" + q.getQuestionId()));
-            
-            faqRepository.findAll().stream()
-                    .filter(f -> "N".equals(f.getIsActive()))
-                    .forEach(f -> vectorsToDelete.add("FAQ_" + f.getFaqId()));
-                    
-            knowledgeBaseRepository.findByIsActive("N").forEach(kb -> {
-                // Safely delete up to 20 potential chunks for deactivated KB articles
-                for(int i = 0; i < 20; i++) {
-                    vectorsToDelete.add("CONCEPTUAL_" + kb.getDocId() + "_chunk_" + i);
-                }
-            });
 
-            if (!vectorsToDelete.isEmpty()) {
-                embeddingStore.removeAll(vectorsToDelete);
-                log.info("[AI-INGEST] Purged {} inactive vectors from Redis.", vectorsToDelete.size());
-            }
 
-            // =========================================================================
-            // ACTIVE DATA PREPARATION
-            // =========================================================================
-            log.info("[AI-INGEST] Step 2: Preparing Active Vectors...");
-            List<TextSegment> allSegments = new ArrayList<>();
-            List<String> allIds = new ArrayList<>();
+branch_master:
 
-            // 1. PROCEDURAL DATA 
-            questionRepository.findByIsActive("Y").forEach(q -> {
-                String content = "Module: " + (q.getScreenName() != null ? q.getScreenName() : "General") +
-                        "\nQuestion: " + q.getQuestionText() + 
-                        "\nAnswer: " + q.getAnswerContent() +
-                        (q.getProTip() != null ? "\nPro Tip: " + q.getProTip() : "");
+CODE	VARCHAR2(255 CHAR)	No		1	Unique 5 digit branch code.
+NAME	VARCHAR2(255 CHAR)	No		2	Branch name.
+CIRCLE_CODE	VARCHAR2(255 CHAR)	No		3	FK Circle code of this branch.
+STATE	VARCHAR2(255 CHAR)	No		4	FK State code of this branch.
+CITY	VARCHAR2(255 CHAR)	Yes		5	City of this branch.
+ADDRESS	VARCHAR2(255 CHAR)	Yes		6	Street/Address of this branch.
+PINCODE	VARCHAR2(255 CHAR)	Yes		7	Pincode of this branch.
+PHONE_NUMBER	VARCHAR2(255 CHAR)	No		8	Contact number of this branch.
+EMAIL_ID	VARCHAR2(255 CHAR)	No		9	Contact email of this branch.
+NMR_CODE	VARCHAR2(255 CHAR)	No		10	N-M-R code (NETWORK_CODE - module_CODE - region_CODE).
+STATUS	NUMBER(1,0)	No		11	Status of this branch (Live/Closed). value: '1' or '0'
+OPEN_DATE	DATE	No		12	When this branch was created.
+CLOSE_DATE	DATE	Yes		13	When this branch was closed.
+MERGE_DATE	DATE	Yes		14	When this branch was merged with other branch.
+MERGED_WITH_BRANCH	VARCHAR2(255 CHAR)	Yes		15	Branch code of the branch with which this branch was merged.
+LAST_CHANGE_DATE	DATE	Yes	SYSDATE 	16	When this branch was last changed.
+CPC_FLAG	NUMBER(1,0)	Yes		17	CPC Flag.
+FOOD_CREDIT_FLAG	NUMBER(1,0)	No		18	Food credit flag.
+CURR_CHEST_FLAG	NUMBER(1,0)	No		19	CURR_CHEST_FLAG.
+BRANCH_TYPE	VARCHAR2(255 CHAR)	No		20	Type of this branch (A: Automated, M: Manual).
 
-                Metadata metadata = new Metadata()
-                        .put("permissionId", q.getPermissionId() != null ? String.valueOf(q.getPermissionId()) : "GLOBAL")
-                        .put("actionLink", q.getActionLink() != null ? q.getActionLink() : "NONE")
-                        .put("actionLabel", q.getActionLabel() != null ? q.getActionLabel() : "NONE")
-                        .put("dataType", "PROCEDURAL");
 
-                allIds.add("PROCEDURAL_" + q.getQuestionId());
-                allSegments.add(TextSegment.from(content, metadata));
-            });
+data :
 
-            // 2. FAQ DATA 
-            faqRepository.findAll().stream().filter(f -> "Y".equals(f.getIsActive())).forEach(faq -> {
-                String content = "FAQ Question: " + faq.getQuestionText() + "\nAnswer: " + faq.getAnswerContent();
-                Metadata metadata = new Metadata()
-                        .put("permissionId", "GLOBAL")
-                        .put("actionLink", "NONE")
-                        .put("actionLabel", "NONE")
-                        .put("dataType", "FAQ");
+08080	CHAKAN	002	TN	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.08080@sbi.co.in	810051390	1	24-11-25				26-11-25	1	1	1	A
+10400	CCL CAMPUS RANCHI	009	TR	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.10400@sbi.co.in	439015517	1	24-11-25		26-03-26	02225	27-03-26	0	1	1	A
+05008	SMECCC COIMBATORE	003	UK	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.05008@sbi.co.in	343284235	1	24-11-25				26-11-25	1	1	1	A
+02787	RAJANAGARAM	024	WB	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.02787@sbi.co.in	576224891	1	24-11-25				26-11-25	1	1	1	A
+11103	SAJJAPURAM (TANUKU)	024	CH	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11103@sbi.co.in	721455591	1	24-11-25				26-11-25	1	1	1	A
+11436	H A L BRANCH OZHAR	002	LA	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11436@sbi.co.in	451352504	1	24-11-25				26-11-25	1	1	1	A
+11324	PANDEKHOLA	004	LD	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11324@sbi.co.in	678285358	1	24-11-25				26-11-25	1	1	1	A
+11092	OLD GUNTUR  GUNTUR	024	AP	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11092@sbi.co.in	176801214	1	24-11-25				26-11-25	1	1	1	A
+11094	LAKSHMIPURAM GUNTUR	024	AS	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11094@sbi.co.in	688066988	1	24-11-25				26-11-25	1	1	1	A
+11095	BRODIPET  DIST-GUNTUR	024	BR	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11095@sbi.co.in	717505679	1	24-11-25				26-11-25	1	1	1	A
+11010	NIRNAYNAGAR BRANCH	006	GA	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.11010@sbi.co.in	184525770	1	24-11-25				26-11-25	1	1	1	A
+10966	GHATLODIA	006	GJ	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.10966@sbi.co.in	863152407	1	24-11-25				26-11-25	1	1	1	A
+06179	BISWANATHPUR	011	HP	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06179@sbi.co.in	065097699	1	24-11-25				26-11-25	1	1	1	A
+06181	KARLAMUNDA	011	KA	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06181@sbi.co.in	604303725	1	24-11-25				26-11-25	1	1	1	A
+06182	CHURACHANDPUR	012	KL	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06182@sbi.co.in	092956521	1	24-11-25				26-11-25	1	1	1	A
+06184	BAGHERA	023	MH	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06184@sbi.co.in	626162325	1	24-11-25				26-11-25	1	1	1	A
+06185	BRAHAMBAD	023	MN	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06185@sbi.co.in	293130272	1	24-11-25				26-11-25	1	1	1	A
+06193	ITACHANDA ADB	001	NL	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.06193@sbi.co.in	793322117	1	24-11-25				26-11-25	1	1	1	A
+04628	MANTOWN SAWAI MADHOPUR	023	PB	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04628@sbi.co.in	181578432	1	24-11-25				26-11-25	1	1	1	A
+04631	NAKODAR	010	RJ	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04631@sbi.co.in	573760786	1	24-11-25				26-11-25	1	1	1	A
+04633	MUNDIAN KALAN	010	TN	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04633@sbi.co.in	600207191	1	24-11-25				26-11-25	1	1	1	A
+04635	DHIMA	006	TR	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04635@sbi.co.in	462788495	1	24-11-25				26-11-25	1	1	1	A
+04636	MASLANDPUR	001	UK	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04636@sbi.co.in	180873140	1	24-11-25				26-11-25	1	1	1	A
+04638	AGARNAGAR(LUDHIANA)	010	WB	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.04638@sbi.co.in	931690446	1	24-11-25				26-11-25	1	1	1	A
+00154	PHULBANI	011	GJ	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00154@sbi.co.in	114730540	1	24-11-25				26-11-25	1	1	1	A
+00155	PHULPUR (ALLAAHABAD)	005	HR	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00155@sbi.co.in	987697906	1	24-11-25				26-11-25	1	1	1	A
+00157	PRATAPGARH	005	HP	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00157@sbi.co.in	301478501	1	24-11-25				26-11-25	1	1	1	A
+00158	PURI	011	JH	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00158@sbi.co.in	954842103	1	24-11-25				26-11-25	1	1	1	A
+00159	PURNEA	009	KA	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00159@sbi.co.in	489864098	1	24-11-25				26-11-25	1	1	1	A
+00160	PURULIA	001	KL	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00160@sbi.co.in	774908453	1	24-11-25				26-11-25	1	1	1	A
+00161	RAE BARELI	005	MP	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00161@sbi.co.in	156113342	1	24-11-25				26-11-25	1	1	1	A
+00163	RAIRANGPUR	011	MH	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00163@sbi.co.in	019314385	1	24-11-25				26-11-25	1	1	1	A
+00164	RAMGARH CANTT(HAZARIBAGH	009	MN	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00164@sbi.co.in	824327909	1	24-11-25				26-11-25	1	1	1	A
+00165	RAMPURHAT	001	ML	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00165@sbi.co.in	295455983	1	24-11-25				26-11-25	1	1	1	A
+00166	RANAGHAT	001	MZ	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00166@sbi.co.in	896060172	1	24-11-25				26-11-25	1	1	1	A
+00167	RANCHI	009	NL	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00167@sbi.co.in	708531330	1	24-11-25				26-11-25	1	1	1	A
+00168	RASRA	005	OD	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00168@sbi.co.in	372534456	1	24-11-25				26-11-25	1	1	1	A
+00169	RAYAGADA	011	PB	Thane	Tower No 7, 4th Flr, Railway Stn Bldg, CBD Belapur	400614	1234567891	sbi.00169@sbi.co.in	944218878	1	24-11-25				26-11-25	1	1	1	A
 
-                allIds.add("FAQ_" + faq.getFaqId());
-                allSegments.add(TextSegment.from(content, metadata));
-            });
 
-            // 3. CONCEPTUAL DATA (Knowledge Base)
-            knowledgeBaseRepository.findByIsActive("Y").forEach(kb -> {
-                String content = "Topic: " + kb.getTopic() + "\nInformation: " + kb.getContentParagraph();
-                Metadata metadata = new Metadata()
-                        .put("permissionId", kb.getPermissionId() != null ? String.valueOf(kb.getPermissionId()) : "GLOBAL")
-                        .put("actionLink", "NONE")
-                        .put("actionLabel", "NONE")
-                        .put("dataType", "CONCEPTUAL");
 
-                // EDGE CASE FIX 3: Reduced chunk limit to 1500 chars to respect the mxbai 512-token context limit!
-                List<TextSegment> kbChunks = DocumentSplitters.recursive(1500, 150).split(Document.from(content, metadata));
-                
-                for (int i = 0; i < kbChunks.size(); i++) {
-                    allIds.add("CONCEPTUAL_" + kb.getDocId() + "_chunk_" + i);
-                    allSegments.add(kbChunks.get(i));
-                }
-            });
 
-            // =========================================================================
-            // BATCH EMBEDDING & BATCH REDIS INGESTION
-            // =========================================================================
-            if (allSegments.isEmpty()) {
-                log.warn("[AI-INGEST] No active documents found in Oracle DB to ingest!");
-                return;
-            }
 
-            int totalSegments = allSegments.size();
-            int successfulBatches = 0;
-            
-            log.info("[AI-INGEST] Processing {} total segments in batches of {}...", totalSegments, BATCH_SIZE);
 
-            for (int i = 0; i < totalSegments; i += BATCH_SIZE) {
-                // Safe sublist logic (e.g. if size is 52, loop 1 is 0-50, loop 2 is 50-52)
-                int end = Math.min(totalSegments, i + BATCH_SIZE);
-                List<TextSegment> batchSegments = allSegments.subList(i, end);
-                List<String> batchIds = allIds.subList(i, end);
 
-                try {
-                    List<Embedding> batchEmbeddings = embeddingModel.embedAll(batchSegments).content();
-                    embeddingStore.addAll(batchIds, batchEmbeddings, batchSegments);
-                    successfulBatches++;
-                } catch (Exception e) {
-                    log.error("[AI-INGEST] Failed to process batch {}-{}.", i, end - 1, e);
-                }
-            }
+users:
 
-            log.info("[AI-INGEST] COMPLETE. {}/{} batches stored successfully in {} seconds.", successfulBatches, (int) Math.ceil((double) totalSegments / BATCH_SIZE), (System.currentTimeMillis() - startTime) / 1000);
+USER_ID	VARCHAR2(255 CHAR)	No		1	 Unique identifier for the user
+FIRST_NAME	VARCHAR2(255 CHAR)	Yes		2	 User's first name
+LAST_NAME	VARCHAR2(255 CHAR)	Yes		3	 User's last name
+PHONE_NUMBER	VARCHAR2(255 CHAR)	Yes		4	 User's phone number
+EMAIL	VARCHAR2(255 CHAR)	No		5	 User's primary email address
+PASSWORD_HASH	VARCHAR2(255 BYTE)	Yes		6	 Hashed and salted password
+ACCOUNT_STATUS	VARCHAR2(255 CHAR)	No		7	 Status of the user's account
+CREATED_AT	TIMESTAMP(6)	No	SYSTIMESTAMP	8	 Timestamp when the user account was created
+UPDATED_AT	TIMESTAMP(6)	No	SYSTIMESTAMP	9	 Timestamp when the user account was last updated
+LAST_LOGIN_AT	TIMESTAMP(6)	Yes		10	 Timestamp of the user's last successful login
+IS_DELETED	CHAR(1 BYTE)	No	'N'	11	 Flag for soft deletion: Y if deleted, N otherwise
+DELETED_AT	TIMESTAMP(6)	Yes		12	 Timestamp when the user was soft-deleted
+TEMP_PASSWORD_SET_AT	TIMESTAMP(6)	Yes	SYSTIMESTAMP	13	 Timestamp when the current temporary password was set via OTP
+MIDDLE_NAME	VARCHAR2(255 CHAR)	Yes		14	 User's middle name
+USER_WRONG_PASSWORD_COUNT	NUMBER(5,0)	No	0	15	Number of wrong login attempts 
+BRANCH	NUMBER(5,0)	No		16	Branch Number
+PASSWORD_LOGIN	VARCHAR2(20 BYTE)	No	"'ACTIVE'
+   "	17	Status of users ability to login through password ( ACTIVE OR INACTIVE)
 
-        } catch (Exception e) {
-            log.error("[AI-INGEST] FATAL ERROR during background ingestion.", e);
-        } finally {
-            // Always release the lock so it can run again on the next server restart
-            redisTemplate.delete(INGESTION_LOCK_KEY);
-            log.info("[AI-INGEST] Ingestion lock released.");
-        }
-    }
-}
 
+data :
+
+1022918	Sasank	FRT	4223963422	sbiuser15825898@sbi.co.in	$2a$10$dmMsdq8DzSD4b0QfICp5tuCuIMFSEWfBJ0ISMqFnwDBLJGnRe8iL6	ACTIVE	11-08-25 11:59:42.622654000 AM	11-08-25 11:59:42.622654000 AM		N		04-05-26 10:19:46.440585000 AM		0	8080	ACTIVE
+1010101	ggyh			hghjgh@sbi.co.in	$2a$10$THOiwIeW86NsK.LFzoYZRO0C.h03KSK0w4CDYU87hnWajiQyHKk0q	ACTIVE	29-12-25 02:03:46.644000000 PM	09-01-26 04:51:43.476248000 PM		N		04-05-26 10:19:46.440585000 AM		0	7704	ACTIVE
+7300000	Tejas		9999999999	tejas.bhong@sbi.co.in	$2a$10$mi4EEX2Zd.mnQj6xY6KtEeNrCtxgTHTdaOGZrpSMY1Iu.KLSwjB96	ACTIVE	31-12-25 04:03:53.962000000 PM	07-01-26 04:35:03.023000000 PM		N		04-05-26 10:19:46.440585000 AM		0	61020	ACTIVE
+1021253	Adeshbhjn			adesh@sbi.co.in	$2a$10$8986D8NKo3OSJb/kCbba0ugZeMRYAIY9.vKJz0c62RsC6.2uDmdKO	ACTIVE	31-12-25 04:08:44.796000000 PM	09-02-26 01:11:58.634880000 PM		N		04-05-26 10:19:46.440585000 AM	wdwdw	0	3999	ACTIVE
+1234565	f.name	l	4567654324	serf@sbi.co.in	$2a$10$5X91YhRgIZ2Sit/KFjEqiu4zPoI8sJbiNR1U1ad/M/kjFL1Yn95ru	ACTIVE	31-12-25 05:00:13.741000000 PM	31-12-25 05:00:13.741000000 PM		N		04-05-26 10:19:46.440585000 AM	mn	0	4282	ACTIVE
 
