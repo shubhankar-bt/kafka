@@ -1,1043 +1,198 @@
 ```java
-package com.fincore.gateway.dto;
-
-/**
- * Projection interface to capture specific fields from the JOIN query
- * between BRANCH_MASTER and CIRCLE_MASTER.
- */
-public interface BranchCircleProjection {
-    
-    String getBranchName();
-    
-    String getCircleCode();
-    
-    String getCircleName();
-    
-    String getCircleBranch();
-}
-
-```
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.repository;
-
-import com.fincore.gateway.dto.BranchCircleProjection;
-import com.fincore.gateway.model.User; // using an arbitrary entity to satisfy JpaRepository, though we only use native queries here
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
-
-@Repository
-public interface BranchRepository extends JpaRepository<User, String> {
-
-    /**
-     * Native query to fetch Branch and Circle details by performing a LEFT JOIN.
-     * LEFT JOIN ensures that even if a branch doesn't have a mapped circle, 
-     * the query won't fail and will still return the branch name.
-     */
-    @Query(value = """
-            SELECT 
-                b.NAME AS branchName, 
-                c.CIRCLE_CODE AS circleCode, 
-                c.CIRCLE_NAME AS circleName, 
-                c.BRANCH_CODE AS circleBranch 
-            FROM BRANCH_MASTER b
-            LEFT JOIN CIRCLE_MASTER c ON b.CIRCLE_CODE = c.CIRCLE_CODE
-            WHERE b.CODE = :branchCode
-            FETCH FIRST 1 ROWS ONLY
-            """, nativeQuery = true)
-    BranchCircleProjection findBranchAndCircleDetails(@Param("branchCode") String branchCode);
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * DTO that carries minimal user data embedded inside a token.
- *
- * This object is typically serialized within access or refresh tokens
- * to represent the authenticated user's identity and basic profile info.
- */
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class UserTokenDataDto {
-
-    /** Unique identifier of the user. */
-    private String userId;
-
-    /** Numeric role ID assigned to the user. */
-    private Integer role;
-
-    /** Name of the role (e.g. ADMIN, MANAGER, USER). */
-    private String roleName;
-
-    /** First name of the user. */
-    private String firstName;
-
-    /** Middle name, if provided. */
-    private String middleName;
-
-    /** Last name of the user. */
-    private String lastName;
-
-    /** Contact number registered with the user. */
-    private String phoneNumber;
-
-    /** Email address associated with the user account. */
-    private String email;
-
-    /** Branch or office code where the user is mapped (numeric). */
-    private int branch;
-
-    // --- NEW FIELDS FOR BRANCH & CIRCLE CONTEXT ---
-    
-    /** Name of the branch. */
-    private String branchName;
-
-    /** Code of the circle. */
-    private String circleCode;
-
-    /** Name of the circle. */
-    private String circleName;
-
-    /** Branch code representing the circle headquarters. */
-    private String circleBranch;
-
-    /** Flag indicating if the user's mapped branch is the Circle HQ. */
-    private Boolean isCircle;
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LoginResponseDTO implements UserLoginDTO {
-
-    private String userId;
-    private String accessToken;
-    private String tokenType;
-    private long expiresIn;
-    private String sub;
-    private String jti;
-    private MenuResponse roleData;
-    private String error;
-    private boolean validCredentials;
-    private String userStatus;
-    private String passwordLoginStatus;
-    private String refreshToken;
-    private Integer attemptsLeft;
-
-    /**
-     * User profile details extracted directly for frontend convenience.
-     * This avoids the frontend having to manually decode the JWT to display the user's name/branch.
-     */
-    private UserTokenDataDto userData;
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.Service;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.Config.KeyUtils;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.model.LoginAttempt;
-import com.fincore.gateway.model.LoginParam;
-import com.fincore.gateway.model.User;
-import com.fincore.gateway.model.UserRoles;
-import com.fincore.gateway.repository.*;
-import com.fincore.gateway.utility.Constants;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.orm.ObjectOptimisticLockingFailureException;
-import org.springframework.orm.jpa.JpaSystemException;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-
-@Slf4j
-@Service("LoginService")
-@RequiredArgsConstructor
-public class LoginServiceImpl implements LoginService {
-
-    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
-    
-    private final UserRepository userRepository;
-    private final LoginAttemptRepository loginAttemptRepository;
-    private final LoginParamRepository loginParamRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final MenuService menuService;
-    private final ObjectMapper mapper;
-    private final AdAuthenticationService adAuthenticationService;
-    
-    // Injecting the new BranchRepository
-    private final BranchRepository branchRepository;
-
-    @Value("${security.payload.rsa-private:}")
-    private String rsaPrivatePem;
-    
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-    
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long ttlSeconds;
-
-    @Transactional(readOnly = true)
-    @Override
-    public MenuResponse fetchRoleWiseData(String userId) {
-        log.info("Fetching role-wise data for userId: {}", userId);
-        try {
-            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
-
-            if (rows == null || rows.isEmpty()) {
-                log.info("No permissions found for userId: {}", userId);
-                return new MenuResponse(Collections.emptyList());
-            }
-            return menuService.transformFromProjection(rows);
-        } catch (Exception e) {
-            log.error("Error fetching permissions for userId: {}", userId, e);
-            return new MenuResponse(Collections.emptyList());
-        }
-    }
-
-    @Transactional
-    @Override
-    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
-
-        final String userId = userCredentials.getUserId();
-        final String encryptedPassword = userCredentials.getPassword(); 
-
-        UserDto result = new UserDto();
-
-        User user = userRepository.findByUserId(userId);
-        if (user == null) {
-            result.setValidCredentials(false);
-            result.setUserStatus(Constants.INVALID);
-            log.warn("Login blocked: User {} not found in local DB.", userId);
-            return result;
-        }
-
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        char activeMode = loginParam.getActiveLoginMode();
-
-        LoginAttempt attempt = new LoginAttempt();
-        attempt.setLoginMethod(determineMethodString(activeMode));
-        attempt.setSuccess("N");
-        attempt.setIpAddress(clientIp);
-        attempt.setUserId(userId);
-
-        result.setLoginMethod(activeMode);
-        result.setUserId(user.getUserId());
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        result.setRoleStatus(userRole.getRoleStatus());
-        result.setUserStatus(user.getAccountStatus());
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
-            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
-            loginAttemptRepository.save(attempt);
-            result.setValidCredentials(false);
-            return result;
-        }
-
-        try {
-            String rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-
-            if (activeMode == Constants.LDAP) {
-                log.info("Processing LDAP Login for user: {}", userId);
-                try {
-                    boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
-                    if (ldapSuccess) {
-                        handleSuccess(attempt, result, user, userRole);
-                    } else {
-                        handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
-                    }
-                } catch (RuntimeException e) {
-                    log.error("LDAP Server Error for user {}: {}", userId, e.getMessage());
-                    attempt.setSuccess("N");
-                    attempt.setFailureReason("LDAP Server Down / Connectivity Issue");
-                    result.setValidCredentials(false);
-                    result.setMessage("System Error: Unable to connect to Authentication Server. Please try again later.");
-                    return result;
-                }
-
-            } else if (activeMode == Constants.PASSWORD) {
-                if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-                    passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
-                } else {
-                    handleAccountLocked(attempt, result, user);
-                }
-            }
-        } catch (SecurityException e) {
-            log.error("Login rejected for user {}: Payload decryption failed", userId);
-            result.setValidCredentials(false);
-            result.setMessage("Security Error: Invalid encrypted payload");
-            attempt.setFailureReason("Payload Decryption Failed (Possible MITM or invalid format)");
-            return result;
-        }
-
-        loginAttemptRepository.save(attempt);
-        log.debug("verifyUserCredentials result={}", result);
-        return result;
-    }
-
-    @Transactional
-    @Override
-    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
-        log.info("Password-based login for userId={}", user.getUserId());
-
-        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            handleAccountLocked(loginAttempt, userInfo, user);
-            return;
-        }
-
-        if (encoder.matches(password, user.getPasswordHash())) {
-            UserRoles userRole = userRepository.getUserRole(user.getUserId());
-            handleSuccess(loginAttempt, userInfo, user, userRole);
-        } else {
-            handleFailure(loginAttempt, userInfo, user, loginParam, "Wrong Password");
-        }
-    }
-
-    @Override
-    public String generateStatusMessage(String status, String type) {
-        return String.format("Trying to login with a %s %s", status, type);
-    }
-
-    @Transactional(readOnly = true)
-    public VerifyUserDTO checkUser(String userId) {
-        VerifyUserDTO out = new VerifyUserDTO();
-        out.setUserId(userId);
-
-        User user = userRepository.findByUserId(userId);
-        LoginParam loginParam = loginParamRepository.getLoginParam();
-        out.setLoginMethod(loginParam.getActiveLoginMode());
-
-        if (user == null) {
-            out.setUserCheck(false);
-            out.setUserStatus(Constants.INVALID);
-            out.setMessage("Invalid User");
-            return out;
-        }
-
-        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
-            Timestamp setAt = user.getTempPasswordSetAt();
-            boolean isPasswordValid = false;
-
-            if (loginParam.getActiveLoginMode() == Constants.PASSWORD && setAt != null) {
-                LocalDateTime lastUpdate = setAt.toLocalDateTime();
-                isPasswordValid = LocalDateTime.now()
-                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
-            } else {
-                isPasswordValid = true;
-            }
-
-            UserRoles userRole = userRepository.getUserRole(userId);
-            out.setRoleStatus(userRole.getRoleStatus());
-
-            boolean updateNeeded = (loginParam.getActiveLoginMode() == Constants.PASSWORD)
-                    && (user.getPasswordHash() == null || !isPasswordValid);
-
-            out.setUpdatePassword(updateNeeded);
-            out.setUserStatus(Constants.ACTIVE);
-            out.setMessage(Constants.ACTIVE_USER);
-            out.setPasswordLoginStatus(user.getPasswordLogin());
-        } else {
-            String accountStatus = user.getAccountStatus();
-            out.setUserCheck(true);
-            out.setUserStatus(accountStatus);
-            out.setMessage(
-                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact support."
-                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
-            );
-        }
-
-        return out;
-    }
-
-    @Transactional
-    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
-        String userId = userCredentials.getUserId();
-        String encryptedPassword = userCredentials.getPassword();
-
-        userCredentials.setUpdateFlag(false);
-        userCredentials.setPassword("");
-        userCredentials.setOtp("");
-
-        try {
-            User user = userRepository.findByUserId(userId);
-            if (user == null) {
-                userCredentials.setMessage("Invalid user id");
-                return userCredentials;
-            }
-
-            String rawPassword;
-            try {
-                rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
-            } catch (SecurityException e) {
-                log.error("Update password rejected for user {}: Payload decryption failed", userId);
-                userCredentials.setMessage("Security Error: Invalid encrypted payload");
-                return userCredentials;
-            }
-
-            String passwordHash = encoder.encode(rawPassword);
-            user.setPasswordHash(passwordHash);
-            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
-            userRepository.save(user);
-
-            userCredentials.setMessage("User password successfully updated");
-            userCredentials.setUpdateFlag(true);
-
-        } catch (DataIntegrityViolationException e) {
-            log.warn("Data integrity violation while updating password for userId={}", userId, e);
-            userCredentials.setMessage("Failed to change password, please try again");
-        } catch (ObjectOptimisticLockingFailureException e) {
-            log.warn("Optimistic locking failure while updating password for userId={}", userId, e);
-            userCredentials.setMessage("The user data was modified by another process, please retry");
-        } catch (JpaSystemException e) {
-            log.error("JPA system error while updating password for userId={}", userId, e);
-            userCredentials.setMessage("A database error occurred, please try again later");
-        }
-
-        return userCredentials;
-    }
-
-    /**
-     * Initializes the token-visible user data embedded/returned alongside the JWT.
-     * Fetches branch and circle mapping dynamically.
-     */
-    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
-        UserTokenDataDto tokenData = new UserTokenDataDto();
-        tokenData.setFirstName(user.getFirstName());
-        tokenData.setLastName(user.getLastName());
-        tokenData.setPhoneNumber(user.getPhoneNumber());
-        tokenData.setUserId(user.getUserId());
-        tokenData.setBranch(user.getBranch());
-        tokenData.setEmail(user.getEmail());
-        tokenData.setRole(userRole.getRole());
-        tokenData.setRoleName(userRole.getRoleName());
-        
-        // FORMAT the branch integer to a 5-digit string (e.g., 8080 -> "08080")
-        String branchCodeStr = String.format("%05d", user.getBranch());
-        
-        // Fetch specific details from the database
-        BranchCircleProjection bcInfo = branchRepository.findBranchAndCircleDetails(branchCodeStr);
-        
-        if (bcInfo != null) {
-            tokenData.setBranchName(bcInfo.getBranchName());
-            tokenData.setCircleCode(bcInfo.getCircleCode());
-            tokenData.setCircleName(bcInfo.getCircleName());
-            tokenData.setCircleBranch(bcInfo.getCircleBranch());
-            
-            // Check if user's branch matches the Circle's designated branch code
-            boolean isCircle = branchCodeStr.equals(bcInfo.getCircleBranch());
-            tokenData.setIsCircle(isCircle);
-        } else {
-            // Fallback if branch is somehow missing in the master table
-            tokenData.setIsCircle(false);
-            log.warn("Branch details not found in BRANCH_MASTER for branch code: {}", branchCodeStr);
-        }
-
-        return tokenData;
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public UserDto getUserProfile(String userId) {
-        User user = userRepository.findByUserId(userId);
-        UserRoles userRole = userRepository.getUserRole(userId);
-
-        if (user == null) {
-            return null;
-        }
-        UserDto userDto = new UserDto();
-        userDto.setUserId(user.getUserId());
-        userDto.setUserStatus(user.getPasswordLogin());
-        userDto.setPasswordLoginStatus(user.getPasswordLogin());
-        userDto.setUser(initializeTokenData(user, userRole)); // Will re-fetch branch & circle details
-        return userDto;
-    }
-
-    private String determineMethodString(char mode) {
-        if (mode == Constants.LDAP) return "LDAP";
-        if (mode == Constants.PASSWORD) return Constants.PASSWORD_BASED_LOGIN;
-        return Constants.SSO_BASED_LOGIN;
-    }
-
-    private void handleAccountLocked(LoginAttempt attempt, UserDto result, User user) {
-        result.setValidCredentials(false);
-        result.setPasswordLoginStatus(user.getPasswordLogin());
-        result.setMessage("Your account is locked due to multiple failed attempts.");
-
-        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
-            result.setAttemptsLeft(0);
-            attempt.setFailureReason("Account Locked (Pre-check)");
-        } else {
-            result.setMessage("Password login is disabled.");
-            attempt.setFailureReason("Password login disabled");
-        }
-    }
-
-    private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
-        attempt.setSuccess("Y");
-        attempt.setFailureReason("Success");
-        result.setValidCredentials(true);
-        result.setMessage("Login Successful");
-
-        if (user.getUserWrongPasswordCount() > 0) {
-            user.setUserWrongPasswordCount(0);
-            userRepository.save(user);
-        }
-
-        log.info("Credentials validated. Issuing token for userId={}", user.getUserId());
-        
-        // Fetch contextual user data (including branch and circle)
-        UserTokenDataDto tokenData = initializeTokenData(user, userRole);
-        
-        @SuppressWarnings("unchecked")
-        String accessToken = HmacJwtUtil.generate(
-                hmacSecret,
-                user.getUserId(),
-                ttlSeconds,
-                mapper.convertValue(tokenData, Map.class) // Embed all tokenData properties into the JWT claims
-        );
-
-        result.setAccessToken(accessToken);
-        result.setUser(tokenData);
-    }
-
-    private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
-        log.warn("Login failed for user {}: {}", user.getUserId(), reason);
-        attempt.setSuccess("N");
-
-        int currentFailedCount = user.getUserWrongPasswordCount();
-        int maxAllowed = loginParam.getWrongPasswordAttempts();
-        int newFailedCount = currentFailedCount + 1;
-
-        user.setUserWrongPasswordCount(newFailedCount);
-        userInfo.setValidCredentials(false);
-
-        if (newFailedCount >= maxAllowed) {
-            user.setPasswordLogin(Constants.INACTIVE);
-            attempt.setFailureReason(reason + " -> Account Locked");
-            userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
-            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
-            userInfo.setAttemptsLeft(0);
-        } else {
-            int remaining = maxAllowed - newFailedCount;
-            attempt.setFailureReason(reason);
-            if (remaining > 1) {
-                userInfo.setMessage("Incorrect credentials. Please check and try again.");
-            } else {
-                userInfo.setMessage("Incorrect credentials. Final attempt before lock.");
-            }
-            userInfo.setAttemptsLeft(remaining);
-        }
-        userRepository.save(user);
-    }
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.Controller;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.Service.LaunchService;
-import com.fincore.gateway.Service.LoginService;
-import com.fincore.gateway.Service.TokenSessionValidator;
-import com.fincore.gateway.dto.*;
-import com.fincore.gateway.utility.Constants;
-import com.fincore.gateway.utility.LoginUtility;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.ExpiredJwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
-import jakarta.validation.Valid;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseCookie;
-import org.springframework.http.ResponseEntity;
-import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-
-import java.time.Duration;
-import java.util.Arrays;
+package com.fincore.commonutilities.util;
+
+import org.springframework.stereotype.Component;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.Base64;
-import java.util.List;
-import java.util.Map;
 
-@Slf4j
-@RestController
-@RequestMapping("/api/auth")
-@RequiredArgsConstructor
-public class AuthController {
+/**
+ * Standard utility for AES-256-GCM Payload Encryption.
+ * Shared across all Fincore microservices.
+ */
+@Component
+public class AesEncryptionUtil {
 
-    private static final String USER_PREFIX = "USR:";
+    private static final String ALGORITHM = "AES/GCM/NoPadding";
+    private static final int TAG_LENGTH_BIT = 128; // 16 bytes authentication tag
+    private static final int KEY_SIZE = 256;
 
-    private final TokenSessionValidator validator;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final LoginService loginService;
-    private final ObjectMapper mapper;
-    private final LaunchService launchService;
-
-    @Value("${security.jwt.hmac-base64-secret:}")
-    private String hmacSecret;
-
-    @Value("${security.jwt.ttl-seconds:900}")
-    private long accessTokenTtl;
-
-    @Value("${security.jwt.refresh-ttl-seconds:43200}")
-    private long refreshTokenTtl;
-
-    @Value("${security.login.blocked-ips:}")
-    private String blockedIpsConfig;
-
-    @Value("${security.payload.rsa-public:}")
-    private String rsaPublicPem;
-
-
-    private String sanitizeIp(String rawIp) {
-        if (rawIp == null) return "";
-        String ip = rawIp;
-        if (ip.startsWith("/")) ip = ip.substring(1);
-        int colonIndex = ip.indexOf(':');
-        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
-        return ip;
-    }
-
-    private boolean isIpBlocked(String rawClientIp) {
-        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
-        String cleanIp = sanitizeIp(rawClientIp);
-        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
-        boolean blocked = blockedIps.contains(cleanIp);
-        if (blocked) log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", rawClientIp, cleanIp);
-        return blocked;
-    }
-
-    private ResponseCookie createRefreshTokenCookie(String token) {
-        return ResponseCookie.from("refresh_token", token)
-                .httpOnly(true)
-                .secure(true) // Set to true in PROD
-                .path("/")
-                .maxAge(Duration.ofSeconds(refreshTokenTtl))
-                .sameSite("Strict")
-                .build();
-    }
-
-    private ResponseCookie createEmptyCookie() {
-        return ResponseCookie.from("refresh_token", "")
-                .httpOnly(true)
-                .secure(true) // Set to true in PROD
-                .path("/")
-                .maxAge(0)
-                .sameSite("Strict")
-                .build();
-    }
-
-    private Claims extractClaims(String token) {
-        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
-        return Jwts.parser()
-                .verifyWith(Keys.hmacShaKeyFor(secretBytes))
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-
-    @PostMapping(value = "/check-user")
-    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
-    {
-        final String rawClientIp = LoginUtility.getClientIp(request);
-        String userId = body.get("userId");
-        log.info("Check-User info user id: {} , ip : {}", userId, rawClientIp);
-
-        if (isIpBlocked(rawClientIp)) {
-            log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
-            VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
-                    .userId(userId)
-                    .message("Access denied: Your IP address is blocked.")
-                    .userStatus(Constants.RESTRICTED)
-                    .build();
-            return Mono.just(ApiResponse.success(blockedResponse, "Access Restricted"));
+    /**
+     * Generates a cryptographically secure 256-bit AES Key.
+     * To be called by the Login/Auth Service upon successful authentication.
+     */
+    public String generateBase64SessionKey() {
+        try {
+            KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+            SecureRandom secureRandom = new SecureRandom();
+            keyGen.init(KEY_SIZE, secureRandom);
+            SecretKey secretKey = keyGen.generateKey();
+            return Base64.getEncoder().encodeToString(secretKey.getEncoded());
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("AES Algorithm not found", e);
         }
-
-        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
-            return Mono.just(ApiResponse.error("Public key not configured on server", "CONFIG_ERROR"));
-        }
-
-        return Mono.fromCallable(() -> loginService.checkUser(userId))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(dto -> {
-                    dto.setPublicKey(rsaPublicPem);
-                    return ApiResponse.success(dto, "User check completed");
-                });
     }
 
-
-    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(
-            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload)
-    {
-        final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
-
-        if (isIpBlocked(clientIp)) {
-            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
-        }
-
-        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(user -> {
-
-                    if (!user.isValidCredentials()) {
-                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
-
-                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
-                                .userId(user.getUserId())
-                                .validCredentials(false)
-                                .userStatus(user.getUserStatus())
-                                .passwordLoginStatus(user.getPasswordLoginStatus())
-                                .attemptsLeft(user.getAttemptsLeft())
-                                .error(user.getMessage())
-                                .build();
-
-                        HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
-                                ? HttpStatus.FORBIDDEN
-                                : HttpStatus.UNAUTHORIZED;
-
-                        return Mono.just(ResponseEntity.status(status)
-                                .body(ApiResponse.success(errorResponse, user.getMessage())));
-                    }
-
-                    if (hmacSecret == null || hmacSecret.isBlank()) {
-                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
-                    }
-
-                    // Extract the built user context mapping it to the token claims
-                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
-                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-
-                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
-
-                    String jti = extractClaims(accessToken).getId();
-                    response.addCookie(createRefreshTokenCookie(refreshToken));
-
-                    return validator.registerUserSession(user.getUserId(), jti)
-                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
-                                    .subscribeOn(Schedulers.boundedElastic())))
-                            .map(roleData -> {
-                                LoginResponseDTO loginResponse = LoginResponseDTO.builder()
-                                        .userId(user.getUserId())
-                                        .validCredentials(true)
-                                        .accessToken(accessToken)
-                                        .tokenType("Bearer")
-                                        .expiresIn(accessTokenTtl)
-                                        .sub(user.getUserId())
-                                        .jti(jti)
-                                        .roleData(roleData)
-                                        .userData(user.getUser()) // <--- Pass user details directly to response
-                                        .userStatus(user.getUserStatus())
-                                        .passwordLoginStatus(user.getPasswordLoginStatus())
-                                        .attemptsLeft(null)
-                                        .build();
-
-                                return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
-                            });
-                });
-    }
-
-    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response)
-    {
-        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
-        String refreshToken = (cookie != null) ? cookie.getValue() : null;
-
-        if (refreshToken == null || refreshToken.isBlank()) {
-            log.warn("Refresh failed: No refresh token cookie.");
-            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing refresh token cookie"));
-        }
-
-        return Mono.fromCallable(() -> extractClaims(refreshToken))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String userKey = USER_PREFIX + userId;
-                    log.info("Refreshing Token for User: {}", userId);
-
-                    return redisTemplate.opsForValue().get(userKey)
-                            .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("Redis returned EMPTY for key: {}. Session expired.", userKey);
-                                return Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Session expired. Please login again."));
-                            }))
-                            .flatMap(currentJti -> {
-                                log.info("Session Active in Redis. Fetching Full Profile.");
-
-                                return Mono.fromCallable(() -> loginService.getUserProfile(userId))
-                                        .subscribeOn(Schedulers.boundedElastic())
-                                        .flatMap(userDto -> {
-                                            if (userDto == null) {
-                                                return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
-                                            }
-
-                                            return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
-                                                    .subscribeOn(Schedulers.boundedElastic())
-                                                    .flatMap(roleData -> {
-
-                                                        @SuppressWarnings("unchecked")
-                                                        Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
-                                                        String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
-
-                                                        Map<String, Object> refreshClaims = Map.of("type", "refresh");
-                                                        String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
-                                                        String newJti = extractClaims(newAccessToken).getId();
-
-                                                        response.addCookie(createRefreshTokenCookie(newRefreshToken));
-
-                                                        return validator.registerUserSession(userId, newJti)
-                                                                .thenReturn(ApiResponse.success(
-                                                                        LoginResponseDTO.builder()
-                                                                                .accessToken(newAccessToken)
-                                                                                .userId(userId)
-                                                                                .jti(newJti)
-                                                                                .expiresIn(accessTokenTtl)
-                                                                                .validCredentials(true)
-                                                                                .roleData(roleData)
-                                                                                .userData(userDto.getUser()) // <--- Pass user details directly to response
-                                                                                .userStatus(userDto.getUserStatus())
-                                                                                .passwordLoginStatus(userDto.getPasswordLoginStatus())
-                                                                                .sub(userId)
-                                                                                .build(),
-                                                                        "Token refreshed successfully"
-                                                                ));
-                                                    });
-                                        });
-                            });
-                });
-    }
-
-    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
-            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response)
-    {
-        response.addCookie(createEmptyCookie());
-        String tokenString = null;
-
-        if (jwtAuth != null && jwtAuth.getToken() != null) {
-            tokenString = jwtAuth.getToken().getTokenValue();
-        } else {
-            String header = request.getHeaders().getFirst("Authorization");
-            if (header != null && header.startsWith("Bearer ")) {
-                tokenString = header.substring(7);
+    /**
+     * Decrypts an AES-256-GCM encrypted payload.
+     * Expects frontend to send format: "Base64(IV):Base64(Ciphertext)"
+     */
+    public String decrypt(String encryptedPayload, String base64SecretKey) {
+        try {
+            // 1. Split the IV and the Ciphertext
+            String[] parts = encryptedPayload.split(":");
+            if (parts.length != 2) {
+                throw new IllegalArgumentException("Invalid encrypted payload format. Expected IV:Ciphertext");
             }
+
+            byte[] iv = Base64.getDecoder().decode(parts[0]);
+            byte[] cipherText = Base64.getDecoder().decode(parts[1]);
+            byte[] decodedKey = Base64.getDecoder().decode(base64SecretKey);
+
+            // 2. Rebuild the Key and GCM Spec
+            SecretKey secretKey = new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES");
+            GCMParameterSpec gcmParameterSpec = new GCMParameterSpec(TAG_LENGTH_BIT, iv);
+
+            // 3. Decrypt
+            Cipher cipher = Cipher.getInstance(ALGORITHM);
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmParameterSpec);
+
+            byte[] decryptedText = cipher.doFinal(cipherText);
+            
+            // 4. Return pure JSON string
+            return new String(decryptedText, StandardCharsets.UTF_8);
+
+        } catch (Exception e) {
+            throw new SecurityException("Failed to decrypt payload. Data may be tampered or key is invalid.", e);
         }
-
-        if (tokenString == null || tokenString.isBlank()) {
-            log.warn("Logout called without token. Cleaning up cookies only.");
-            return Mono.just(ResponseEntity.ok(
-                    ApiResponse.<LoginResponseDTO>success(
-                            LoginResponseDTO.builder().userId("anonymous").build(),
-                            "Logged out (No Token)"
-                    )
-            ));
-        }
-
-        final String finalToken = tokenString;
-
-        return Mono.fromCallable(() -> {
-                    try {
-                        return extractClaims(finalToken);
-                    } catch (ExpiredJwtException e) {
-                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
-                        return e.getClaims();
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(claims -> {
-                    String userId = claims.getSubject();
-                    String incomingJti = claims.getId();
-
-                    if (userId == null || incomingJti == null) {
-                        return Mono.just(ResponseEntity.ok(
-                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
-                        ));
-                    }
-
-                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
-
-                    return validator.blacklistToken(incomingJti)
-                            .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
-                            .flatMap(activeJti -> {
-                                if (activeJti != null && activeJti.equals(incomingJti)) {
-                                    log.info("Session MATCH. Deleting active session for user: {}", userId);
-                                    return validator.clearUserSession(userId)
-                                            .then(Mono.just(ResponseEntity.ok(
-                                                    ApiResponse.<LoginResponseDTO>success(
-                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
-                                                            "Logged out successfully"
-                                                    )
-                                            )));
-                                } else {
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
-                                    return Mono.just(ResponseEntity.ok(
-                                            ApiResponse.<LoginResponseDTO>success(
-                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
-                                                    "Logged out (Concurrent Session Preserved)"
-                                            )
-                                    ));
-                                }
-                            })
-                            .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                                    ApiResponse.<LoginResponseDTO>success(
-                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
-                                            "Logged out (Session already expired)"
-                                    )
-                            )));
-                })
-                .onErrorResume(e -> {
-                    log.error("Logout Unexpected Error", e);
-                    return Mono.just(ResponseEntity.ok(
-                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
-                    ));
-                });
-    }
-
-    @PostMapping(value = "/update-password")
-    public Mono<ApiResponse<UpdatePasswordDTO>> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
-        return Mono.fromCallable(() -> loginService.updatePassword(dto))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(result -> ApiResponse.success(result, result.getMessage()));
-    }
-
-    @GetMapping(value = "/public-key", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<Map<String, String>>> getPublicKey() {
-        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
-            return Mono.just(ApiResponse.error("Public key not configured", "CONFIG_ERROR"));
-        }
-        return Mono.just(ApiResponse.success(Map.of("publicKey", rsaPublicPem), "Public Key fetched successfully"));
-    }
-
-    @GetMapping("/start-prod")
-    public ResponseEntity<LaunchResponse> getLaunchData() {
-        return ResponseEntity.ok(launchService.getLaunchDetails());
     }
 }
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.util.AesEncryptionUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.MethodParameter;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpInputMessage;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Global Interceptor that decrypts incoming @RequestBody payloads 
+ * before they reach the Controller DTO mapping.
+ */
+@Slf4j
+@ControllerAdvice
+@RequiredArgsConstructor
+public class DecryptRequestBodyAdvice extends RequestBodyAdviceAdapter {
+
+    private final AesEncryptionUtil aesEncryptionUtil;
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+
+    private static final String ENCRYPTION_HEADER = "X-Encrypted-Payload";
+    private static final String REDIS_AES_KEY_PREFIX = "AES_KEY:";
+
+    @Override
+    public boolean supports(MethodParameter methodParameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) {
+        // We support ALL controllers. 
+        // The actual decision to decrypt happens in beforeBodyRead based on the header.
+        return true;
+    }
+
+    @Override
+    public HttpInputMessage beforeBodyRead(HttpInputMessage inputMessage, MethodParameter parameter,
+                                           Type targetType, Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
+
+        // 1. Check if the frontend flagged this payload as encrypted
+        boolean isEncrypted = false;
+        if (inputMessage.getHeaders().containsKey(ENCRYPTION_HEADER)) {
+            isEncrypted = "true".equalsIgnoreCase(inputMessage.getHeaders().getFirst(ENCRYPTION_HEADER));
+        }
+
+        // If no header, let standard JSON parsing handle it (Good for Postman testing)
+        if (!isEncrypted) {
+            return inputMessage;
+        }
+
+        try {
+            // 2. Read the raw encrypted string from the frontend
+            String encryptedBody = new String(inputMessage.getBody().readAllBytes(), StandardCharsets.UTF_8);
+
+            // 3. Extract the User ID from the Token
+            String token = inputMessage.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            if (token == null || !token.startsWith("Bearer ")) {
+                throw new SecurityException("Missing or invalid Authorization header for encrypted payload");
+            }
+            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
+
+            // 4. Fetch the user's specific AES session key from Redis
+            String base64AesKey = redisTemplate.opsForValue().get(REDIS_AES_KEY_PREFIX + userId);
+            if (base64AesKey == null) {
+                log.error("AES Session Key not found in Redis for user: {}", userId);
+                throw new SecurityException("Encryption Session expired. Please refresh the page.");
+            }
+
+            // 5. Decrypt the payload
+            String decryptedJson = aesEncryptionUtil.decrypt(encryptedBody, base64AesKey);
+
+            // 6. Pass the decrypted JSON bytes down the chain, disguised as the original request!
+            InputStream decryptedStream = new ByteArrayInputStream(decryptedJson.getBytes(StandardCharsets.UTF_8));
+            
+            return new HttpInputMessage() {
+                @Override
+                public InputStream getBody() {
+                    return decryptedStream;
+                }
+
+                @Override
+                public HttpHeaders getHeaders() {
+                    return inputMessage.getHeaders();
+                }
+            };
+
+        } catch (SecurityException se) {
+            throw se; // Re-throw security exceptions
+        } catch (Exception e) {
+            log.error("Critical failure during payload decryption", e);
+            throw new RuntimeException("Malformed encrypted payload", e);
+        }
+    }
+}
+
 
 ```
 
@@ -1053,3 +208,64 @@ public class AuthController {
 
 
 
+
+@Import({
+        RedisConfig.class,
+        JwtUtil.class,
+        CommonSecurityConfig.class,
+        ResilienceConfig.class,
+        AesEncryptionUtil.class,            // <--- NEW
+        DecryptRequestBodyAdvice.class      // <--- NEW
+})
+public class SecurityConfig { ... }
+
+### Step 4: Updating your Login API (Auth Service)
+
+Now, your Authentication microservice needs to generate the key when the user logs in. You will likely update your `AuthServiceImpl` (or equivalent).
+
+*Note: The Login API payload itself (username/password) is **not** encrypted by AES because the user doesn't have a key yet! It is secured purely by HTTPS TLS. Once the API validates the password, it generates the key for all future requests.*
+
+**Here is the exact code snippet for your Auth Service developer:**
+
+```java
+@Service
+@RequiredArgsConstructor
+public class AuthServiceImpl implements AuthService {
+
+    private final AesEncryptionUtil aesUtil;
+    private final StringRedisTemplate redisTemplate;
+    // ... your existing dependencies (JwtUtil, etc)
+
+    public LoginResponse login(LoginRequest request) {
+        
+        // 1. Authenticate user against DB/AD...
+        User user = authenticateUser(request.getUsername(), request.getPassword());
+        
+        // 2. Generate Tokens
+        String jwtToken = jwtUtil.generateToken(user);
+        String refreshToken = jwtUtil.generateRefreshToken(user);
+
+        // 3. GENERATE THE AES SESSION KEY
+        String base64AesKey = aesUtil.generateBase64SessionKey();
+
+        // 4. STORE IN REDIS (Bind it to the Refresh Token's lifespan, e.g., 8 hours)
+        redisTemplate.opsForValue().set("AES_KEY:" + user.getId(), base64AesKey, Duration.ofHours(8));
+
+        // 5. RETURN TO FRONTEND
+        return LoginResponse.builder()
+                .accessToken(jwtToken)
+                .refreshToken(refreshToken)
+                .sessionKey(base64AesKey) // NEW FIELD in your LoginResponse DTO
+                .build();
+    }
+    
+    // Make sure to fetch and return the EXISTING key during /refresh-token too!
+}
+
+### Summary of what we just achieved:
+1. We created the utility to handle strict **AES-256-GCM** encryption.
+2. We placed an invisible shield (`DecryptRequestBodyAdvice`) in front of all controllers.
+3. Your controller logic (`@RequestBody MyDto request`) does **not need to change by a single line of code**.
+4. You avoided the performance and security disaster of PBKDF2.
+
+Is your team ready to review the Frontend React logic for encrypting the Axios request, or do you want to finalize the `/refresh-token` backend logic first?
