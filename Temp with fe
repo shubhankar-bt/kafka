@@ -1,263 +1,1045 @@
 ```java
-package com.fincore.gateway.Service;
+package com.fincore.gateway.dto;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.gateway.JwtUtil.HmacJwtUtil;
-import com.fincore.gateway.dto.LoginRequest;
-import com.fincore.gateway.dto.LoginResponse;
-import com.fincore.gateway.entity.*;
-import com.fincore.gateway.repository.LoginAttemptRepository;
-import com.fincore.gateway.repository.LoginParamRepository;
-import com.fincore.gateway.repository.RolePermissionsRepository;
-import com.fincore.gateway.repository.UserRepository;
-import com.fincore.gateway.utility.Constants;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.EmptyResultDataAccessException;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
-
-import java.time.Duration;
-import java.time.LocalDateTime;
-import java.util.*;
-import java.util.stream.Collectors;
-
-@Service
-@RequiredArgsConstructor
-@Slf4j
-public class LoginServiceImpl implements LoginService {
-
-    private final UserRepository userRepository;
-    private final RolePermissionsRepository rolePermissionsRepository;
-    private final HmacJwtUtil hmacJwtUtil;
-    private final ReactiveStringRedisTemplate redisTemplate;
-    private final ObjectMapper objectMapper;
-    private final AdAuthenticationService adAuthenticationService;
-    private final LoginAttemptRepository loginAttemptRepository;
-    private final LoginParamRepository loginParamRepository;
+/**
+ * Projection interface to capture specific fields from the JOIN query
+ * between BRANCH_MASTER and CIRCLE_MASTER.
+ */
+public interface BranchCircleProjection {
     
-    // ✅ Injected JdbcTemplate for lighting-fast native queries
-    private final JdbcTemplate jdbcTemplate;
-
-    @Value("${jwt.expiration}")
-    private long jwtExpiration;
-
-    // ✅ Java 16+ Record to efficiently hold organizational data in memory
-    private record OrgDetails(String branchName, String circleName, String circleCode, String circleBranch, boolean isCircle) {}
-
-    @Override
-    public Mono<LoginResponse> login(LoginRequest loginRequest) {
-        log.info("Processing LDAP Login for user: {}", loginRequest.getUserId());
-
-        return Mono.fromCallable(() -> {
-            // 1. Fetch User
-            User user = userRepository.findByUserId(loginRequest.getUserId())
-                    .orElseThrow(() -> new RuntimeException("User not found: " + loginRequest.getUserId()));
-
-            if (user.getIsDeleted() == 'Y') {
-                throw new RuntimeException("User account is disabled");
-            }
-
-            // 2. Perform LDAP Auth
-            try {
-                boolean isLdapAuthSuccess = adAuthenticationService.authenticateUser(loginRequest.getUserId(), loginRequest.getPassword());
-                if (!isLdapAuthSuccess) {
-                    recordFailedAttempt(user, "LDAP Authentication Failed", "LDAP");
-                    throw new RuntimeException("Invalid credentials from AD");
-                }
-            } catch (Exception e) {
-                recordFailedAttempt(user, "LDAP Error: " + e.getMessage(), "LDAP");
-                log.error("LDAP Auth failed for {}: {}", loginRequest.getUserId(), e.getMessage());
-                throw new RuntimeException("Invalid credentials from AD");
-            }
-
-            // 3. Reset failed attempts
-            if (user.getUserWrongPasswordCount() > 0) {
-                user.setUserWrongPasswordCount(0);
-                userRepository.save(user);
-            }
-
-            // 4. Fetch Permissions
-            List<RolePermissions> rolePermissionsList = rolePermissionsRepository.findByRoleId(user.getRoleId());
-            if (rolePermissionsList.isEmpty()) {
-                throw new RuntimeException("No permissions configured for user role");
-            }
-            RolePermissions rolePerms = rolePermissionsList.get(0);
-            Set<String> permissions = rolePermissionsList.stream()
-                    .map(RolePermissions::getPermissionId)
-                    .collect(Collectors.toSet());
-
-            // ✅ 5. Fetch Organization Details (Branch & Circle)
-            OrgDetails orgDetails = fetchOrgDetails(user.getBranch());
-
-            // Prepare extra claims for JWT
-            Map<String, Object> extraClaims = new HashMap<>();
-            extraClaims.put("branchName", orgDetails.branchName());
-            extraClaims.put("circleName", orgDetails.circleName());
-            extraClaims.put("circleCode", orgDetails.circleCode());
-            extraClaims.put("circleBranch", orgDetails.circleBranch());
-            extraClaims.put("isCircle", orgDetails.isCircle());
-
-            // ✅ 6. Generate JWT (Passing the extra claims)
-            String jwtToken = hmacJwtUtil.generateToken(
-                    user.getUserId(), 
-                    user.getRoleId(), 
-                    rolePerms.getRoleType(), 
-                    Set.copyOf(permissions), 
-                    extraClaims
-            );
-
-            // 7. Save Login Attempt
-            saveLoginAttempt(loginRequest.getUserId(), true, "LDAP", "Success", "APP");
-
-            // ✅ 8. Construct enriched LoginResponse
-            LoginResponse response = LoginResponse.builder()
-                    .accessToken(jwtToken)
-                    .tokenType("Bearer")
-                    .expiresIn(jwtExpiration)
-                    .roleType(rolePerms.getRoleType())
-                    .requirePasswordChange(false)
-                    .branchName(orgDetails.branchName())
-                    .circleName(orgDetails.circleName())
-                    .circleCode(orgDetails.circleCode())
-                    .circleBranch(orgDetails.circleBranch())
-                    .isCircle(orgDetails.isCircle())
-                    .build();
-
-            return response;
-            
-        }).subscribeOn(Schedulers.boundedElastic())
-        .flatMap(response -> {
-            return saveSessionToRedis(loginRequest.getUserId(), response.getAccessToken())
-                    .thenReturn(response);
-        });
-    }
-
-    /**
-     * ✅ O(1) Time Complexity Native Query to fetch Branch and Circle Details.
-     */
-    private OrgDetails fetchOrgDetails(Integer branchCodeNumber) {
-        if (branchCodeNumber == null) {
-            return new OrgDetails(null, null, null, null, false);
-        }
-
-        // Pad the branch number to exactly 5 digits to match VARCHAR2 CODE in DB
-        String paddedBranchCode = String.format("%05d", branchCodeNumber);
-
-        String sql = """
-                SELECT 
-                    b.NAME as branchName, 
-                    c.CIRCLE_NAME as circleName, 
-                    b.CIRCLE_CODE as circleCode, 
-                    c.BRANCH_CODE as circleBranch
-                FROM branch_master b
-                JOIN circle_master c ON b.CIRCLE_CODE = c.CIRCLE_CODE
-                WHERE b.CODE = ?
-                """;
-
-        try {
-            return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> {
-                String cBranch = rs.getString("circleBranch");
-                
-                // Logic: isCircle is true if the user's branch exact matches the Circle's main branch
-                boolean isCircle = paddedBranchCode.equals(cBranch);
-                
-                return new OrgDetails(
-                        rs.getString("branchName"),
-                        rs.getString("circleName"),
-                        rs.getString("circleCode"),
-                        cBranch,
-                        isCircle
-                );
-            }, paddedBranchCode);
-            
-        } catch (EmptyResultDataAccessException e) {
-            log.warn("Organization details not found for branch code: {}", paddedBranchCode);
-            return new OrgDetails(null, null, null, null, false);
-        } catch (Exception e) {
-            log.error("Error fetching organization details for branch: {}", paddedBranchCode, e);
-            return new OrgDetails(null, null, null, null, false);
-        }
-    }
-
-    private void recordFailedAttempt(User user, String reason, String loginMethod) {
-        user.setUserWrongPasswordCount(user.getUserWrongPasswordCount() + 1);
-        userRepository.save(user);
-
-        LoginParam limitParam = loginParamRepository.findByParamName("MAX_WRONG_PASSWORD_ATTEMPTS")
-                .orElseThrow(() -> new RuntimeException("System configuration error: login params missing"));
-
-        int maxAttempts = Integer.parseInt(limitParam.getParamValue());
-        if (user.getUserWrongPasswordCount() >= maxAttempts) {
-            user.setPasswordLogin("INACTIVE");
-            userRepository.save(user);
-            reason += " | Account Locked due to max failed attempts";
-        }
-
-        saveLoginAttempt(user.getUserId(), false, loginMethod, reason, "APP");
-    }
-
-    private void saveLoginAttempt(String userId, boolean isSuccess, String loginMethod, String failureReason, String appCode) {
-        LoginAttempt attempt = new LoginAttempt();
-        attempt.setUserId(userId);
-        attempt.setLoginMethod(loginMethod); // E.g., "LDAP"
-        attempt.setAppCode(appCode);
-        attempt.setSuccess(isSuccess);
-        attempt.setFailureReason(failureReason);
-        attempt.setAttemptTime(LocalDateTime.now());
-        attempt.setIpAddress("0.0.0.0"); // Consider passing real IP later
-        loginAttemptRepository.save(attempt);
-    }
-
-    private Mono<Void> saveSessionToRedis(String userId, String token) {
-        String sessionKey = Constants.SESSION_PREFIX + userId;
-        Map<String, String> sessionData = new HashMap<>();
-        sessionData.put("token", token);
-        sessionData.put("loginTime", LocalDateTime.now().toString());
-
-        try {
-            String sessionJson = objectMapper.writeValueAsString(sessionData);
-            return redisTemplate.opsForValue()
-                    .set(sessionKey, sessionJson, Duration.ofSeconds(jwtExpiration))
-                    .then();
-        } catch (JsonProcessingException e) {
-            return Mono.error(new RuntimeException("Error creating session data", e));
-        }
-    }
+    String getBranchName();
+    
+    String getCircleCode();
+    
+    String getCircleName();
+    
+    String getCircleBranch();
 }
-
 
 ```
 
 
 
 
-     
 
 
 
 
-    // Update the method signature to accept additionalClaims
-    public String generateToken(String userId, String roleId, String roleType, Set<String> permissions, Map<String, Object> additionalClaims) {
+
+```java
+package com.fincore.gateway.repository;
+
+import com.fincore.gateway.dto.BranchCircleProjection;
+import com.fincore.gateway.model.User; // using an arbitrary entity to satisfy JpaRepository, though we only use native queries here
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface BranchRepository extends JpaRepository<User, String> {
+
+    /**
+     * Native query to fetch Branch and Circle details by performing a LEFT JOIN.
+     * LEFT JOIN ensures that even if a branch doesn't have a mapped circle, 
+     * the query won't fail and will still return the branch name.
+     */
+    @Query(value = """
+            SELECT 
+                b.NAME AS branchName, 
+                c.CIRCLE_CODE AS circleCode, 
+                c.CIRCLE_NAME AS circleName, 
+                c.BRANCH_CODE AS circleBranch 
+            FROM BRANCH_MASTER b
+            LEFT JOIN CIRCLE_MASTER c ON b.CIRCLE_CODE = c.CIRCLE_CODE
+            WHERE b.CODE = :branchCode
+            FETCH FIRST 1 ROWS ONLY
+            """, nativeQuery = true)
+    BranchCircleProjection findBranchAndCircleDetails(@Param("branchCode") String branchCode);
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * DTO that carries minimal user data embedded inside a token.
+ *
+ * This object is typically serialized within access or refresh tokens
+ * to represent the authenticated user's identity and basic profile info.
+ */
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class UserTokenDataDto {
+
+    /** Unique identifier of the user. */
+    private String userId;
+
+    /** Numeric role ID assigned to the user. */
+    private Integer role;
+
+    /** Name of the role (e.g. ADMIN, MANAGER, USER). */
+    private String roleName;
+
+    /** First name of the user. */
+    private String firstName;
+
+    /** Middle name, if provided. */
+    private String middleName;
+
+    /** Last name of the user. */
+    private String lastName;
+
+    /** Contact number registered with the user. */
+    private String phoneNumber;
+
+    /** Email address associated with the user account. */
+    private String email;
+
+    /** Branch or office code where the user is mapped (numeric). */
+    private int branch;
+
+    // --- NEW FIELDS FOR BRANCH & CIRCLE CONTEXT ---
+    
+    /** Name of the branch. */
+    private String branchName;
+
+    /** Code of the circle. */
+    private String circleCode;
+
+    /** Name of the circle. */
+    private String circleName;
+
+    /** Branch code representing the circle headquarters. */
+    private String circleBranch;
+
+    /** Flag indicating if the user's mapped branch is the Circle HQ. */
+    private Boolean isCircle;
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class LoginResponseDTO implements UserLoginDTO {
+
+    private String userId;
+    private String accessToken;
+    private String tokenType;
+    private long expiresIn;
+    private String sub;
+    private String jti;
+    private MenuResponse roleData;
+    private String error;
+    private boolean validCredentials;
+    private String userStatus;
+    private String passwordLoginStatus;
+    private String refreshToken;
+    private Integer attemptsLeft;
+
+    /**
+     * User profile details extracted directly for frontend convenience.
+     * This avoids the frontend having to manually decode the JWT to display the user's name/branch.
+     */
+    private UserTokenDataDto userData;
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.Config.KeyUtils;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.model.LoginAttempt;
+import com.fincore.gateway.model.LoginParam;
+import com.fincore.gateway.model.User;
+import com.fincore.gateway.model.UserRoles;
+import com.fincore.gateway.repository.*;
+import com.fincore.gateway.utility.Constants;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.orm.jpa.JpaSystemException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@Service("LoginService")
+@RequiredArgsConstructor
+public class LoginServiceImpl implements LoginService {
+
+    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+    
+    private final UserRepository userRepository;
+    private final LoginAttemptRepository loginAttemptRepository;
+    private final LoginParamRepository loginParamRepository;
+    private final RolePermissionsRepository rolePermissionsRepository;
+    private final MenuService menuService;
+    private final ObjectMapper mapper;
+    private final AdAuthenticationService adAuthenticationService;
+    
+    // Injecting the new BranchRepository
+    private final BranchRepository branchRepository;
+
+    @Value("${security.payload.rsa-private:}")
+    private String rsaPrivatePem;
+    
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+    
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long ttlSeconds;
+
+    @Transactional(readOnly = true)
+    @Override
+    public MenuResponse fetchRoleWiseData(String userId) {
+        log.info("Fetching role-wise data for userId: {}", userId);
+        try {
+            List<PermissionRow> rows = rolePermissionsRepository.findAllPermissionsByUserId(userId);
+
+            if (rows == null || rows.isEmpty()) {
+                log.info("No permissions found for userId: {}", userId);
+                return new MenuResponse(Collections.emptyList());
+            }
+            return menuService.transformFromProjection(rows);
+        } catch (Exception e) {
+            log.error("Error fetching permissions for userId: {}", userId, e);
+            return new MenuResponse(Collections.emptyList());
+        }
+    }
+
+    @Transactional
+    @Override
+    public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
+
+        final String userId = userCredentials.getUserId();
+        final String encryptedPassword = userCredentials.getPassword(); 
+
+        UserDto result = new UserDto();
+
+        User user = userRepository.findByUserId(userId);
+        if (user == null) {
+            result.setValidCredentials(false);
+            result.setUserStatus(Constants.INVALID);
+            log.warn("Login blocked: User {} not found in local DB.", userId);
+            return result;
+        }
+
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        char activeMode = loginParam.getActiveLoginMode();
+
+        LoginAttempt attempt = new LoginAttempt();
+        attempt.setLoginMethod(determineMethodString(activeMode));
+        attempt.setSuccess("N");
+        attempt.setIpAddress(clientIp);
+        attempt.setUserId(userId);
+
+        result.setLoginMethod(activeMode);
+        result.setUserId(user.getUserId());
+        UserRoles userRole = userRepository.getUserRole(userId);
+
+        result.setRoleStatus(userRole.getRoleStatus());
+        result.setUserStatus(user.getAccountStatus());
+        result.setPasswordLoginStatus(user.getPasswordLogin());
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(userRole.getRoleStatus())) {
+            attempt.setFailureReason(generateStatusMessage(userRole.getRoleStatus(), "role"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        if (!Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            attempt.setFailureReason(generateStatusMessage(user.getAccountStatus(), "user"));
+            loginAttemptRepository.save(attempt);
+            result.setValidCredentials(false);
+            return result;
+        }
+
+        try {
+            String rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
+
+            if (activeMode == Constants.LDAP) {
+                log.info("Processing LDAP Login for user: {}", userId);
+                try {
+                    boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+                    if (ldapSuccess) {
+                        handleSuccess(attempt, result, user, userRole);
+                    } else {
+                        handleFailure(attempt, result, user, loginParam, "LDAP Authentication Failed");
+                    }
+                } catch (RuntimeException e) {
+                    log.error("LDAP Server Error for user {}: {}", userId, e.getMessage());
+                    attempt.setSuccess("N");
+                    attempt.setFailureReason("LDAP Server Down / Connectivity Issue");
+                    result.setValidCredentials(false);
+                    result.setMessage("System Error: Unable to connect to Authentication Server. Please try again later.");
+                    return result;
+                }
+
+            } else if (activeMode == Constants.PASSWORD) {
+                if (Constants.ACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+                    passwordBasedLogin(rawPassword, attempt, result, user, loginParam);
+                } else {
+                    handleAccountLocked(attempt, result, user);
+                }
+            }
+        } catch (SecurityException e) {
+            log.error("Login rejected for user {}: Payload decryption failed", userId);
+            result.setValidCredentials(false);
+            result.setMessage("Security Error: Invalid encrypted payload");
+            attempt.setFailureReason("Payload Decryption Failed (Possible MITM or invalid format)");
+            return result;
+        }
+
+        loginAttemptRepository.save(attempt);
+        log.debug("verifyUserCredentials result={}", result);
+        return result;
+    }
+
+    @Transactional
+    @Override
+    public void passwordBasedLogin(String password, LoginAttempt loginAttempt, UserDto userInfo, User user, LoginParam loginParam) {
+        log.info("Password-based login for userId={}", user.getUserId());
+
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            handleAccountLocked(loginAttempt, userInfo, user);
+            return;
+        }
+
+        if (encoder.matches(password, user.getPasswordHash())) {
+            UserRoles userRole = userRepository.getUserRole(user.getUserId());
+            handleSuccess(loginAttempt, userInfo, user, userRole);
+        } else {
+            handleFailure(loginAttempt, userInfo, user, loginParam, "Wrong Password");
+        }
+    }
+
+    @Override
+    public String generateStatusMessage(String status, String type) {
+        return String.format("Trying to login with a %s %s", status, type);
+    }
+
+    @Transactional(readOnly = true)
+    public VerifyUserDTO checkUser(String userId) {
+        VerifyUserDTO out = new VerifyUserDTO();
+        out.setUserId(userId);
+
+        User user = userRepository.findByUserId(userId);
+        LoginParam loginParam = loginParamRepository.getLoginParam();
+        out.setLoginMethod(loginParam.getActiveLoginMode());
+
+        if (user == null) {
+            out.setUserCheck(false);
+            out.setUserStatus(Constants.INVALID);
+            out.setMessage("Invalid User");
+            return out;
+        }
+
+        if (Constants.ACTIVE.equalsIgnoreCase(user.getAccountStatus())) {
+            Timestamp setAt = user.getTempPasswordSetAt();
+            boolean isPasswordValid = false;
+
+            if (loginParam.getActiveLoginMode() == Constants.PASSWORD && setAt != null) {
+                LocalDateTime lastUpdate = setAt.toLocalDateTime();
+                isPasswordValid = LocalDateTime.now()
+                        .isBefore(lastUpdate.plusHours(loginParam.getPasswordValidity()));
+            } else {
+                isPasswordValid = true;
+            }
+
+            UserRoles userRole = userRepository.getUserRole(userId);
+            out.setRoleStatus(userRole.getRoleStatus());
+
+            boolean updateNeeded = (loginParam.getActiveLoginMode() == Constants.PASSWORD)
+                    && (user.getPasswordHash() == null || !isPasswordValid);
+
+            out.setUpdatePassword(updateNeeded);
+            out.setUserStatus(Constants.ACTIVE);
+            out.setMessage(Constants.ACTIVE_USER);
+            out.setPasswordLoginStatus(user.getPasswordLogin());
+        } else {
+            String accountStatus = user.getAccountStatus();
+            out.setUserCheck(true);
+            out.setUserStatus(accountStatus);
+            out.setMessage(
+                    accountStatus.equalsIgnoreCase("locked") ? "Your account is locked. Please contact support."
+                            : accountStatus.equalsIgnoreCase("inactive") ? "Inactive User" : "Verification Pending"
+            );
+        }
+
+        return out;
+    }
+
+    @Transactional
+    public UpdatePasswordDTO updatePassword(UpdatePasswordDTO userCredentials) {
+        String userId = userCredentials.getUserId();
+        String encryptedPassword = userCredentials.getPassword();
+
+        userCredentials.setUpdateFlag(false);
+        userCredentials.setPassword("");
+        userCredentials.setOtp("");
+
+        try {
+            User user = userRepository.findByUserId(userId);
+            if (user == null) {
+                userCredentials.setMessage("Invalid user id");
+                return userCredentials;
+            }
+
+            String rawPassword;
+            try {
+                rawPassword = KeyUtils.decryptRsaPassword(encryptedPassword, rsaPrivatePem);
+            } catch (SecurityException e) {
+                log.error("Update password rejected for user {}: Payload decryption failed", userId);
+                userCredentials.setMessage("Security Error: Invalid encrypted payload");
+                return userCredentials;
+            }
+
+            String passwordHash = encoder.encode(rawPassword);
+            user.setPasswordHash(passwordHash);
+            user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
+            userRepository.save(user);
+
+            userCredentials.setMessage("User password successfully updated");
+            userCredentials.setUpdateFlag(true);
+
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Data integrity violation while updating password for userId={}", userId, e);
+            userCredentials.setMessage("Failed to change password, please try again");
+        } catch (ObjectOptimisticLockingFailureException e) {
+            log.warn("Optimistic locking failure while updating password for userId={}", userId, e);
+            userCredentials.setMessage("The user data was modified by another process, please retry");
+        } catch (JpaSystemException e) {
+            log.error("JPA system error while updating password for userId={}", userId, e);
+            userCredentials.setMessage("A database error occurred, please try again later");
+        }
+
+        return userCredentials;
+    }
+
+    /**
+     * Initializes the token-visible user data embedded/returned alongside the JWT.
+     * Fetches branch and circle mapping dynamically.
+     */
+    private UserTokenDataDto initializeTokenData(User user, UserRoles userRole) {
+        UserTokenDataDto tokenData = new UserTokenDataDto();
+        tokenData.setFirstName(user.getFirstName());
+        tokenData.setLastName(user.getLastName());
+        tokenData.setPhoneNumber(user.getPhoneNumber());
+        tokenData.setUserId(user.getUserId());
+        tokenData.setBranch(user.getBranch());
+        tokenData.setEmail(user.getEmail());
+        tokenData.setRole(userRole.getRole());
+        tokenData.setRoleName(userRole.getRoleName());
         
-        return Jwts.builder()
-                .setSubject(userId)
-                .claim("roleId", roleId)
-                .claim("roleType", roleType)
-                .claim("permissions", permissions)
-                .addClaims(additionalClaims) // <--- ADD THIS LINE
-                .setIssuedAt(new Date(System.currentTimeMillis()))
-                .setExpiration(new Date(System.currentTimeMillis() + expiration * 1000))
-                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
-                .compact();
+        // FORMAT the branch integer to a 5-digit string (e.g., 8080 -> "08080")
+        String branchCodeStr = String.format("%05d", user.getBranch());
+        
+        // Fetch specific details from the database
+        BranchCircleProjection bcInfo = branchRepository.findBranchAndCircleDetails(branchCodeStr);
+        
+        if (bcInfo != null) {
+            tokenData.setBranchName(bcInfo.getBranchName());
+            tokenData.setCircleCode(bcInfo.getCircleCode());
+            tokenData.setCircleName(bcInfo.getCircleName());
+            tokenData.setCircleBranch(bcInfo.getCircleBranch());
+            
+            // Check if user's branch matches the Circle's designated branch code
+            boolean isCircle = branchCodeStr.equals(bcInfo.getCircleBranch());
+            tokenData.setIsCircle(isCircle);
+        } else {
+            // Fallback if branch is somehow missing in the master table
+            tokenData.setIsCircle(false);
+            log.warn("Branch details not found in BRANCH_MASTER for branch code: {}", branchCodeStr);
+        }
+
+        return tokenData;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public UserDto getUserProfile(String userId) {
+        User user = userRepository.findByUserId(userId);
+        UserRoles userRole = userRepository.getUserRole(userId);
+
+        if (user == null) {
+            return null;
+        }
+        UserDto userDto = new UserDto();
+        userDto.setUserId(user.getUserId());
+        userDto.setUserStatus(user.getPasswordLogin());
+        userDto.setPasswordLoginStatus(user.getPasswordLogin());
+        userDto.setUser(initializeTokenData(user, userRole)); // Will re-fetch branch & circle details
+        return userDto;
+    }
+
+    private String determineMethodString(char mode) {
+        if (mode == Constants.LDAP) return "LDAP";
+        if (mode == Constants.PASSWORD) return Constants.PASSWORD_BASED_LOGIN;
+        return Constants.SSO_BASED_LOGIN;
+    }
+
+    private void handleAccountLocked(LoginAttempt attempt, UserDto result, User user) {
+        result.setValidCredentials(false);
+        result.setPasswordLoginStatus(user.getPasswordLogin());
+        result.setMessage("Your account is locked due to multiple failed attempts.");
+
+        if (Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLogin())) {
+            result.setAttemptsLeft(0);
+            attempt.setFailureReason("Account Locked (Pre-check)");
+        } else {
+            result.setMessage("Password login is disabled.");
+            attempt.setFailureReason("Password login disabled");
+        }
+    }
+
+    private void handleSuccess(LoginAttempt attempt, UserDto result, User user, UserRoles userRole) {
+        attempt.setSuccess("Y");
+        attempt.setFailureReason("Success");
+        result.setValidCredentials(true);
+        result.setMessage("Login Successful");
+
+        if (user.getUserWrongPasswordCount() > 0) {
+            user.setUserWrongPasswordCount(0);
+            userRepository.save(user);
+        }
+
+        log.info("Credentials validated. Issuing token for userId={}", user.getUserId());
+        
+        // Fetch contextual user data (including branch and circle)
+        UserTokenDataDto tokenData = initializeTokenData(user, userRole);
+        
+        @SuppressWarnings("unchecked")
+        String accessToken = HmacJwtUtil.generate(
+                hmacSecret,
+                user.getUserId(),
+                ttlSeconds,
+                mapper.convertValue(tokenData, Map.class) // Embed all tokenData properties into the JWT claims
+        );
+
+        result.setAccessToken(accessToken);
+        result.setUser(tokenData);
+    }
+
+    private void handleFailure(LoginAttempt attempt, UserDto userInfo, User user, LoginParam loginParam, String reason) {
+        log.warn("Login failed for user {}: {}", user.getUserId(), reason);
+        attempt.setSuccess("N");
+
+        int currentFailedCount = user.getUserWrongPasswordCount();
+        int maxAllowed = loginParam.getWrongPasswordAttempts();
+        int newFailedCount = currentFailedCount + 1;
+
+        user.setUserWrongPasswordCount(newFailedCount);
+        userInfo.setValidCredentials(false);
+
+        if (newFailedCount >= maxAllowed) {
+            user.setPasswordLogin(Constants.INACTIVE);
+            attempt.setFailureReason(reason + " -> Account Locked");
+            userInfo.setMessage("Your account has been locked due to multiple unsuccessful login attempts.");
+            userInfo.setPasswordLoginStatus(Constants.INACTIVE);
+            userInfo.setAttemptsLeft(0);
+        } else {
+            int remaining = maxAllowed - newFailedCount;
+            attempt.setFailureReason(reason);
+            if (remaining > 1) {
+                userInfo.setMessage("Incorrect credentials. Please check and try again.");
+            } else {
+                userInfo.setMessage("Incorrect credentials. Final attempt before lock.");
+            }
+            userInfo.setAttemptsLeft(remaining);
+        }
+        userRepository.save(user);
+    }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Controller;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.Service.LaunchService;
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.Service.TokenSessionValidator;
+import com.fincore.gateway.dto.*;
+import com.fincore.gateway.utility.Constants;
+import com.fincore.gateway.utility.LoginUtility;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseCookie;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private static final String USER_PREFIX = "USR:";
+
+    private final TokenSessionValidator validator;
+    private final ReactiveStringRedisTemplate redisTemplate;
+    private final LoginService loginService;
+    private final ObjectMapper mapper;
+    private final LaunchService launchService;
+
+    @Value("${security.jwt.hmac-base64-secret:}")
+    private String hmacSecret;
+
+    @Value("${security.jwt.ttl-seconds:900}")
+    private long accessTokenTtl;
+
+    @Value("${security.jwt.refresh-ttl-seconds:43200}")
+    private long refreshTokenTtl;
+
+    @Value("${security.login.blocked-ips:}")
+    private String blockedIpsConfig;
+
+    @Value("${security.payload.rsa-public:}")
+    private String rsaPublicPem;
+
+
+    private String sanitizeIp(String rawIp) {
+        if (rawIp == null) return "";
+        String ip = rawIp;
+        if (ip.startsWith("/")) ip = ip.substring(1);
+        int colonIndex = ip.indexOf(':');
+        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
+        return ip;
+    }
+
+    private boolean isIpBlocked(String rawClientIp) {
+        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
+        String cleanIp = sanitizeIp(rawClientIp);
+        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
+        boolean blocked = blockedIps.contains(cleanIp);
+        if (blocked) log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", rawClientIp, cleanIp);
+        return blocked;
+    }
+
+    private ResponseCookie createRefreshTokenCookie(String token) {
+        return ResponseCookie.from("refresh_token", token)
+                .httpOnly(true)
+                .secure(true) // Set to true in PROD
+                .path("/")
+                .maxAge(Duration.ofSeconds(refreshTokenTtl))
+                .sameSite("Strict")
+                .build();
+    }
+
+    private ResponseCookie createEmptyCookie() {
+        return ResponseCookie.from("refresh_token", "")
+                .httpOnly(true)
+                .secure(true) // Set to true in PROD
+                .path("/")
+                .maxAge(0)
+                .sameSite("Strict")
+                .build();
+    }
+
+    private Claims extractClaims(String token) {
+        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
+        return Jwts.parser()
+                .verifyWith(Keys.hmacShaKeyFor(secretBytes))
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
     }
 
 
+    @PostMapping(value = "/check-user")
+    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
+    {
+        final String rawClientIp = LoginUtility.getClientIp(request);
+        String userId = body.get("userId");
+        log.info("Check-User info user id: {} , ip : {}", userId, rawClientIp);
+
+        if (isIpBlocked(rawClientIp)) {
+            log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
+            VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
+                    .userId(userId)
+                    .message("Access denied: Your IP address is blocked.")
+                    .userStatus(Constants.RESTRICTED)
+                    .build();
+            return Mono.just(ApiResponse.success(blockedResponse, "Access Restricted"));
+        }
+
+        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
+            return Mono.just(ApiResponse.error("Public key not configured on server", "CONFIG_ERROR"));
+        }
+
+        return Mono.fromCallable(() -> loginService.checkUser(userId))
+                .subscribeOn(Schedulers.boundedElastic())
+                .map(dto -> {
+                    dto.setPublicKey(rsaPublicPem);
+                    return ApiResponse.success(dto, "User check completed");
+                });
+    }
+
+
+    @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(
+            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload)
+    {
+        final String clientIp = LoginUtility.getClientIp(request);
+        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+
+        if (isIpBlocked(clientIp)) {
+            return Mono.just(ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(ApiResponse.error("Access denied: Your IP address is blocked.", "IP_BLOCKED")));
+        }
+
+        return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(user -> {
+
+                    if (!user.isValidCredentials()) {
+                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
+
+                        LoginResponseDTO errorResponse = LoginResponseDTO.builder()
+                                .userId(user.getUserId())
+                                .validCredentials(false)
+                                .userStatus(user.getUserStatus())
+                                .passwordLoginStatus(user.getPasswordLoginStatus())
+                                .attemptsLeft(user.getAttemptsLeft())
+                                .error(user.getMessage())
+                                .build();
+
+                        HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
+                                ? HttpStatus.FORBIDDEN
+                                : HttpStatus.UNAUTHORIZED;
+
+                        return Mono.just(ResponseEntity.status(status)
+                                .body(ApiResponse.success(errorResponse, user.getMessage())));
+                    }
+
+                    if (hmacSecret == null || hmacSecret.isBlank()) {
+                        return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                                .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
+                    }
+
+                    // Extract the built user context mapping it to the token claims
+                    Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
+                    String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+
+                    Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                    String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+                    String jti = extractClaims(accessToken).getId();
+                    response.addCookie(createRefreshTokenCookie(refreshToken));
+
+                    return validator.registerUserSession(user.getUserId(), jti)
+                            .then(Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                    .subscribeOn(Schedulers.boundedElastic())))
+                            .map(roleData -> {
+                                LoginResponseDTO loginResponse = LoginResponseDTO.builder()
+                                        .userId(user.getUserId())
+                                        .validCredentials(true)
+                                        .accessToken(accessToken)
+                                        .tokenType("Bearer")
+                                        .expiresIn(accessTokenTtl)
+                                        .sub(user.getUserId())
+                                        .jti(jti)
+                                        .roleData(roleData)
+                                        .userData(user.getUser()) // <--- Pass user details directly to response
+                                        .userStatus(user.getUserStatus())
+                                        .passwordLoginStatus(user.getPasswordLoginStatus())
+                                        .attemptsLeft(null)
+                                        .build();
+
+                                return ResponseEntity.ok(ApiResponse.success(loginResponse, "Login successful"));
+                            });
+                });
+    }
+
+    @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response)
+    {
+        org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
+        String refreshToken = (cookie != null) ? cookie.getValue() : null;
+
+        if (refreshToken == null || refreshToken.isBlank()) {
+            log.warn("Refresh failed: No refresh token cookie.");
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Missing refresh token cookie"));
+        }
+
+        return Mono.fromCallable(() -> extractClaims(refreshToken))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(claims -> {
+                    String userId = claims.getSubject();
+                    String userKey = USER_PREFIX + userId;
+                    log.info("Refreshing Token for User: {}", userId);
+
+                    return redisTemplate.opsForValue().get(userKey)
+                            .switchIfEmpty(Mono.defer(() -> {
+                                log.warn("Redis returned EMPTY for key: {}. Session expired.", userKey);
+                                return Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Session expired. Please login again."));
+                            }))
+                            .flatMap(currentJti -> {
+                                log.info("Session Active in Redis. Fetching Full Profile.");
+
+                                return Mono.fromCallable(() -> loginService.getUserProfile(userId))
+                                        .subscribeOn(Schedulers.boundedElastic())
+                                        .flatMap(userDto -> {
+                                            if (userDto == null) {
+                                                return Mono.error(new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
+                                            }
+
+                                            return Mono.fromCallable(() -> loginService.fetchRoleWiseData(userId))
+                                                    .subscribeOn(Schedulers.boundedElastic())
+                                                    .flatMap(roleData -> {
+
+                                                        @SuppressWarnings("unchecked")
+                                                        Map<String, Object> claimsMap = mapper.convertValue(userDto.getUser(), Map.class);
+                                                        String newAccessToken = HmacJwtUtil.generate(hmacSecret, userId, accessTokenTtl, claimsMap);
+
+                                                        Map<String, Object> refreshClaims = Map.of("type", "refresh");
+                                                        String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
+
+                                                        String newJti = extractClaims(newAccessToken).getId();
+
+                                                        response.addCookie(createRefreshTokenCookie(newRefreshToken));
+
+                                                        return validator.registerUserSession(userId, newJti)
+                                                                .thenReturn(ApiResponse.success(
+                                                                        LoginResponseDTO.builder()
+                                                                                .accessToken(newAccessToken)
+                                                                                .userId(userId)
+                                                                                .jti(newJti)
+                                                                                .expiresIn(accessTokenTtl)
+                                                                                .validCredentials(true)
+                                                                                .roleData(roleData)
+                                                                                .userData(userDto.getUser()) // <--- Pass user details directly to response
+                                                                                .userStatus(userDto.getUserStatus())
+                                                                                .passwordLoginStatus(userDto.getPasswordLoginStatus())
+                                                                                .sub(userId)
+                                                                                .build(),
+                                                                        "Token refreshed successfully"
+                                                                ));
+                                                    });
+                                        });
+                            });
+                });
+    }
+
+    @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
+            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response)
+    {
+        response.addCookie(createEmptyCookie());
+        String tokenString = null;
+
+        if (jwtAuth != null && jwtAuth.getToken() != null) {
+            tokenString = jwtAuth.getToken().getTokenValue();
+        } else {
+            String header = request.getHeaders().getFirst("Authorization");
+            if (header != null && header.startsWith("Bearer ")) {
+                tokenString = header.substring(7);
+            }
+        }
+
+        if (tokenString == null || tokenString.isBlank()) {
+            log.warn("Logout called without token. Cleaning up cookies only.");
+            return Mono.just(ResponseEntity.ok(
+                    ApiResponse.<LoginResponseDTO>success(
+                            LoginResponseDTO.builder().userId("anonymous").build(),
+                            "Logged out (No Token)"
+                    )
+            ));
+        }
+
+        final String finalToken = tokenString;
+
+        return Mono.fromCallable(() -> {
+                    try {
+                        return extractClaims(finalToken);
+                    } catch (ExpiredJwtException e) {
+                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
+                        return e.getClaims();
+                    }
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(claims -> {
+                    String userId = claims.getSubject();
+                    String incomingJti = claims.getId();
+
+                    if (userId == null || incomingJti == null) {
+                        return Mono.just(ResponseEntity.ok(
+                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
+                        ));
+                    }
+
+                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
+
+                    return validator.blacklistToken(incomingJti)
+                            .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
+                            .flatMap(activeJti -> {
+                                if (activeJti != null && activeJti.equals(incomingJti)) {
+                                    log.info("Session MATCH. Deleting active session for user: {}", userId);
+                                    return validator.clearUserSession(userId)
+                                            .then(Mono.just(ResponseEntity.ok(
+                                                    ApiResponse.<LoginResponseDTO>success(
+                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
+                                                            "Logged out successfully"
+                                                    )
+                                            )));
+                                } else {
+                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
+                                    return Mono.just(ResponseEntity.ok(
+                                            ApiResponse.<LoginResponseDTO>success(
+                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
+                                                    "Logged out (Concurrent Session Preserved)"
+                                            )
+                                    ));
+                                }
+                            })
+                            .switchIfEmpty(Mono.just(ResponseEntity.ok(
+                                    ApiResponse.<LoginResponseDTO>success(
+                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
+                                            "Logged out (Session already expired)"
+                                    )
+                            )));
+                })
+                .onErrorResume(e -> {
+                    log.error("Logout Unexpected Error", e);
+                    return Mono.just(ResponseEntity.ok(
+                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
+                    ));
+                });
+    }
+
+    @PostMapping(value = "/update-password")
+    public Mono<ApiResponse<UpdatePasswordDTO>> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
+        return Mono.fromCallable(() -> loginService.updatePassword(dto))
+                .subscribeOn(Schedulers.boundedElastic())
+                .map(result -> ApiResponse.success(result, result.getMessage()));
+    }
+
+    @GetMapping(value = "/public-key", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ApiResponse<Map<String, String>>> getPublicKey() {
+        if (rsaPublicPem == null || rsaPublicPem.isBlank()) {
+            return Mono.just(ApiResponse.error("Public key not configured", "CONFIG_ERROR"));
+        }
+        return Mono.just(ApiResponse.success(Map.of("publicKey", rsaPublicPem), "Public Key fetched successfully"));
+    }
+
+    @GetMapping("/start-prod")
+    public ResponseEntity<LaunchResponse> getLaunchData() {
+        return ResponseEntity.ok(launchService.getLaunchDetails());
+    }
+}
+
+```
 
 
 
@@ -267,9 +1049,7 @@ public class LoginServiceImpl implements LoginService {
 
 
 
-    private String branchName;
-    private String circleName;
-    private String circleCode;
-    private boolean isCircle;
-    private String circleBranch;
+
+
+
 
