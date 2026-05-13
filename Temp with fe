@@ -1,352 +1,4 @@
 ```java
-package com.fincore.commonutilities.util;
-
-import org.springframework.stereotype.Component;
-
-import javax.crypto.Cipher;
-import javax.crypto.KeyGenerator;
-import javax.crypto.SecretKey;
-import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
-import java.nio.charset.StandardCharsets;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
-import java.util.Base64;
-
-/**
- * Standard utility for AES-256-GCM Payload Encryption.
- * Shared across all Fincore microservices.
- */
-@Component
-public class AesEncryptionUtil {
-
-    private static final String ALGORITHM = "AES/GCM/NoPadding";
-    private static final int TAG_LENGTH_BIT = 128; // 16 bytes authentication tag
-    private static final int KEY_SIZE = 256;
-
-    /**
-     * Generates a cryptographically secure 256-bit AES Key.
-     * To be called by the Login/Auth Service upon successful authentication.
-     */
-    public String generateBase64SessionKey() {
-        try {
-            KeyGenerator keyGen = KeyGenerator.getInstance("AES");
-            SecureRandom secureRandom = new SecureRandom();
-            keyGen.init(KEY_SIZE, secureRandom);
-            SecretKey secretKey = keyGen.generateKey();
-            return Base64.getEncoder().encodeToString(secretKey.getEncoded());
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("AES Algorithm not found", e);
-        }
-    }
-
-    /**
-     * Decrypts an AES-256-GCM encrypted payload.
-     * Expects frontend to send format: "Base64(IV):Base64(Ciphertext)"
-     */
-    public String decrypt(String encryptedPayload, String base64SecretKey) {
-        try {
-            // 1. Split the IV and the Ciphertext
-            String[] parts = encryptedPayload.split(":");
-            if (parts.length != 2) {
-                throw new IllegalArgumentException("Invalid encrypted payload format. Expected IV:Ciphertext");
-            }
-
-            byte[] iv = Base64.getDecoder().decode(parts[0]);
-            byte[] cipherText = Base64.getDecoder().decode(parts[1]);
-            byte[] decodedKey = Base64.getDecoder().decode(base64SecretKey);
-
-            // 2. Rebuild the Key and GCM Spec
-            SecretKey secretKey = new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES");
-            GCMParameterSpec gcmParameterSpec = new GCMParameterSpec(TAG_LENGTH_BIT, iv);
-
-            // 3. Decrypt
-            Cipher cipher = Cipher.getInstance(ALGORITHM);
-            cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmParameterSpec);
-
-            byte[] decryptedText = cipher.doFinal(cipherText);
-            
-            // 4. Return pure JSON string
-            return new String(decryptedText, StandardCharsets.UTF_8);
-
-        } catch (Exception e) {
-            throw new SecurityException("Failed to decrypt payload. Data may be tampered or key is invalid.", e);
-        }
-    }
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.commonutilities.security;
-
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.commonutilities.util.AesEncryptionUtil;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.MethodParameter;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpInputMessage;
-import org.springframework.http.converter.HttpMessageConverter;
-import org.springframework.web.bind.annotation.ControllerAdvice;
-import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
-
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
-
-/**
- * Global Interceptor that decrypts incoming @RequestBody payloads 
- * before they reach the Controller DTO mapping.
- */
-@Slf4j
-@ControllerAdvice
-@RequiredArgsConstructor
-public class DecryptRequestBodyAdvice extends RequestBodyAdviceAdapter {
-
-    private final AesEncryptionUtil aesEncryptionUtil;
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-
-    private static final String ENCRYPTION_HEADER = "X-Encrypted-Payload";
-    private static final String REDIS_AES_KEY_PREFIX = "AES_KEY:";
-
-    @Override
-    public boolean supports(MethodParameter methodParameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) {
-        // We support ALL controllers. 
-        // The actual decision to decrypt happens in beforeBodyRead based on the header.
-        return true;
-    }
-
-    @Override
-    public HttpInputMessage beforeBodyRead(HttpInputMessage inputMessage, MethodParameter parameter,
-                                           Type targetType, Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
-
-        // 1. Check if the frontend flagged this payload as encrypted
-        boolean isEncrypted = false;
-        if (inputMessage.getHeaders().containsKey(ENCRYPTION_HEADER)) {
-            isEncrypted = "true".equalsIgnoreCase(inputMessage.getHeaders().getFirst(ENCRYPTION_HEADER));
-        }
-
-        // If no header, let standard JSON parsing handle it (Good for Postman testing)
-        if (!isEncrypted) {
-            return inputMessage;
-        }
-
-        try {
-            // 2. Read the raw encrypted string from the frontend
-            String encryptedBody = new String(inputMessage.getBody().readAllBytes(), StandardCharsets.UTF_8);
-
-            // 3. Extract the User ID from the Token
-            String token = inputMessage.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-            if (token == null || !token.startsWith("Bearer ")) {
-                throw new SecurityException("Missing or invalid Authorization header for encrypted payload");
-            }
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
-
-            // 4. Fetch the user's specific AES session key from Redis
-            String base64AesKey = redisTemplate.opsForValue().get(REDIS_AES_KEY_PREFIX + userId);
-            if (base64AesKey == null) {
-                log.error("AES Session Key not found in Redis for user: {}", userId);
-                throw new SecurityException("Encryption Session expired. Please refresh the page.");
-            }
-
-            // 5. Decrypt the payload
-            String decryptedJson = aesEncryptionUtil.decrypt(encryptedBody, base64AesKey);
-
-            // 6. Pass the decrypted JSON bytes down the chain, disguised as the original request!
-            InputStream decryptedStream = new ByteArrayInputStream(decryptedJson.getBytes(StandardCharsets.UTF_8));
-            
-            return new HttpInputMessage() {
-                @Override
-                public InputStream getBody() {
-                    return decryptedStream;
-                }
-
-                @Override
-                public HttpHeaders getHeaders() {
-                    return inputMessage.getHeaders();
-                }
-            };
-
-        } catch (SecurityException se) {
-            throw se; // Re-throw security exceptions
-        } catch (Exception e) {
-            log.error("Critical failure during payload decryption", e);
-            throw new RuntimeException("Malformed encrypted payload", e);
-        }
-    }
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@Import({
-        RedisConfig.class,
-        JwtUtil.class,
-        CommonSecurityConfig.class,
-        ResilienceConfig.class,
-        AesEncryptionUtil.class,            // <--- NEW
-        DecryptRequestBodyAdvice.class      // <--- NEW
-})
-public class SecurityConfig { ... }
-
-### Step 4: Updating your Login API (Auth Service)
-
-Now, your Authentication microservice needs to generate the key when the user logs in. You will likely update your `AuthServiceImpl` (or equivalent).
-
-*Note: The Login API payload itself (username/password) is **not** encrypted by AES because the user doesn't have a key yet! It is secured purely by HTTPS TLS. Once the API validates the password, it generates the key for all future requests.*
-
-**Here is the exact code snippet for your Auth Service developer:**
-
-```java
-@Service
-@RequiredArgsConstructor
-public class AuthServiceImpl implements AuthService {
-
-    private final AesEncryptionUtil aesUtil;
-    private final StringRedisTemplate redisTemplate;
-    // ... your existing dependencies (JwtUtil, etc)
-
-    public LoginResponse login(LoginRequest request) {
-        
-        // 1. Authenticate user against DB/AD...
-        User user = authenticateUser(request.getUsername(), request.getPassword());
-        
-        // 2. Generate Tokens
-        String jwtToken = jwtUtil.generateToken(user);
-        String refreshToken = jwtUtil.generateRefreshToken(user);
-
-        // 3. GENERATE THE AES SESSION KEY
-        String base64AesKey = aesUtil.generateBase64SessionKey();
-
-        // 4. STORE IN REDIS (Bind it to the Refresh Token's lifespan, e.g., 8 hours)
-        redisTemplate.opsForValue().set("AES_KEY:" + user.getId(), base64AesKey, Duration.ofHours(8));
-
-        // 5. RETURN TO FRONTEND
-        return LoginResponse.builder()
-                .accessToken(jwtToken)
-                .refreshToken(refreshToken)
-                .sessionKey(base64AesKey) // NEW FIELD in your LoginResponse DTO
-                .build();
-    }
-    
-    // Make sure to fetch and return the EXISTING key during /refresh-token too!
-}
-
-### Summary of what we just achieved:
-1. We created the utility to handle strict **AES-256-GCM** encryption.
-2. We placed an invisible shield (`DecryptRequestBodyAdvice`) in front of all controllers.
-3. Your controller logic (`@RequestBody MyDto request`) does **not need to change by a single line of code**.
-4. You avoided the performance and security disaster of PBKDF2.
-
-Is your team ready to review the Frontend React logic for encrypting the Axios request, or do you want to finalize the `/refresh-token` backend logic first?
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.gateway.dto;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-/**
- * Data Transfer Object (DTO) used to carry the response data after a successful or failed login attempt.
- */
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class LoginResponseDTO implements UserLoginDTO {
-
-    private String userId;
-    private String accessToken;
-    private String tokenType;
-    private long expiresIn;
-    private String sub;
-    private String jti;
-    private MenuResponse roleData;
-    private String error;
-    private boolean validCredentials;
-    private String userStatus;
-    private String passwordLoginStatus;
-    private String refreshToken;
-    private Integer attemptsLeft;
-
-    /**
-     * User profile details extracted directly for frontend convenience.
-     */
-    private UserTokenDataDto userData;
-
-    /**
-     * Session-scoped True-Random AES-256 key for payload encryption.
-     * To be held in volatile memory on the frontend.
-     */
-    private String payloadEncryptionKey;
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-```java
 package com.fincore.gateway.Controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -366,7 +18,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseCookie;
@@ -400,9 +51,6 @@ public class AuthController {
     private final LoginService loginService;
     private final ObjectMapper mapper;
     private final LaunchService launchService;
-    
-    // Auto-wired from your common-utilities
-    // private final AesEncryptionUtil aesEncryptionUtil;
 
     @Value("${security.jwt.hmac-base64-secret:}")
     private String hmacSecret;
@@ -418,7 +66,6 @@ public class AuthController {
 
     @Value("${security.payload.rsa-public:}")
     private String rsaPublicPem;
-
 
     // =================================================================================================
     //                                              HELPERS
@@ -455,7 +102,7 @@ public class AuthController {
     private ResponseCookie createEmptyCookie() {
         return ResponseCookie.from("refresh_token", "")
                 .httpOnly(true)
-                .secure(true) // Set to true in PROD
+                .secure(true)
                 .path("/")
                 .maxAge(0)
                 .sameSite("Strict")
@@ -472,20 +119,40 @@ public class AuthController {
     }
 
     /**
-     * Securely generates a true-random 256-bit AES key, encodes it in Base64, 
-     * and saves it to Redis bound to the user's session lifecycle.
+     * Helper to generate a new AES key if one doesn't exist.
+     */
+    private String generateNewAesKey() {
+        byte[] keyBytes = new byte[32]; // 256 bits
+        new SecureRandom().nextBytes(keyBytes);
+        return Base64.getEncoder().encodeToString(keyBytes);
+    }
+
+    /**
+     * Generates a new AES key and saves it to Redis. Used during Initial Login.
      */
     private Mono<String> generateAndStoreAesKey(String userId) {
-        return Mono.fromCallable(() -> {
-            // Alternatively, use aesEncryptionUtil.generateKey() here if it returns a Base64 string
-            byte[] keyBytes = new byte[32]; // 256 bits
-            new SecureRandom().nextBytes(keyBytes);
-            return Base64.getEncoder().encodeToString(keyBytes);
-        }).flatMap(aesKey -> 
-            redisTemplate.opsForValue()
-                .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
-                .thenReturn(aesKey)
-        );
+        return Mono.fromCallable(this::generateNewAesKey)
+                .flatMap(aesKey -> redisTemplate.opsForValue()
+                        .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
+                        .thenReturn(aesKey)
+                );
+    }
+
+    /**
+     * Fetches the existing AES key, heals it if missing, and extends the TTL. Used during Refresh.
+     */
+    private Mono<String> fetchAndExtendAesKey(String userId) {
+        return redisTemplate.opsForValue().get(AES_KEY_PREFIX + userId)
+                .switchIfEmpty(Mono.defer(() -> {
+                    log.warn("AES key missing/evicted for user {} during refresh. Generating new fallback key.", userId);
+                    return Mono.just(generateNewAesKey());
+                }))
+                .flatMap(aesKey -> 
+                    // Extend the TTL for the rolling session
+                    redisTemplate.opsForValue()
+                            .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
+                            .thenReturn(aesKey)
+                );
     }
 
     // =================================================================================================
@@ -493,14 +160,13 @@ public class AuthController {
     // =================================================================================================
 
     @PostMapping(value = "/check-user")
-    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body)
-    {
+    public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body) {
         final String rawClientIp = LoginUtility.getClientIp(request);
         String userId = body.get("userId");
         log.info("Check-User info user id: {} , ip : {}", userId, rawClientIp);
 
         if (isIpBlocked(rawClientIp)) {
-            log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
+            log.warn("Check-User BLOCKED for user: {} from IP: {}", userId, rawClientIp);
             VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
                     .userId(userId)
                     .message("Access denied: Your IP address is blocked.")
@@ -521,11 +187,10 @@ public class AuthController {
                 });
     }
 
-
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> login(
-            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload)
-    {
+            ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
+        
         final String clientIp = LoginUtility.getClientIp(request);
         log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
 
@@ -537,10 +202,8 @@ public class AuthController {
         return Mono.fromCallable(() -> loginService.verifyUserCredentials(payload, clientIp))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(user -> {
-
                     if (!user.isValidCredentials()) {
                         log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
-
                         LoginResponseDTO errorResponse = LoginResponseDTO.builder()
                                 .userId(user.getUserId())
                                 .validCredentials(false)
@@ -551,11 +214,9 @@ public class AuthController {
                                 .build();
 
                         HttpStatus status = (user.getAttemptsLeft() == 0) || Constants.INACTIVE.equalsIgnoreCase(user.getPasswordLoginStatus())
-                                ? HttpStatus.FORBIDDEN
-                                : HttpStatus.UNAUTHORIZED;
+                                ? HttpStatus.FORBIDDEN : HttpStatus.UNAUTHORIZED;
 
-                        return Mono.just(ResponseEntity.status(status)
-                                .body(ApiResponse.success(errorResponse, user.getMessage())));
+                        return Mono.just(ResponseEntity.status(status).body(ApiResponse.success(errorResponse, user.getMessage())));
                     }
 
                     if (hmacSecret == null || hmacSecret.isBlank()) {
@@ -566,14 +227,16 @@ public class AuthController {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> claimsMap = mapper.convertValue(user.getUser(), Map.class);
                     String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
-
+                    
                     Map<String, Object> refreshClaims = Map.of("type", "refresh");
                     String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
 
                     String jti = extractClaims(accessToken).getId();
                     response.addCookie(createRefreshTokenCookie(refreshToken));
 
-                    // Register session -> Generate AES Key -> Fetch Roles -> Return DTO
+                    // 1. Register JWT Session
+                    // 2. Generate brand new AES key
+                    // 3. Fetch Roles
                     return validator.registerUserSession(user.getUserId(), jti)
                             .then(generateAndStoreAesKey(user.getUserId()))
                             .flatMap(aesKey -> Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
@@ -589,7 +252,7 @@ public class AuthController {
                                         .jti(jti)
                                         .roleData(roleData)
                                         .userData(user.getUser())
-                                        .payloadEncryptionKey(aesKey) // <--- Send AES key to frontend
+                                        .payloadEncryptionKey(aesKey) // Provide new AES Key
                                         .userStatus(user.getUserStatus())
                                         .passwordLoginStatus(user.getPasswordLoginStatus())
                                         .attemptsLeft(null)
@@ -601,8 +264,7 @@ public class AuthController {
     }
 
     @PostMapping(value = "/refresh-token", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response)
-    {
+    public Mono<ApiResponse<LoginResponseDTO>> refreshToken(ServerHttpRequest request, ServerHttpResponse response) {
         org.springframework.http.HttpCookie cookie = request.getCookies().getFirst("refresh_token");
         String refreshToken = (cookie != null) ? cookie.getValue() : null;
 
@@ -643,15 +305,15 @@ public class AuthController {
 
                                                         Map<String, Object> refreshClaims = Map.of("type", "refresh");
                                                         String newRefreshToken = HmacJwtUtil.generate(hmacSecret, userId, refreshTokenTtl, refreshClaims);
-
                                                         String newJti = extractClaims(newAccessToken).getId();
 
                                                         response.addCookie(createRefreshTokenCookie(newRefreshToken));
 
-                                                        // Rotate Session -> Rotate AES Key -> Return DTO
+                                                        // 1. Rotate JWT Session
+                                                        // 2. FETCH and EXTEND the existing AES Key
                                                         return validator.registerUserSession(userId, newJti)
-                                                                .then(generateAndStoreAesKey(userId)) // Rotate the AES key on refresh!
-                                                                .map(newAesKey -> ApiResponse.success(
+                                                                .then(fetchAndExtendAesKey(userId))
+                                                                .map(existingAesKey -> ApiResponse.success(
                                                                         LoginResponseDTO.builder()
                                                                                 .accessToken(newAccessToken)
                                                                                 .userId(userId)
@@ -660,7 +322,7 @@ public class AuthController {
                                                                                 .validCredentials(true)
                                                                                 .roleData(roleData)
                                                                                 .userData(userDto.getUser())
-                                                                                .payloadEncryptionKey(newAesKey) // <--- Deliver rotated AES key
+                                                                                .payloadEncryptionKey(existingAesKey) // Provide existing/healed AES Key
                                                                                 .userStatus(userDto.getUserStatus())
                                                                                 .passwordLoginStatus(userDto.getPasswordLoginStatus())
                                                                                 .sub(userId)
@@ -675,8 +337,8 @@ public class AuthController {
 
     @PostMapping(value = "/logout", produces = MediaType.APPLICATION_JSON_VALUE)
     public Mono<ResponseEntity<ApiResponse<LoginResponseDTO>>> logout(
-            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response)
-    {
+            JwtAuthenticationToken jwtAuth, ServerHttpRequest request, ServerHttpResponse response) {
+        
         response.addCookie(createEmptyCookie());
         String tokenString = null;
 
@@ -692,20 +354,14 @@ public class AuthController {
         if (tokenString == null || tokenString.isBlank()) {
             log.warn("Logout called without token. Cleaning up cookies only.");
             return Mono.just(ResponseEntity.ok(
-                    ApiResponse.<LoginResponseDTO>success(
-                            LoginResponseDTO.builder().userId("anonymous").build(),
-                            "Logged out (No Token)"
-                    )
+                    ApiResponse.<LoginResponseDTO>success(LoginResponseDTO.builder().userId("anonymous").build(), "Logged out (No Token)")
             ));
         }
 
-        final String finalToken = tokenString;
-
         return Mono.fromCallable(() -> {
                     try {
-                        return extractClaims(finalToken);
+                        return extractClaims(tokenString);
                     } catch (ExpiredJwtException e) {
-                        log.info("Logout: Token is expired. Using claims from exception for cleanup.");
                         return e.getClaims();
                     }
                 })
@@ -715,51 +371,30 @@ public class AuthController {
                     String incomingJti = claims.getId();
 
                     if (userId == null || incomingJti == null) {
-                        return Mono.just(ResponseEntity.ok(
-                                ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims during logout")
-                        ));
+                        return Mono.just(ResponseEntity.ok(ApiResponse.<LoginResponseDTO>success(null, "Invalid Token Claims")));
                     }
-
-                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
 
                     return validator.blacklistToken(incomingJti)
                             .then(redisTemplate.opsForValue().get(USER_PREFIX + userId))
                             .flatMap(activeJti -> {
                                 if (activeJti != null && activeJti.equals(incomingJti)) {
-                                    log.info("Session MATCH. Deleting active session and AES key for user: {}", userId);
-                                    
-                                    // CRITICAL: Ensure the AES key is wiped from Redis along with the session
+                                    // CRITICAL: Wipe both session AND the AES key
                                     return validator.clearUserSession(userId)
                                             .then(redisTemplate.delete(AES_KEY_PREFIX + userId))
                                             .then(Mono.just(ResponseEntity.ok(
-                                                    ApiResponse.<LoginResponseDTO>success(
-                                                            LoginResponseDTO.builder().userId(userId).error("Logged out").build(),
-                                                            "Logged out successfully"
-                                                    )
+                                                    ApiResponse.<LoginResponseDTO>success(LoginResponseDTO.builder().userId(userId).build(), "Logged out successfully")
                                             )));
                                 } else {
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
                                     return Mono.just(ResponseEntity.ok(
-                                            ApiResponse.<LoginResponseDTO>success(
-                                                    LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
-                                                    "Logged out (Concurrent Session Preserved)"
-                                            )
+                                            ApiResponse.<LoginResponseDTO>success(LoginResponseDTO.builder().userId(userId).build(), "Logged out (Concurrent Session Preserved)")
                                     ));
                                 }
                             })
                             .switchIfEmpty(Mono.just(ResponseEntity.ok(
-                                    ApiResponse.<LoginResponseDTO>success(
-                                            LoginResponseDTO.builder().userId(userId).error("Logged out (Session already expired)").build(),
-                                            "Logged out (Session already expired)"
-                                    )
+                                    ApiResponse.<LoginResponseDTO>success(LoginResponseDTO.builder().userId(userId).build(), "Logged out (Session already expired)")
                             )));
                 })
-                .onErrorResume(e -> {
-                    log.error("Logout Unexpected Error", e);
-                    return Mono.just(ResponseEntity.ok(
-                            ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
-                    ));
-                });
+                .onErrorResume(e -> Mono.just(ResponseEntity.ok(ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)"))));
     }
 
     @PostMapping(value = "/update-password")
@@ -785,19 +420,3 @@ public class AuthController {
 
 
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
