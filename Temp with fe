@@ -1,260 +1,7 @@
 ```java
-package com.fincore.commonutilities.annotation;
-
-import java.lang.annotation.ElementType;
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
-
-/**
- * Mark any Controller method with this annotation to automatically 
- * encrypt the outbound JSON response using AES-256-GCM.
- */
-@Target({ElementType.METHOD, ElementType.TYPE})
-@Retention(RetentionPolicy.RUNTIME)
-public @interface EncryptedResponse {
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-    /**
-     * Encrypts a plaintext JSON string using AES-256-GCM.
-     * Returns format: "Base64(IV):Base64(Ciphertext)"
-     */
-    public String encrypt(String plainTextJson, String base64SecretKey) throws GeneralSecurityException {
-        
-        byte[] decodedKey = Base64.getDecoder().decode(base64SecretKey);
-        var secretKey = new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES");
-
-        // Generate a random 12-byte IV for this specific response
-        byte[] iv = new byte[12];
-        new SecureRandom().nextBytes(iv);
-        var gcmParameterSpec = new GCMParameterSpec(TAG_LENGTH_BIT, iv);
-
-        var cipher = Cipher.getInstance(ALGORITHM);
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey, gcmParameterSpec);
-
-        byte[] cipherText = cipher.doFinal(plainTextJson.getBytes(StandardCharsets.UTF_8));
-
-        return Base64.getEncoder().encodeToString(iv) + ":" + Base64.getEncoder().encodeToString(cipherText);
-    }
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
 package com.fincore.commonutilities.security;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fincore.commonutilities.annotation.EncryptedResponse;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.commonutilities.util.AesEncryptionUtil;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.MethodParameter;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.converter.HttpMessageConverter;
-import org.springframework.http.server.ServerHttpRequest;
-import org.springframework.http.server.ServerHttpResponse;
-import org.springframework.http.server.ServletServerHttpRequest;
-import org.springframework.web.bind.annotation.ControllerAdvice;
-import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
-
-import java.util.Map;
-
-/**
- * Global Interceptor that encrypts outgoing responses for methods 
- * annotated with @EncryptedResponse.
- */
-@Slf4j
-@ControllerAdvice
-@RequiredArgsConstructor
-public class EncryptResponseBodyAdvice implements ResponseBodyAdvice<Object> {
-
-    private final AesEncryptionUtil aesEncryptionUtil;
-    private final StringRedisTemplate redisTemplate;
-    private final JwtUtil jwtUtil;
-    private final ObjectMapper objectMapper;
-
-    private static final String REDIS_AES_KEY_PREFIX = "AES_KEY:";
-
-    @Override
-    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
-        // ONLY intercept if the Controller method has @EncryptedResponse
-        return returnType.hasMethodAnnotation(EncryptedResponse.class) || 
-               returnType.getDeclaringClass().isAnnotationPresent(EncryptedResponse.class);
-    }
-
-    @Override
-    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
-                                  Class<? extends HttpMessageConverter<?>> selectedConverterType,
-                                  ServerHttpRequest request, ServerHttpResponse response) {
-
-        // If the body is already an error or null, don't encrypt it
-        if (body == null || body instanceof String) {
-            return body;
-        }
-
-        try {
-            // 1. Convert the outgoing Java DTO to a plain JSON string
-            String plainJson = objectMapper.writeValueAsString(body);
-
-            // 2. Get the token from the Request to identify the user
-            var servletRequest = ((ServletServerHttpRequest) request).getServletRequest();
-            String token = servletRequest.getHeader(HttpHeaders.AUTHORIZATION);
-            if (token == null || !token.toLowerCase().startsWith("bearer ")) {
-                log.warn("Cannot encrypt response: No Auth token found.");
-                return body; // Fallback to plain if unauthorized (filters should catch this anyway)
-            }
-            
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
-
-            // 3. Fetch Session Key from Redis
-            String base64AesKey = redisTemplate.opsForValue().get(REDIS_AES_KEY_PREFIX + userId);
-            if (base64AesKey == null) {
-                log.error("Cannot encrypt response: AES Key missing for user {}", userId);
-                throw new SecurityException("Encryption Session expired.");
-            }
-
-            // 4. Encrypt the JSON String
-            String encryptedString = aesEncryptionUtil.encrypt(plainJson, base64AesKey);
-
-            // 5. Tell the Frontend this response is encrypted via a Header
-            response.getHeaders().add("X-Encrypted-Response", "true");
-
-            // 6. Return it inside a Map so Jackson serializes it cleanly without ClassCastExceptions
-            return Map.of("encryptedPayload", encryptedString);
-
-        } catch (Exception e) {
-            log.error("Failed to encrypt response payload", e);
-            throw new RuntimeException("Server Error during payload encryption");
-        }
-    }
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    @GetMapping("/accounts/{id}")
-    @EncryptedResponse // <--- Just add this!
-    public AccountDetailsDto getAccountDetails(@PathVariable String id) {
-        return accountService.getDetails(id); 
-    }
-
----
-
-### Step 5: The Frontend Fix (Axios Response Interceptor)
-
-Send this quick update to your React developer. They need to add a **Response Interceptor** to catch the `encryptedPayload`, decrypt it, and trick the React app into thinking the API responded normally.
-
-```javascript
-// src/api/axiosSetup.js (Add this below your Request Interceptor)
-
-import { decryptPayload } from '../utils/cryptoUtil'; // They need to write the reverse decrypt util
-
-// Response Interceptor
-apiClient.interceptors.response.use(async (response) => {
-    
-    // Check if the backend flagged this response as encrypted
-    const isEncrypted = response.headers['x-encrypted-response'] === 'true';
-
-    // Check if the response contains our wrapper map
-    if (isEncrypted && response.data && response.data.encryptedPayload) {
-        
-        const sessionKey = getSessionKeyFromState();
-        
-        if (sessionKey) {
-            try {
-                // 1. Decrypt the payload
-                const decryptedJsonString = await decryptPayload(response.data.encryptedPayload, sessionKey);
-                
-                // 2. Parse the JSON back into an object
-                const decryptedObject = JSON.parse(decryptedJsonString);
-                
-                // 3. Replace the response data so React components don't even know it was encrypted!
-                response.data = decryptedObject;
-                
-            } catch (error) {
-                console.error("Failed to decrypt server response", error);
-                return Promise.reject(error);
-            }
-        }
-    }
-
-    return response;
-}, (error) => {
-    return Promise.reject(error);
-});
-
-### Why this architecture is a Masterpiece:
-1. **Performance:** Only sensitive APIs suffer the tiny microsecond delay of encryption.
-2. **Developer Experience:** Your backend engineers don't have to write messy encryption code in their services. They just type `@EncryptedResponse`.
-3. **Frontend Experience:** The React components don't change. A component calls `const res = await api.get('/account')` and receives a standard JSON object because Axios decrypts it invisibly in the background.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.commonutilities.security;
-
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fincore.commonutilities.annotation.EncryptedResponse;
 import com.fincore.commonutilities.jwt.JwtUtil;
@@ -268,12 +15,15 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.http.server.ServerHttpRequest;
 import org.springframework.http.server.ServerHttpResponse;
 import org.springframework.http.server.ServletServerHttpRequest;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
 
+import java.security.GeneralSecurityException;
 import java.util.Map;
 
 /**
@@ -303,60 +53,67 @@ public class EncryptResponseBodyAdvice implements ResponseBodyAdvice<Object> {
                                   Class<? extends HttpMessageConverter<?>> selectedConverterType,
                                   ServerHttpRequest request, ServerHttpResponse response) {
 
-        // EDGE CASE 1 & 3: Skip Nulls, File Downloads (Resource/byte[]), and Spring Error Responses
-        if (body == null || 
-            body instanceof Resource || 
-            body instanceof byte[] ||
-            body instanceof ProblemDetail || 
-            body.getClass().getSimpleName().toLowerCase().contains("error")) {
+        // EDGE CASE 1: Skip Nulls, File Downloads, and Spring Standard Error Responses
+        if (body == null || body instanceof Resource || body instanceof byte[] || body instanceof ProblemDetail) {
+            return body;
+        }
+
+        // EDGE CASE 2: Custom Error Wrappers (Don't encrypt 400/500 API responses)
+        if (body.getClass().getSimpleName().toLowerCase().contains("error")) {
             return body;
         }
 
         try {
-            // EDGE CASE 2: Handle raw Strings safely without double-JSON stringification
-            String plainTextPayload;
-            if (body instanceof String) {
-                plainTextPayload = (String) body;
-            } else {
-                plainTextPayload = objectMapper.writeValueAsString(body);
-            }
+            // 1. Serialize payload to JSON (handle raw Strings cleanly)
+            var plainTextPayload = body instanceof String ? (String) body : objectMapper.writeValueAsString(body);
 
-            // Extract Token from Request
+            // 2. Validate Token & Extract User
             var servletRequest = ((ServletServerHttpRequest) request).getServletRequest();
-            String token = servletRequest.getHeader(HttpHeaders.AUTHORIZATION);
+            var token = servletRequest.getHeader(HttpHeaders.AUTHORIZATION);
             if (token == null || !token.toLowerCase().startsWith("bearer ")) {
-                log.warn("Bypassing response encryption: No valid Auth token found.");
-                return body; 
+                throw new AccessDeniedException("No valid Auth token found for encrypted response.");
             }
             
-            String userId = jwtUtil.getUserIdFromToken(token.substring(7));
+            var userId = jwtUtil.getUserIdFromToken(token.substring(7));
 
-            // Fetch Session Key
-            String base64AesKey = redisTemplate.opsForValue().get(REDIS_AES_KEY_PREFIX + userId);
+            // 3. Fetch AES Session Key
+            var base64AesKey = redisTemplate.opsForValue().get(REDIS_AES_KEY_PREFIX + userId);
+            
+            // EDGE CASE 3: The Data Leak Trap. NEVER return plaintext if marked for encryption.
             if (base64AesKey == null) {
-                log.error("Cannot encrypt response: AES Key missing in Redis for user {}", userId);
-                // Return plain body. The global auth filter will eventually catch this expired session anyway.
-                return body; 
+                log.error("Encryption failed: AES Key missing for user {}", userId);
+                throw new IllegalStateException("Encryption Session expired. Cannot securely transmit data.");
             }
 
-            // Encrypt
-            String encryptedString = aesEncryptionUtil.encrypt(plainTextPayload, base64AesKey);
+            // 4. Perform AES-256-GCM Encryption
+            var encryptedString = aesEncryptionUtil.encrypt(plainTextPayload, base64AesKey);
 
-            // Add Header so Frontend knows to decrypt
+            // 5. Add Header so Frontend knows to decrypt
             response.getHeaders().add("X-Encrypted-Response", "true");
 
-            // Return wrapped Map
-            return Map.of("encryptedPayload", encryptedString);
+            // 6. Wrap in JSON Map structure
+            var wrappedResponse = Map.of("encryptedPayload", encryptedString);
 
-        } catch (Exception e) {
-            log.error("Critical failure encrypting outbound response payload", e);
-            // If encryption fails, DO NOT return plaintext sensitive data. Return a safe error structure.
-            response.setStatusCode(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR);
-            return Map.of("error", "Encryption failure", "message", "Unable to secure response payload.");
+            // EDGE CASE 4: The StringHttpMessageConverter Trap
+            // If the controller returns a String, Spring will crash trying to map a Map.
+            // We must manually serialize our wrapper map back into a String.
+            if (selectedConverterType.equals(StringHttpMessageConverter.class)) {
+                return objectMapper.writeValueAsString(wrappedResponse);
+            }
+
+            return wrappedResponse;
+
+        } catch (GeneralSecurityException e) {
+            log.error("Cryptographic failure during response encryption: {}", e.getMessage());
+            // Hard fail - Do not leak plaintext
+            throw new SecurityException("Failed to secure sensitive response.", e);
+        } catch (JsonProcessingException e) {
+            log.error("JSON serialization failure during response encryption: {}", e.getMessage());
+            throw new IllegalStateException("Failed to serialize response payload.", e);
         }
     }
 }
 
 
 ```
-
+p
