@@ -1,1 +1,299 @@
-i have one debezium connector running in my kubernetes cluster through kafka cdonnect, but sometimes it gets turned off for some reason. can i make a admin dashboard for me where i can make a screen by which i can post the connector, check connector status as well as start kafka, check kafka status, kafka connect status,  kafka connect logs etc through my own frontend screen by calling be apis, and api will fetch those data and perform actions accrodingn to me,  my frontend, backend, kafka, kafka connect everything is running in the same cluster.
+```xml
+<!-- Add these to your existing pom.xml -->
+<dependency>
+    <groupId>io.fabric8</groupId>
+    <artifactId>kubernetes-client</artifactId>
+    <version>6.10.0</version>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+    <!-- We use WebClient to make easy REST calls to Kafka Connect -->
+</dependency>
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.NotificationService.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+
+import java.util.Map;
+
+@Service
+@Slf4j
+public class KafkaConnectAdminService {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    // In application.properties, set this to your K8s service URL
+    // e.g., kafka.connect.url=http://kafka-connect:8083
+    @Value("${kafka.connect.url:http://localhost:8083}")
+    private String connectUrl;
+
+    /**
+     * Get status of a specific connector
+     */
+    public Object getConnectorStatus(String connectorName) {
+        String url = connectUrl + "/connectors/" + connectorName + "/status";
+        try {
+            ResponseEntity<Object> response = restTemplate.getForEntity(url, Object.class);
+            return response.getBody();
+        } catch (Exception e) {
+            log.error("Failed to fetch connector status", e);
+            return Map.of("error", e.getMessage(), "status", "UNREACHABLE");
+        }
+    }
+
+    /**
+     * Create or Update a Connector (Your JSON config)
+     */
+    public Object deployConnector(String connectorName, Map<String, Object> configMap) {
+        // We use PUT /connectors/{name}/config to create OR update
+        String url = connectUrl + "/connectors/" + connectorName + "/config";
+        try {
+            restTemplate.put(url, configMap);
+            return getConnectorStatus(connectorName);
+        } catch (Exception e) {
+            log.error("Failed to deploy connector", e);
+            throw new RuntimeException("Deployment failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Restart a failed connector or its tasks
+     */
+    public void restartConnector(String connectorName) {
+        String url = connectUrl + "/connectors/" + connectorName + "/restart?includeTasks=true";
+        try {
+            restTemplate.postForLocation(url, null);
+        } catch (Exception e) {
+            log.error("Failed to restart connector", e);
+            throw new RuntimeException("Restart failed");
+        }
+    }
+
+    /**
+     * Delete the connector entirely
+     */
+    public void deleteConnector(String connectorName) {
+        String url = connectUrl + "/connectors/" + connectorName;
+        try {
+            restTemplate.delete(url);
+        } catch (Exception e) {
+            log.error("Failed to delete connector", e);
+        }
+    }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.NotificationService.service;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+@Service
+@Slf4j
+public class KubernetesAdminService {
+
+    // Fabric8 automatically detects if it is running inside a Kubernetes cluster
+    // and uses the ServiceAccount token mounted inside the pod.
+    private final KubernetesClient client = new KubernetesClientBuilder().build();
+
+    /**
+     * Fetch logs for a deployment (e.g., "kafka-connect" or "kafka")
+     */
+    public String getDeploymentLogs(String namespace, String deploymentName, int tailLines) {
+        try {
+            return client.apps().deployments()
+                    .inNamespace(namespace)
+                    .withName(deploymentName)
+                    .getLog(true) // true = pretty/colored
+                    .substring(0, Math.min(10000, 10000)); // Protect memory, limit to last 10k chars roughly or use tailing logic
+        } catch (Exception e) {
+            log.error("Failed to fetch logs for {}", deploymentName, e);
+            return "Error fetching logs: " + e.getMessage() + "\n(Did you configure Kubernetes RBAC ServiceAccount permissions for this pod?)";
+        }
+    }
+
+    /**
+     * Restart a pod/deployment (Equivalent to kubectl rollout restart)
+     */
+    public void restartDeployment(String namespace, String deploymentName) {
+        try {
+            client.apps().deployments()
+                    .inNamespace(namespace)
+                    .withName(deploymentName)
+                    .rolling().restart();
+            log.info("Restarted deployment: {}", deploymentName);
+        } catch (Exception e) {
+            log.error("Failed to restart deployment", e);
+            throw new RuntimeException("Could not restart " + deploymentName);
+        }
+    }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.NotificationService.controller;
+
+import com.fincore.NotificationService.service.KafkaConnectAdminService;
+import com.fincore.NotificationService.service.KubernetesAdminService;
+import lombok.RequiredArgsConstructor;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.DescribeClusterResult;
+import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+
+@RestController
+@RequestMapping("/api/admin")
+@RequiredArgsConstructor
+public class AdminDashboardController {
+
+    private final KafkaConnectAdminService connectService;
+    private final KubernetesAdminService k8sService;
+    private final KafkaAdmin kafkaAdmin; // Provided by Spring Kafka
+
+    // --- KAFKA CONNECT MANAGEMENT ---
+
+    @GetMapping("/connectors/{name}/status")
+    public ResponseEntity<Object> getConnectorStatus(@PathVariable String name) {
+        return ResponseEntity.ok(connectService.getConnectorStatus(name));
+    }
+
+    @PostMapping("/connectors/{name}")
+    public ResponseEntity<Object> deployConnector(@PathVariable String name, @RequestBody Map<String, Object> config) {
+        // You would pass the "config" block of your JSON here from the frontend
+        return ResponseEntity.ok(connectService.deployConnector(name, config));
+    }
+
+    @PostMapping("/connectors/{name}/restart")
+    public ResponseEntity<String> restartConnector(@PathVariable String name) {
+        connectService.restartConnector(name);
+        return ResponseEntity.ok("Restart command issued successfully");
+    }
+
+    // --- KAFKA CLUSTER STATUS ---
+
+    @GetMapping("/kafka/status")
+    public ResponseEntity<Object> getKafkaClusterStatus() {
+        try (AdminClient adminClient = AdminClient.create(kafkaAdmin.getConfigurationProperties())) {
+            DescribeClusterResult cluster = adminClient.describeCluster();
+            String clusterId = cluster.clusterId().get(3, TimeUnit.SECONDS);
+            int nodeCount = cluster.nodes().get(3, TimeUnit.SECONDS).size();
+            
+            return ResponseEntity.ok(Map.of(
+                    "status", "HEALTHY",
+                    "clusterId", clusterId,
+                    "brokerCount", nodeCount
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.ok(Map.of("status", "DOWN", "error", e.getMessage()));
+        }
+    }
+
+    // --- KUBERNETES LOGS & POD MANAGEMENT ---
+    // Note: Pass your actual namespace here (e.g., "default", "kafka-ns")
+
+    @GetMapping("/logs/{app}")
+    public ResponseEntity<String> getAppLogs(@PathVariable String app, @RequestParam(defaultValue = "default") String namespace) {
+        // app could be "kafka" or "connect" (based on your Tanzu deployment names)
+        return ResponseEntity.ok(k8sService.getDeploymentLogs(namespace, app, 100));
+    }
+
+    @PostMapping("/restart-app/{app}")
+    public ResponseEntity<String> restartApp(@PathVariable String app, @RequestParam(defaultValue = "default") String namespace) {
+        k8sService.restartDeployment(namespace, app);
+        return ResponseEntity.ok(app + " is restarting...");
+    }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
