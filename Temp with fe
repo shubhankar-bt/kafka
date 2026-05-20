@@ -1,371 +1,463 @@
-<dependency>
-    <groupId>io.fabric8</groupId>
-    <artifactId>kubernetes-client</artifactId>
-    <version>6.10.0</version>
-</dependency>
+```react
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  Box,
+  Card,
+  CardContent,
+  CardHeader,
+  CardActions,
+  Grid,
+  Typography,
+  Button,
+  Chip,
+  IconButton,
+  Tooltip,
+  CircularProgress,
+  Divider,
+  Snackbar,
+  Alert,
+  Paper,
+  Switch,
+  FormControlLabel
+} from '@mui/material';
+import {
+  Play,
+  Square,
+  RotateCcw,
+  RefreshCw,
+  Copy,
+  Terminal,
+  Activity,
+  Server,
+  Pause,
+  Trash2
+} from 'lucide-react';
 
+// ============================================================================
+// INSTRUCTIONS: 
+// Import your actual useApi hook here. 
+// I am assuming it returns a function (e.g., callApi) that accepts { url, method, payload }.
+// import useApi from '../../hooks/useApi'; 
+// ============================================================================
 
+// Mocking useApi for demonstration so the file doesn't break. 
+// DELETE this mock block and use your actual import above.
+const useApi = () => {
+  const [loading, setLoading] = useState(false);
+  const callApi = async ({ url, method, payload }) => {
+    setLoading(true);
+    // Simulate API delay
+    await new Promise((res) => setTimeout(res, 800));
+    setLoading(false);
+    console.log(`Called ${method} ${url}`, payload);
+    return { data: { status: 'RUNNING', message: 'Success' } }; 
+  };
+  return { callApi, loading };
+};
+// --- END MOCK ---
 
+const AdminDashboard = () => {
+  const { callApi, loading: apiLoading } = useApi();
 
+  // State Management
+  const [kafkaStatus, setKafkaStatus] = useState(null);
+  const [debeziumStatus, setDebeziumStatus] = useState(null);
+  const [logs, setLogs] = useState("Initializing log stream...\n");
+  const [isAutoRefresh, setIsAutoRefresh] = useState(true);
+  
+  // Loading states for specific actions
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
+  const [isActionLoading, setIsActionLoading] = useState(false);
+  const [isLogRefreshing, setIsLogRefreshing] = useState(false);
 
+  // Toast Notification State
+  const [toast, setToast] = useState({ open: false, message: '', severity: 'info' });
 
+  const logsEndRef = useRef(null);
+  const logContainerRef = useRef(null);
 
-```java
-package com.fincore.NotificationService.service;
+  const showToast = (message, severity = 'success') => {
+    setToast({ open: true, message, severity });
+  };
 
-import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.apps.Deployment;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
+  const handleCloseToast = () => setToast((prev) => ({ ...prev, open: false }));
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+  // --- API CALLS ---
 
-@Service
-@Slf4j
-public class KubernetesAdminService {
+  const fetchClusterStatus = useCallback(async () => {
+    setIsRefreshingStatus(true);
+    try {
+      // Fetch Kafka Status
+      const kRes = await callApi({ url: '/api/admin/kafka/status', method: 'GET' });
+      if (kRes?.data) setKafkaStatus(kRes.data);
 
-    // Automatically connects to the cluster using the pod's service account
-    private final KubernetesClient client = new KubernetesClientBuilder().build();
-
-    // Pulls the namespace dynamically from application.properties (e.g., be-test, be-uat)
-    @Value("${kubernetes.namespace:be-test}")
-    private String namespace;
-
-    /**
-     * Get the status of a Deployment (e.g., "debezium-server" or "kafka")
-     */
-    public Map<String, Object> getDeploymentStatus(String deploymentName) {
-        Map<String, Object> status = new HashMap<>();
-        try {
-            Deployment deployment = client.apps().deployments()
-                    .inNamespace(namespace)
-                    .withName(deploymentName)
-                    .get();
-
-            if (deployment == null) {
-                status.put("status", "NOT_FOUND");
-                return status;
-            }
-
-            Integer readyReplicas = deployment.getStatus().getReadyReplicas();
-            Integer desiredReplicas = deployment.getSpec().getReplicas();
-
-            status.put("desiredReplicas", desiredReplicas != null ? desiredReplicas : 0);
-            status.put("readyReplicas", readyReplicas != null ? readyReplicas : 0);
-            status.put("status", (readyReplicas != null && readyReplicas > 0) ? "RUNNING" : "STOPPED");
-
-        } catch (Exception e) {
-            log.error("Error fetching status for {}", deploymentName, e);
-            status.put("status", "ERROR");
-            status.put("message", e.getMessage());
-        }
-        return status;
+      // Fetch Debezium Status
+      const dRes = await callApi({ url: '/api/admin/debezium/status', method: 'GET' });
+      if (dRes?.data) setDebeziumStatus(dRes.data);
+    } catch (error) {
+      showToast('Failed to fetch status data.', 'error');
+    } finally {
+      setIsRefreshingStatus(false);
     }
+  }, [callApi]);
 
-    /**
-     * Start or Stop Debezium by scaling the replicas
-     */
-    public void scaleDeployment(String deploymentName, int replicas) {
-        try {
-            client.apps().deployments()
-                    .inNamespace(namespace)
-                    .withName(deploymentName)
-                    .scale(replicas);
-            log.info("Scaled {} to {} replicas", deploymentName, replicas);
-        } catch (Exception e) {
-            log.error("Failed to scale deployment {}", deploymentName, e);
-            throw new RuntimeException("Failed to scale: " + e.getMessage());
-        }
+  const fetchLogs = useCallback(async (isBackground = false) => {
+    if (!isBackground) setIsLogRefreshing(true);
+    try {
+      const res = await callApi({ url: '/api/admin/debezium/logs?lines=200', method: 'GET' });
+      if (res?.data) {
+        // If your API returns a raw string, use it directly. If it's JSON, parse it appropriately.
+        const logText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data, null, 2);
+        setLogs(logText);
+      }
+    } catch (error) {
+      if (!isBackground) showToast('Failed to fetch logs.', 'error');
+    } finally {
+      if (!isBackground) setIsLogRefreshing(false);
     }
+  }, [callApi]);
 
-    /**
-     * Restart a deployment (Equivalent to kubectl rollout restart)
-     */
-    public void restartDeployment(String deploymentName) {
-        try {
-            client.apps().deployments()
-                    .inNamespace(namespace)
-                    .withName(deploymentName)
-                    .rolling().restart();
-            log.info("Restarted deployment: {}", deploymentName);
-        } catch (Exception e) {
-            log.error("Failed to restart {}", deploymentName, e);
-            throw new RuntimeException("Failed to restart: " + e.getMessage());
-        }
+  const handleDebeziumAction = async (action) => {
+    setIsActionLoading(true);
+    try {
+      const res = await callApi({ url: `/api/admin/debezium/${action}`, method: 'POST' });
+      showToast(res?.data?.message || `Successfully executed ${action}.`);
+      // Refresh status after 2 seconds to allow K8s to process the scale/restart
+      setTimeout(() => fetchClusterStatus(), 2000);
+    } catch (error) {
+      showToast(`Failed to ${action} Debezium.`, 'error');
+    } finally {
+      setIsActionLoading(false);
     }
+  };
 
-    /**
-     * Fetch the last N lines of logs for a deployment
-     */
-    public String getDeploymentLogs(String deploymentName, int tailLines) {
-        try {
-            // Find the active pod for this deployment
-            List<Pod> pods = client.pods().inNamespace(namespace).withLabel("app", deploymentName).list().getItems();
-            
-            if (pods.isEmpty()) {
-                return "No active pods found for " + deploymentName + ". Is it stopped?";
-            }
+  // --- LIFECYCLE & EFFECTS ---
 
-            // Get logs from the first pod found
-            return client.pods()
-                    .inNamespace(namespace)
-                    .withName(pods.get(0).getMetadata().getName())
-                    .tailingLines(tailLines)
-                    .getLog();
-        } catch (Exception e) {
-            log.error("Failed to fetch logs for {}", deploymentName, e);
-            return "Error fetching logs: " + e.getMessage();
-        }
+  // Initial Load
+  useEffect(() => {
+    fetchClusterStatus();
+    fetchLogs();
+  }, [fetchClusterStatus, fetchLogs]);
+
+  // Auto-refresh Logs Effect
+  useEffect(() => {
+    let intervalId;
+    if (isAutoRefresh) {
+      intervalId = setInterval(() => {
+        fetchLogs(true); // silent background fetch
+      }, 5000); // Fetch every 5 seconds
     }
-}
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [isAutoRefresh, fetchLogs]);
 
+  // Auto-scroll logs to bottom when new logs arrive
+  useEffect(() => {
+    if (isAutoRefresh && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs]);
+
+  // --- HANDLERS ---
+
+  const handleCopyLogs = () => {
+    navigator.clipboard.writeText(logs).then(() => {
+      showToast('Logs copied to clipboard!');
+    }).catch(() => {
+      // Fallback for older browsers or non-secure contexts
+      const textArea = document.createElement("textarea");
+      textArea.value = logs;
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand('copy');
+        showToast('Logs copied to clipboard!');
+      } catch (err) {
+        showToast('Failed to copy logs.', 'error');
+      }
+      document.body.removeChild(textArea);
+    });
+  };
+
+  const handleClearLogs = () => {
+    setLogs("Logs cleared locally.\n");
+  };
+
+  // --- RENDER HELPERS ---
+
+  const getStatusColor = (status) => {
+    if (!status) return 'default';
+    const s = status.toUpperCase();
+    if (s === 'HEALTHY' || s === 'RUNNING') return 'success';
+    if (s === 'STOPPED') return 'warning';
+    if (s === 'DOWN' || s === 'ERROR') return 'error';
+    return 'default';
+  };
+
+  return (
+    <Box sx={{ p: 3, maxWidth: '1400px', margin: '0 auto' }}>
+      
+      {/* HEADER */}
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 4 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <Activity size={32} color="#1976d2" />
+          <Typography variant="h4" fontWeight="600" color="text.primary">
+            Streaming Engine Admin
+          </Typography>
+        </Box>
+        <Button 
+          variant="outlined" 
+          color="primary" 
+          startIcon={isRefreshingStatus ? <CircularProgress size={16} /> : <RefreshCw size={18} />}
+          onClick={fetchClusterStatus}
+          disabled={isRefreshingStatus}
+        >
+          Refresh Status
+        </Button>
+      </Box>
+
+      <Grid container spacing={3}>
+        
+        {/* KAFKA CLUSTER STATUS CARD */}
+        <Grid item xs={12} md={6}>
+          <Card elevation={2} sx={{ height: '100%', borderRadius: 2 }}>
+            <CardHeader 
+              title="Kafka Cluster" 
+              titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+              avatar={<Server size={24} color="#555" />}
+              action={
+                <Chip 
+                  label={kafkaStatus?.status || 'UNKNOWN'} 
+                  color={getStatusColor(kafkaStatus?.status)} 
+                  variant="filled" 
+                  size="small"
+                  sx={{ fontWeight: 'bold' }}
+                />
+              }
+              sx={{ pb: 0 }}
+            />
+            <CardContent>
+              <Grid container spacing={2} sx={{ mt: 1 }}>
+                <Grid item xs={6}>
+                  <Typography variant="body2" color="text.secondary">Cluster ID</Typography>
+                  <Typography variant="body1" fontWeight="500">
+                    {kafkaStatus?.clusterId || '---'}
+                  </Typography>
+                </Grid>
+                <Grid item xs={6}>
+                  <Typography variant="body2" color="text.secondary">Active Brokers</Typography>
+                  <Typography variant="body1" fontWeight="500">
+                    {kafkaStatus?.brokerCount !== undefined ? kafkaStatus.brokerCount : '---'}
+                  </Typography>
+                </Grid>
+              </Grid>
+            </CardContent>
+          </Card>
+        </Grid>
+
+        {/* DEBEZIUM CONNECTOR STATUS CARD */}
+        <Grid item xs={12} md={6}>
+          <Card elevation={2} sx={{ height: '100%', borderRadius: 2, display: 'flex', flexDirection: 'column' }}>
+            <CardHeader 
+              title="Debezium Server" 
+              titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
+              avatar={<Activity size={24} color="#555" />}
+              action={
+                <Chip 
+                  label={debeziumStatus?.status || 'UNKNOWN'} 
+                  color={getStatusColor(debeziumStatus?.status)} 
+                  variant="filled" 
+                  size="small"
+                  sx={{ fontWeight: 'bold' }}
+                />
+              }
+              sx={{ pb: 0 }}
+            />
+            <CardContent sx={{ flexGrow: 1 }}>
+              <Grid container spacing={2} sx={{ mt: 1 }}>
+                <Grid item xs={6}>
+                  <Typography variant="body2" color="text.secondary">Desired Replicas</Typography>
+                  <Typography variant="body1" fontWeight="500">
+                    {debeziumStatus?.desiredReplicas !== undefined ? debeziumStatus.desiredReplicas : '---'}
+                  </Typography>
+                </Grid>
+                <Grid item xs={6}>
+                  <Typography variant="body2" color="text.secondary">Ready Replicas</Typography>
+                  <Typography variant="body1" fontWeight="500">
+                    {debeziumStatus?.readyReplicas !== undefined ? debeziumStatus.readyReplicas : '---'}
+                  </Typography>
+                </Grid>
+              </Grid>
+            </CardContent>
+            <Divider />
+            <CardActions sx={{ justifyContent: 'flex-end', p: 2, gap: 1 }}>
+              <Button 
+                variant="contained" 
+                color="success" 
+                startIcon={<Play size={16} />}
+                onClick={() => handleDebeziumAction('start')}
+                disabled={isActionLoading || debeziumStatus?.status === 'RUNNING'}
+                disableElevation
+              >
+                Start
+              </Button>
+              <Button 
+                variant="contained" 
+                color="warning" 
+                startIcon={<Square size={16} />}
+                onClick={() => handleDebeziumAction('stop')}
+                disabled={isActionLoading || debeziumStatus?.status === 'STOPPED'}
+                disableElevation
+              >
+                Stop
+              </Button>
+              <Button 
+                variant="contained" 
+                color="primary" 
+                startIcon={<RotateCcw size={16} />}
+                onClick={() => handleDebeziumAction('restart')}
+                disabled={isActionLoading}
+                disableElevation
+              >
+                Restart
+              </Button>
+            </CardActions>
+          </Card>
+        </Grid>
+
+        {/* LOG VIEWER SECTION */}
+        <Grid item xs={12}>
+          <Paper 
+            elevation={3} 
+            sx={{ 
+              borderRadius: 2, 
+              overflow: 'hidden', 
+              display: 'flex', 
+              flexDirection: 'column',
+              bgcolor: '#1e1e1e', // Dark terminal background
+              border: '1px solid #333'
+            }}
+          >
+            {/* Terminal Toolbar */}
+            <Box 
+              sx={{ 
+                bgcolor: '#2d2d2d', 
+                px: 2, 
+                py: 1, 
+                display: 'flex', 
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                borderBottom: '1px solid #000'
+              }}
+            >
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Terminal size={18} color="#aaa" />
+                <Typography variant="subtitle2" sx={{ color: '#eee', fontFamily: 'monospace' }}>
+                  Debezium Pod Logs
+                </Typography>
+              </Box>
+              
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <FormControlLabel
+                  control={
+                    <Switch 
+                      size="small" 
+                      checked={isAutoRefresh} 
+                      onChange={(e) => setIsAutoRefresh(e.target.checked)} 
+                      color="primary"
+                    />
+                  }
+                  label={
+                    <Typography variant="caption" sx={{ color: '#aaa', userSelect: 'none' }}>
+                      Auto-Tail
+                    </Typography>
+                  }
+                  sx={{ mr: 1, m: 0 }}
+                />
+                
+                <Tooltip title="Refresh Logs Now">
+                  <IconButton 
+                    size="small" 
+                    onClick={() => fetchLogs()} 
+                    disabled={isLogRefreshing}
+                    sx={{ color: '#aaa', '&:hover': { color: '#fff' } }}
+                  >
+                    <RefreshCw size={16} className={isLogRefreshing ? "animate-spin" : ""} />
+                  </IconButton>
+                </Tooltip>
+                
+                <Tooltip title="Copy Logs">
+                  <IconButton 
+                    size="small" 
+                    onClick={handleCopyLogs}
+                    sx={{ color: '#aaa', '&:hover': { color: '#fff' } }}
+                  >
+                    <Copy size={16} />
+                  </IconButton>
+                </Tooltip>
+                
+                <Tooltip title="Clear Window (Local)">
+                  <IconButton 
+                    size="small" 
+                    onClick={handleClearLogs}
+                    sx={{ color: '#aaa', '&:hover': { color: '#fff' } }}
+                  >
+                    <Trash2 size={16} />
+                  </IconButton>
+                </Tooltip>
+              </Box>
+            </Box>
+
+            {/* Terminal Output */}
+            <Box 
+              ref={logContainerRef}
+              sx={{ 
+                height: '450px', 
+                overflowY: 'auto', 
+                p: 2,
+                '&::-webkit-scrollbar': { width: '8px' },
+                '&::-webkit-scrollbar-track': { background: '#1e1e1e' },
+                '&::-webkit-scrollbar-thumb': { background: '#555', borderRadius: '4px' },
+                '&::-webkit-scrollbar-thumb:hover': { background: '#777' }
+              }}
+            >
+              <Typography 
+                component="pre" 
+                sx={{ 
+                  margin: 0, 
+                  fontFamily: '"Fira Code", "Consolas", monospace', 
+                  fontSize: '0.85rem',
+                  color: '#4af626', // Hacker green
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all',
+                  lineHeight: 1.5
+                }}
+              >
+                {logs}
+                {/* Invisible element to anchor the auto-scroll */}
+                <span ref={logsEndRef} />
+              </Typography>
+            </Box>
+          </Paper>
+        </Grid>
+      </Grid>
+
+      {/* Global Snackbar for Notifications */}
+      <Snackbar
+        open={toast.open}
+        autoHideDuration={4000}
+        onClose={handleCloseToast}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+      >
+        <Alert onClose={handleCloseToast} severity={toast.severity} sx={{ width: '100%' }} variant="filled">
+          {toast.message}
+        </Alert>
+      </Snackbar>
+    </Box>
+  );
+};
+
+export default AdminDashboard;
 
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.NotificationService.controller;
-
-import com.fincore.NotificationService.service.KubernetesAdminService;
-import lombok.RequiredArgsConstructor;
-import org.apache.kafka.clients.admin.AdminClient;
-import org.apache.kafka.clients.admin.DescribeClusterResult;
-import org.springframework.http.ResponseEntity;
-import org.springframework.kafka.core.KafkaAdmin;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-
-@RestController
-@RequestMapping("/api/admin")
-@RequiredArgsConstructor
-public class AdminDashboardController {
-
-    private final KubernetesAdminService k8sService;
-    private final KafkaAdmin kafkaAdmin; // Provided by Spring Kafka auto-configuration
-
-    private static final String DEBEZIUM_APP_NAME = "debezium-server";
-
-    // --- DEBEZIUM SERVER MANAGEMENT ---
-
-    @GetMapping("/debezium/status")
-    public ResponseEntity<Map<String, Object>> getDebeziumStatus() {
-        return ResponseEntity.ok(k8sService.getDeploymentStatus(DEBEZIUM_APP_NAME));
-    }
-
-    @PostMapping("/debezium/start")
-    public ResponseEntity<Map<String, String>> startDebezium() {
-        // Scale to 1 to start the connector
-        k8sService.scaleDeployment(DEBEZIUM_APP_NAME, 1);
-        return ResponseEntity.ok(Map.of("message", "Debezium Server starting..."));
-    }
-
-    @PostMapping("/debezium/stop")
-    public ResponseEntity<Map<String, String>> stopDebezium() {
-        // Scale to 0 to stop the connector completely
-        k8sService.scaleDeployment(DEBEZIUM_APP_NAME, 0);
-        return ResponseEntity.ok(Map.of("message", "Debezium Server stopped."));
-    }
-
-    @PostMapping("/debezium/restart")
-    public ResponseEntity<Map<String, String>> restartDebezium() {
-        k8sService.restartDeployment(DEBEZIUM_APP_NAME);
-        return ResponseEntity.ok(Map.of("message", "Debezium Server restarting..."));
-    }
-
-    @GetMapping("/debezium/logs")
-    public ResponseEntity<String> getDebeziumLogs(@RequestParam(defaultValue = "200") int lines) {
-        return ResponseEntity.ok(k8sService.getDeploymentLogs(DEBEZIUM_APP_NAME, lines));
-    }
-
-    // --- KAFKA CLUSTER STATUS ---
-
-    @GetMapping("/kafka/status")
-    public ResponseEntity<Object> getKafkaClusterStatus() {
-        try (AdminClient adminClient = AdminClient.create(kafkaAdmin.getConfigurationProperties())) {
-            DescribeClusterResult cluster = adminClient.describeCluster();
-            String clusterId = cluster.clusterId().get(3, TimeUnit.SECONDS);
-            int nodeCount = cluster.nodes().get(3, TimeUnit.SECONDS).size();
-            
-            return ResponseEntity.ok(Map.of(
-                    "status", "HEALTHY",
-                    "clusterId", clusterId,
-                    "brokerCount", nodeCount
-            ));
-        } catch (Exception e) {
-            return ResponseEntity.ok(Map.of("status", "DOWN", "error", e.getMessage()));
-        }
-    }
-}
-
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-
-# The Kubernetes namespace where Kafka and Debezium are deployed
-kubernetes.namespace=be-test
-
-### The Absolute Must-Have: Kubernetes RBAC
-
-For your Spring Boot backend to be allowed to "talk" to Kubernetes (to scale pods and read logs), your DevOps team **must** assign a Role to the Spring Boot Pod. 
-
-Give this exactly to your DevOps team:
-
-> *"Can you please apply this Role and RoleBinding to the ServiceAccount used by the Notification Service Backend in Tanzu? It needs permission to check status, restart, and view logs of Debezium."*
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: be-test
-  name: notification-admin-role
-rules:
-- apiGroups: ["apps"]
-  resources: ["deployments", "deployments/scale"]
-  verbs: ["get", "list", "watch", "patch", "update"]
-- apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: notification-admin-rolebinding
-  namespace: be-test
-subjects:
-- kind: ServiceAccount
-  name: default # Change this if your Backend uses a specific service account name
-  namespace: be-test
-roleRef:
-  kind: Role
-  name: notification-admin-role
-  apiGroup: rbac.authorization.k8s.io
-
-### Summary of this approach:
-1. **Highly Flexible:** Because you use the Kubernetes API instead of Kafka Connect, it doesn't matter what URLs are configured for Dev vs. Prod. Debezium will just use whatever ConfigMap DevOps gave it.
-2. **Safe:** You are scaling the Deployment up and down (0 or 1). This is the safest way to pause Debezium in Kubernetes because it gracefully stops reading from Oracle and commits offsets to Kafka.
-3. **Easy for Frontend:** The frontend simply creates buttons for "Start", "Stop", "Restart" and a text box for Logs, calling the REST APIs above!
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Add this inside src/main/java/com/fincore/NotificationService/config/KafkaConfig.java
-
-import org.springframework.kafka.core.KafkaAdmin;
-import org.apache.kafka.clients.admin.AdminClientConfig;
-import java.util.HashMap;
-
-    // --- BEAN G: KAFKA ADMIN (For Dashboard Health Checks) ---
-    @Bean
-    public KafkaAdmin kafkaAdmin(KafkaProperties kafkaProperties) {
-        Map<String, Object> configs = new HashMap<>();
-        // Use the bootstrap servers defined in application.properties
-        configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, 
-            kafkaProperties.getConsumer().getBootstrapServers());
-        return new KafkaAdmin(configs);
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-```java
-package com.fincore.NotificationService.config;
-
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-@Configuration
-public class KubernetesConfig {
-
-    @Bean(destroyMethod = "close")
-    public KubernetesClient kubernetesClient() {
-        // Automatically picks up the service account token inside the Tanzu cluster
-        return new KubernetesClientBuilder().build();
-    }
-}
-
-```
-
-
-
-
-
-
-
-
-
-
-
-
-// Inside KubernetesAdminService.java
-private final KubernetesClient client;
-
-public KubernetesAdminService(KubernetesClient client) {
-    this.client = client;
-}
-
-### Final Confirmation
-With these three tweaks applied:
-1. **Dependencies:** You have `fabric8-kubernetes-client` in `pom.xml`.
-2. **Logic:** You have the `KubernetesAdminService` and `AdminDashboardController` managing Debezium via K8s Scaling (0 or 1).
-3. **Properties:** You have `kubernetes.namespace=be-test` (or whatever it is per environment) in your properties files.
-4. **Permissions:** You have requested the DevOps team to apply the `Role` and `RoleBinding` to your Pod's Service Account.
-5. **Security:** Your API is locked down to Admins only.
-
-**You are 100% good to go.** 🚀 
-
-You can safely hand over the API contract (`GET /api/admin/debezium/status`, `POST /api/admin/debezium/start`, etc.) to your frontend logic and start building the UI dashboard!
