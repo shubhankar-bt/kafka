@@ -1,89 +1,20 @@
-```yaml
----
-# ==========================================
-# 1. THE DEPLOYMENT
-# ==========================================
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ollama-deployment
-  namespace: fincore-dev
-spec:
-  replicas: 1 # The HPA will take control of this number once deployed
-  selector:
-    matchLabels:
-      app: ollama
-  template:
-    metadata:
-      labels:
-        app: ollama
-    spec:
-      containers:
-      - name: ollama
-        # Point to your custom, baked image
-        image: your-internal-registry.sbi.com/fincore-ai/finny:v1.0 
-        imagePullPolicy: IfNotPresent 
-        ports:
-        - containerPort: 11434
-        env:
-        # Keep models in memory forever (no 5m timeouts)
-        - name: OLLAMA_KEEP_ALIVE
-          value: "-1" 
-        # Force Ollama to keep BOTH the Chat and Embedding models loaded at the same time
-        - name: OLLAMA_MAX_LOADED_MODELS
-          value: "2"
-        resources:
-          requests:
-            # Baseline required to hold the 8B LLM and Embedding Model
-            memory: "8Gi"   
-            cpu: "2000m"
-          limits:
-            # Ceiling raised to prevent OOMKills during long context chats
-            memory: "12Gi"  
-            cpu: "4000m"
-            # IF YOUR DEV CLUSTER HAS GPUs, UNCOMMENT THE LINE BELOW:
-            # nvidia.com/gpu: 1
+# ==============================================================
+# KUBERNETES AI CONFIGS (UAT REGION - fincore-cbops1)
+# ==============================================================
 
----
-# ==========================================
-# 2. THE SERVICE
-# ==========================================
-apiVersion: v1
-kind: Service
-metadata:
-  name: ollama-service
-  namespace: fincore-dev
-spec:
-  selector:
-    app: ollama
-  ports:
-    - protocol: TCP
-      port: 11434
-      targetPort: 11434
+# 1. Ollama Connection (Uses K8s CoreDNS to find the pod automatically)
+langchain4j.ollama.base-url=http://ollama-service.fincore-cbops1.svc.cluster.local:11434
+langchain4j.ollama.chat-model.name=llama-fincore
+langchain4j.ollama.chat-model.temperature=0.1
+# Note: Ensure this matches the exact name we built in the Dockerfile!
+langchain4j.ollama.embedding-model.name=mxbai-embed-large 
 
----
-# ==========================================
-# 3. HORIZONTAL POD AUTOSCALER (HPA)
-# ==========================================
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: ollama-hpa
-  namespace: fincore-dev
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: ollama-deployment
-  minReplicas: 1
-  # CAUTION: Max Replicas = 3 means at peak traffic, this will consume up to 36GB of Cluster RAM (12Gi * 3).
-  maxReplicas: 3
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 80 # Scale up if CPU goes above 80%
-
-```
+# 2. Redis Vector Store Connection
+# Point to your Redis Vector Kubernetes Service
+langchain4j.vector-store.redis.host=redis-vector-service.fincore-cbops1.svc.cluster.local
+# NOTE: If your K8s Redis service exposes port 6380 (from our earlier YAML), use 6380. 
+# If it exposes standard 6379, change this to 6379.
+langchain4j.vector-store.redis.port=6380 
+langchain4j.vector-store.redis.index-name=fincore-help-index-v2
+langchain4j.vector-store.redis.prefix=fincore:doc:v2:
+langchain4j.vector-store.redis.dimension=1024
