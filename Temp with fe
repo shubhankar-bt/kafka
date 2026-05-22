@@ -1,13 +1,89 @@
-FROM /root/.ollama/models/Meta-Llama-3-8B-Instruct-Q5_K_M.gguf
-PARAMETER temperature 0.1
-PARAMETER num_ctx 4096
+```yaml
+---
+# ==========================================
+# 1. THE DEPLOYMENT
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-deployment
+  namespace: fincore-dev
+spec:
+  replicas: 1 # The HPA will take control of this number once deployed
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        # Point to your custom, baked image
+        image: your-internal-registry.sbi.com/fincore-ai/finny:v1.0 
+        imagePullPolicy: IfNotPresent 
+        ports:
+        - containerPort: 11434
+        env:
+        # Keep models in memory forever (no 5m timeouts)
+        - name: OLLAMA_KEEP_ALIVE
+          value: "-1" 
+        # Force Ollama to keep BOTH the Chat and Embedding models loaded at the same time
+        - name: OLLAMA_MAX_LOADED_MODELS
+          value: "2"
+        resources:
+          requests:
+            # Baseline required to hold the 8B LLM and Embedding Model
+            memory: "8Gi"   
+            cpu: "2000m"
+          limits:
+            # Ceiling raised to prevent OOMKills during long context chats
+            memory: "12Gi"  
+            cpu: "4000m"
+            # IF YOUR DEV CLUSTER HAS GPUs, UNCOMMENT THE LINE BELOW:
+            # nvidia.com/gpu: 1
 
+---
+# ==========================================
+# 2. THE SERVICE
+# ==========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: fincore-dev
+spec:
+  selector:
+    app: ollama
+  ports:
+    - protocol: TCP
+      port: 11434
+      targetPort: 11434
 
+---
+# ==========================================
+# 3. HORIZONTAL POD AUTOSCALER (HPA)
+# ==========================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ollama-hpa
+  namespace: fincore-dev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ollama-deployment
+  minReplicas: 1
+  # CAUTION: Max Replicas = 3 means at peak traffic, this will consume up to 36GB of Cluster RAM (12Gi * 3).
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80 # Scale up if CPU goes above 80%
 
-
-
-FROM /root/.ollama/models/mxbai-embed-large-v1-f16.gguf
-
-
-
-
+```
