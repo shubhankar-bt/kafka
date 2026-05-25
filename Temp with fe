@@ -1,20 +1,438 @@
-# ==============================================================
-# KUBERNETES AI CONFIGS (UAT REGION - fincore-cbops1)
-# ==============================================================
+```java
+package com.fincore.helpservice.controller;
 
-# 1. Ollama Connection (Uses K8s CoreDNS to find the pod automatically)
-langchain4j.ollama.base-url=http://ollama-service.fincore-cbops1.svc.cluster.local:11434
-langchain4j.ollama.chat-model.name=llama-fincore
-langchain4j.ollama.chat-model.temperature=0.1
-# Note: Ensure this matches the exact name we built in the Dockerfile!
-langchain4j.ollama.embedding-model.name=mxbai-embed-large 
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.helpservice.dto.HelpRequestDTO;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.service.DocumentIngestionService;
+import com.fincore.helpservice.service.FinCoreChatAgent;
+import com.fincore.helpservice.service.HelpAnalyticsService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-# 2. Redis Vector Store Connection
-# Point to your Redis Vector Kubernetes Service
-langchain4j.vector-store.redis.host=redis-vector-service.fincore-cbops1.svc.cluster.local
-# NOTE: If your K8s Redis service exposes port 6380 (from our earlier YAML), use 6380. 
-# If it exposes standard 6379, change this to 6379.
-langchain4j.vector-store.redis.port=6380 
-langchain4j.vector-store.redis.index-name=fincore-help-index-v2
-langchain4j.vector-store.redis.prefix=fincore:doc:v2:
-langchain4j.vector-store.redis.dimension=1024
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/help")
+@RequiredArgsConstructor
+@Slf4j
+public class HelpController {
+
+    private final JwtUtil jwtUtil;
+    private final FinCoreChatAgent chatAgent;
+    private final HelpQuestionRepository questionRepository;
+    private final HelpAnalyticsService analyticsService;
+    private final DocumentIngestionService ingestionService;
+    private final StringRedisTemplate redisTemplate;
+
+    private static final String STRICT_MODE_KEY = "fincore:ai:strict_mode";
+
+    // ========================================================================
+    // CHAT & FAQ ENDPOINTS (Existing)
+    // ========================================================================
+    @GetMapping("/faqs")
+    public ResponseEntity<List<HelpQuestionEntity>> getGlobalFaqs(@RequestHeader("Authorization") String token) {
+        return ResponseEntity.ok(questionRepository.findGlobalFaqs());
+    }
+
+    @PostMapping("/feedback")
+    public ResponseEntity<Void> submitChatFeedback(@RequestHeader("Authorization") String token, @RequestBody Map<String, Object> payload) {
+        analyticsService.updateFeedback(Long.valueOf(payload.get("logId").toString()), (Boolean) payload.get("isHelpful"));
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/faqs/track")
+    public ResponseEntity<Void> trackFaqClick(@RequestBody Map<String, String> payload) {
+        chatAgent.incrementFaqPopularity(payload.get("questionText"));
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter handleChatQuery(@RequestHeader("Authorization") String token, @RequestBody HelpRequestDTO request) {
+        String userId = jwtUtil.getUserIdFromToken(token);
+        String roleId = String.valueOf(jwtUtil.getUserRoleFromToken(token));
+        return chatAgent.handleStreamChat(userId, roleId, request.getUserMessage(), request.getCurrentScreen());
+    }
+
+    // ========================================================================
+    // ADMIN ENDPOINTS (New Features)
+    // ========================================================================
+
+    // 1. Manually Trigger Vector DB Ingestion
+    @PostMapping("/admin/ingest")
+    public ResponseEntity<String> triggerManualIngestion(@RequestHeader("Authorization") String token) {
+        String roleId = String.valueOf(jwtUtil.getUserRoleFromToken(token));
+        if (!"10".equals(roleId)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Only Admin (Role 10) can trigger data ingestion.");
+        }
+        
+        // Triggers the Java 21 Virtual Thread in the background
+        boolean started = ingestionService.triggerManualIngestion();
+        
+        if (started) {
+            return ResponseEntity.accepted().body("Data ingestion started in the background. It may take a few minutes to reflect in chats.");
+        } else {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Ingestion is already currently running.");
+        }
+    }
+
+    // 2. Toggle Strict Mode
+    @PostMapping("/admin/strict-mode")
+    public ResponseEntity<String> toggleStrictMode(@RequestHeader("Authorization") String token, @RequestBody Map<String, Boolean> payload) {
+        String roleId = String.valueOf(jwtUtil.getUserRoleFromToken(token));
+        if (!"10".equals(roleId)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Only Admin (Role 10) can change AI settings.");
+        }
+
+        Boolean isStrict = payload.getOrDefault("enabled", true);
+        redisTemplate.opsForValue().set(STRICT_MODE_KEY, String.valueOf(isStrict));
+        
+        log.info("[ADMIN] FinCore AI Strict Mode changed to: {}", isStrict);
+        return ResponseEntity.ok("Strict Mode successfully set to " + isStrict);
+    }
+    
+    // Helper to get current Strict Mode status for UI toggle rendering
+    @GetMapping("/admin/strict-mode")
+    public ResponseEntity<Boolean> getStrictModeStatus(@RequestHeader("Authorization") String token) {
+        String roleId = String.valueOf(jwtUtil.getUserRoleFromToken(token));
+        if (!"10".equals(roleId)) return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+
+        String status = redisTemplate.opsForValue().get(STRICT_MODE_KEY);
+        // Default to true if not set
+        return ResponseEntity.ok(status == null || Boolean.parseBoolean(status));
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.model.HelpFaqEntity;
+import com.fincore.helpservice.model.HelpQuestionEntity;
+import com.fincore.helpservice.model.KnowledgeBaseEntity;
+import com.fincore.helpservice.repository.HelpFaqRepository;
+import com.fincore.helpservice.repository.HelpQuestionRepository;
+import com.fincore.helpservice.repository.KnowledgeBaseRepository;
+import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.document.Metadata;
+import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DocumentIngestionService {
+
+    // ... (Keep your existing repository injections and constants) ...
+    private final HelpQuestionRepository questionRepository;
+    private final KnowledgeBaseRepository knowledgeBaseRepository;
+    private final HelpFaqRepository faqRepository;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> embeddingStore;
+    private final StringRedisTemplate redisTemplate;
+
+    private static final int BATCH_SIZE = 50;
+    private static final String INGESTION_LOCK_KEY = "fincore:ai:ingestion_lock";
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void triggerIngestionOnStartup() {
+        attemptIngestion("Startup");
+    }
+
+    /**
+     * Called via REST API by the Admin.
+     * Returns true if it successfully started, false if it's currently locked/running.
+     */
+    public boolean triggerManualIngestion() {
+        return attemptIngestion("Manual API Trigger");
+    }
+
+    private boolean attemptIngestion(String source) {
+        Boolean acquiredLock = redisTemplate.opsForValue().setIfAbsent(INGESTION_LOCK_KEY, "LOCKED", Duration.ofMinutes(10));
+
+        if (Boolean.TRUE.equals(acquiredLock)) {
+            log.info("[AI-INGEST] Lock acquired (Source: {}). Triggering async data ingestion on Virtual Thread...", source);
+            Thread.startVirtualThread(this::performRobustIngestion);
+            return true;
+        } else {
+            log.warn("[AI-INGEST] Ingestion skipped. Another process is currently syncing vectors.");
+            return false;
+        }
+    }
+
+    private void performRobustIngestion() {
+        // ... (Keep the exact identical implementation of performRobustIngestion from our previous session) ...
+        // ... (Ensure redisTemplate.delete(INGESTION_LOCK_KEY) is in the finally block) ...
+        long startTime = System.currentTimeMillis();
+        try {
+            // Step 1: Cleanup Ghost Vectors
+            log.info("[AI-INGEST] Step 1: Cleaning up Ghost Vectors...");
+            // ... (rest of the logic)
+        } catch (Exception e) {
+            log.error("[AI-INGEST] FATAL ERROR during background ingestion.", e);
+        } finally {
+            redisTemplate.delete(INGESTION_LOCK_KEY);
+            log.info("[AI-INGEST] Ingestion lock released.");
+        }
+    }
+}
+
+
+```
+
+
+
+
+
+
+```java
+package com.fincore.helpservice.service;
+
+// ... (existing imports)
+import org.springframework.data.redis.core.StringRedisTemplate;
+// ... (existing imports)
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class FinCoreChatAgent {
+
+    // ... (Existing variables) ...
+    private final StringRedisTemplate redisTemplate;
+    private static final String STRICT_MODE_KEY = "fincore:ai:strict_mode";
+
+    public SseEmitter handleStreamChat(String userId, String roleId, String userMessage, String currentScreen) {
+        // ... (Keep Steps 1, 2, 3, and 4 exactly the same as before) ...
+        
+        // CHECK REDIS FOR STRICT MODE STATUS
+        String strictModeFlag = redisTemplate.opsForValue().get(STRICT_MODE_KEY);
+        boolean isStrictMode = (strictModeFlag == null || Boolean.parseBoolean(strictModeFlag));
+
+        // ...
+        
+        // ========================================================================
+        // 5. PREPARE THE PROMPT & MEMORY (DYNAMIC BASED ON STRICT MODE)
+        // ========================================================================
+        String liveEtlDate = permissionService.getLiveEtlDate();
+        String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM dd, yyyy - hh:mm a"));
+        String currentScreenContext = (currentScreen != null && !currentScreen.isEmpty()) ? currentScreen : "Unknown";
+
+        String dynamicPrompt;
+
+        if (isStrictMode) {
+            // STRICT BANKING MODE (High compliance, rigid boundaries)
+            dynamicPrompt = """
+                    You are the FinCore Smart Assistant, an advanced, highly capable AI banking bot built by Shubhankar, A Software Developer From Fincore Development Team.
+                    Current Time: %s
+                    System ETL Date: %s
+                    User's Current Screen: %s
+                    
+                    <INSTRUCTIONS>
+                    1. CASUAL CONVERSATION: If the user message is a greeting or gratitude, respond warmly. Do NOT mention banking context.
+                    2. BANKING QUERIES: For FinCore questions, you MUST rely EXCLUSIVELY on the <AUTHORIZED_CONTEXT> below.
+                    3. FORMATTING: Use standard Markdown formatting.
+                    4. UNAUTHORIZED / NO MATCH: If the <AUTHORIZED_CONTEXT> does not clearly answer the question, or says "NO BANKING CONTEXT FOUND", you MUST output the exact phrase below and NOTHING else:
+                       %s
+                    5. NO HALLUCINATION: Never invent rules or guess. Strictly follow this rule.
+                    </INSTRUCTIONS>
+                    
+                    <AUTHORIZED_CONTEXT>
+                    %s
+                    </AUTHORIZED_CONTEXT>
+                    """.formatted(currentTime, liveEtlDate, currentScreenContext, FAILURE_MSG, contextBuilder.toString());
+        } else {
+            // LOOSE MODE (Free access, conversational, helpful, falls back to general knowledge)
+            dynamicPrompt = """
+                    You are the FinCore Smart Assistant, an AI banking bot built by Shubhankar.
+                    Current Time: %s
+                    System ETL Date: %s
+                    User's Current Screen: %s
+                    
+                    <INSTRUCTIONS>
+                    You are currently in 'Developer/Loose Mode'. You are free to answer general questions, chat casually, or help the user with programming, formatting, or general banking concepts.
+                    
+                    If the user asks about FinCore specifically, try to use the <AUTHORIZED_CONTEXT> provided below. If the context does not contain the answer, you are FREE to use your general knowledge to assist them as best you can. You do not need to restrict yourself.
+                    
+                    Always be helpful, friendly, and use Markdown formatting.
+                    </INSTRUCTIONS>
+                    
+                    <AUTHORIZED_CONTEXT>
+                    %s
+                    </AUTHORIZED_CONTEXT>
+                    """.formatted(currentTime, liveEtlDate, currentScreenContext, contextBuilder.toString());
+        }
+
+        // ... (Keep the rest of the generation logic the exact same) ...
+        
+        // Update the Fallback Logic check in onComplete:
+        // If we are NOT in strict mode, we shouldn't force the FAILURE_MSG penalty.
+        if (isStrictMode && (aiResponse.contains("I cannot find this information") || aiResponse.contains(FAILURE_MSG))) {
+            // Trigger penalty strikes
+        } else {
+            // Treat as successful answer
+        }
+        
+        // ...
+        return emitter;
+    }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```yaml
+# =========================================================================
+# SPRING BOOT BACKEND DEPLOYMENT (UAT: fincore-cbops1)
+# =========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fincore-helpservice
+  namespace: fincore-cbops1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fincore-helpservice
+  template:
+    metadata:
+      labels:
+        app: fincore-helpservice
+    spec:
+      containers:
+      - name: helpservice
+        image: your-internal-registry.sbi.com/fincore-backend/helpservice:v1.0
+        ports:
+        - containerPort: 9099
+        env:
+        # Override application.properties environment variables here
+        - name: SPRING_PROFILES_ACTIVE
+          value: "uat"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        # Increase the readiness probe delays so it doesn't fail while running initial ingestion
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 9099
+          initialDelaySeconds: 45
+          periodSeconds: 10
+---
+# =========================================================================
+# SPRING BOOT SERVICE
+# =========================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: fincore-helpservice-svc
+  namespace: fincore-cbops1
+spec:
+  selector:
+    app: fincore-helpservice
+  ports:
+    - protocol: TCP
+      port: 9099
+      targetPort: 9099
+
+---
+# =========================================================================
+# INGRESS CONFIGURATION (CRITICAL FOR SSE CHATBOT)
+# =========================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fincore-helpservice-ingress
+  namespace: fincore-cbops1
+  annotations:
+    # IF YOU USE NGINX INGRESS:
+    # You MUST increase these timeouts. By default, NGINX closes idle connections
+    # after 60 seconds. Since LLMs stream data, if the LLM takes 61 seconds to finish,
+    # NGINX will abruptly cut the stream and the UI will throw a network error.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    
+    # Required for Server-Sent Events (SSE) so NGINX doesn't buffer the stream
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: fincore-uat.sbi.com
+    http:
+      paths:
+      - path: /HS/api/help
+        pathType: Prefix
+        backend:
+          service:
+            name: fincore-helpservice-svc
+            port:
+              number: 9099
+
+```
+
+
+
+
+
+
+
+
+
+
