@@ -1,41 +1,26 @@
-1. The Foundation: Database Relationships
-The entire system is driven by five deeply interconnected tables:
- ⁠PERMISSIONS⁠: The master table defining both UI and Backend rules. Critical columns include:
- ⁠MENU_ACTION⁠: Defines allowed UI actions (e.g., ⁠view|create|modify⁠).
- ⁠MAPPED_REQUEST_TYPE⁠: Defines the operational context (e.g., ⁠CGL_CODE⁠, ⁠USER_MANAGEMENT⁠).
- ⁠API_RESOURCE_PATTERN⁠: Defines the actual backend endpoints required (e.g., ⁠/api/user/**⁠).
- ⁠ROLES⁠: The master list of roles (e.g., UCO, PSO, Branch).
- ⁠ROLE_PERMISSIONS⁠: The bridge table mapping Roles to Permissions, including ⁠PERMISSION_ORDER⁠ for UI sorting.
- ⁠USER_ROLES⁠: Maps a User to a Role.
- ⁠USERS⁠: The core user profiles.
-Phase 1: Login & UI Rendering (Frontend Flow)
-When a user attempts to log in via ⁠/api/auth/login⁠ in the Gateway/Login Service:
-1 Authentication: ⁠LoginServiceImpl⁠ verifies the user against LDAP or the local BCrypt password.
-2 Fetch Permissions: It calls ⁠RolePermissionsRepository.findAllPermissionsByUserId()⁠. This executes a native SQL query joining ⁠USERS⁠ -> ⁠USER_ROLES⁠ -> ⁠ROLE_PERMISSIONS⁠ -> ⁠PERMISSIONS⁠, returning a flat list of ⁠PermissionRow⁠ projections.
-3 Transform to Hierarchy: This list is passed to ⁠MenuService.transformFromProjection()⁠.
- It groups items by ⁠MENU_TITLE⁠ to create Parent/Child nested menus.
- It dynamically merges ⁠MENU_ACTION⁠s. For example, if a user has two submenus under "CGL Management" where one allows "create" and the other allows "approve", the root menu action becomes ⁠create|approve⁠.
-4 Payload Delivery: The structured ⁠MenuResponse⁠ is attached to the ⁠LoginResponseDTO⁠. The React frontend uses this data to dynamically render the sidebar navigation and show/hide specific action buttons based on the user's role.
-Phase 2: RBAC Cache Translation (Backend Preparation)
-While the frontend relies on the Login response, backend microservices do not query the database for permissions on every request. Instead, they rely on Redis.
-1 Cache Warming: On startup, or when a role is modified, the ⁠UserService⁠ triggers ⁠PermissionCacheService.refreshRolePermissions(roleId)⁠.
-2 Translation Logic: It converts the database ⁠PERMISSIONS⁠ rows into highly specific REST access rules.
- If ⁠MENU_ACTION⁠ contains ⁠create⁠ and ⁠API_RESOURCE_PATTERN⁠ is ⁠/api/user/**⁠, it creates a rule: ⁠POST:/api/user/**|USER_MANAGEMENT⁠.
- If ⁠MENU_ACTION⁠ contains ⁠view⁠, it creates a rule: ⁠GET:/api/user/**|USER_MANAGEMENT⁠.
-3 Storage: These rules are pushed into a Redis Set under the key ⁠RBAC::PERMISSIONS::{roleId}⁠.
-Phase 3: API Gateway Enforcement (The Gatekeeper)
-When the user makes an actual API call (e.g., trying to create a user):
-1 Interception: The request hits the ⁠ContextRbacFilter⁠ (from your ⁠common-utilities⁠ jar, deployed across services).
-2 Token Extraction: The filter validates the JWT and extracts the user's ⁠roleId⁠.
-3 Context Extraction: It reads the ⁠X-Request-Type⁠ header (e.g., ⁠USER_MANAGEMENT⁠) to understand the business context of the request.
-4 Redis Verification: It fetches the permissions from ⁠RBAC::PERMISSIONS::{roleId}⁠ in Redis and uses an ⁠AntPathMatcher⁠ to check if the incoming HTTP Method, URI, and Context match any allowed rule.
-5 Decision: If a match is found, the request proceeds. If not, the filter halts the request and returns a ⁠403 FORBIDDEN⁠ immediately, saving database and processing load.
-Phase 4: Dynamic Role Creation & Real-Time Updates
-Because you have a Maker-Checker flow for roles, permissions change dynamically.
-1 Role Modification: When an admin uses the ⁠RoleRequestController⁠ in ⁠UserService⁠ to update a role's permissions, the ⁠ROLE_PERMISSIONS⁠ database table is updated.
-2 Debezium & Kafka: A Change Data Capture (CDC) tool captures this database row change and pushes an event to a Kafka topic (⁠fincore.FINCORE.ROLE_PERMISSIONS⁠).
-3 Live Refresh: The ⁠RbacEventListener⁠ in ⁠UserService⁠ consumes this Kafka message in real-time, extracts the affected ⁠roleId⁠, and triggers ⁠cacheService.refreshRolePermissions(roleId)⁠.
-4 Zero-Downtime: The Redis cache is instantly updated. The next time a user with that role makes an API call, ⁠ContextRbacFilter⁠ will enforce the brand new rules—no application restarts required.
+-- 1. Add the restriction flag to the existing PERMISSIONS table
+ALTER TABLE PERMISSIONS ADD IS_RESTRICTED CHAR(1) DEFAULT 'N' NOT NULL;
+
+-- 2. Create the Eligibility Matrix table
+CREATE TABLE RESTRICTED_PERMISSION_ELIGIBILITY (
+    MENU_ID NUMBER(38,0) NOT NULL,
+    ROLE_ID NUMBER(10,0) NOT NULL,
+    CONSTRAINT PK_REST_PERM_ELIG PRIMARY KEY (MENU_ID, ROLE_ID),
+    CONSTRAINT FK_RPE_MENU FOREIGN KEY (MENU_ID) REFERENCES PERMISSIONS(MENU_ID),
+    CONSTRAINT FK_RPE_ROLE FOREIGN KEY (ROLE_ID) REFERENCES ROLES(ROLE_ID)
+);
+
+-- 3. Data Migration: Mark sensitive screens as restricted
+-- Example: Admin Support (47) and Role Management (22)
+UPDATE PERMISSIONS SET IS_RESTRICTED = 'Y' WHERE MENU_ID IN (22, 47);
+
+-- 4. Data Migration: Grant the ADMIN role (10) access to these restricted screens
+INSERT INTO RESTRICTED_PERMISSION_ELIGIBILITY (MENU_ID, ROLE_ID) VALUES (22, 10);
+INSERT INTO RESTRICTED_PERMISSION_ELIGIBILITY (MENU_ID, ROLE_ID) VALUES (47, 10);
+
+-- Example for your future "Voucher Download" screen:
+-- INSERT INTO RESTRICTED_PERMISSION_ELIGIBILITY (MENU_ID, ROLE_ID) VALUES (<new_menu_id>, 56); -- GLIF
+-- INSERT INTO RESTRICTED_PERMISSION_ELIGIBILITY (MENU_ID, ROLE_ID) VALUES (<new_menu_id>, 52); -- PSO
 
 
 
@@ -51,21 +36,214 @@ Because you have a Maker-Checker flow for roles, permissions change dynamically.
 
 
 
-Here is a summary of my understanding of the key mechanisms you have implemented:
-1. Advanced Security & RBAC
- Centralized Filter: The ⁠ContextRbacFilter⁠ handles JWT validation and enforces a strict "One Session Per User" policy by comparing the JWT ⁠jti⁠ claim against active sessions in Redis.  
- Dynamic Access Control: Access is evaluated on the fly by cross-referencing the incoming HTTP method, URI, and ⁠X-Request-Type⁠ header against the specific user's Redis-cached role permissions.  
-2. Cryptographic Payload Protection
- AES-256-GCM: The application utilizes session-specific AES keys stored in Redis to encrypt and decrypt data.  
- Request/Response Interception: The ⁠DecryptRequestBodyAdvice⁠ automatically decrypts incoming payloads flagged with the ⁠X-Encrypted-Payload⁠ header. Conversely, the ⁠EncryptResponseBodyAdvice⁠ secures outbound JSON responses for any endpoint annotated with ⁠@EncryptedResponse⁠.  
-3. Fault Tolerance & Resilience
- Global Wrapper: The ⁠GlobalResilienceAspect⁠ automatically applies Resilience4j Circuit Breaker and Retry logic to all ⁠@Service⁠ methods.  
- Safety Bypass: Operations that are not idempotent (like file uploads or notifications) can safely bypass this retry logic using the ⁠@NoRetry⁠ annotation.  
-4. Observability & Data Masking
- MDC Logging: The ⁠MdcLoggingFilter⁠ ensures traceability across distributed systems by injecting a ⁠traceId⁠, ⁠clientIp⁠, ⁠userId⁠, and the full request URL into the SLF4J MDC context.  
- PII Protection: The ⁠MaskingUtil⁠ ensures that sensitive user data (like emails, PANs, and passwords) is redacted when JSON payloads are converted to strings, likely to protect application logs.  
-5. Standardized Configuration
- CORS: The ⁠CommonSecurityConfig⁠ establishes a strict, whitelisted CORS policy that explicitly prohibits wildcard origins when credentials are in use, aligning with enterprise security standards.  
-The architecture and business rules from both the ⁠userservice⁠ microservice and this ⁠common-utilities⁠ library are now fully integrated into my context. I am ready to assist you.
+
+
+
+
+
+
+package com.tcs.userservice.model;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Entity
+@Table(name = "PERMISSIONS")
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Permissions {
+
+    @Id
+    @Column(name = "MENU_ID")
+    private int menuId;
+
+    @Column(name = "MENU_TITLE")
+    private String menuTitle;
+
+    @Column(name = "MENU_ICON")
+    private String menuIcon;
+
+    @Column(name = "MENU_SUBMENU")
+    private String menuSubmenu;
+
+    @Column(name = "MENU_ACTION")
+    private String menuAction;
+
+    @Column(name = "MENU_URL")
+    private String menuUrl;
+
+    @Column(name = "MENU_COMPONENT_PATH")
+    private String menuComponentPath;
+
+    @Column(name = "MENU_DESCRIPTION")
+    private String menuDescription;
+
+    @Column(name = "MENU_DEPENDANT")
+    private Integer menuDependant;
+
+    @Column(name = "MAPPED_REQUEST_TYPE")
+    private String mappedRequestType;
+
+    @Column(name = "API_RESOURCE_PATTERN")
+    private String apiResourcePattern;
+
+    // --- NEW FIELD ---
+    @Column(name = "IS_RESTRICTED")
+    private String isRestricted;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.tcs.userservice.repository;
+
+import com.tcs.userservice.model.Permissions;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.List;
+import java.util.Set;
+
+public interface PermissionsRepository extends JpaRepository<Permissions, Integer> {
+
+    List<Permissions> findAll();
+
+    @Query("SELECT p.mappedRequestType FROM Permissions p WHERE p.menuId IN :incomingIds")
+    List<String> findMappedRequestTypeByMenuId(@Param("incomingIds") Set<Integer> incomingIds);
+
+    @Query(value = """
+            SELECT p.MENU_URL, rp.ROLE_ID
+            FROM PERMISSIONS p
+            JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+            JOIN ROLES r ON rp.ROLE_ID = r.ROLE_ID
+            WHERE p.MAPPED_REQUEST_TYPE = :requestType
+            AND (p.MENU_ACTION LIKE '%approve%' OR p.MENU_ACTION LIKE '%reject%')
+            AND r.ROLE_STATUS = 'ACTIVE'
+            """, nativeQuery = true)
+    List<Object[]> findUrlAndRolesByRequestType(@Param("requestType") String requestType);
+
+    @Query(value = """
+                SELECT p.* FROM PERMISSIONS p
+                JOIN ROLE_PERMISSIONS rp ON p.MENU_ID = rp.PERMISSION_ID
+                WHERE rp.ROLE_ID = :roleId
+            """, nativeQuery = true)
+    List<Permissions> findAllByRoleId(@Param("roleId") Long roleId);
+
+    // --- NEW DYNAMIC ELIGIBILITY QUERY ---
+    @Query(value = """
+            SELECT p.* FROM PERMISSIONS p
+            WHERE p.IS_RESTRICTED = 'N'
+               OR (p.IS_RESTRICTED = 'Y' AND p.MENU_ID IN (
+                   SELECT rpe.MENU_ID 
+                   FROM RESTRICTED_PERMISSION_ELIGIBILITY rpe 
+                   WHERE rpe.ROLE_ID = :roleId
+               ))
+            """, nativeQuery = true)
+    List<Permissions> findEligiblePermissions(@Param("roleId") Integer roleId);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    @GetMapping("/get-all-permissions")
+    public ResponseEntity getAllPermissions(@RequestParam(value = "roleId", required = false) Integer roleId) {
+        log.info("Received request to fetch all eligible permissions for roleId: {}", roleId);
+        return roleRequestService.getAllPermissions(roleId);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// In RoleRequestService.java
+ResponseEntity getAllPermissions(Integer roleId);
+
+
+
+
+
+    // Delete this line:
+    // private static final String RESTRICTED_PERMISSION_TITLE = "Role Management";
+
+    @Override
+    public ResponseEntity<ResponseVO<List<PermissionDto>>> getAllPermissions(Integer roleId) {
+        // Fetch permissions evaluated against the Eligibility Matrix
+        List<Permissions> permissions = permissionsRepository.findEligiblePermissions(roleId);
+
+        List<PermissionDto> dtos = permissions.stream()
+                .map(p -> PermissionDto.builder()
+                        .id(p.getMenuId())
+                        .title(p.getMenuTitle())
+                        .icon(p.getMenuIcon())
+                        .menuSubmenu(p.getMenuSubmenu())
+                        .description(p.getMenuDescription())
+                        .build())
+                .collect(Collectors.toList());
+
+        return ResponseEntity.ok(ResponseVO.<List<PermissionDto>>builder()
+                .statusCode(HttpStatus.OK)
+                .result(dtos)
+                .build());
+    }
+
+
+
+
+
+
+
+
+
+
 
 
