@@ -1,170 +1,38 @@
-```yaml
-# =========================================================================
-# REDIS STACK (VECTOR DB) DEPLOYMENT (UAT: fincore-cbops1)
-# =========================================================================
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: redis-vector-pvc
-  namespace: fincore-cbops1
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi # Enough space to hold tens of thousands of embedded banking rules
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redis-vector-deployment
-  namespace: fincore-cbops1
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redis-vector
-  template:
-    metadata:
-      labels:
-        app: redis-vector
-    spec:
-      containers:
-      - name: redis-vector
-        image: redis/redis-stack-server:latest
-        ports:
-        - containerPort: 6379
-        volumeMounts:
-        - name: redis-data
-          mountPath: /data
-        resources:
-          requests:
-            memory: "2Gi" # Vectors reside in RAM, so allocate enough baseline
-            cpu: "500m"
-          limits:
-            memory: "4Gi"
-            cpu: "1000m"
-      volumes:
-      - name: redis-data
-        persistentVolumeClaim:
-          claimName: redis-vector-pvc
----
-# =========================================================================
-# REDIS SERVICE
-# =========================================================================
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis-vector-service
-  namespace: fincore-cbops1
-spec:
-  selector:
-    app: redis-vector
-  ports:
-    - protocol: TCP
-      port: 6380       # Port the Java App connects to (matches application.properties)
-      targetPort: 6379 # Internal port Redis listens on
-
-```
-
-
-
-
-
-
-
-
-
-
-
-```yaml
-# =========================================================================
-# SPRING BOOT BACKEND DEPLOYMENT (UAT: fincore-cbops1)
-# =========================================================================
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: fincore-helpservice
-  namespace: fincore-cbops1
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: fincore-helpservice
-  template:
-    metadata:
-      labels:
-        app: fincore-helpservice
-    spec:
-      containers:
-      - name: helpservice
-        image: your-internal-registry.sbi.com/fincore-backend/helpservice:v1.0
-        ports:
-        - containerPort: 9099
-        env:
-        - name: SPRING_PROFILES_ACTIVE
-          value: "uat"
-        resources:
-          requests:
-            memory: "1Gi"
-            cpu: "500m"
-          limits:
-            memory: "2Gi"
-            cpu: "1000m"
-        # Delay readiness probe to ensure the Virtual Thread Ingestion has time to fire
-        readinessProbe:
-          httpGet:
-            path: /actuator/health
-            port: 9099
-          initialDelaySeconds: 45
-          periodSeconds: 10
----
-# =========================================================================
-# SPRING BOOT SERVICE
-# =========================================================================
-apiVersion: v1
-kind: Service
-metadata:
-  name: fincore-helpservice-svc
-  namespace: fincore-cbops1
-spec:
-  selector:
-    app: fincore-helpservice
-  ports:
-    - protocol: TCP
-      port: 9099
-      targetPort: 9099
----
-# =========================================================================
-# AVI CONTROLLER INGRESS (AKO)
-# =========================================================================
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: fincore-helpservice-ingress
-  namespace: fincore-cbops1
-  annotations:
-    # 1. Standard AVI Class annotation (if your cluster requires it)
-    kubernetes.io/ingress.class: avi 
-    
-    # 2. CRITICAL FOR AVI SSE STREAMING:
-    # Instructs the Avi Kubernetes Operator (AKO) to apply a specific HTTP profile.
-    # You MUST verify this profile name with your Network/DevOps team.
-    # It must be a profile where "HTTP Keep-Alive" is high, "Response Timeout" is > 300s, 
-    # and connection multiplexing/buffering is disabled for SSE.
-    ako.vmware.com/application-profile: "System-HTTP-SSE" # <-- Change this to your bank's exact AVI profile name
-    
-spec:
-  rules:
-  - host: fincore-uat.sbi.com
-    http:
-      paths:
-      - path: /HS/api/help
-        pathType: Prefix
-        backend:
-          service:
-            name: fincore-helpservice-svc
-            port:
-              number: 9099
-
-```
+1. The Foundation: Database Relationships
+The entire system is driven by five deeply interconnected tables:
+ ⁠PERMISSIONS⁠: The master table defining both UI and Backend rules. Critical columns include:
+ ⁠MENU_ACTION⁠: Defines allowed UI actions (e.g., ⁠view|create|modify⁠).
+ ⁠MAPPED_REQUEST_TYPE⁠: Defines the operational context (e.g., ⁠CGL_CODE⁠, ⁠USER_MANAGEMENT⁠).
+ ⁠API_RESOURCE_PATTERN⁠: Defines the actual backend endpoints required (e.g., ⁠/api/user/**⁠).
+ ⁠ROLES⁠: The master list of roles (e.g., UCO, PSO, Branch).
+ ⁠ROLE_PERMISSIONS⁠: The bridge table mapping Roles to Permissions, including ⁠PERMISSION_ORDER⁠ for UI sorting.
+ ⁠USER_ROLES⁠: Maps a User to a Role.
+ ⁠USERS⁠: The core user profiles.
+Phase 1: Login & UI Rendering (Frontend Flow)
+When a user attempts to log in via ⁠/api/auth/login⁠ in the Gateway/Login Service:
+1 Authentication: ⁠LoginServiceImpl⁠ verifies the user against LDAP or the local BCrypt password.
+2 Fetch Permissions: It calls ⁠RolePermissionsRepository.findAllPermissionsByUserId()⁠. This executes a native SQL query joining ⁠USERS⁠ -> ⁠USER_ROLES⁠ -> ⁠ROLE_PERMISSIONS⁠ -> ⁠PERMISSIONS⁠, returning a flat list of ⁠PermissionRow⁠ projections.
+3 Transform to Hierarchy: This list is passed to ⁠MenuService.transformFromProjection()⁠.
+ It groups items by ⁠MENU_TITLE⁠ to create Parent/Child nested menus.
+ It dynamically merges ⁠MENU_ACTION⁠s. For example, if a user has two submenus under "CGL Management" where one allows "create" and the other allows "approve", the root menu action becomes ⁠create|approve⁠.
+4 Payload Delivery: The structured ⁠MenuResponse⁠ is attached to the ⁠LoginResponseDTO⁠. The React frontend uses this data to dynamically render the sidebar navigation and show/hide specific action buttons based on the user's role.
+Phase 2: RBAC Cache Translation (Backend Preparation)
+While the frontend relies on the Login response, backend microservices do not query the database for permissions on every request. Instead, they rely on Redis.
+1 Cache Warming: On startup, or when a role is modified, the ⁠UserService⁠ triggers ⁠PermissionCacheService.refreshRolePermissions(roleId)⁠.
+2 Translation Logic: It converts the database ⁠PERMISSIONS⁠ rows into highly specific REST access rules.
+ If ⁠MENU_ACTION⁠ contains ⁠create⁠ and ⁠API_RESOURCE_PATTERN⁠ is ⁠/api/user/**⁠, it creates a rule: ⁠POST:/api/user/**|USER_MANAGEMENT⁠.
+ If ⁠MENU_ACTION⁠ contains ⁠view⁠, it creates a rule: ⁠GET:/api/user/**|USER_MANAGEMENT⁠.
+3 Storage: These rules are pushed into a Redis Set under the key ⁠RBAC::PERMISSIONS::{roleId}⁠.
+Phase 3: API Gateway Enforcement (The Gatekeeper)
+When the user makes an actual API call (e.g., trying to create a user):
+1 Interception: The request hits the ⁠ContextRbacFilter⁠ (from your ⁠common-utilities⁠ jar, deployed across services).
+2 Token Extraction: The filter validates the JWT and extracts the user's ⁠roleId⁠.
+3 Context Extraction: It reads the ⁠X-Request-Type⁠ header (e.g., ⁠USER_MANAGEMENT⁠) to understand the business context of the request.
+4 Redis Verification: It fetches the permissions from ⁠RBAC::PERMISSIONS::{roleId}⁠ in Redis and uses an ⁠AntPathMatcher⁠ to check if the incoming HTTP Method, URI, and Context match any allowed rule.
+5 Decision: If a match is found, the request proceeds. If not, the filter halts the request and returns a ⁠403 FORBIDDEN⁠ immediately, saving database and processing load.
+Phase 4: Dynamic Role Creation & Real-Time Updates
+Because you have a Maker-Checker flow for roles, permissions change dynamically.
+1 Role Modification: When an admin uses the ⁠RoleRequestController⁠ in ⁠UserService⁠ to update a role's permissions, the ⁠ROLE_PERMISSIONS⁠ database table is updated.
+2 Debezium & Kafka: A Change Data Capture (CDC) tool captures this database row change and pushes an event to a Kafka topic (⁠fincore.FINCORE.ROLE_PERMISSIONS⁠).
+3 Live Refresh: The ⁠RbacEventListener⁠ in ⁠UserService⁠ consumes this Kafka message in real-time, extracts the affected ⁠roleId⁠, and triggers ⁠cacheService.refreshRolePermissions(roleId)⁠.
+4 Zero-Downtime: The Redis cache is instantly updated. The next time a user with that role makes an API call, ⁠ContextRbacFilter⁠ will enforce the brand new rules—no application restarts required.
