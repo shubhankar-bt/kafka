@@ -6,6 +6,27 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
+ * Mark any Controller method with this annotation to automatically
+ * encrypt the outbound JSON response using AES-256-GCM.
+ */
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface EncryptedResponse {
+}
+
+
+
+
+
+
+package com.fincore.commonutilities.annotation;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+/**
  * Mark any Service method with this annotation to BYPASS the global retry logic.
  * Use this for non-idempotent operations (Sending Notifications, Amount Calculations, File Stream Uploads etc.).
  */
@@ -13,6 +34,8 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 public @interface NoRetry {
 }
+
+
 
 
 
@@ -123,8 +146,6 @@ public class GlobalResilienceAspect {
 
 
 
-
-
 package com.fincore.commonutilities.buisnessobject;
 
 import java.time.LocalDate;
@@ -152,10 +173,6 @@ public class ControlDatesDto {
 
 
 
-
-
-
-
 package com.fincore.commonutilities.buisnessobject;
 
 import jakarta.annotation.PostConstruct;
@@ -163,6 +180,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.sql.Date;
+import java.time.LocalDate;
 
 
 @Service
@@ -183,6 +201,17 @@ public class ControlDateService {
                         rs.getDate("ETL_DATE").toLocalDate()
                 )
         );
+    }
+    public LocalDate getEtlDate()
+    {
+        ControlDatesDto dates = getControlDates();
+        return dates.getEtlDate();
+    }
+
+    public LocalDate getUserDate()
+    {
+        ControlDatesDto dates = getControlDates();
+        return dates.getUserDate();
     }
 }
 
@@ -221,6 +250,18 @@ public interface ControlDatesRepository {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 package com.fincore.commonutilities.config;
 
 import org.springframework.context.annotation.Bean;
@@ -249,9 +290,17 @@ public class CommonSecurityConfig {
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
 
-        // 1. Allowed Origins
-        // In PROD: Replace "*" with specific frontend domains (e.g., "https://myapp.com")
-        configuration.setAllowedOrigins(List.of("https://localhost:1000", "https://localhost:4200", "https://fincoreuat.sbi","https://fincorest.sbi", "*"));
+        // 1. Allowed Origins - APPSEC FIX: Removed wildcard "*"
+        // Explicitly whitelist UI domains. Bank standards prohibit "*" for authenticated APIs.
+        configuration.setAllowedOrigins(List.of(
+                "https://localhost:1000",
+                "https://localhost:4200",
+                "https://fincore-uat.sbi",
+                "https://fincoreuat.sbi",
+                "https://fincorest.sbi",
+                "https://fincore.sbi",
+                "*"
+        ));
 
         // 2. Allowed Methods
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
@@ -327,9 +376,6 @@ public class RedisConfig {
 
 
 
-
-
-
 package com.fincore.commonutilities.config;
 
 import com.fincore.commonutilities.aspect.GlobalResilienceAspect;
@@ -344,11 +390,6 @@ public class ResilienceConfig {
     // This config initializes the Aspect and AOP support.
     // Services just need to @Import(ResilienceConfig.class)
 }
-
-
-
-
-
 
 
 
@@ -479,12 +520,6 @@ public class JwtUtil {
 
 
 
-
-
-
-
-
-
 package com.fincore.commonutilities.logging;
 
 import com.fincore.commonutilities.jwt.JwtUtil;
@@ -512,6 +547,8 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
+
+        String fullUrl = "";
 
         try {
             // 1. Trace ID (Correlation ID)
@@ -546,6 +583,18 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
                 MDC.put("userId", "anonymous");
             }
 
+            // 1: Capture Complete URL with Query Parameters
+            StringBuilder urlBuilder = new StringBuilder(request.getRequestURL());
+            String queryString = request.getQueryString();
+            if (queryString != null) {
+                urlBuilder.append("?").append(queryString);
+            }
+            fullUrl = urlBuilder.toString();
+
+            MDC.put("requestUrl", fullUrl);
+            MDC.put("httpMethod", request.getMethod());
+
+
             // 4. API Path & Method
             MDC.put("apiPath", request.getRequestURI());
             MDC.put("method", request.getMethod());
@@ -553,7 +602,15 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
 
         } finally {
-            // CRITICAL: Clear MDC to prevent data leaking to other requests on the same thread
+            // 2: Capture HTTP Status Code
+            int status = response.getStatus();
+            MDC.put("httpStatus", String.valueOf(status));
+
+            // Log the completion so DFRA ingests it with all MDC variables attached
+            log.info("API Execution Completed - Method: {} | URL: {} | Status: {}",
+                    request.getMethod(), fullUrl, status);
+
+            // 4. Always clear MDC to prevent memory leaks in thread pooling
             MDC.clear();
         }
     }
@@ -584,15 +641,6 @@ public class MdcLoggingFilter extends OncePerRequestFilter {
     }
 
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -866,6 +914,353 @@ public class ContextRbacFilter extends OncePerRequestFilter {
 
 
 
+package com.fincore.commonutilities.security;
+
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.util.AesEncryptionUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.MethodParameter;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpInputMessage;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+
+/**
+ * Global Interceptor that decrypts incoming @RequestBody payloads
+ * before they reach the Controller DTO mapping.
+ */
+@Slf4j
+@ControllerAdvice
+@RequiredArgsConstructor
+public class DecryptRequestBodyAdvice extends RequestBodyAdviceAdapter {
+
+    private final AesEncryptionUtil aesEncryptionUtil;
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+
+    private static final String ENCRYPTION_HEADER = "X-Encrypted-Payload";
+    private static final String AES_KEY_PREFIX = "AES:USR:";
+
+    @Override
+    public boolean supports(MethodParameter methodParameter, Type targetType, Class<? extends HttpMessageConverter<?>> converterType) {
+        return true;
+    }
+
+    @Override
+    public HttpInputMessage beforeBodyRead(HttpInputMessage inputMessage, MethodParameter parameter,
+                                           Type targetType, Class<? extends HttpMessageConverter<?>> converterType) throws IOException {
+
+        var headers = inputMessage.getHeaders();
+        boolean isEncrypted = "true".equalsIgnoreCase(headers.getFirst(ENCRYPTION_HEADER));
+
+        if (!isEncrypted) {
+            return inputMessage;
+        }
+
+        // 1. Read body safely
+        var encryptedBody = new String(inputMessage.getBody().readAllBytes(), StandardCharsets.UTF_8).trim();
+
+        // Safely strip double quotes if the frontend stringified the payload (Axios edge-case)
+        if (encryptedBody.startsWith("\"") && encryptedBody.endsWith("\"")) {
+            encryptedBody = encryptedBody.substring(1, encryptedBody.length() - 1);
+        }
+
+        // 2. Validate Token & Extract User
+        var token = headers.getFirst(HttpHeaders.AUTHORIZATION);
+        if (token == null || !token.toLowerCase().startsWith("bearer ")) {
+            throw new AccessDeniedException("Missing or invalid Authorization header for encrypted payload.");
+        }
+        var userId = jwtUtil.getUserIdFromToken(token.substring(7));
+        log.info("User id : {}", userId);
+
+        // 3. Fetch Session Key
+        var base64AesKey = redisTemplate.opsForValue().get(AES_KEY_PREFIX + userId);
+        log.info("base64AesKey : {}", base64AesKey);
+        if (base64AesKey == null) {
+            log.warn("Encryption Session Key missing in Redis for User: {}", userId);
+            throw new AccessDeniedException("Encryption Session expired. Please refresh the page.");
+        }
+
+        // 4. Decrypt with precise exception handling
+        try {
+            var decryptedJson = aesEncryptionUtil.decrypt(encryptedBody, base64AesKey);
+            var decryptedBytes = decryptedJson.getBytes(StandardCharsets.UTF_8);
+
+            return new HttpInputMessage() {
+                @Override
+                public InputStream getBody() {
+                    return new ByteArrayInputStream(decryptedBytes);
+                }
+
+                @Override
+                public HttpHeaders getHeaders() {
+                    return headers;
+                }
+            };
+
+        } catch (IllegalArgumentException | GeneralSecurityException e) {
+            log.error("Payload decryption failed for User {}: {}", userId, e.getMessage());
+
+            // Throwing this ensures Spring MVC translates it into a 400 BAD REQUEST,
+            // rather than crashing the thread with a 500 INTERNAL SERVER ERROR.
+            throw new HttpMessageNotReadableException("Malformed encrypted payload or decryption failed.", e, inputMessage);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.security;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.commonutilities.annotation.EncryptedResponse;
+import com.fincore.commonutilities.jwt.JwtUtil;
+import com.fincore.commonutilities.util.AesEncryptionUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.MethodParameter;
+import org.springframework.core.io.Resource;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.converter.StringHttpMessageConverter;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.http.server.ServletServerHttpRequest;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyAdvice;
+
+import java.security.GeneralSecurityException;
+import java.util.Map;
+
+/**
+ * Global Interceptor that encrypts outgoing responses for methods
+ * annotated with @EncryptedResponse.
+ */
+@Slf4j
+@ControllerAdvice
+@RequiredArgsConstructor
+public class EncryptResponseBodyAdvice implements ResponseBodyAdvice<Object> {
+
+    private final AesEncryptionUtil aesEncryptionUtil;
+    private final StringRedisTemplate redisTemplate;
+    private final JwtUtil jwtUtil;
+    private final ObjectMapper objectMapper;
+
+    private static final String AES_KEY_PREFIX = "AES:USR:";
+
+    @Override
+    public boolean supports(MethodParameter returnType, Class<? extends HttpMessageConverter<?>> converterType) {
+        return returnType.hasMethodAnnotation(EncryptedResponse.class) ||
+                returnType.getDeclaringClass().isAnnotationPresent(EncryptedResponse.class);
+    }
+
+    @Override
+    public Object beforeBodyWrite(Object body, MethodParameter returnType, MediaType selectedContentType,
+                                  Class<? extends HttpMessageConverter<?>> selectedConverterType,
+                                  ServerHttpRequest request, ServerHttpResponse response) {
+
+        // EDGE CASE 1: Skip Nulls, File Downloads, and Spring Standard Error Responses
+        if (body == null || body instanceof Resource || body instanceof byte[] || body instanceof ProblemDetail) {
+            return body;
+        }
+
+        // EDGE CASE 2: Custom Error Wrappers (Don't encrypt 400/500 API responses)
+        if (body.getClass().getSimpleName().toLowerCase().contains("error")) {
+            return body;
+        }
+
+        try {
+            // 1. Serialize payload to JSON (handle raw Strings cleanly)
+            var plainTextPayload = body instanceof String ? (String) body : objectMapper.writeValueAsString(body);
+
+            // 2. Validate Token & Extract User
+            var servletRequest = ((ServletServerHttpRequest) request).getServletRequest();
+            var token = servletRequest.getHeader(HttpHeaders.AUTHORIZATION);
+            if (token == null || !token.toLowerCase().startsWith("bearer ")) {
+                throw new AccessDeniedException("No valid Auth token found for encrypted response.");
+            }
+
+            var userId = jwtUtil.getUserIdFromToken(token.substring(7));
+
+            // 3. Fetch AES Session Key
+            var base64AesKey = redisTemplate.opsForValue().get(AES_KEY_PREFIX + userId);
+
+            // EDGE CASE 3: The Data Leak Trap. NEVER return plaintext if marked for encryption.
+            if (base64AesKey == null) {
+                log.error("Encryption failed: AES Key missing for user {}", userId);
+                throw new IllegalStateException("Encryption Session expired. Cannot securely transmit data.");
+            }
+
+            // 4. Perform AES-256-GCM Encryption
+            var encryptedString = aesEncryptionUtil.encrypt(plainTextPayload, base64AesKey);
+
+            // 5. Add Header so Frontend knows to decrypt
+            response.getHeaders().add("X-Encrypted-Response", "true");
+
+            // 6. Wrap in JSON Map structure
+            var wrappedResponse = Map.of("encryptedResponse", encryptedString);
+
+            // EDGE CASE 4: The StringHttpMessageConverter Trap
+            // If the controller returns a String, Spring will crash trying to map a Map.
+            // We must manually serialize our wrapper map back into a String.
+            if (selectedConverterType.equals(StringHttpMessageConverter.class)) {
+                return objectMapper.writeValueAsString(wrappedResponse);
+            }
+
+            return wrappedResponse;
+
+        } catch (GeneralSecurityException e) {
+            log.error("Cryptographic failure during response encryption: {}", e.getMessage());
+            // Hard fail - Do not leak plaintext
+            throw new SecurityException("Failed to secure sensitive response.", e);
+        } catch (JsonProcessingException e) {
+            log.error("JSON serialization failure during response encryption: {}", e.getMessage());
+            throw new IllegalStateException("Failed to serialize response payload.", e);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.commonutilities.util;
+
+import org.springframework.stereotype.Component;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import java.security.GeneralSecurityException;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+/**
+ * Standard utility for AES-256-GCM Payload Encryption.
+ * Shared across all Fincore microservices.
+ */
+@Component
+public class AesEncryptionUtil {
+
+    private static final String ALGORITHM = "AES/GCM/NoPadding";
+    private static final int TAG_LENGTH_BIT = 128; // 16 bytes authentication tag
+    private static final int KEY_SIZE = 256;
+
+    /**
+     * Generates a cryptographically secure 256-bit AES Key.
+     * To be called by the Login/Auth Service upon successful authentication.
+     */
+    public String generateBase64SessionKey() {
+        try {
+            var keyGen = KeyGenerator.getInstance("AES");
+            var secureRandom = new SecureRandom();
+            keyGen.init(KEY_SIZE, secureRandom);
+            var secretKey = keyGen.generateKey();
+            return Base64.getEncoder().encodeToString(secretKey.getEncoded());
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("AES Algorithm not found in JVM", e);
+        }
+    }
+
+    /**
+     * Decrypts an AES-256-GCM encrypted payload.
+     * Expects frontend to send format: "Base64(IV):Base64(Ciphertext)"
+     */
+
+    /**
+     * Decrypts payload. Throws precise exceptions so the caller can handle them gracefully.
+     */
+    public String decrypt(String encryptedPayload, String base64SecretKey)
+            throws GeneralSecurityException, IllegalArgumentException {
+
+        String[] parts = encryptedPayload.split(":");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("Invalid encrypted payload format. Expected IV:Ciphertext");
+        }
+
+        byte[] iv = Base64.getDecoder().decode(parts[0]);
+        byte[] cipherText = Base64.getDecoder().decode(parts[1]);
+        byte[] decodedKey = Base64.getDecoder().decode(base64SecretKey);
+
+        var secretKey = new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES");
+        var gcmParameterSpec = new GCMParameterSpec(TAG_LENGTH_BIT, iv);
+
+        var cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, gcmParameterSpec);
+
+        byte[] decryptedText = cipher.doFinal(cipherText);
+        return new String(decryptedText, StandardCharsets.UTF_8);
+    }
+
+
+    /**
+     * Encrypts a plaintext JSON string using AES-256-GCM.
+     * Returns format: "Base64(IV):Base64(Ciphertext)"
+     */
+    public String encrypt(String plainTextJson, String base64SecretKey) throws GeneralSecurityException {
+
+        byte[] decodedKey = Base64.getDecoder().decode(base64SecretKey);
+        var secretKey = new SecretKeySpec(decodedKey, 0, decodedKey.length, "AES");
+
+        // Generate a random 12-byte IV for this specific response
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);
+        var gcmParameterSpec = new GCMParameterSpec(TAG_LENGTH_BIT, iv);
+
+        var cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, gcmParameterSpec);
+
+        byte[] cipherText = cipher.doFinal(plainTextJson.getBytes(StandardCharsets.UTF_8));
+
+        return Base64.getEncoder().encodeToString(iv) + ":" + Base64.getEncoder().encodeToString(cipherText);
+    }
+}
+
+
+
+
+
+
+
+
+
+
 
 package com.fincore.commonutilities.util;
 
@@ -937,100 +1332,27 @@ public class MaskingUtil {
 
 
 
-security config in common request serrvice which imports common-utilities :
-
-package com.tcs.fincore.CommonRequestService.config;
-
-import com.fincore.commonutilities.config.CommonSecurityConfig;
-import com.fincore.commonutilities.config.RedisConfig;
-import com.fincore.commonutilities.config.ResilienceConfig;
-import com.fincore.commonutilities.jwt.JwtUtil;
-import com.fincore.commonutilities.logging.MdcLoggingFilter;
-import com.fincore.commonutilities.security.ContextRbacFilter;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.web.servlet.FilterRegistrationBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Import;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
 
-/**
- * Common Security Configuration.
- * * Aligned with the "Distributed Gateway" architecture.
- * It uses the ContextRbacFilter from Common Utilities to enforce:
- * 1. Token Validity
- * 2. Single Session (Redis check)
- * 3. RBAC Permissions
- * Enforces Centralised Mdc Logging Filter, RESILIENCE4J Retry and Circuit Breaker
- */
-@Configuration
-@EnableWebSecurity
-@Import({
-        RedisConfig.class,
-        JwtUtil.class,
-        CommonSecurityConfig.class,
-        ResilienceConfig.class
-})
-public class SecurityConfig {
 
-    @Autowired
-    private StringRedisTemplate redisTemplate;
 
-    @Autowired
-    private JwtUtil jwtUtil;
 
-    @Autowired
-    private CommonSecurityConfig commonSecurityConfig;
 
-    // --- 1. Define Filters as Beans (Explicitly) ---
 
-    @Bean
-    public MdcLoggingFilter mdcLoggingFilter() {
-        return new MdcLoggingFilter(jwtUtil);
-    }
 
-    @Bean
-    public ContextRbacFilter contextRbacFilter() {
-        return new ContextRbacFilter(redisTemplate, jwtUtil);
-    }
 
-    // --- 2. Prevent Global Registration ---
-    // This stops "The Filter class ... does not have a registered order" error
 
-    @Bean
-    public FilterRegistrationBean<MdcLoggingFilter> mdcFilterRegistration(MdcLoggingFilter filter) {
-        FilterRegistrationBean<MdcLoggingFilter> registration = new FilterRegistrationBean<>(filter);
-        registration.setEnabled(false); // Disable global chain
-        return registration;
-    }
 
-    @Bean
-    public FilterRegistrationBean<ContextRbacFilter> rbacFilterRegistration(ContextRbacFilter filter) {
-        FilterRegistrationBean<ContextRbacFilter> registration = new FilterRegistrationBean<>(filter);
-        registration.setEnabled(false); // Disable global chain
-        return registration;
-    }
 
-    @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
-        http
-                .csrf(csrf -> csrf.disable())
-                .cors(cors -> cors.configurationSource(commonSecurityConfig.corsConfigurationSource()))
-                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(authz -> authz
-                        .requestMatchers("/actuator/**", "/api/auth/**", "/error", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
-                        .anyRequest().permitAll()
-                )
-                // Add Filters using the BEAN references (methods above)
-                .addFilterBefore(mdcLoggingFilter(), UsernamePasswordAuthenticationFilter.class)
-                .addFilterAfter(contextRbacFilter(), MdcLoggingFilter.class);
 
-        return http.build();
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
