@@ -36,3 +36,36 @@ Because you have a Maker-Checker flow for roles, permissions change dynamically.
 2 Debezium & Kafka: A Change Data Capture (CDC) tool captures this database row change and pushes an event to a Kafka topic (⁠fincore.FINCORE.ROLE_PERMISSIONS⁠).
 3 Live Refresh: The ⁠RbacEventListener⁠ in ⁠UserService⁠ consumes this Kafka message in real-time, extracts the affected ⁠roleId⁠, and triggers ⁠cacheService.refreshRolePermissions(roleId)⁠.
 4 Zero-Downtime: The Redis cache is instantly updated. The next time a user with that role makes an API call, ⁠ContextRbacFilter⁠ will enforce the brand new rules—no application restarts required.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Here is a summary of my understanding of the key mechanisms you have implemented:
+1. Advanced Security & RBAC
+ Centralized Filter: The ⁠ContextRbacFilter⁠ handles JWT validation and enforces a strict "One Session Per User" policy by comparing the JWT ⁠jti⁠ claim against active sessions in Redis.  
+ Dynamic Access Control: Access is evaluated on the fly by cross-referencing the incoming HTTP method, URI, and ⁠X-Request-Type⁠ header against the specific user's Redis-cached role permissions.  
+2. Cryptographic Payload Protection
+ AES-256-GCM: The application utilizes session-specific AES keys stored in Redis to encrypt and decrypt data.  
+ Request/Response Interception: The ⁠DecryptRequestBodyAdvice⁠ automatically decrypts incoming payloads flagged with the ⁠X-Encrypted-Payload⁠ header. Conversely, the ⁠EncryptResponseBodyAdvice⁠ secures outbound JSON responses for any endpoint annotated with ⁠@EncryptedResponse⁠.  
+3. Fault Tolerance & Resilience
+ Global Wrapper: The ⁠GlobalResilienceAspect⁠ automatically applies Resilience4j Circuit Breaker and Retry logic to all ⁠@Service⁠ methods.  
+ Safety Bypass: Operations that are not idempotent (like file uploads or notifications) can safely bypass this retry logic using the ⁠@NoRetry⁠ annotation.  
+4. Observability & Data Masking
+ MDC Logging: The ⁠MdcLoggingFilter⁠ ensures traceability across distributed systems by injecting a ⁠traceId⁠, ⁠clientIp⁠, ⁠userId⁠, and the full request URL into the SLF4J MDC context.  
+ PII Protection: The ⁠MaskingUtil⁠ ensures that sensitive user data (like emails, PANs, and passwords) is redacted when JSON payloads are converted to strings, likely to protect application logs.  
+5. Standardized Configuration
+ CORS: The ⁠CommonSecurityConfig⁠ establishes a strict, whitelisted CORS policy that explicitly prohibits wildcard origins when credentials are in use, aligning with enterprise security standards.  
+The architecture and business rules from both the ⁠userservice⁠ microservice and this ⁠common-utilities⁠ library are now fully integrated into my context. I am ready to assist you.
+
+
