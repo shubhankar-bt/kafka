@@ -2,64 +2,94 @@
 -- 1. Clear out the old data
 TRUNCATE TABLE help_question_master;
 
--- 2. Insert fresh, dynamically generated data matching EXACTLY 9 columns
+-- 2. Insert fresh data using a CROSS JOIN to generate 4 questions per screen!
 INSERT INTO help_question_master (
-    question_id, 
-    screen_name, 
-    question_text, 
-    answer_content, 
-    permission_id, 
-    action_link, 
-    action_label, 
-    pro_tip, 
-    is_active
+    question_id, screen_name, question_text, answer_content, 
+    permission_id, action_link, action_label, pro_tip, is_active
+)
+WITH screen_data AS (
+    SELECT MENU_ID, MENU_TITLE, MENU_SUBMENU, MENU_ACTION, MENU_DESCRIPTION, MENU_URL, 'Y' AS IS_ACTIVE
+    FROM permissions
+    WHERE MENU_URL IS NOT NULL
+),
+question_types AS (
+    SELECT 1 AS q_type FROM dual UNION ALL
+    SELECT 2 AS q_type FROM dual UNION ALL
+    SELECT 3 AS q_type FROM dual UNION ALL
+    SELECT 4 AS q_type FROM dual
 )
 SELECT 
     FINCORE.ISEQ$$_78061.nextval, 
-    p.MENU_TITLE, -- Maps to "Circle Management", "CGL Management", etc.
+    s.MENU_TITLE, -- e.g., "Circle Management"
     
-    -- DYNAMIC QUESTION GENERATOR (Based on Action and Submenu)
-    CASE 
-        WHEN UPPER(p.MENU_ACTION) LIKE '%APPROVE%' OR UPPER(p.MENU_SUBMENU) LIKE '%REQUEST%' THEN 
-            'How do I review, approve, or reject pending requests in ' || p.MENU_SUBMENU || '?'
-        WHEN UPPER(p.MENU_SUBMENU) LIKE '%REPORT%' THEN 
-            'How do I view, generate, or download the ' || p.MENU_SUBMENU || '?'
-        WHEN UPPER(p.MENU_ACTION) LIKE '%CREATE%' OR UPPER(p.MENU_ACTION) LIKE '%MODIFY%' THEN 
-            'How do I manage, create, or update records for ' || p.MENU_SUBMENU || '?'
-        ELSE 
-            'How do I access and navigate ' || p.MENU_SUBMENU || '?'
-    END,
+    -- ==========================================
+    -- GENERATE 4 DIFFERENT QUESTIONS PER SCREEN
+    -- ==========================================
+    CASE q.q_type
+        WHEN 1 THEN 'How do I access, find, or navigate to the ' || s.MENU_SUBMENU || ' screen?'
+        WHEN 2 THEN 'What is the purpose of ' || s.MENU_SUBMENU || '? What can I do there?'
+        WHEN 3 THEN 
+            CASE 
+                WHEN UPPER(s.MENU_ACTION) LIKE '%APPROVE%' THEN 'How do I review, approve, or reject pending requests in ' || s.MENU_SUBMENU || '?'
+                WHEN UPPER(s.MENU_SUBMENU) LIKE '%REPORT%' THEN 'How do I view, generate, or download the ' || s.MENU_SUBMENU || '?'
+                WHEN UPPER(s.MENU_ACTION) LIKE '%CREATE%' OR UPPER(s.MENU_ACTION) LIKE '%MODIFY%' THEN 'How do I manage, create, or update records for ' || s.MENU_SUBMENU || '?'
+                ELSE 'How do I view the details and records in ' || s.MENU_SUBMENU || '?'
+            END
+        WHEN 4 THEN 
+            CASE 
+                WHEN UPPER(s.MENU_ACTION) LIKE '%CANCEL%' AND UPPER(s.MENU_ACTION) NOT LIKE '%APPROVE%' THEN 'How do I cancel a pending ' || s.MENU_SUBMENU || ' request that I created?'
+                WHEN UPPER(s.MENU_ACTION) LIKE '%APPROVE%' THEN 'I submitted a request for ' || s.MENU_SUBMENU || '. Can I approve it myself or when will it be approved?'
+                ELSE 'Why can I not access or perform actions on the ' || s.MENU_SUBMENU || ' screen?'
+            END
+    END AS question_text,
     
-    -- DYNAMIC ANSWER GENERATOR (Injecting actual DB Description)
-    CASE 
-        WHEN UPPER(p.MENU_ACTION) LIKE '%APPROVE%' THEN 
-            'Navigate to ' || p.MENU_TITLE || ' -> ' || p.MENU_SUBMENU || '. ' || NVL(p.MENU_DESCRIPTION, '') || '. **Important:** FinCore enforces strict Maker-Checker separation. You cannot approve requests that you initiated yourself. Rejections require a mandatory remark.'
-        WHEN UPPER(p.MENU_SUBMENU) LIKE '%REPORT%' THEN 
-            'Navigate to ' || p.MENU_TITLE || ' -> ' || p.MENU_SUBMENU || '. ' || NVL(p.MENU_DESCRIPTION, '') || '. You can apply relevant filters before downloading the data.'
-        ELSE 
-            'Navigate to ' || p.MENU_TITLE || ' -> ' || p.MENU_SUBMENU || '. ' || NVL(p.MENU_DESCRIPTION, '') || '. Ensure your active role has the necessary permissions.'
-    END,
+    -- ==========================================
+    -- GENERATE 4 CORRESPONDING ANSWERS
+    -- ==========================================
+    CASE q.q_type
+        WHEN 1 THEN 'To access this feature, navigate to the main **' || s.MENU_TITLE || '** module from the sidebar, then click on **' || s.MENU_SUBMENU || '**.'
+        WHEN 2 THEN 'The **' || s.MENU_SUBMENU || '** screen is used to: ' || NVL(s.MENU_DESCRIPTION, 'manage related data and workflows') || '. Your available actions (' || REPLACE(s.MENU_ACTION, '|', ', ') || ') depend on your assigned role.'
+        WHEN 3 THEN 
+            CASE 
+                WHEN UPPER(s.MENU_ACTION) LIKE '%APPROVE%' THEN 'Navigate to ' || s.MENU_TITLE || ' -> ' || s.MENU_SUBMENU || '. From here, Checkers can review pending items submitted by Makers and take Approve or Reject actions. Rejections require a mandatory remark.'
+                WHEN UPPER(s.MENU_SUBMENU) LIKE '%REPORT%' THEN 'Navigate to ' || s.MENU_TITLE || ' -> ' || s.MENU_SUBMENU || '. You can apply date ranges and relevant filters before downloading or extracting the data.'
+                ELSE 'Navigate to ' || s.MENU_TITLE || ' -> ' || s.MENU_SUBMENU || ' to perform your authorized actions. You can initiate new requests or modify existing records, which will then be sent to a Checker for approval.'
+            END
+        WHEN 4 THEN 
+            CASE 
+                WHEN UPPER(s.MENU_ACTION) LIKE '%CANCEL%' AND UPPER(s.MENU_ACTION) NOT LIKE '%APPROVE%' THEN 'If you initiated a request and need to recall it, navigate to the ' || s.MENU_SUBMENU || ' screen. You can only cancel requests that are still in a "Pending" state. Once a Checker processes it, it cannot be cancelled.'
+                WHEN UPPER(s.MENU_ACTION) LIKE '%APPROVE%' THEN 'FinCore enforces a strict **Maker-Checker** policy. You cannot approve your own requests, even if your role has approval rights. Another authorized user must review your submission in their pending queue.'
+                ELSE 'Access to this screen requires specific permissions. If you cannot view it or perform certain actions, your current Role does not have the necessary privileges mapped to it. Please contact the Administrator to request access.'
+            END
+    END AS answer_content,
     
-    p.MENU_ID,
-    p.MENU_URL, 
+    s.MENU_ID,
+    s.MENU_URL, 
+    'View ' || s.MENU_SUBMENU AS action_label,
     
-    -- DYNAMIC ACTION LABEL (Matches your sample data style)
-    'View ' || p.MENU_SUBMENU,
+    -- ==========================================
+    -- GENERATE 4 DIFFERENT PRO-TIPS
+    -- ==========================================
+    CASE q.q_type
+        WHEN 1 THEN 'Tip: Use the global search bar at the top to jump to this screen instantly.'
+        WHEN 2 THEN 'Tip: Check the Action column on the grid to see what operations you are permitted to perform.'
+        WHEN 3 THEN 
+            CASE 
+                WHEN UPPER(s.MENU_ACTION) LIKE '%APPROVE%' THEN 'Tip: Always verify the Maker''s attached documents and input details before approving.'
+                WHEN UPPER(s.MENU_SUBMENU) LIKE '%REPORT%' THEN 'Tip: Generating reports for large date ranges may take a few moments. Please be patient.'
+                ELSE 'Tip: Ensure all mandatory fields are correctly filled before submitting your request.'
+            END
+        WHEN 4 THEN 'Tip: You can check your assigned roles by navigating to your User Profile.'
+    END AS pro_tip,
     
-    -- DYNAMIC PRO-TIP
-    CASE 
-        WHEN UPPER(p.MENU_ACTION) LIKE '%APPROVE%' THEN 'Tip: Always verify the Maker''s attached documents and details before taking an approve or reject action.'
-        WHEN UPPER(p.MENU_ACTION) LIKE '%CREATE%' THEN 'Tip: You can check the approval status of your submitted actions in the corresponding Requests screen.'
-        WHEN UPPER(p.MENU_SUBMENU) LIKE '%REPORT%' THEN 'Tip: Reports involving large date ranges may take a few moments to generate. Please be patient after clicking download.'
-        ELSE 'Tip: Use the global search bar to jump to this screen instantly.'
-    END,
-    
-    'Y' -- Hardcoded active status for the initial fresh load
-FROM permissions p
-WHERE p.MENU_URL IS NOT NULL;
+    s.IS_ACTIVE
+FROM screen_data s
+CROSS JOIN question_types q;
 
 
 ```
+
+
 
 
 
@@ -80,75 +110,106 @@ BEGIN
     job_type        => 'PLSQL_BLOCK',
     job_action      => '
       BEGIN
-        MERGE INTO help_question_master hqm
-        USING (
-            SELECT 
-                MENU_ID, 
-                MENU_TITLE, 
-                MENU_SUBMENU, 
-                MENU_ACTION,
-                MENU_DESCRIPTION,
-                MENU_URL,
-                ''Y'' as IS_ACTIVE 
-            FROM permissions
-            WHERE MENU_URL IS NOT NULL
-        ) p
-        ON (hqm.permission_id = p.MENU_ID)
-        
-        -- CASE 1: SCREEN EXISTS (Updates URL & Title, PRESERVES AI Answers)
-        WHEN MATCHED THEN 
-          UPDATE SET 
-            hqm.screen_name = p.MENU_TITLE,
-            hqm.action_link = p.MENU_URL,
-            hqm.is_active = p.IS_ACTIVE
-            
-        -- CASE 2: BRAND NEW SCREEN (Generates Dynamic AI Context)
-        WHEN NOT MATCHED THEN 
-          INSERT (
+        -- STEP 1: Update URLs and Active status for existing screens. 
+        -- (This safely ignores question/answer text to protect Admin edits)
+        UPDATE help_question_master hqm
+        SET (action_link, is_active, screen_name) = (
+            SELECT MENU_URL, ''Y'', MENU_TITLE
+            FROM permissions p
+            WHERE p.MENU_ID = hqm.permission_id
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM permissions p WHERE p.MENU_ID = hqm.permission_id
+        );
+
+        -- STEP 2: Generate the 4-Angle Multiplier for completely NEW screens
+        INSERT INTO help_question_master (
             question_id, screen_name, question_text, answer_content, 
             permission_id, action_link, action_label, pro_tip, is_active
-          ) VALUES (
+        )
+        WITH new_screens AS (
+            SELECT MENU_ID, MENU_TITLE, MENU_SUBMENU, MENU_ACTION, MENU_DESCRIPTION, MENU_URL
+            FROM permissions
+            WHERE MENU_URL IS NOT NULL
+              -- Only select screens that are NOT in the help table yet
+              AND MENU_ID NOT IN (SELECT NVL(permission_id, 0) FROM help_question_master)
+        ),
+        question_types AS (
+            SELECT 1 AS q_type FROM dual UNION ALL
+            SELECT 2 AS q_type FROM dual UNION ALL
+            SELECT 3 AS q_type FROM dual UNION ALL
+            SELECT 4 AS q_type FROM dual
+        )
+        SELECT 
             FINCORE.ISEQ$$_78061.nextval, 
-            p.MENU_TITLE,
+            s.MENU_TITLE,
             
-            CASE 
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' OR UPPER(p.MENU_SUBMENU) LIKE ''%REQUEST%'' THEN ''How do I review, approve, or reject pending requests in '' || p.MENU_SUBMENU || ''?''
-                WHEN UPPER(p.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''How do I view, generate, or download the '' || p.MENU_SUBMENU || ''?''
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%CREATE%'' OR UPPER(p.MENU_ACTION) LIKE ''%MODIFY%'' THEN ''How do I manage, create, or update records for '' || p.MENU_SUBMENU || ''?''
-                ELSE ''How do I access and navigate '' || p.MENU_SUBMENU || ''?''
+            CASE q.q_type
+                WHEN 1 THEN ''How do I access, find, or navigate to the '' || s.MENU_SUBMENU || '' screen?''
+                WHEN 2 THEN ''What is the purpose of '' || s.MENU_SUBMENU || ''? What can I do there?''
+                WHEN 3 THEN 
+                    CASE 
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''How do I review, approve, or reject pending requests in '' || s.MENU_SUBMENU || ''?''
+                        WHEN UPPER(s.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''How do I view, generate, or download the '' || s.MENU_SUBMENU || ''?''
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%CREATE%'' OR UPPER(s.MENU_ACTION) LIKE ''%MODIFY%'' THEN ''How do I manage, create, or update records for '' || s.MENU_SUBMENU || ''?''
+                        ELSE ''How do I view the details and records in '' || s.MENU_SUBMENU || ''?''
+                    END
+                WHEN 4 THEN 
+                    CASE 
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%CANCEL%'' AND UPPER(s.MENU_ACTION) NOT LIKE ''%APPROVE%'' THEN ''How do I cancel a pending '' || s.MENU_SUBMENU || '' request that I created?''
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''I submitted a request for '' || s.MENU_SUBMENU || ''. Can I approve it myself or when will it be approved?''
+                        ELSE ''Why can I not access or perform actions on the '' || s.MENU_SUBMENU || '' screen?''
+                    END
             END,
             
-            CASE 
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''Navigate to '' || p.MENU_TITLE || '' -> '' || p.MENU_SUBMENU || ''. '' || NVL(p.MENU_DESCRIPTION, '''') || ''. **Important:** FinCore enforces strict Maker-Checker separation. You cannot approve requests that you initiated yourself. Rejections require a mandatory remark.''
-                WHEN UPPER(p.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''Navigate to '' || p.MENU_TITLE || '' -> '' || p.MENU_SUBMENU || ''. '' || NVL(p.MENU_DESCRIPTION, '''') || ''. You can apply relevant filters before downloading the data.''
-                ELSE ''Navigate to '' || p.MENU_TITLE || '' -> '' || p.MENU_SUBMENU || ''. '' || NVL(p.MENU_DESCRIPTION, '''') || ''. Ensure your active role has the necessary permissions.''
+            CASE q.q_type
+                WHEN 1 THEN ''To access this feature, navigate to the main **'' || s.MENU_TITLE || ''** module from the sidebar, then click on **'' || s.MENU_SUBMENU || ''**.''
+                WHEN 2 THEN ''The **'' || s.MENU_SUBMENU || ''** screen is used to: '' || NVL(s.MENU_DESCRIPTION, ''manage related data and workflows'') || ''. Your available actions ('' || REPLACE(s.MENU_ACTION, ''|'', '', '') || '') depend on your assigned role.''
+                WHEN 3 THEN 
+                    CASE 
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''Navigate to '' || s.MENU_TITLE || '' -> '' || s.MENU_SUBMENU || ''. From here, Checkers can review pending items submitted by Makers and take Approve or Reject actions. Rejections require a mandatory remark.''
+                        WHEN UPPER(s.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''Navigate to '' || s.MENU_TITLE || '' -> '' || s.MENU_SUBMENU || ''. You can apply date ranges and relevant filters before downloading or extracting the data.''
+                        ELSE ''Navigate to '' || s.MENU_TITLE || '' -> '' || s.MENU_SUBMENU || '' to perform your authorized actions. You can initiate new requests or modify existing records, which will then be sent to a Checker for approval.''
+                    END
+                WHEN 4 THEN 
+                    CASE 
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%CANCEL%'' AND UPPER(s.MENU_ACTION) NOT LIKE ''%APPROVE%'' THEN ''If you initiated a request and need to recall it, navigate to the '' || s.MENU_SUBMENU || '' screen. You can only cancel requests that are still in a "Pending" state. Once a Checker processes it, it cannot be cancelled.''
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''FinCore enforces a strict **Maker-Checker** policy. You cannot approve your own requests, even if your role has approval rights. Another authorized user must review your submission in their pending queue.''
+                        ELSE ''Access to this screen requires specific permissions. If you cannot view it or perform certain actions, your current Role does not have the necessary privileges mapped to it. Please contact the Administrator to request access.''
+                    END
             END,
             
-            p.MENU_ID,
-            p.MENU_URL,
+            s.MENU_ID,
+            s.MENU_URL, 
+            ''View '' || s.MENU_SUBMENU,
             
-            ''View '' || p.MENU_SUBMENU,
-            
-            CASE 
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''Tip: Always verify the Maker''''s attached documents and details before taking an approve or reject action.''
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%CREATE%'' THEN ''Tip: You can check the approval status of your submitted actions in the corresponding Requests screen.''
-                WHEN UPPER(p.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''Tip: Reports involving large date ranges may take a few moments to generate. Please be patient after clicking download.''
-                ELSE ''Tip: Use the global search bar to jump to this screen instantly.''
+            CASE q.q_type
+                WHEN 1 THEN ''Tip: Use the global search bar at the top to jump to this screen instantly.''
+                WHEN 2 THEN ''Tip: Check the Action column on the grid to see what operations you are permitted to perform.''
+                WHEN 3 THEN 
+                    CASE 
+                        WHEN UPPER(s.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''Tip: Always verify the Maker''''s attached documents and input details before approving.''
+                        WHEN UPPER(s.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''Tip: Generating reports for large date ranges may take a few moments. Please be patient.''
+                        ELSE ''Tip: Ensure all mandatory fields are correctly filled before submitting your request.''
+                    END
+                WHEN 4 THEN ''Tip: You can check your assigned roles by navigating to your User Profile.''
             END,
             
-            p.IS_ACTIVE
-          );
-          
+            ''Y''
+        FROM new_screens s
+        CROSS JOIN question_types q;
+
         COMMIT;
       END;',
-    -- Runs daily at 1:00 AM
+    -- Run daily at 1:00 AM
     start_date      => TRUNC(SYSDATE) + 1 + 1/24, 
     repeat_interval => 'FREQ=DAILY; BYHOUR=1; BYMINUTE=0; BYSECOND=0',
     enabled         => TRUE,
-    comments        => 'Dynamically syncs new Fincore screens to the AI table matching the 9 exact schema columns.'
+    comments        => 'Dynamically multiplies new Fincore screens into 4 distinct AI Help context angles.'
   );
 END;
 /
 
 
 ```
+
