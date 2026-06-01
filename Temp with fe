@@ -1,40 +1,36 @@
 ```sql
--- 1. Clear out the old, manual data
+-- 1. Clear out the old data
 TRUNCATE TABLE help_question_master;
 
--- 2. Insert fresh, dynamically generated data from the permissions table
+-- 2. Insert fresh, dynamically generated data matching EXACTLY 9 columns
 INSERT INTO help_question_master (
     question_id, 
-    permission_id, 
     screen_name, 
     question_text, 
     answer_content, 
+    permission_id, 
     action_link, 
     action_label, 
     pro_tip, 
-    is_active, 
-    created_by, 
-    created_date
+    is_active
 )
 SELECT 
-    -- Replace with your actual sequence if you don't use identity columns
     FINCORE.ISEQ$$_78061.nextval, 
-    p.MENU_ID,
-    p.MENU_SUBMENU,
+    p.MENU_TITLE, -- Maps to "Circle Management", "CGL Management", etc.
     
-    -- DYNAMIC QUESTION GENERATOR (Based on MENU_ACTION and TITLE)
+    -- DYNAMIC QUESTION GENERATOR (Based on Action and Submenu)
     CASE 
         WHEN UPPER(p.MENU_ACTION) LIKE '%APPROVE%' OR UPPER(p.MENU_SUBMENU) LIKE '%REQUEST%' THEN 
-            'How do I review, approve, or reject pending requests for ' || p.MENU_TITLE || '?'
+            'How do I review, approve, or reject pending requests in ' || p.MENU_SUBMENU || '?'
         WHEN UPPER(p.MENU_SUBMENU) LIKE '%REPORT%' THEN 
             'How do I view, generate, or download the ' || p.MENU_SUBMENU || '?'
         WHEN UPPER(p.MENU_ACTION) LIKE '%CREATE%' OR UPPER(p.MENU_ACTION) LIKE '%MODIFY%' THEN 
-            'How do I manage, create, or update records in ' || p.MENU_SUBMENU || '?'
+            'How do I manage, create, or update records for ' || p.MENU_SUBMENU || '?'
         ELSE 
-            'How do I access and navigate the ' || p.MENU_SUBMENU || ' screen?'
+            'How do I access and navigate ' || p.MENU_SUBMENU || '?'
     END,
     
-    -- DYNAMIC ANSWER GENERATOR (Injects the actual MENU_DESCRIPTION from DB)
+    -- DYNAMIC ANSWER GENERATOR (Injecting actual DB Description)
     CASE 
         WHEN UPPER(p.MENU_ACTION) LIKE '%APPROVE%' THEN 
             'Navigate to ' || p.MENU_TITLE || ' -> ' || p.MENU_SUBMENU || '. ' || NVL(p.MENU_DESCRIPTION, '') || '. **Important:** FinCore enforces strict Maker-Checker separation. You cannot approve requests that you initiated yourself. Rejections require a mandatory remark.'
@@ -44,10 +40,11 @@ SELECT
             'Navigate to ' || p.MENU_TITLE || ' -> ' || p.MENU_SUBMENU || '. ' || NVL(p.MENU_DESCRIPTION, '') || '. Ensure your active role has the necessary permissions.'
     END,
     
+    p.MENU_ID,
     p.MENU_URL, 
     
-    -- DYNAMIC ACTION LABEL
-    'Open ' || p.MENU_SUBMENU,
+    -- DYNAMIC ACTION LABEL (Matches your sample data style)
+    'View ' || p.MENU_SUBMENU,
     
     -- DYNAMIC PRO-TIP
     CASE 
@@ -57,19 +54,12 @@ SELECT
         ELSE 'Tip: Use the global search bar to jump to this screen instantly.'
     END,
     
-    -- Assuming the 13th column in your data is IS_ACTIVE. Adjust if named differently.
-    'Y', 
-    'SYSTEM_INIT',
-    SYSDATE
+    'Y' -- Hardcoded active status for the initial fresh load
 FROM permissions p
-WHERE p.MENU_URL IS NOT NULL; -- Ignore parent menu headers that don't have URLs
+WHERE p.MENU_URL IS NOT NULL;
 
 
 ```
-
-
-
-
 
 
 
@@ -99,38 +89,33 @@ BEGIN
                 MENU_ACTION,
                 MENU_DESCRIPTION,
                 MENU_URL,
-                -- Assuming you have an IS_ACTIVE column based on your Y/N data. 
-                -- If not, just hardcode ''Y'' here.
                 ''Y'' as IS_ACTIVE 
             FROM permissions
             WHERE MENU_URL IS NOT NULL
         ) p
         ON (hqm.permission_id = p.MENU_ID)
         
-        -- CASE 1: SCREEN ALREADY EXISTS
-        -- We update the URL and Active status, but PRESERVE the human-edited answer!
+        -- CASE 1: SCREEN EXISTS (Updates URL & Title, PRESERVES AI Answers)
         WHEN MATCHED THEN 
           UPDATE SET 
-            hqm.screen_name = p.MENU_SUBMENU,
+            hqm.screen_name = p.MENU_TITLE,
             hqm.action_link = p.MENU_URL,
             hqm.is_active = p.IS_ACTIVE
             
-        -- CASE 2: BRAND NEW SCREEN ADDED TO FINCORE
-        -- We generate the AI Context dynamically based on MENU_ACTION
+        -- CASE 2: BRAND NEW SCREEN (Generates Dynamic AI Context)
         WHEN NOT MATCHED THEN 
           INSERT (
-            question_id, permission_id, screen_name, question_text, answer_content, 
-            action_link, action_label, pro_tip, is_active, created_by, created_date
+            question_id, screen_name, question_text, answer_content, 
+            permission_id, action_link, action_label, pro_tip, is_active
           ) VALUES (
             FINCORE.ISEQ$$_78061.nextval, 
-            p.MENU_ID,
-            p.MENU_SUBMENU,
+            p.MENU_TITLE,
             
             CASE 
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' OR UPPER(p.MENU_SUBMENU) LIKE ''%REQUEST%'' THEN ''How do I review, approve, or reject pending requests for '' || p.MENU_TITLE || ''?''
+                WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' OR UPPER(p.MENU_SUBMENU) LIKE ''%REQUEST%'' THEN ''How do I review, approve, or reject pending requests in '' || p.MENU_SUBMENU || ''?''
                 WHEN UPPER(p.MENU_SUBMENU) LIKE ''%REPORT%'' THEN ''How do I view, generate, or download the '' || p.MENU_SUBMENU || ''?''
-                WHEN UPPER(p.MENU_ACTION) LIKE ''%CREATE%'' OR UPPER(p.MENU_ACTION) LIKE ''%MODIFY%'' THEN ''How do I manage, create, or update records in '' || p.MENU_SUBMENU || ''?''
-                ELSE ''How do I access and navigate the '' || p.MENU_SUBMENU || '' screen?''
+                WHEN UPPER(p.MENU_ACTION) LIKE ''%CREATE%'' OR UPPER(p.MENU_ACTION) LIKE ''%MODIFY%'' THEN ''How do I manage, create, or update records for '' || p.MENU_SUBMENU || ''?''
+                ELSE ''How do I access and navigate '' || p.MENU_SUBMENU || ''?''
             END,
             
             CASE 
@@ -139,9 +124,10 @@ BEGIN
                 ELSE ''Navigate to '' || p.MENU_TITLE || '' -> '' || p.MENU_SUBMENU || ''. '' || NVL(p.MENU_DESCRIPTION, '''') || ''. Ensure your active role has the necessary permissions.''
             END,
             
+            p.MENU_ID,
             p.MENU_URL,
             
-            ''Open '' || p.MENU_SUBMENU,
+            ''View '' || p.MENU_SUBMENU,
             
             CASE 
                 WHEN UPPER(p.MENU_ACTION) LIKE ''%APPROVE%'' THEN ''Tip: Always verify the Maker''''s attached documents and details before taking an approve or reject action.''
@@ -150,18 +136,16 @@ BEGIN
                 ELSE ''Tip: Use the global search bar to jump to this screen instantly.''
             END,
             
-            p.IS_ACTIVE,
-            ''SYSTEM_SYNC'',
-            SYSDATE
+            p.IS_ACTIVE
           );
           
         COMMIT;
       END;',
-    -- Run daily at 1:00 AM
+    -- Runs daily at 1:00 AM
     start_date      => TRUNC(SYSDATE) + 1 + 1/24, 
     repeat_interval => 'FREQ=DAILY; BYHOUR=1; BYMINUTE=0; BYSECOND=0',
     enabled         => TRUE,
-    comments        => 'Dynamically syncs new Fincore screens to the AI table with smart contextual questions based on Action types.'
+    comments        => 'Dynamically syncs new Fincore screens to the AI table matching the 9 exact schema columns.'
   );
 END;
 /
