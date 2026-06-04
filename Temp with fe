@@ -150,3 +150,118 @@ data:
 
 
 
+
+
+
+
+
+package com.fincore.gateway.Config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+import org.springframework.ldap.pool2.factory.PoolConfig;
+import org.springframework.ldap.pool2.factory.PooledContextSource;
+import org.springframework.ldap.pool2.validation.DefaultDirContextValidator;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Configuration
+public class LdapConfig {
+
+    // ... [Keep your existing @Value annotations and SSL Truststore constructor here] ...
+
+    // ==========================================
+    // 1. BASE NATIVE CONTEXT SOURCE (Un-pooled)
+    // ==========================================
+    @Bean
+    public LdapContextSource targetContextSource() {
+        log.info("Configuring target LDAP Context Source. URLs: {}", ldapUrl);
+        
+        // ... [Insert your existing SSL Truststore try-catch logic here] ...
+        
+        LdapContextSource contextSource = new LdapContextSource();
+        contextSource.setUrl(ldapUrl);
+        contextSource.setBase(ldapBaseDn);
+        
+        if (ldapUsername != null && !ldapUsername.isBlank()) {
+            contextSource.setUserDn(ldapUsername);
+            contextSource.setPassword(ldapPassword);
+        }
+
+        Map<String, Object> baseEnv = new HashMap<>();
+        if (ldapUrl.toLowerCase().startsWith("ldaps")) {
+            baseEnv.put("java.naming.security.protocol", "ssl");
+        }
+        
+        // Fail-fast JNDI timeouts for rapid, seamless failover across your server list
+        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "1500");
+        baseEnv.put("com.sun.jndi.ldap.read.timeout", "3000");
+        baseEnv.put("java.naming.referral", "ignore");
+
+        // CRITICAL: Disable native JNDI pooling; Commons Pool 2 will handle it
+        contextSource.setPooled(false); 
+        contextSource.setBaseEnvironmentProperties(baseEnv);
+        
+        return contextSource;
+    }
+
+    // ==========================================
+    // 2. COMMONS POOL 2 WRAPPER
+    // ==========================================
+    @Bean
+    public PooledContextSource pooledContextSource() {
+        PoolConfig poolConfig = new PoolConfig();
+        // Constraints are applied per ContextType (Read-Only vs Read-Write)
+        poolConfig.setMaxTotalPerKey(50);
+        poolConfig.setMaxIdlePerKey(10);
+        poolConfig.setMinIdlePerKey(2);
+        
+        // Active health checks to ensure dead servers are evicted
+        poolConfig.setTestOnBorrow(true);
+        poolConfig.setTestWhileIdle(true);
+        poolConfig.setTimeBetweenEvictionRunsMillis(60000L); // 1-minute eviction thread
+
+        PooledContextSource pooledSource = new PooledContextSource(poolConfig);
+        pooledSource.setContextSource(targetContextSource());
+        pooledSource.setDirContextValidator(new DefaultDirContextValidator());
+        
+        return pooledSource;
+    }
+
+    // ==========================================
+    // 3. LDAP TEMPLATE
+    // ==========================================
+    @Bean
+    public LdapTemplate ldapTemplate() {
+        LdapTemplate template = new LdapTemplate(pooledContextSource());
+        template.setIgnorePartialResultException(true);
+        template.setIgnoreNameNotFoundException(true);
+        return template;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
