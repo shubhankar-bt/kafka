@@ -9,3 +9,378 @@ fincore.help-service.ai-enabled-roles=10,60
 
 
 
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import lombok.Data;
+
+@Data
+public class HelpRequestDTO {
+    private String userMessage;
+    private String currentScreen;
+    
+    // The state of the UI Toggle (true = AI Mode, false = Guided Menu)
+    // Default to false. Only Admins can set this to true.
+    private boolean aiMode = false; 
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class HelpPreferenceDTO {
+    private boolean aiModeEnabled;
+    private boolean isEligibleForAi; // Tells the UI whether to render the Gear Icon at all
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpPreferenceDTO;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HelpPreferenceService {
+
+    private final StringRedisTemplate redisTemplate;
+
+    @Value("${fincore.help-service.ai-enabled-roles}")
+    private String aiEnabledRoles;
+
+    private static final String PREF_KEY_PREFIX = "fincore:help:prefs:";
+
+    public boolean isUserEligibleForAi(String roleId) {
+        if (roleId == null) return false;
+        List<String> allowedRoles = Arrays.asList(aiEnabledRoles.split(","));
+        return allowedRoles.contains(roleId);
+    }
+
+    public HelpPreferenceDTO getUserPreferences(String userId, String roleId) {
+        boolean isEligible = isUserEligibleForAi(roleId);
+        
+        // If they aren't eligible, short-circuit and return false immediately
+        if (!isEligible) {
+            return new HelpPreferenceDTO(false, false);
+        }
+
+        // Fetch from Redis. Default to TRUE for Admins if not set yet.
+        String redisKey = PREF_KEY_PREFIX + userId;
+        String savedPref = redisTemplate.opsForValue().get(redisKey);
+        
+        boolean aiMode = (savedPref == null) ? true : Boolean.parseBoolean(savedPref);
+        
+        return new HelpPreferenceDTO(aiMode, true);
+    }
+
+    public HelpPreferenceDTO saveUserPreference(String userId, String roleId, boolean aiMode) {
+        boolean isEligible = isUserEligibleForAi(roleId);
+        
+        // Defense in Depth: Do not save true if user is not authorized
+        if (!isEligible) {
+            log.warn("[SECURITY] Unauthorized user {} attempted to enable AI Mode.", userId);
+            return new HelpPreferenceDTO(false, false);
+        }
+
+        String redisKey = PREF_KEY_PREFIX + userId;
+        // Save to Redis with a 30-day TTL
+        redisTemplate.opsForValue().set(redisKey, String.valueOf(aiMode), Duration.ofDays(30));
+        
+        log.info("[PREFERENCE] User {} updated AI Mode to: {}", userId, aiMode);
+        return new HelpPreferenceDTO(aiMode, true);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ... existing imports ...
+import com.fincore.helpservice.dto.HelpPreferenceDTO;
+import com.fincore.helpservice.service.HelpPreferenceService;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/help")
+@RequiredArgsConstructor
+public class HelpController {
+
+    private final FinCoreChatAgent chatAgent;
+    private final HelpPreferenceService preferenceService;
+
+    /**
+     * Called by UI when the Chatbot Widget is first opened.
+     */
+    @GetMapping("/preferences")
+    public ApiResponse<HelpPreferenceDTO> getPreferences(
+            @RequestHeader("X-User-Id") String userId, 
+            @RequestHeader("X-Role-Id") String roleId) {
+            
+        return ApiResponse.success(preferenceService.getUserPreferences(userId, roleId));
+    }
+
+    /**
+     * Called by UI when Admin flips the toggle.
+     */
+    @PostMapping("/preferences")
+    public ApiResponse<HelpPreferenceDTO> updatePreferences(
+            @RequestHeader("X-User-Id") String userId, 
+            @RequestHeader("X-Role-Id") String roleId,
+            @RequestParam boolean aiMode) {
+            
+        return ApiResponse.success(preferenceService.saveUserPreference(userId, roleId, aiMode));
+    }
+
+    /**
+     * Stream endpoint updated to pass the full DTO.
+     */
+    @PostMapping("/chat/stream")
+    public SseEmitter streamChat(
+            @RequestHeader("X-User-Id") String userId,
+            @RequestHeader("X-Role-Id") String roleId,
+            @RequestBody @Valid HelpRequestDTO request) {
+            
+        return chatAgent.handleChatRequest(userId, roleId, request);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.helpservice.service;
+
+import com.fincore.helpservice.dto.HelpRequestDTO;
+// ... all your existing imports ...
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class FinCoreChatAgent {
+
+    private final StreamingChatLanguageModel streamingChatClient;
+    private final EmbeddingModel embeddingModel;
+    private final EmbeddingStore<TextSegment> vectorStore;
+    private final PermissionService permissionService;
+    private final ChatSessionService sessionService;
+    private final HelpAnalyticsService analyticsService;
+    private final HelpQuestionRepository questionRepository;
+    private final HelpFaqRepository faqRepository;
+    private final HelpPreferenceService preferenceService;
+
+    // Same memory setup as before...
+    private final Cache<String, ChatMemory> userMemories = Caffeine.newBuilder()
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .maximumSize(10000)
+            .build();
+
+    private static final String FAILURE_MSG = "I cannot find this information in your authorized FinCore manuals. Please check your permissions or contact Fincore support.";
+
+    /**
+     * THE SECURE ROUTER
+     */
+    public SseEmitter handleChatRequest(String userId, String roleId, HelpRequestDTO request) {
+        SseEmitter emitter = new SseEmitter(180000L);
+        String userMessage = request.getUserMessage().trim();
+
+        // 1. Double Security Check (Never trust the client payload)
+        boolean isEligible = preferenceService.isUserEligibleForAi(roleId);
+        boolean useAiEngine = isEligible && request.isAiMode();
+
+        log.info("[CHAT-ROUTER] User: {} | Role: {} | AI-Eligible: {} | UI-Toggle: {} | Routed To: {}", 
+                userId, roleId, isEligible, request.isAiMode(), useAiEngine ? "LLM_RAG" : "GUIDED_MENU");
+
+        try {
+            if (useAiEngine) {
+                return executeAiStreamingEngine(userId, roleId, userMessage, request.getCurrentScreen(), emitter);
+            } else {
+                return executeGuidedMenuFallback(userId, roleId, userMessage, emitter);
+            }
+        } catch (Exception e) {
+            log.error("Routing failure", e);
+            emitter.completeWithError(e);
+            return emitter;
+        }
+    }
+
+    /**
+     * ENGINE 1: ZERO-LLM GUIDED MENU (Phase 1 Default)
+     * Response Time: < 20ms
+     */
+    private SseEmitter executeGuidedMenuFallback(String userId, String roleId, String userMessage, SseEmitter emitter) throws Exception {
+        
+        List<Long> allowedPermIds = permissionService.getAllAllowedPermissionIdsForRole(roleId)
+                .stream().map(Long::valueOf).toList();
+
+        if ("/action faq".equalsIgnoreCase(userMessage)) {
+            List<String> faqQuestions = faqRepository.findTop10ByIsActiveOrderByViewCountDesc("Y")
+                    .stream().map(HelpFaqEntity::getQuestionText).toList();
+            emitSuggestionAndClose(emitter, "Here are a few frequently asked questions:", faqQuestions);
+            
+            // Log analytics for zero-llm hit
+            analyticsService.logChatInteraction(userId, "GUIDED_MENU", "FAQ Request", "SUGGESTION", 100);
+            return emitter;
+        }
+
+        if (userMessage.startsWith("/action module")) {
+            String requestedScreen = userMessage.replace("/action module", "").trim();
+            List<String> moduleQuestions = questionRepository.findAllowedQuestions(requestedScreen, "Y", allowedPermIds)
+                    .stream().map(HelpQuestionEntity::getQuestionText).toList();
+
+            if (moduleQuestions.isEmpty()) {
+                emitTextAndClose(emitter, "No specific guides available for " + requestedScreen + " with your current permissions.");
+            } else {
+                emitSuggestionAndClose(emitter, "Here are a few common questions for the " + requestedScreen + " screen:", moduleQuestions);
+            }
+            
+            analyticsService.logChatInteraction(userId, "GUIDED_MENU", "Module Help: " + requestedScreen, "SUGGESTION", 100);
+            return emitter;
+        }
+
+        // SECURITY CATCH-ALL: If user manually types a question while in fallback mode
+        emitTextAndClose(emitter, "Finny AI is currently in Beta. Please use the quick action buttons to navigate the help menus.");
+        analyticsService.logChatInteraction(userId, "GUIDED_MENU", userMessage, "REJECTED_FREE_TEXT", 0);
+        return emitter;
+    }
+
+    /**
+     * ENGINE 2: HEAVY LLM & VECTOR DB (Admin Testing Mode)
+     */
+    private SseEmitter executeAiStreamingEngine(String userId, String roleId, String userMessage, String currentScreen, SseEmitter emitter) throws Exception {
+        
+        // ========================================================================
+        // COPY-PASTE your exact existing logic here from:
+        // "2. ESCALATION CHECK" all the way down to the streamingChatClient.generate()
+        // ========================================================================
+        
+        // (Just a stub for brevity, put your actual vector search and LLM call here)
+        emitEvent(emitter, "start", Map.of("status", "typing"));
+        
+        // Note: You still want your /action checks inside here too, so Admins can click buttons AND type!
+        // Copy the /action faq logic here as well so the UI buttons work for admins.
+
+        return emitter; // Make sure to return the emitter!
+    }
+
+    // --- Helper Methods ---
+    private void emitEvent(SseEmitter emitter, String eventName, Map<String, Object> data) throws Exception {
+        emitter.send(SseEmitter.event().name(eventName).data(data));
+    }
+
+    private void emitSuggestionAndClose(SseEmitter emitter, String botReply, List<String> items) throws Exception {
+        emitEvent(emitter, "suggestion", Map.of("botReply", botReply, "items", items));
+        emitter.complete();
+    }
+
+    private void emitTextAndClose(SseEmitter emitter, String botReply) throws Exception {
+        emitEvent(emitter, "text_reply", Map.of("botReply", botReply));
+        emitter.complete();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
