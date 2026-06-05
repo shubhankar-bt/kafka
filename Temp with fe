@@ -1,267 +1,72 @@
-// In LdapConfig.java
-baseEnv.put("com.sun.jndi.ldap.connect.timeout", "1500"); // 1.5 seconds to establish TCP handshake
-baseEnv.put("com.sun.jndi.ldap.read.timeout", "3000");    // 3.0 seconds to wait for AD to process the search/bind
+Dear Sir\Madam,
 
 
+Sample LDAP URL for root server - ldaps://CORP.AD.SBI:636
 
+LDAP Port - 636
 
+Please find below CORP server details along with certificate.
 
+Kindly rename certificate from .txt to .cer
 
+Find below Corp server details.
 
+
 
+ 
 
+IP Address
 
+Host Name
 
-import org.springframework.ldap.pool2.factory.PoolingContextSource;
-import org.springframework.ldap.pool2.validation.DefaultDirContextValidator;
+Site
 
-// Replace your contextSource() bean with this:
-@Bean
-public LdapContextSource targetContextSource() {
-    LdapContextSource contextSource = new LdapContextSource();
-    contextSource.setUrl(ldapUrl);
-    contextSource.setBase(ldapBaseDn);
-    contextSource.setUserDn(ldapUsername);
-    contextSource.setPassword(ldapPassword);
-    
-    Map<String, Object> baseEnv = new HashMap<>();
-    if (ldapUrl.toLowerCase().startsWith("ldaps")) {
-        baseEnv.put("java.naming.security.protocol", "ssl");
-    }
-    baseEnv.put("com.sun.jndi.ldap.connect.timeout", "1500");
-    baseEnv.put("com.sun.jndi.ldap.read.timeout", "3000");
-    baseEnv.put("java.naming.referral", "ignore");
-    
-    contextSource.setBaseEnvironmentProperties(baseEnv);
-    return contextSource;
-}
+10.176.53.145
 
-@Bean
-public PoolingContextSource poolingContextSource() {
-    PoolingContextSource poolingSource = new PoolingContextSource();
-    poolingSource.setDirContextValidator(new DefaultDirContextValidator());
-    poolingSource.setContextSource(targetContextSource());
-    poolingSource.setTestOnBorrow(true); // Ensures the connection is alive before using it
-    poolingSource.setTestWhileIdle(true); 
-    poolingSource.setMaxTotal(50);       // Max active connections
-    poolingSource.setMaxIdle(10);        // Keep 10 idle connections ready for traffic spikes
-    return poolingSource;
-}
+CORPDCMDGBL01.CORP.AD.SBI
 
-@Bean
-public LdapTemplate ldapTemplate() {
-    LdapTemplate template = new LdapTemplate(poolingContextSource()); // Use the pooled source
-    template.setIgnorePartialResultException(true);
-    template.setIgnoreNameNotFoundException(true);
-    return template;
-}
+GBL
 
+10.176.54.30
 
+CORPDCMDGBL02.CORP.AD.SBI
 
+GBL
 
+10.176.54.31
 
+CORPDCMDGBL03.CORP.AD.SBI
 
+GBL
 
+10.176.54.32
 
+CORPDCMDGBL04.CORP.AD.SBI
 
+GBL
 
-import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
+10.189.37.135
 
-@Configuration
-public class LdapSchedulerConfig {
-    
-    // Creates a dedicated thread pool for LDAP. 
-    // 50 threads max, with a queue size of 1000.
-    @Bean
-    public Scheduler ldapScheduler() {
-        return Schedulers.newBoundedElastic(50, 1000, "ldap-pool");
-    }
-}
+CORPDCMDRBL01.CORP.AD.SBI
 
+RBL
 
+10.189.37.136
 
+CORPDCMDRBL02.CORP.AD.SBI
 
+RBL
 
+10.189.37.137
 
+CORPDCMDRBL03.CORP.AD.SBI
 
+RBL
 
+10.189.37.138
 
+CORPDCMDRBL04.CORP.AD.SBI
 
+RBL
 
-
-
-
-
-
-// Inside verifyUserCredentials() in LoginServiceImpl
-try {
-    if (activeMode == Constants.LDAP) {
-        log.info("Processing LDAP Login for user: {}", userId);
-        
-        // Execute the blocking LDAP call on the isolated thread pool
-        Boolean ldapSuccess = Mono.fromCallable(() -> adAuthenticationService.authenticate(userId, rawPassword))
-                .subscribeOn(ldapScheduler) // <-- Use the dedicated pool
-                .block(); // Block is acceptable here as we are already inside a thread dedicated to the login transaction
-        
-        // ... rest of the logic
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-=========================================================
-
-
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ldap-config
-  namespace: backend
-data:
-  # Space-separated list containing all 4 Primary (GBL) and 4 Secondary (RBL) AD servers
-  SPRING_LDAP_URLS: "ldaps://corpdcmdgbl01.corp.ad.sbi:636 ldaps://corpdcmdgbl02.corp.ad.sbi:636 ldaps://corpdcmdgbl03.corp.ad.sbi:636 ldaps://corpdcmdgbl04.corp.ad.sbi:636 ldaps://corpdcmdrbl01.corp.ad.sbi:636 ldaps://corpdcmdrbl02.corp.ad.sbi:636 ldaps://corpdcmdrbl03.corp.ad.sbi:636 ldaps://corpdcmdrbl04.corp.ad.sbi:636"
-  LDAP_TRUSTSTORE_PATH: "file:/etc/fincore/secrets/ad-truststore.jks"
-  SPRING_LDAP_USERNAME: "fincorecbops@CORP.AD.SBI"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.gateway.Config;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.ResourceLoader;
-import org.springframework.ldap.core.LdapTemplate;
-import org.springframework.ldap.core.support.LdapContextSource;
-import org.springframework.ldap.pool2.factory.PoolConfig;
-import org.springframework.ldap.pool2.factory.PooledContextSource;
-import org.springframework.ldap.pool2.validation.DefaultDirContextValidator;
-
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
-
-@Slf4j
-@Configuration
-public class LdapConfig {
-
-    // ... [Keep your existing @Value annotations and SSL Truststore constructor here] ...
-
-    // ==========================================
-    // 1. BASE NATIVE CONTEXT SOURCE (Un-pooled)
-    // ==========================================
-    @Bean
-    public LdapContextSource targetContextSource() {
-        log.info("Configuring target LDAP Context Source. URLs: {}", ldapUrl);
-        
-        // ... [Insert your existing SSL Truststore try-catch logic here] ...
-        
-        LdapContextSource contextSource = new LdapContextSource();
-        contextSource.setUrl(ldapUrl);
-        contextSource.setBase(ldapBaseDn);
-        
-        if (ldapUsername != null && !ldapUsername.isBlank()) {
-            contextSource.setUserDn(ldapUsername);
-            contextSource.setPassword(ldapPassword);
-        }
-
-        Map<String, Object> baseEnv = new HashMap<>();
-        if (ldapUrl.toLowerCase().startsWith("ldaps")) {
-            baseEnv.put("java.naming.security.protocol", "ssl");
-        }
-        
-        // Fail-fast JNDI timeouts for rapid, seamless failover across your server list
-        baseEnv.put("com.sun.jndi.ldap.connect.timeout", "1500");
-        baseEnv.put("com.sun.jndi.ldap.read.timeout", "3000");
-        baseEnv.put("java.naming.referral", "ignore");
-
-        // CRITICAL: Disable native JNDI pooling; Commons Pool 2 will handle it
-        contextSource.setPooled(false); 
-        contextSource.setBaseEnvironmentProperties(baseEnv);
-        
-        return contextSource;
-    }
-
-    // ==========================================
-    // 2. COMMONS POOL 2 WRAPPER
-    // ==========================================
-    @Bean
-    public PooledContextSource pooledContextSource() {
-        PoolConfig poolConfig = new PoolConfig();
-        // Constraints are applied per ContextType (Read-Only vs Read-Write)
-        poolConfig.setMaxTotalPerKey(50);
-        poolConfig.setMaxIdlePerKey(10);
-        poolConfig.setMinIdlePerKey(2);
-        
-        // Active health checks to ensure dead servers are evicted
-        poolConfig.setTestOnBorrow(true);
-        poolConfig.setTestWhileIdle(true);
-        poolConfig.setTimeBetweenEvictionRunsMillis(60000L); // 1-minute eviction thread
-
-        PooledContextSource pooledSource = new PooledContextSource(poolConfig);
-        pooledSource.setContextSource(targetContextSource());
-        pooledSource.setDirContextValidator(new DefaultDirContextValidator());
-        
-        return pooledSource;
-    }
-
-    // ==========================================
-    // 3. LDAP TEMPLATE
-    // ==========================================
-    @Bean
-    public LdapTemplate ldapTemplate() {
-        LdapTemplate template = new LdapTemplate(pooledContextSource());
-        template.setIgnorePartialResultException(true);
-        template.setIgnoreNameNotFoundException(true);
-        return template;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+ 
