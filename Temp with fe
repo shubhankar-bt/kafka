@@ -1,12 +1,103 @@
-2026-06-05 :: 19:17:19.521 || INFO :: AuthController.java: | 253 | :: Refresh Triggered
-2026-06-05 :: 19:17:19.523 || INFO :: AuthController.java: | 271 | :: Refreshing Token for User: 2488766
-2026-06-05 :: 19:17:19.527 || INFO :: AuthController.java: | 280 | :: Session Active in Redis. Fetching Full Profile.
-2026-06-05 :: 19:17:19.641 || INFO :: LoginServiceImpl.java: | 99 | :: Fetching role-wise data for userId: 2488766
-2026-06-05 :: 19:17:19.739 || INFO :: HmacJwtUtil.java: | 52 | :: Generated exp in Seconds=2026-06-05T13:47:34.739707200Z
-2026-06-05 :: 19:17:19.740 || INFO :: HmacJwtUtil.java: | 54 | :: Jti generated=9a1d8624-cf65-4f50-85e7-8e1751f08f0e
-2026-06-05 :: 19:17:19.740 || INFO :: HmacJwtUtil.java: | 52 | :: Generated exp in Seconds=2026-06-06T01:47:19.740706800Z
-2026-06-05 :: 19:17:19.740 || INFO :: HmacJwtUtil.java: | 54 | :: Jti generated=ea8a28e3-962c-44bf-b3b6-141f32daed57
-2026-06-05 :: 19:17:19.742 || INFO :: TokenSessionValidator.java: | 98 | :: Registering new session user=2488766 jti=9a1d8624-cf65-4f50-85e7-8e1751f08f0e
-2026-06-05 :: 19:17:19.746 || INFO :: TokenSessionValidator.java: | 103 | :: Moving old session to Grace Period for user=2488766 -> oldJti=07639a06-2cc7-49a2-b762-ca4660d9f6be
-2026-06-05 :: 19:17:19.750 || INFO :: TokenSessionValidator.java: | 111 | :: Registered active session in Redis user=2488766 jti=9a1d8624-cf65-4f50-85e7-8e1751f08f0e
-2026-06-05 :: 19:17:20.037 || WARN :: AuthController.java: | 362 | :: Logout called without token. Cleaning up cookies only.
+    // Assuming you have these constants defined
+    private static final String USER_PREFIX = "USR:";
+    private static final String GRACE_PREFIX = "GRACE:";
+
+    private void validateSessionPointer(String userId, String incomingJti) {
+        String activeJti = redisTemplate.opsForValue().get(USER_PREFIX + userId);
+
+        // 1. Primary Session Match
+        if (activeJti != null && activeJti.equals(incomingJti)) {
+            return; // Valid
+        }
+
+        // 2. Grace Period Fallback (The Missing Link)
+        Boolean isInGrace = redisTemplate.hasKey(GRACE_PREFIX + incomingJti);
+        if (Boolean.TRUE.equals(isInGrace)) {
+            log.debug("Microservice accepted token under Grace Period for user={} jti={}", userId, incomingJti);
+            return; // Valid during rotation window
+        }
+
+        // 3. Absolute Rejection
+        log.error("Security Violation: Concurrent login detected in microservice for user={}. Active JTI: {}, Incoming JTI: {}", userId, activeJti, incomingJti);
+        throw new ConcurrentLoginException("Session expired or active in another device.");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+import apiClient from './apiClient'; // The Axios instance with the Mutex we built
+
+const connectToChatbotStream = async (chatPayload) => {
+    
+    // Helper to get the absolute latest token from storage
+    const getLatestToken = () => localStorage.getItem('accessToken');
+
+    await fetchEventSource('http://your-gateway/api/chatbot/stream', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${getLatestToken()}`
+        },
+        body: JSON.stringify(chatPayload),
+        
+        async onopen(response) {
+            if (response.ok) return; // Successfully connected
+
+            if (response.status === 401) {
+                // STREAM DIED DUE TO TOKEN ROTATION.
+                // 1. DO NOT trigger a global logout here.
+                // 2. We trigger a dummy Axios request to force the Mutex to refresh the token.
+                try {
+                    await apiClient.get('/api/auth/check-user'); 
+                    // By the time this line resolves, the Axios interceptor has 
+                    // successfully refreshed the token and saved it.
+                    
+                    // Throw a specific error to trigger the onclose/retry loop
+                    throw new Error("TOKEN_ROTATED_RECONNECTING");
+                } catch (error) {
+                    // If the check-user fails (refresh token actually expired), then we logout
+                    throw new Error("FATAL_AUTH_FAILURE");
+                }
+            }
+        },
+        
+        onmessage(msg) {
+            // Process your SSE chunks here
+            console.log(msg.data);
+        },
+        
+        onclose() {
+            // Called when the server closes the stream normally
+            console.log("Stream closed by server");
+        },
+        
+        onerror(err) {
+            if (err.message === "TOKEN_ROTATED_RECONNECTING") {
+                // Return a positive number (e.g., 100ms) to tell fetchEventSource 
+                // to silently reconnect using the NEW token we just fetched.
+                return 100; 
+            }
+            if (err.message === "FATAL_AUTH_FAILURE") {
+                // This is a true session expiration. Now we route to login.
+                window.location.href = '/login';
+                throw err; // Stop retrying
+            }
+            
+            // For standard network blips, retry after 3 seconds
+            return 3000;
+        }
+    });
+};
