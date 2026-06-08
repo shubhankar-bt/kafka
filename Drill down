@@ -1,27 +1,95 @@
-druid dev cluster url : 10.177.103.194:8282
+-- ==============================================================================
+-- 1. DR_DATASOURCE: Physical Druid Table Configuration
+-- ==============================================================================
+CREATE TABLE DR_DATASOURCE (
+    ID NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DATASOURCE_CODE VARCHAR2(50) NOT NULL UNIQUE,
+    DRUID_TABLE_NAME VARCHAR2(100) NOT NULL,
+    CLUSTER_URL VARCHAR2(255),
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CREATED_BY VARCHAR2(50) DEFAULT 'SYSTEM' NOT NULL,
+    CREATED_DT TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    UPDATED_BY VARCHAR2(50),
+    UPDATED_DT TIMESTAMP
+);
+COMMENT ON TABLE DR_DATASOURCE IS 'Registry of physical Druid datasources/tables.';
+COMMENT ON COLUMN DR_DATASOURCE.DATASOURCE_CODE IS 'Internal lookup code (e.g., GLIF_PROD).';
+COMMENT ON COLUMN DR_DATASOURCE.DRUID_TABLE_NAME IS 'Exact physical table name in Apache Druid (e.g., GLIF).';
 
-data source name : GLIF
+-- ==============================================================================
+-- 2. DR_REPORT: Logical Business Reports
+-- ==============================================================================
+CREATE TABLE DR_REPORT (
+    ID NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    REPORT_CODE VARCHAR2(50) NOT NULL UNIQUE,
+    DISPLAY_NAME VARCHAR2(100) NOT NULL,
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CREATED_BY VARCHAR2(50) DEFAULT 'SYSTEM' NOT NULL,
+    CREATED_DT TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+);
+COMMENT ON TABLE DR_REPORT IS 'High-level business reports (e.g., YSA, NWSA).';
 
-ALL COLUMNS :
+-- ==============================================================================
+-- 3. DR_REPORT_VIEW: Specific drill-down configurations (The Router)
+-- ==============================================================================
+CREATE TABLE DR_REPORT_VIEW (
+    ID NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    REPORT_ID NUMBER(19) NOT NULL,
+    DATASOURCE_ID NUMBER(19) NOT NULL,
+    VIEW_CODE VARCHAR2(50) NOT NULL UNIQUE,
+    DISPLAY_NAME VARCHAR2(100) NOT NULL,
+    REQUIRED_ROLE VARCHAR2(100),
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CREATED_BY VARCHAR2(50) DEFAULT 'SYSTEM' NOT NULL,
+    CREATED_DT TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT FK_DR_VIEW_REPORT FOREIGN KEY (REPORT_ID) REFERENCES DR_REPORT(ID),
+    CONSTRAINT FK_DR_VIEW_DS FOREIGN KEY (DATASOURCE_ID) REFERENCES DR_DATASOURCE(ID)
+);
+-- FK Indexes (Crucial in Oracle to prevent full table locks during cascading updates/deletes)
+CREATE INDEX IDX_DR_VIEW_REPORT_ID ON DR_REPORT_VIEW(REPORT_ID);
+CREATE INDEX IDX_DR_VIEW_DS_ID ON DR_REPORT_VIEW(DATASOURCE_ID);
 
-SELECT
-  "__time",
-  "CURRENCY",
-  "TRANSACTION_CODE",
-  "CGL",
-  "BRCH",
-  "LCY_AMT",
-  "JOURNAL_NUMBER",
-  "ACCOUNT",
-  "DESCRIPTION",
-  "AMOUNT",
-  "TRANS_DATE",
-  "SOURCE",
-  "BRANCH_CODE",
-  "POST_DATE",
-  "FCY_CODE",
-  "FCY_AMT"
-FROM "GLIF"
+COMMENT ON TABLE DR_REPORT_VIEW IS 'Maps a logical view to a physical Druid datasource. Enforces RBAC.';
+COMMENT ON COLUMN DR_REPORT_VIEW.VIEW_CODE IS 'The unique string the frontend sends to initiate a drill-down.';
+
+-- ==============================================================================
+-- 4. DR_VIEW_DIMENSION: Logical to Physical Hierarchy Mapping
+-- ==============================================================================
+CREATE TABLE DR_VIEW_DIMENSION (
+    ID NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    VIEW_ID NUMBER(19) NOT NULL,
+    LOGICAL_NAME VARCHAR2(50) NOT NULL,
+    PHYSICAL_COLUMN VARCHAR2(100) NOT NULL,
+    DRILL_LEVEL NUMBER(5) NOT NULL,
+    CREATED_BY VARCHAR2(50) DEFAULT 'SYSTEM' NOT NULL,
+    CREATED_DT TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT FK_DR_DIM_VIEW FOREIGN KEY (VIEW_ID) REFERENCES DR_REPORT_VIEW(ID),
+    CONSTRAINT UQ_VIEW_LOGICAL_DIM UNIQUE (VIEW_ID, LOGICAL_NAME),
+    CONSTRAINT UQ_VIEW_DRILL_LVL UNIQUE (VIEW_ID, DRILL_LEVEL)
+);
+CREATE INDEX IDX_DR_DIM_VIEW_ID ON DR_VIEW_DIMENSION(VIEW_ID);
+
+COMMENT ON TABLE DR_VIEW_DIMENSION IS 'Translates frontend dimension requests to Druid columns and enforces drill-down order.';
+COMMENT ON COLUMN DR_VIEW_DIMENSION.DRILL_LEVEL IS 'The sequence 1, 2, 3... defines the strict hierarchy path.';
+
+-- ==============================================================================
+-- 5. DR_VIEW_METRIC: Logical to Java Strategy Mapping
+-- ==============================================================================
+CREATE TABLE DR_VIEW_METRIC (
+    ID NUMBER(19) GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    VIEW_ID NUMBER(19) NOT NULL,
+    LOGICAL_NAME VARCHAR2(50) NOT NULL,
+    DISPLAY_NAME VARCHAR2(100) NOT NULL,
+    STRATEGY_CODE VARCHAR2(50) NOT NULL,
+    CREATED_BY VARCHAR2(50) DEFAULT 'SYSTEM' NOT NULL,
+    CREATED_DT TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT FK_DR_METRIC_VIEW FOREIGN KEY (VIEW_ID) REFERENCES DR_REPORT_VIEW(ID),
+    CONSTRAINT UQ_VIEW_LOGICAL_METRIC UNIQUE (VIEW_ID, LOGICAL_NAME)
+);
+CREATE INDEX IDX_DR_METRIC_VIEW_ID ON DR_VIEW_METRIC(VIEW_ID);
+
+COMMENT ON TABLE DR_VIEW_METRIC IS 'Maps frontend metric requests to Backend Java Metric Strategies.';
+COMMENT ON COLUMN DR_VIEW_METRIC.STRATEGY_CODE IS 'The Java Enum/Strategy identifier (e.g., SUM_LOCAL_CURRENCY). NO RAW SQL.';
 
 
 
@@ -34,20 +102,38 @@ FROM "GLIF"
 
 
 
-SAMPLE DATA FOR ONE ROW :-
-2026-03-31T04:44:25.000Z
-INR
-98499
-7402505001
-00780
-17.7
-761031362
-4484893928
-EXCESS DB ATM
-17.7
-1,774,915,200,000
-INV
-00780
-1,774,915,200,000
-INR
-0
+
+
+
+
+
+
+
+-- 1. Register the Physical Druid Datasource
+INSERT INTO DR_DATASOURCE (DATASOURCE_CODE, DRUID_TABLE_NAME, CLUSTER_URL) 
+VALUES ('GLIF_DEV', 'GLIF', 'http://10.177.103.194:8282');
+
+-- 2. Register the Logical Business Report
+INSERT INTO DR_REPORT (REPORT_CODE, DISPLAY_NAME) 
+VALUES ('YSA', 'Yield Sweep Analysis');
+
+-- 3. Create the specific View (The Routing Rule)
+-- Let's assume ID 1 is GLIF_DEV and ID 1 is YSA
+INSERT INTO DR_REPORT_VIEW (REPORT_ID, DATASOURCE_ID, VIEW_CODE, DISPLAY_NAME, REQUIRED_ROLE) 
+VALUES (1, 1, 'YSA_BRANCH_VIEW', 'YSA Standard Branch Drill-down', 'ROLE_BRANCH_MANAGER');
+
+-- 4. Define the Drill-Down Hierarchy (Logical -> Physical Mapping)
+-- The frontend will ask for "Branch", the backend translates it to "BRANCH_CODE"
+INSERT INTO DR_VIEW_DIMENSION (VIEW_ID, LOGICAL_NAME, PHYSICAL_COLUMN, DRILL_LEVEL) VALUES (1, 'Branch', 'BRANCH_CODE', 1);
+INSERT INTO DR_VIEW_DIMENSION (VIEW_ID, LOGICAL_NAME, PHYSICAL_COLUMN, DRILL_LEVEL) VALUES (1, 'GeneralLedger', 'CGL', 2);
+INSERT INTO DR_VIEW_DIMENSION (VIEW_ID, LOGICAL_NAME, PHYSICAL_COLUMN, DRILL_LEVEL) VALUES (1, 'Account', 'ACCOUNT', 3);
+
+-- 5. Define the Allowed Metrics
+-- The frontend asks for "TotalAmount", the backend uses the "SUM_LCY" Java Strategy.
+INSERT INTO DR_VIEW_METRIC (VIEW_ID, LOGICAL_NAME, DISPLAY_NAME, STRATEGY_CODE) 
+VALUES (1, 'TotalAmount', 'Total Local Currency', 'SUM_LCY');
+
+INSERT INTO DR_VIEW_METRIC (VIEW_ID, LOGICAL_NAME, DISPLAY_NAME, STRATEGY_CODE) 
+VALUES (1, 'TotalForeignAmount', 'Total Foreign Currency', 'SUM_FCY');
+
+COMMIT;
