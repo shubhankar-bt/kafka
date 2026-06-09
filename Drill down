@@ -1,3 +1,4 @@
+```java
 package com.fincore.analyticsservice.controller;
 
 import com.fincore.analyticsservice.dto.DrillDownRequest;
@@ -9,17 +10,19 @@ import com.fincore.commonutilities.jwt.JwtUtil;
 import jakarta.validation.Valid;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.stream.Collectors;
 
-
+/**
+ * Enterprise REST Controller for the Analytics Drill-Down Engine.
+ * Follows clean architecture: the controller solely handles HTTP routing, 
+ * token extraction, and delegates core business logic to the service layer.
+ */
 @Slf4j
 @RestController
 @RequestMapping("/api/v1/analytics")
+@CrossOrigin(origins = "*")
 public class AnalyticsController {
 
     private final SemanticDrillDownService semanticDrillDownService;
@@ -34,41 +37,63 @@ public class AnalyticsController {
 
     /**
      * POST /api/v1/analytics/drill-down
+     * Executes the dynamic drill-down query against Apache Druid.
+     * * @param request The logical JSON payload from the React frontend.
+     * @param token The JWT authorization token.
+     * @return DrillDownResponse containing aggregated data and metadata.
      */
     @PostMapping("/drill-down")
     public ResponseEntity<DrillDownResponse> executeDrillDown(
             @Valid @RequestBody DrillDownRequest request,
             @RequestHeader("Authorization") String token) {
 
-        // 1. Extract role from common-utilities
+        // Extract the integer Role ID (e.g., 10 for Admin, 54 for Branch)
         Integer roleId = jwtUtil.getUserRoleFromToken(token);
         
-        // 2. Pass request and context to the Semantic Engine
-        DrillDownResponse response = semanticDrillDownService.executeDrillDown(request, userRoles); // userRoles needs to be fixed in service
+        // Pass the request and the User's Role ID to the Semantic Engine
+        DrillDownResponse response = semanticDrillDownService.executeDrillDown(request, roleId);
+        
         return ResponseEntity.ok(response);
     }
 
-
     /**
      * GET /api/v1/analytics/config
-     * UI calls this immediately on application load.
+     * UI calls this immediately on application load to figure out which reports 
+     * and dropdowns this specific user is allowed to see.
      */
     @GetMapping("/config")
-    public ResponseEntity<List<ReportConfigResponse>> getUIConfiguration(@RequestHeader("Authorization") String token) {
-        // 1. Extract role from common-utilities
+    public ResponseEntity<List<ReportConfigResponse>> getUIConfiguration(
+            @RequestHeader("Authorization") String token) {
+        
         Integer roleId = jwtUtil.getUserRoleFromToken(token);
-
-        List<ReportConfigResponse> config = configService.getPermittedConfigurations(userRoles); // userRoles needs to be fixed in service
+        
+        // Fetch only configurations permitted for this Role ID
+        List<ReportConfigResponse> config = configService.getPermittedConfigurations(roleId);
 
         return ResponseEntity.ok(config);
     }
 }
 
+```
 
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
 package com.fincore.analyticsservice.service;
 
 import com.fincore.analyticsservice.client.DruidRestClient;
@@ -89,14 +114,22 @@ import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * The "Brain" of the Semantic Layer. 
+ * This service takes a "Logical" request from the frontend (e.g., "Give me the Total Balance for Branches"),
+ * looks up the physical rules in Oracle, translates the request, enforces RBAC, and executes it.
+ */
 @Service
 public class SemanticDrillDownService {
 
     private static final Logger log = LoggerFactory.getLogger(SemanticDrillDownService.class);
+    
+    // Hardcoded Admin Role ID based on your provided Roles table
+    private static final Integer ROLE_ADMIN = 10;
 
     private final DruidRestClient druidRestClient;
     private final DruidQueryBuilder queryBuilder;
-    private final ReportMetadataProvider metadataProvider; // Interface fetching from Oracle
+    private final ReportMetadataProvider metadataProvider;
     private final Map<String, MetricStrategy> strategyRegistry;
 
     public SemanticDrillDownService(
@@ -107,29 +140,34 @@ public class SemanticDrillDownService {
         this.druidRestClient = druidRestClient;
         this.queryBuilder = queryBuilder;
         this.metadataProvider = metadataProvider;
-        // Automatically registers all Spring Beans that implement MetricStrategy
+        
+        // This automatically collects all MetricStrategy implementations (e.g., SumBalanceStrategy) 
+        // into a highly optimized Map for O(1) lookup at runtime.
         this.strategyRegistry = strategies.stream()
                 .collect(Collectors.toMap(MetricStrategy::getStrategyCode, Function.identity()));
     }
 
+    /**
+     * Executes the Drill Down operation. Cached to ensure identical clicks return instantly.
+     */
     @Cacheable(value = "drillDownData", key = "T(java.lang.String).valueOf(#request.hashCode())")
-    public DrillDownResponse executeDrillDown(DrillDownRequest request, List<String> userRoles) {
+    public DrillDownResponse executeDrillDown(DrillDownRequest request, Integer roleId) {
         long startTime = System.currentTimeMillis();
         String logicalTargetDim = request.dimensions().get(0);
 
         log.info("Executing DrillDown for view: [{}], logicalDim: [{}]", request.viewCode(), logicalTargetDim);
 
-        // 1. Fetch Metadata context for this view (Cached)
+        // 1. Fetch Metadata context for this view from Oracle
         ViewMetadataContext context = metadataProvider.getViewContext(request.viewCode());
 
-        // 2. Perform RBAC validation
-        validateAccess(context.requiredRole(), userRoles);
+        // 2. Perform RBAC validation (Are they allowed to see this specific view?)
+        validateAccess(context.requiredRoleIds(), roleId);
 
-        // 3. Translate Logical to Physical
+        // 3. Translate Logical to Physical (e.g., "Branch" -> "BRANCH_CODE")
         String physicalTargetDim = translateDimension(logicalTargetDim, context.dimensionMap());
         Map<String, MetricStrategy> resolvedMetrics = resolveMetrics(request.metrics(), context.metricMap());
 
-        // 4. Build and Execute Query securely
+        // 4. Build the exact SQL Query string securely
         Map<String, Object> druidPayload = queryBuilder.buildSqlPayload(
                 context.physicalDruidTable(),
                 logicalTargetDim,
@@ -140,24 +178,43 @@ public class SemanticDrillDownService {
                 context.dimensionMap()
         );
 
-        List<Map<String, Object>> rawDruidData = druidRestClient.executeQuery(druidPayload); // here is the issue, Expected 3 arguments but found 1
+        // 5. Execute against Druid (FIXED: Passed single payload object)
+        List<Map<String, Object>> rawDruidData = druidRestClient.executeQuery(druidPayload);
 
         if (CollectionUtils.isEmpty(rawDruidData)) {
             return new DrillDownResponse(new Meta("SUCCESS", logicalTargetDim, 0, System.currentTimeMillis() - startTime), Collections.emptyList());
         }
 
-        // 5. Determine UI Hierarchy State
+        // 6. Determine UI Hierarchy State ([+] button logic)
         boolean hasChildren = determineIfHasChildren(logicalTargetDim, context.logicalHierarchyOrdered());
 
-        // 6. Format Final UI Response (Deterministic IDs)
+        // 7. Format Final UI Response with unique deterministic IDs
         List<Map<String, Object>> formattedData = formatResponseData(rawDruidData, logicalTargetDim, hasChildren);
 
         long executionTime = System.currentTimeMillis() - startTime;
         return new DrillDownResponse(new Meta("SUCCESS", logicalTargetDim, formattedData.size(), executionTime), formattedData);
     }
 
-    private void validateAccess(String requiredRole, List<String> userRoles) {
-        if (requiredRole != null && !userRoles.contains(requiredRole) && !userRoles.contains("ROLE_SUPER_ADMIN")) {
+    /**
+     * Validates if the user's integer role ID is permitted to view this report.
+     * * @param requiredRoleIds A comma-separated string from DB (e.g., "54,56"). Null means public.
+     * @param roleId The user's actual role ID from JWT.
+     */
+    private void validateAccess(String requiredRoleIds, Integer roleId) {
+        // Admin always has access to everything
+        if (ROLE_ADMIN.equals(roleId)) {
+            return;
+        }
+
+        // If DB has no restrictions, allow access
+        if (requiredRoleIds == null || requiredRoleIds.trim().isEmpty()) {
+            return;
+        }
+
+        // Parse comma-separated list and check for match
+        List<String> allowedRoles = Arrays.asList(requiredRoleIds.split(","));
+        if (!allowedRoles.contains(String.valueOf(roleId))) {
+            log.warn("Security Alert: User with Role ID [{}] attempted to access restricted view requiring roles [{}]", roleId, requiredRoleIds);
             throw new AccessDeniedException("Insufficient permissions to execute drill-down for this view.");
         }
     }
@@ -194,7 +251,6 @@ public class SemanticDrillDownService {
         for (Map<String, Object> row : rawData) {
             Map<String, Object> formattedRow = new LinkedHashMap<>();
 
-            // The query aliased the physical col to the logicalDim, so we extract it directly
             Object nameObj = row.get(logicalDim);
             String nameValue = (nameObj != null && !nameObj.toString().isBlank()) ? nameObj.toString() : "Unassigned";
 
@@ -213,6 +269,7 @@ public class SemanticDrillDownService {
     }
 }
 
+```
 
 
 
@@ -220,6 +277,16 @@ public class SemanticDrillDownService {
 
 
 
+
+
+
+
+
+
+
+
+
+```java
 package com.fincore.analyticsservice.client;
 
 import org.slf4j.Logger;
@@ -230,21 +297,23 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
-import java.util.*;
+import java.util.List;
+import java.util.Map;
 
+/**
+ * Handles HTTP communication with the Apache Druid Cluster.
+ * Designed to be highly performant utilizing Spring Boot 3's modern RestClient.
+ */
 @Component
 public class DruidRestClient {
 
     private static final Logger log = LoggerFactory.getLogger(DruidRestClient.class);
     private final RestClient restClient;
-    private final boolean mockEnabled;
 
     public DruidRestClient(
             RestClient.Builder restClientBuilder,
-            @Value("${druid.router.url:http://localhost:8888}") String druidUrl,
-            @Value("${druid.mock.enabled:false}") boolean mockEnabled) {
+            @Value("${druid.router.url:http://10.177.103.194:8282}") String druidUrl) {
 
-        this.mockEnabled = mockEnabled;
         this.restClient = restClientBuilder
                 .baseUrl(druidUrl)
                 .defaultHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
@@ -253,15 +322,11 @@ public class DruidRestClient {
     }
 
     /**
-     * Executes the query or returns Mock Data if mock mode is enabled.
-     * We pass targetDimension and metrics purely to help generate realistic mock data.
+     * Executes the compiled SQL payload securely against Druid.
+     * * @param druidSqlPayload A Map containing the "query" and "parameters" arrays.
+     * @return List of JSON row objects from Druid.
      */
-    public List<Map<String, Object>> executeQuery(Map<String, Object> druidSqlPayload, String targetDimension, List<String> metrics) {
-        if (mockEnabled) {
-            log.info("MOCK MODE ENABLED: Generating fake Druid response for dimension [{}]", targetDimension);
-            return generateMockDruidResponse(targetDimension, metrics);
-        }
-
+    public List<Map<String, Object>> executeQuery(Map<String, Object> druidSqlPayload) {
         log.debug("Executing REAL Druid Query payload: {}", druidSqlPayload);
 
         return restClient.post()
@@ -270,390 +335,62 @@ public class DruidRestClient {
                 .retrieve()
                 .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
     }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.analyticsservice.strategy;
+
+import org.springframework.stereotype.Component;
+
+/**
+ * Strategy implementation for calculating Total Balance.
+ * * WHY WE USE THIS:
+ * The LOAN table has a typo in its column ("BALALANCE").
+ * The DEPOSIT table calls it ("BALANCE").
+ * By using this Strategy, the frontend just asks for "TotalBalance", 
+ * and this code handles the weird database schemas securely without if/else blocks.
+ */
+@Component
+public class SumBalanceStrategy implements MetricStrategy {
 
     /**
-     * Generates dummy data that perfectly mimics how Druid groups and returns JSON.
+     * The internal code mapped in the Oracle DR_VIEW_METRIC table.
      */
-    private List<Map<String, Object>> generateMockDruidResponse(String targetDimension, List<String> metrics) {
-        List<Map<String, Object>> mockData = new ArrayList<>();
-        Random random = new Random();
-
-        // Generate 3 to 6 mock rows
-        int rowCount = random.nextInt(4) + 3;
-
-        // e.g., if targetDimension is "Branch_name", cleanName becomes "Branch"
-        String cleanName = targetDimension.split("_")[0];
-        // Capitalize first letter
-        cleanName = cleanName.substring(0, 1).toUpperCase() + cleanName.substring(1);
-
-        String[] regions = {"North", "South", "East", "West", "Central", "Main"};
-
-        for (int i = 0; i < rowCount; i++) {
-            Map<String, Object> row = new LinkedHashMap<>();
-
-            // Druid always returns the grouped column mapped to whatever AS alias we gave it.
-            // Our query builder aliases the target dimension AS "name"
-            row.put("name", cleanName + " " + regions[i % regions.length] + " " + (i + 1));
-
-            // Generate a random number for each requested metric (e.g., jan, feb, mar)
-            for (String metric : metrics) {
-                // Generate a realistic financial amount between 50,000 and 250,000
-                double randomAmount = 50000 + (200000 * random.nextDouble());
-                // Round to 2 decimal places to mimic actual currency data
-                row.put(metric, Math.round(randomAmount * 100.0) / 100.0);
-            }
-
-            mockData.add(row);
-        }
-
-        // Simulate network delay of 200ms to 600ms so the frontend UI spinners actually show up!
-        try { Thread.sleep(random.nextInt(400) + 200); } catch (InterruptedException ignored) {}
-
-        return mockData;
+    @Override
+    public String getStrategyCode() {
+        return "SUM_BALANCE";
     }
 
+    /**
+     * Safely constructs the SQL expression.
+     * Notice we use the physical DB column we want to sum (e.g., BALALANCE).
+     * The UI will receive it as the clean logical name (e.g., "TotalBalance").
+     */
+    @Override
+    public String buildSqlExpression(String logicalAlias) {
+        // Change "BALALANCE" to whatever the physical column is for the specific view.
+        // If dealing with multiple DBs, you'd create SumLoanBalanceStrategy vs SumDepositBalanceStrategy.
+        return "SUM(\"BALALANCE\") AS \"" + logicalAlias + "\"";
+    }
 }
 
-
-
-
-
-
-
-
-
-package com.fincore.analyticsservice.model;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-
-import java.util.List;
-
-@Entity
-@Table(name = "DR_REPORT_VIEW")
-@Getter
-@Setter
-public class DrReportView {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "DATASOURCE_ID", nullable = false)
-    private DrDatasource datasource;
-
-    @Column(name = "VIEW_CODE", unique = true, nullable = false)
-    private String viewCode;
-
-    @Column(name = "REQUIRED_ROLE")
-    private String requiredRole;
-
-    @Column(name = "IS_ACTIVE")
-    private boolean active;
-
-    @OneToMany(mappedBy = "reportView", fetch = FetchType.LAZY)
-    @OrderBy("drillLevel ASC")
-    private List<DrViewDimension> dimensions;
-
-    @OneToMany(mappedBy = "reportView", fetch = FetchType.LAZY)
-    private List<DrViewMetric> metrics;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-package com.fincore.analyticsservice.model;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-
-@Entity
-@Table(name = "DR_VIEW_METRIC")
-@Getter
-@Setter
-public class DrViewMetric {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "VIEW_ID", nullable = false)
-    private DrReportView reportView;
-
-    @Column(name = "LOGICAL_NAME", nullable = false)
-    private String logicalName;
-
-    @Column(name = "STRATEGY_CODE", nullable = false)
-    private String strategyCode;
-}
-
-
-
-
-
-
-package com.fincore.analyticsservice.model;
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-
-@Entity
-@Getter
-@Setter
-@Table(name = "DR_VIEW_DIMENSION")
-public class DrViewDimension {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "VIEW_ID", nullable = false)
-    private DrReportView reportView;
-
-    @Column(name = "LOGICAL_NAME", nullable = false)
-    private String logicalName;
-
-    @Column(name = "PHYSICAL_COLUMN", nullable = false)
-    private String physicalColumn;
-
-    @Column(name = "DRILL_LEVEL", nullable = false)
-    private Integer drillLevel;
-}
-
-
-
-
-
-
-package com.fincore.analyticsservice.model;
-
-
-import jakarta.persistence.*;
-import lombok.Getter;
-import lombok.Setter;
-
-import java.util.Set;
-
-@Entity
-@Table(name = "DR_REPORT")
-@Getter
-@Setter
-public class DrReport {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @Column(name = "REPORT_CODE", unique = true, nullable = false)
-    private String reportCode;
-
-    @Column(name = "DISPLAY_NAME", nullable = false)
-    private String displayName;
-
-    @Column(name = "IS_ACTIVE")
-    private boolean active;
-
-    // Using Set instead of List to avoid Hibernate's MultipleBagFetchException during JOIN FETCH
-    @OneToMany(mappedBy = "report", fetch = FetchType.LAZY)
-    private Set<DrReportView> views;
-}
-
-
-
-
-roles table :
-roles:
-ROLE_ID	NUMBER(10,0)	No	NULL 	1	 Unique identifier for the role
-ROLE_NAME	VARCHAR2(255 CHAR)	No		2	 Name of the role
-DESCRIPTION	VARCHAR2(255 CHAR)	Yes		3	 Description of the role
-ROLE_STATUS	VARCHAR2(255 CHAR)	No	"'ACTIVE'
-   "	4	Status of the role ( Active/Blocked)
-
-51	UCO	users will be responsible for managing users in fincore system	ACTIVE
-52	PSO 	Will be monitoring the applications day to day activities, start or kill any job activity makerchecker can be added for critical activities	ACTIVE
-53	FRT 	for whole bank	ACTIVE
-54	Branch 	existing branch users rights	ACTIVE
-55	Support 	for providing technical support for the application	ACTIVE
-56	GLIF 	GLIF and IMPL teams of TCS manage their work in fincore application.	ACTIVE
-148	SASANK	Testing	ACTIVE
-58	External users	for providing access to other application through API's etc	ACTIVE
-150	Dummy	Dummy	ACTIVE
-152	JKA	Dummy	ACTIVE
-157	FRT	rtrff	ACTIVE
-192	Testing new role	testing purpose	ACTIVE
-193	RETEST1	RETEST ROLE CREATION BY SHUBHANKAR, Small correction	ACTIVE
-9001	TCSGLIF	TCS Maker and Checker Role	ACTIVE
-9002	SBIGLIF	SBI  Checker Role	ACTIVE
-9003	OTHER	Standard Branch Maker Role	ACTIVE
-130	STA	TESTING FOR DROPDOWN	ACTIVE
-153	OFFICE	Dummy	ACTIVE
-60	Developer	For Developer access to build fincore application	ACTIVE
-11	F1/BOG 	Finance One and BOG User	ACTIVE
-191	Testing	bghbbdzszcb	ACTIVE
-10	ADMIN	Administartor access to fincore application	ACTIVE
-146	Niharika	Testing role	ACTIVE
-
-
-
-Please check the above code files, for different filers, there are mismatches in the code, causing compilation error. 
-* I have added comments where i am getting errors in the comoiler because of mismatch in arguments and model files. Please check vcarefully. 
-* Also i have added the controller file where i have written my application logic to get the role id from the token and there is also a mismatch in the role id. you are passing and expecting list but i am not having a list, i am only having role id with me. From that i can map to the reports to be drill down to which roles. 
-*  check this roles and see if we need to modify our dr_* tables to assig report to the roles based on their role ids not varchar role names, also if one report to be given to multiple roles and also all roles by all keywprd. If empty then to all, explicit case to only admin. 0
-* Also i think we have little over complicated the structure, i only have 3 to 4 type of rerports and also not so many dynamic data siurces will be there. Only 3 to 4 data sources will be there, as the data soources is not fianlised yet thats why i am little confused about the data sources and the data structures which will be there. Like today i got TWO new data source in druid named LOAN AND DEPOSIT.
-  BELOW I WILL ATTCH THE DATA FOR THOSE TWO TABLES FOR YOUR IDEA. sO CAN WE SIMPLIFY THIS DATS SOURCE TO DIRECTLY WRITE TO OUR CODE? OR WHATEVER WE HASVE DONE IS CORRECT? PLEASE CHECK, ALSO THE STAETGY YOU HAVE MADE, I HAVE TO UNDERSTAND THAT AS WELL WHY AND HOW TO USE THOSE AND IS THAT REALLY REQUIRED? AS THE DEVELOPMENT IS ONE TIME ONLY.
-  DATA WILL NOT CHANGE LATER AND STRUCTURES ALSO NOT CHANGE LATER, EVERYTHING IS STATIC ONLY NOW IT IS CHANGING, LATER NO CHANGES NO CALCULATION CHANGES WILL BE THERE, SO PLEASE THINK IN THAT WAY.
-* NO PROPER COMMENTS IS THERE IN THE CODE. WRITE APROPROTAE JUAVA DOC SUPPORTED COMMENTS WHILE WRITING CODE AND ALSO MAKE ME UNDERDTAQND ALL THE PARTS OF THE CODE BASE WHAT WE ARE DOING, HOW WE ARE DOING ASND WHY WE ARE DOING SO THAT LATER I WILL UNDERSTAND EVERYTHING IF ANY ISSUE ARRISE.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-========================================================================================================================================================================
-
-
-
-
-
-
-
-
-LOAN :
---------------------------------------------------------------------------------------------------------------------------------------------------------
-
-SELECT
-  "__time",
-  "TERM_BASIS",
-  "BALALANCE",
-  "CGL_COMP_1_DR",
-  "CGL_COMP_2_CR",
-  "INT_ADJUSTMENT",
-  "INT_CAT",
-  "INT_ACCR",
-  "STATUS",
-  "TRANS_DATE",
-  "OLD_BAD_DEBT_IND",
-  "BRANCH",
-  "CURRENCY",
-  "SEGMENT",
-  "GLCC",
-  "CGL_COMP_2_DR",
-  "LOAN_TERM",
-  "APP_AMT",
-  "CI_ACCR",
-  "COLLECTION_AMT",
-  "CGL_COMP_1_CR",
-  "ARR_INT_ACCR",
-  "ACCT_TYPE",
-  "ADV_VAL",
-  "ARR_INT_ADJUSTMENT",
-  "BPI_ACCR"
-FROM "LOAN"
-WHERE __time >= CURRENT_TIMESTAMP - INTERVAL '1' DAY
-
-SAMPLE DATA : (JSON)
-
-{"__time":"2096-06-14T05:39:39.000Z","TERM_BASIS":"M","BALALANCE":1750486000,"CGL_COMP_1_DR":"1043","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"2204","INT_ACCR":387750000,"STATUS":"08","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"21464","CURRENCY":"INR","SEGMENT":"0706","GLCC":"21464INR1043070601","CGL_COMP_2_DR":"01","LOAN_TERM":419,"APP_AMT":1980000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6400","ADV_VAL":1980000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:39:40.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1043","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"2064","INT_ACCR":0,"STATUS":"10","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"08190","CURRENCY":"INR","SEGMENT":"0706","GLCC":"08190INR1043070601","CGL_COMP_2_DR":"01","LOAN_TERM":336,"APP_AMT":0,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6400","ADV_VAL":0,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:05.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1047","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4239","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"13636","CURRENCY":"INR","SEGMENT":"0706","GLCC":"13636INR1047070604","CGL_COMP_2_DR":"04","LOAN_TERM":60,"APP_AMT":120000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6450","ADV_VAL":120000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:06.000Z","TERM_BASIS":"M","BALALANCE":34324000,"CGL_COMP_1_DR":"1043","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"2606","INT_ACCR":8173000,"STATUS":"08","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"60243","CURRENCY":"INR","SEGMENT":"0706","GLCC":"60243INR1043070601","CGL_COMP_2_DR":"01","LOAN_TERM":384,"APP_AMT":37974000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6400","ADV_VAL":37974000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:08.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1007","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4092","INT_ACCR":0,"STATUS":"01","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"15070","CURRENCY":"INR","SEGMENT":"5001","GLCC":"15070INR1007500101","CGL_COMP_2_DR":"01","LOAN_TERM":12,"APP_AMT":0,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6400","ADV_VAL":0,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:11.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1002","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4161","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"32688","CURRENCY":"INR","SEGMENT":"5007","GLCC":"32688INR1002500701","CGL_COMP_2_DR":"01","LOAN_TERM":12,"APP_AMT":12000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6431","ADV_VAL":12000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:13.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1007","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4011","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"05112","CURRENCY":"INR","SEGMENT":"0706","GLCC":"05112INR1007070601","CGL_COMP_2_DR":"04","LOAN_TERM":37,"APP_AMT":70000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6451","ADV_VAL":70000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:16.000Z","TERM_BASIS":"M","BALALANCE":2001450,"CGL_COMP_1_DR":"1007","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4086","INT_ACCR":20932000,"STATUS":"08","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"07","BRANCH":"20309","CURRENCY":"INR","SEGMENT":"5004","GLCC":"20309INR1007500401","CGL_COMP_2_DR":"01","LOAN_TERM":12,"APP_AMT":10000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6400","ADV_VAL":10000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:17.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1007","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4020","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"02","BRANCH":"00929","CURRENCY":"INR","SEGMENT":"0706","GLCC":"00929INR1002070601","CGL_COMP_2_DR":"04","LOAN_TERM":12,"APP_AMT":156600000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6451","ADV_VAL":156600000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:21.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1047","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"2199","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"03046","CURRENCY":"INR","SEGMENT":"0706","GLCC":"03046INR1047070604","CGL_COMP_2_DR":"04","LOAN_TERM":72,"APP_AMT":425000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6450","ADV_VAL":425000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:22.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1047","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"2199","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"09832","CURRENCY":"INR","SEGMENT":"0706","GLCC":"09832INR1047070604","CGL_COMP_2_DR":"04","LOAN_TERM":48,"APP_AMT":250000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6450","ADV_VAL":250000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-{"__time":"2096-06-14T05:40:23.000Z","TERM_BASIS":"M","BALALANCE":0,"CGL_COMP_1_DR":"1007","CGL_COMP_2_CR":"00","INT_ADJUSTMENT":0,"INT_CAT":"4020","INT_ACCR":0,"STATUS":"40","TRANS_DATE":1778457600000,"OLD_BAD_DEBT_IND":"00","BRANCH":"21633","CURRENCY":"INR","SEGMENT":"0706","GLCC":"21633INR1002070601","CGL_COMP_2_DR":"04","LOAN_TERM":12,"APP_AMT":76000000,"CI_ACCR":0,"COLLECTION_AMT":0,"CGL_COMP_1_CR":"0000","ARR_INT_ACCR":0,"ACCT_TYPE":"6451","ADV_VAL":76000000,"ARR_INT_ADJUSTMENT":0,"BPI_ACCR":0}
-
-
-
-
-DEPOSIT :
---------------------------------------------------------------------------------------------------------------------------------------------------------
-
-SELECT
-  "__time",
-  "CGL_COMP_1_DR",
-  "CGL_COMP_2_CR",
-  "INT_ADJUSTMENT",
-  "INT_CAT",
-  "OD_DR_INT_INCR",
-  "STATUS",
-  "INT_INCR",
-  "TRANS_DATE",
-  "INT_AVAILABLE",
-  "OD_PENALTY_INT_ADJ",
-  "BRANCH",
-  "CURRENCY",
-  "OD_STATUS",
-  "SEGMENT",
-  "GLCC",
-  "CGL_COMP_2_DR",
-  "CGL_COMP_1_CR",
-  "OD_DR_INT_AVAIL",
-  "ACCT_TYPE",
-  "BALANCE",
-  "OD_PENALTY_INT_ACCR",
-  "DR_INT_ADJUSTMENT",
-  "OD_ALLOWED",
-  "OD_INDICATOR"
-FROM "DEPOSIT"
-
-
-SAMPLE DATA : (JSON)
-
-
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00308","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00308INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00866","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00866INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"01975","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"01975INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"03357","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"03357INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"07446","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"07446INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"11660","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"11660INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"11662","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"11662INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"12970","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"12970INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"30014","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"30014INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1011","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"60103","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"60103INR2041070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2041","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2011","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1032","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00308","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00308INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1032","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00308","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00308INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1032","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00308","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00308INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1032","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"03591","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"03591INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1032","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"03957","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"03957INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1051","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"01150","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"01150INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1051","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"02112","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"02112INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1051","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"09588","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"09588INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1051","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"11796","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"11796INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00126","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"00126INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"03232","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"03232INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"03232","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"03232INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"05844","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"05844INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"12761","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"12761INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1061","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"50306","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"50306INR2051070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2051","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2511","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"00259","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0306","GLCC":"00259INR2046030601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"07968","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"07968INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"10366","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"10366INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"10368","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"10368INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"11821","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"11821INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"16768","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"16768INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"40050","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"40050INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"40152","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"40152INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
-{"__time":"2026-05-11T00:00:00.000Z","CGL_COMP_1_DR":"0000","CGL_COMP_2_CR":"01","INT_ADJUSTMENT":0,"INT_CAT":"1081","OD_DR_INT_INCR":0,"STATUS":"07","INT_INCR":0,"TRANS_DATE":1778457600000,"INT_AVAILABLE":0,"OD_PENALTY_INT_ADJ":0,"BRANCH":"40152","CURRENCY":"INR","OD_STATUS":"0000","SEGMENT":"0706","GLCC":"40152INR2046070601","CGL_COMP_2_DR":"00","CGL_COMP_1_CR":"2046","OD_DR_INT_AVAIL":0,"ACCT_TYPE":"2811","BALANCE":0,"OD_PENALTY_INT_ACCR":0,"DR_INT_ADJUSTMENT":0,"OD_ALLOWED":"T","OD_INDICATOR":"N"}
+```
 
