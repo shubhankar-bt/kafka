@@ -1,165 +1,585 @@
 ```java
-package com.fincore.analyticsservice.service;
+package com.fincore.gateway.dto;
 
-import com.fincore.analyticsservice.client.DruidRestClient;
-import com.fincore.analyticsservice.component.DruidQueryBuilder;
-import com.fincore.analyticsservice.dto.DimensionConfig;
-import com.fincore.analyticsservice.dto.DrillDownRequest;
-import com.fincore.analyticsservice.dto.DrillDownResponse;
-import com.fincore.analyticsservice.dto.Meta;
-import com.fincore.analyticsservice.dto.ViewMetadataContext;
-import com.fincore.analyticsservice.strategy.MetricStrategy;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.cache.annotation.Cacheable;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.stereotype.Service;
-import org.springframework.util.CollectionUtils;
-
-import java.util.*;
-import java.util.function.Function;
-import java.util.stream.Collectors;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 /**
- * The Orchestrator of the Semantic Layer.
- * Upgraded to handle Expression-Based dimensions flawlessly.
+ * Payload returned to the frontend when LDAP succeeds and OTP is sent.
+ * Contains NO sensitive data, only masked hints and the transaction ID.
  */
-@Service
-public class SemanticDrillDownService {
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class OtpInitiatedResponseDTO {
+    private String transactionId;
+    private String maskedMobile;
+    private String maskedEmail;
+    private int expiresInSeconds;
+}
 
-    private static final Logger log = LoggerFactory.getLogger(SemanticDrillDownService.class);
+```
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import lombok.Data;
+
+@Data
+public class VerifyOtpRequestDTO {
     
-    private static final Integer ROLE_ADMIN = 10;
+    @NotBlank(message = "Transaction ID is required")
+    private String transactionId;
 
-    private final DruidRestClient druidRestClient;
-    private final DruidQueryBuilder queryBuilder;
-    private final ReportMetadataProvider metadataProvider;
-    private final Map<String, MetricStrategy> strategyRegistry;
+    @NotBlank(message = "OTP is required")
+    @Pattern(regexp = "^\\d{6}$", message = "OTP must be exactly 6 digits")
+    private String otp;
+}
 
-    public SemanticDrillDownService(
-            DruidRestClient druidRestClient,
-            DruidQueryBuilder queryBuilder,
-            ReportMetadataProvider metadataProvider,
-            List<MetricStrategy> strategies) {
-        this.druidRestClient = druidRestClient;
-        this.queryBuilder = queryBuilder;
-        this.metadataProvider = metadataProvider;
-        this.strategyRegistry = strategies.stream()
-                .collect(Collectors.toMap(MetricStrategy::getStrategyCode, Function.identity()));
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class ResendOtpRequestDTO {
+    
+    @NotBlank(message = "Transaction ID is required")
+    private String transactionId;
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.util.function.Tuple2;
+import reactor.util.function.Tuples;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Enterprise-grade, purely non-blocking Redis state engine.
+ * Enforces the 5-key atomic lifecycle for Tier-0 OTP transactions.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OtpSessionService {
+
+    private final ReactiveStringRedisTemplate redis;
+    private final PasswordEncoder passwordEncoder; // Uses Spring Security BCrypt
+    private final ObjectMapper mapper;
+
+    private static final Duration OTP_VALIDITY = Duration.ofMinutes(5);
+    private static final Duration COOLDOWN = Duration.ofSeconds(30);
+    private static final int MAX_RESENDS = 5;
+    private static final int MAX_FAILURES = 5;
+    private static final int MAX_HOURLY_IP_REQUESTS = 50;
+
+    /**
+     * Rate limits OTP requests by IP to prevent API abuse and SMS Toll Fraud.
+     */
+    public Mono<Void> checkIpRateLimit(String clientIp) {
+        String key = "RATE_LIMIT:OTP_REQ:IP:" + clientIp;
+        return redis.opsForValue().increment(key)
+                .flatMap(count -> {
+                    if (count == 1) {
+                        return redis.expire(key, Duration.ofHours(1)).then();
+                    } else if (count > MAX_HOURLY_IP_REQUESTS) {
+                        log.error("SECURITY ALERT: IP {} exceeded hourly OTP limit.", clientIp);
+                        return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later."));
+                    }
+                    return Mono.empty();
+                });
     }
 
-    @Cacheable(value = "drillDownData", key = "T(java.lang.String).valueOf(#request.hashCode())")
-    public DrillDownResponse executeDrillDown(DrillDownRequest request, Integer roleId) {
-        long startTime = System.currentTimeMillis();
-        String logicalTargetDim = request.dimensions().get(0);
+    /**
+     * Initializes or Updates the OTP state in Redis securely.
+     */
+    public Mono<Void> saveOtpState(String txId, String userId, String plainOtp, boolean isResend) {
+        String hash = passwordEncoder.encode(plainOtp);
+        
+        try {
+            String payload = mapper.writeValueAsString(Map.of("userId", userId, "otpHash", hash));
+            List<Mono<?>> operations = new ArrayList<>();
+            
+            // 1. Core Transaction (Overwrites old OTP if resend)
+            operations.add(redis.opsForValue().set("OTP_TX:" + txId, payload, OTP_VALIDITY));
+            // 2. Always reset failures on a fresh OTP dispatch
+            operations.add(redis.opsForValue().set("OTP_FAILURES:" + txId, "0", OTP_VALIDITY));
+            
+            if (!isResend) {
+                // First generation: Initialize resend counter
+                operations.add(redis.opsForValue().set("OTP_RESENDS:" + txId, "0", OTP_VALIDITY));
+            } else {
+                // Resend: Extend the TTL of the resend counter so it survives the 5 min window refresh
+                operations.add(redis.expire("OTP_RESENDS:" + txId, OTP_VALIDITY));
+            }
 
-        log.info("Executing DrillDown for view: [{}], logicalDim: [{}]", request.viewCode(), logicalTargetDim);
-
-        // 1. Fetch Metadata context
-        ViewMetadataContext context = metadataProvider.getViewContext(request.viewCode());
-
-        // 2. Perform RBAC validation
-        validateAccess(context.requiredRoleIds(), roleId);
-
-        // 3. Translate Logical to DimensionConfig (FIXED: Now handles DimensionConfig instead of raw Strings)
-        DimensionConfig targetDimConfig = translateDimension(logicalTargetDim, context.dimensionMap());
-        Map<String, MetricStrategy> resolvedMetrics = resolveMetrics(request.metrics(), context.metricMap());
-
-        // 4. Build the SQL Query string securely (FIXED: Passing the targetDimConfig object)
-        Map<String, Object> druidPayload = queryBuilder.buildSqlPayload(
-                context.physicalDruidTable(),
-                logicalTargetDim,
-                targetDimConfig, // Pass the new config object containing the physical column AND the isExpression flag
-                request.metrics(),
-                resolvedMetrics,
-                request.filters(),
-                context.dimensionMap() // The QueryBuilder correctly expects Map<String, DimensionConfig> now
-        );
-
-        // 5. Execute against Druid
-        List<Map<String, Object>> rawDruidData = druidRestClient.executeQuery(druidPayload);
-
-        if (CollectionUtils.isEmpty(rawDruidData)) {
-            return new DrillDownResponse(new Meta("SUCCESS", logicalTargetDim, 0, System.currentTimeMillis() - startTime), Collections.emptyList());
-        }
-
-        // 6. Determine UI Hierarchy State
-        boolean hasChildren = determineIfHasChildren(logicalTargetDim, context.logicalHierarchyOrdered());
-
-        // 7. Format Final UI Response
-        List<Map<String, Object>> formattedData = formatResponseData(rawDruidData, logicalTargetDim, hasChildren);
-
-        long executionTime = System.currentTimeMillis() - startTime;
-        return new DrillDownResponse(new Meta("SUCCESS", logicalTargetDim, formattedData.size(), executionTime), formattedData);
-    }
-
-    private void validateAccess(String requiredRoleIds, Integer roleId) {
-        if (ROLE_ADMIN.equals(roleId)) {
-            return;
-        }
-        if (requiredRoleIds == null || requiredRoleIds.trim().isEmpty()) {
-            return;
-        }
-
-        List<String> allowedRoles = Arrays.asList(requiredRoleIds.split(","));
-        if (!allowedRoles.contains(String.valueOf(roleId))) {
-            throw new AccessDeniedException("Insufficient permissions to execute drill-down for this view.");
+            return Mono.when(operations)
+                    .doOnSuccess(v -> log.info("Saved OTP State txId={} for user={} isResend={}", txId, userId, isResend));
+                    
+        } catch (JsonProcessingException e) {
+            return Mono.error(new RuntimeException("Failed to serialize OTP payload", e));
         }
     }
 
     /**
-     * FIXED: Method signature updated to expect and return DimensionConfig.
+     * Safely executes an OTP Resend, enforcing cooldowns and max limits atomicaly.
+     * Returns the newly generated plaintext OTP and the associated userId.
      */
-    private DimensionConfig translateDimension(String logicalName, Map<String, DimensionConfig> dimMap) {
-        DimensionConfig config = dimMap.get(logicalName);
-        if (config == null) {
-            throw new IllegalArgumentException("Logical dimension '" + logicalName + "' is not supported in this view.");
-        }
-        return config;
+    public Mono<Tuple2<String, String>> processResend(String txId, String newPlainOtp) {
+        String cooldownKey = "OTP_COOLDOWN:" + txId;
+        String resendKey = "OTP_RESENDS:" + txId;
+
+        // 1. Atomic Cooldown Lock (SETNX equivalent)
+        return redis.opsForValue().setIfAbsent(cooldownKey, "locked", COOLDOWN)
+                .flatMap(acquired -> {
+                    if (!Boolean.TRUE.equals(acquired)) {
+                        return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Please wait 30 seconds before requesting another OTP."));
+                    }
+
+                    // 2. Atomic Increment Resends
+                    return redis.opsForValue().increment(resendKey)
+                            .flatMap(resendCount -> {
+                                if (resendCount > MAX_RESENDS) {
+                                    return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Maximum OTP resend limit exceeded."));
+                                }
+
+                                // 3. Fetch userId, update TX, and return Tuple
+                                return getUserIdFromTx(txId)
+                                        .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Transaction expired.")))
+                                        .flatMap(userId -> saveOtpState(txId, userId, newPlainOtp, true)
+                                                .thenReturn(Tuples.of(newPlainOtp, userId)));
+                            });
+                });
     }
 
-    private Map<String, MetricStrategy> resolveMetrics(List<String> logicalMetrics, Map<String, String> metricMap) {
-        Map<String, MetricStrategy> resolved = new HashMap<>();
-        for (String logicalName : logicalMetrics) {
-            String strategyCode = metricMap.get(logicalName);
-            if (strategyCode == null || !strategyRegistry.containsKey(strategyCode)) {
-                throw new IllegalArgumentException("Logical metric '" + logicalName + "' is not supported in this view.");
-            }
-            resolved.put(logicalName, strategyRegistry.get(strategyCode));
-        }
-        return resolved;
+    /**
+     * Verifies the OTP. Employs constant-time cryptographic matching (BCrypt).
+     * Automatically handles max failures and session locks.
+     */
+    public Mono<String> verifyOtp(String txId, String inputOtp) {
+        String txKey = "OTP_TX:" + txId;
+        String failKey = "OTP_FAILURES:" + txId;
+
+        return redis.opsForValue().get(txKey)
+                .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "OTP Session Expired or Invalid Transaction.")))
+                .flatMap(payload -> {
+                    try {
+                        Map<String, String> data = mapper.readValue(payload, Map.class);
+                        String userId = data.get("userId");
+                        String storedHash = data.get("otpHash");
+
+                        if (passwordEncoder.matches(inputOtp, storedHash)) {
+                            // SUCCESS: Terminate transaction to prevent replay attacks
+                            return redis.delete(txKey).thenReturn(userId);
+                        } else {
+                            // FAILURE: Atomic increment
+                            return redis.opsForValue().increment(failKey)
+                                    .flatMap(failCount -> {
+                                        if (failCount >= MAX_FAILURES) {
+                                            // Enforce Session Lockout (Do NOT lock LDAP account)
+                                            return redis.delete(txKey)
+                                                    .then(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Maximum wrong attempts exceeded. Session locked.")));
+                                        }
+                                        return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid OTP. Attempts remaining: " + (MAX_FAILURES - failCount)));
+                                    });
+                        }
+                    } catch (Exception e) {
+                        return Mono.error(new RuntimeException("Redis payload parsing exception", e));
+                    }
+                });
     }
 
-    private boolean determineIfHasChildren(String currentDim, List<String> hierarchy) {
-        int index = hierarchy.indexOf(currentDim);
-        return index != -1 && index < hierarchy.size() - 1;
-    }
-
-    private List<Map<String, Object>> formatResponseData(List<Map<String, Object>> rawData, String logicalDim, boolean hasChildren) {
-        String idPrefix = logicalDim.toLowerCase() + "_";
-        List<Map<String, Object>> result = new ArrayList<>(rawData.size());
-
-        for (Map<String, Object> row : rawData) {
-            Map<String, Object> formattedRow = new LinkedHashMap<>();
-
-            // Safe extraction because the QueryBuilder AS aliased the complex expression back to the simple logicalDim string
-            Object nameObj = row.get(logicalDim);
-            String nameValue = (nameObj != null && !nameObj.toString().isBlank()) ? nameObj.toString() : "Unassigned";
-
-            formattedRow.put("id", idPrefix + nameValue.toLowerCase().replaceAll("[^a-z0-9]", "_"));
-            formattedRow.put("name", nameValue); 
-
-            for (Map.Entry<String, Object> entry : row.entrySet()) {
-                if (!entry.getKey().equals(logicalDim)) {
-                    formattedRow.put(entry.getKey(), entry.getValue() == null ? 0.0 : entry.getValue());
-                }
-            }
-            formattedRow.put("hasChildren", hasChildren);
-            result.add(formattedRow);
-        }
-        return result;
+    private Mono<String> getUserIdFromTx(String txId) {
+        return redis.opsForValue().get("OTP_TX:" + txId)
+                .map(payload -> {
+                    try {
+                        return mapper.readValue(payload, Map.class).get("userId").toString();
+                    } catch (Exception e) { throw new RuntimeException(e); }
+                });
     }
 }
 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fincore.commonutilities.util.AesEncryptionUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Mono;
+
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Publishes encrypted PII payloads to Kafka, ensuring zero-trust
+ * data security across the event brokers.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OtpKafkaProducer {
+
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper mapper;
+    private final AesEncryptionUtil aesUtil;
+
+    @Value("${security.internal.kafka-aes-key}")
+    private String internalAesKey;
+
+    @Value("${spring.profiles.active:dev}")
+    private String currentEnvironment;
+
+    public Mono<Void> publishOtpEvent(String txId, String mobile, String email, String plainOtp, String userName) {
+        
+        return Mono.fromCallable(() -> {
+            // 1. Build Flexible Payload for Communication Service
+            Map<String, Object> payload = Map.of(
+                "eventId", UUID.randomUUID().toString(),
+                "eventType", "LOGIN_OTP",
+                "txId", txId,
+                "environment", currentEnvironment.toUpperCase(),
+                "channels", new String[]{"SMS", "EMAIL"},
+                "templateId", "AUTH_LOGIN_OTP_V1",
+                "recipients", Map.of(
+                        "mobile", mobile != null ? mobile : "", 
+                        "email", email != null ? email : ""
+                ),
+                "templateData", Map.of(
+                        "otpPlaintext", plainOtp, 
+                        "expiryMins", "5", 
+                        "userName", userName != null ? userName : "User"
+                ),
+                "timestamp", java.time.Instant.now().toString()
+            );
+
+            String jsonString = mapper.writeValueAsString(payload);
+
+            // 2. Encrypt Payload before it hits the broker
+            return aesUtil.encrypt(jsonString, internalAesKey);
+            
+        }).flatMap(encryptedString -> {
+            // 3. Convert CompletableFuture to Mono for non-blocking IO
+            return Mono.fromFuture(
+                kafkaTemplate.send("fincore.auth.otp.priority", txId, encryptedString)
+            );
+        }).doOnSuccess(result -> log.info("Encrypted OTP event published to Kafka for txId={}", txId))
+          .doOnError(e -> log.error("CRITICAL: Kafka publish failed for txId={}", txId, e))
+          .then();
+    }
+}
 
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Service;
+
+import com.fincore.commonutilities.util.AesEncryptionUtil;
+import com.fincore.gateway.JwtUtil.HmacJwtUtil;
+import com.fincore.gateway.dto.*;
+// Assumed standard imports...
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Mono;
+
+import java.security.SecureRandom;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * Orchestrates the Pre-Auth Transaction Phase and the Final Auth Phase.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class LoginServiceImpl implements LoginService {
+
+    // (Assumed Existing Dependencies injected here...)
+    // private final UserRepository userRepository;
+    // private final AdAuthenticationService adAuthService;
+    // private final HmacJwtUtil jwtUtil;
+    // private final TokenSessionValidator sessionValidator;
+    // private final AesEncryptionUtil aesUtil;
+    
+    private final OtpSessionService otpSessionService;
+    private final OtpKafkaProducer otpKafkaProducer;
+
+    // --- PHASE 1: LOGIN REQUEST (LDAP Check -> Generate OTP) ---
+    @Override
+    public Mono<ResponseEntity<ResponseVO<?>>> login(LoginDto loginDto, ServerHttpRequest request, ServerHttpResponse response) {
+        String clientIp = getClientIp(request);
+        
+        // 1. Pre-Auth Rate Limiting (Prevents LDAP DOS & SMS Fraud)
+        return otpSessionService.checkIpRateLimit(clientIp)
+            // 2. Standard flow: Fetch User -> Check Locks -> AD/DB Auth
+            // .then(userRepository.findByUserId(loginDto.getUserId()))
+            // .flatMap(user -> authenticateUser(user, loginDto.getPassword()))
+            .flatMap(user -> { 
+                // Once credentials are confirmed valid, handoff to OTP Phase
+                return initiateOtpPhase(user);
+            });
+    }
+
+    private Mono<ResponseEntity<ResponseVO<?>>> initiateOtpPhase(User user) {
+        String txId = UUID.randomUUID().toString();
+        String plainOtp = generateSecureOtp();
+        
+        return otpSessionService.saveOtpState(txId, user.getUserId(), plainOtp, false)
+            .then(otpKafkaProducer.publishOtpEvent(txId, user.getMobile(), user.getEmail(), plainOtp, user.getFirstName()))
+            .map(v -> {
+                OtpInitiatedResponseDTO dto = OtpInitiatedResponseDTO.builder()
+                    .transactionId(txId)
+                    .maskedEmail(maskEmail(user.getEmail()))
+                    .maskedMobile(maskMobile(user.getMobile()))
+                    .expiresInSeconds(300)
+                    .build();
+                    
+                return ResponseEntity.status(HttpStatus.ACCEPTED).body(
+                    ResponseVO.<OtpInitiatedResponseDTO>builder()
+                        .statusCode(HttpStatus.ACCEPTED)
+                        .message("Credentials verified. OTP sent to registered contacts.")
+                        .result(dto)
+                        .build()
+                );
+            });
+    }
+
+    // --- PHASE 2: VERIFY OTP (OTP Check -> Issue JWT) ---
+    public Mono<ResponseEntity<ResponseVO<?>>> verifyOtp(VerifyOtpRequestDTO requestDto, ServerHttpResponse response) {
+        return otpSessionService.verifyOtp(requestDto.getTransactionId(), requestDto.getOtp())
+            // .flatMap(userId -> userRepository.findByUserId(userId))
+            .flatMap(user -> finalizeLogin(user, response)); 
+    }
+
+    // --- PHASE 3: RESEND OTP ---
+    public Mono<ResponseEntity<ResponseVO<?>>> resendOtp(ResendOtpRequestDTO requestDto, ServerHttpRequest request) {
+        String clientIp = getClientIp(request);
+        String txId = requestDto.getTransactionId();
+        
+        return otpSessionService.checkIpRateLimit(clientIp)
+            .then(otpSessionService.processResend(txId, generateSecureOtp()))
+            .flatMap(tuple -> {
+                String plainOtp = tuple.getT1();
+                String userId = tuple.getT2();
+                
+                // Fetch User to resend to Kafka
+                // return userRepository.findByUserId(userId)
+                //    .flatMap(user -> otpKafkaProducer.publishOtpEvent(txId, user.getMobile(), user.getEmail(), plainOtp, user.getFirstName()))
+                return Mono.empty(); // (Mocked for compilation, replace with DB fetch above)
+            })
+            .thenReturn(ResponseEntity.accepted().body(
+                ResponseVO.builder()
+                    .statusCode(HttpStatus.ACCEPTED)
+                    .message("A new OTP has been dispatched.")
+                    .build()
+            ));
+    }
+
+    /**
+     * Original logic extracted to finalization step.
+     */
+    private Mono<ResponseEntity<ResponseVO<?>>> finalizeLogin(User user, ServerHttpResponse response) {
+        // ... Fetch role data
+        // ... Generate JWT & Refresh Tokens
+        // ... Call TokenSessionValidator to set Redis Session
+        // ... Generate Session AES Key
+        // Return 200 OK with LoginResponseDTO
+        return Mono.empty(); 
+    }
+
+    // --- UTILITIES ---
+    private String generateSecureOtp() {
+        SecureRandom random = new SecureRandom();
+        int otp = 100000 + random.nextInt(900000); 
+        return String.valueOf(otp);
+    }
+
+    private String getClientIp(ServerHttpRequest request) {
+        String ip = request.getHeaders().getFirst("X-Forwarded-For");
+        if (ip == null || ip.isEmpty()) {
+            ip = request.getRemoteAddress() != null ? request.getRemoteAddress().getAddress().getHostAddress() : "UNKNOWN";
+        }
+        return ip;
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) return email;
+        String[] parts = email.split("@");
+        return (parts[0].length() <= 2 ? "**" : parts[0].charAt(0) + "***" + parts[0].charAt(parts[0].length() - 1)) + "@" + parts[1];
+    }
+
+    private String maskMobile(String mobile) {
+        if (mobile == null || mobile.length() < 4) return mobile;
+        return "******" + mobile.substring(mobile.length() - 4);
+    }
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+package com.fincore.gateway.Controller;
+
+import com.fincore.gateway.Service.LoginService;
+import com.fincore.gateway.dto.*;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Mono;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final LoginService loginService;
+
+    @PostMapping("/login")
+    public Mono<ResponseEntity<ResponseVO<?>>> login(@Valid @RequestBody LoginDto loginDto, 
+                                                     ServerHttpRequest request, 
+                                                     ServerHttpResponse response) {
+        log.info("Login Request Initiated for User: {}", loginDto.getUserId());
+        return loginService.login(loginDto, request, response);
+    }
+
+    @PostMapping("/verify-otp")
+    public Mono<ResponseEntity<ResponseVO<?>>> verifyOtp(@Valid @RequestBody VerifyOtpRequestDTO requestDto, 
+                                                         ServerHttpResponse response) {
+        log.info("OTP Verification Initiated for TxId: {}", requestDto.getTransactionId());
+        return loginService.verifyOtp(requestDto, response);
+    }
+
+    @PostMapping("/resend-otp")
+    public Mono<ResponseEntity<ResponseVO<?>>> resendOtp(@Valid @RequestBody ResendOtpRequestDTO requestDto, 
+                                                         ServerHttpRequest request) {
+        log.info("OTP Resend Initiated for TxId: {}", requestDto.getTransactionId());
+        return loginService.resendOtp(requestDto, request);
+    }
+    
+    // (Existing refresh, logout endpoints remain unchanged)
+}
+
+```
+
+
+
+
+
