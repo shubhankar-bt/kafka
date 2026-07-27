@@ -3515,7 +3515,7 @@ public interface LoginService {
 
 package com.fincore.gateway.Service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper; // Jackson 3 ObjectMapper
 import com.fincore.gateway.Config.KeyUtils;
 import com.fincore.gateway.JwtUtil.HmacJwtUtil;
 import com.fincore.gateway.dto.*;
@@ -3529,17 +3529,24 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.orm.jpa.JpaSystemException;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
+import java.security.SecureRandom;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Service implementation handling user login/verification, menu resolution, and password updates.
@@ -3567,7 +3574,7 @@ public class LoginServiceImpl implements LoginService {
     /**
      * Prefer injecting a singleton bean; retained local instance for compatibility.
      */
-    private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
+    private final PasswordEncoder passwordEncoder;
 
     // ======= Config =======
     private final UserRepository userRepository;
@@ -3579,9 +3586,12 @@ public class LoginServiceImpl implements LoginService {
     private final MenuService menuService;
     private final ObjectMapper mapper;
     private final BranchRepository branchRepository;
-
-    // LDAP Service
+    private final Scheduler ldapScheduler;
     private final AdAuthenticationService adAuthenticationService;
+
+    // ========== OTP ==========
+    private final OtpSessionService otpSessionService;
+    private final OtpKafkaProducer otpKafkaProducer;
 
     @Value("${security.payload.rsa-private:}")
     private String rsaPrivatePem;
@@ -3598,7 +3608,144 @@ public class LoginServiceImpl implements LoginService {
     @Value("${security.jwt.ttl-seconds:900}")
     private long ttlSeconds;
 
-    // ======= Public API =======
+    // =========================================================================================
+    // NEW OTP LIFECYCLE METHODS
+    // =========================================================================================
+
+    @Override
+    public Mono<OtpInitiatedResponseDTO> initiateOtpPhase(UserDto userDto) {
+        UserTokenDataDto tokenData = userDto.getUser();
+
+        String mobile = (tokenData != null && tokenData.getPhoneNumber() != null) ? tokenData.getPhoneNumber().trim() : "";
+        String email = (tokenData != null && tokenData.getEmail() != null) ? tokenData.getEmail().trim() : "";
+
+        // 1. THE FAIL-FAST BARRIER
+        boolean hasMobile = !mobile.isEmpty();
+        boolean hasEmail = email.contains("@");
+
+        if (!hasMobile && !hasEmail) {
+            log.error("Login halted for user {}: No registered mobile or email found.", userDto.getUserId());
+            return Mono.error(new ResponseStatusException(
+                    HttpStatus.FORBIDDEN,
+                    "No registered mobile number or email address found. Please contact fincore support to update your profile."
+            ));
+        }
+
+        // 2. DYNAMIC CHANNEL ROUTER
+        List<String> activeChannels = new java.util.ArrayList<>();
+        if (hasMobile) activeChannels.add("SMS");
+        if (hasEmail) activeChannels.add("EMAIL");
+
+        String txId = UUID.randomUUID().toString();
+        String plainOtp = generateSecureOtp();
+        String fName = tokenData.getFirstName() != null ? tokenData.getFirstName() : "User";
+
+        // 3. THE SAGA PIPELINE (Redis -> Kafka -> Success OR Rollback)
+        return otpSessionService.saveOtpState(txId, userDto.getUserId(), plainOtp, false)
+                .then(otpKafkaProducer.publishOtpEvent(txId, mobile, email, plainOtp, fName, activeChannels))
+                .thenReturn(OtpInitiatedResponseDTO.builder()
+                        .transactionId(txId)
+                        .maskedMobile(hasMobile ? maskMobile(mobile) : "Not Registered")
+                        .maskedEmail(hasEmail ? maskEmail(email) : "Not Registered")
+                        .expiresInSeconds(300)
+                        .resendCooldownSeconds(30)
+                        .resendsRemaining(5)
+                        .build())
+                .onErrorResume(error -> {
+                    // 4. COMPENSATING TRANSACTION (KAFKA DOWN)
+                    log.error("Infrastructure failure during OTP dispatch for txId={}. Rolling back Redis state.", txId, error);
+
+                    // If Kafka fails, we must delete the Redis keys so the user isn't stuck
+                    return otpSessionService.rollbackOtpState(txId)
+                            .then(Mono.error(new ResponseStatusException(
+                                    HttpStatus.INTERNAL_SERVER_ERROR,
+                                    "Unable to dispatch OTP due to system latency. Please try again."
+                            )));
+                });
+    }
+
+    @Override
+    public Mono<UserDto> verifyOtpAndGetUser(VerifyOtpRequestDTO requestDto) {
+        return otpSessionService.verifyOtp(requestDto.getTransactionId(), requestDto.getOtp())
+                .flatMap(userId -> Mono.fromCallable(() -> {
+                    // Re-fetch user profile to rebuild the DTO for JWT Issuance
+                    UserDto userDto = getUserProfile(userId);
+                    if (userDto == null) {
+                        throw new IllegalStateException("User missing post OTP verification");
+                    }
+                    userDto.setValidCredentials(true); // Signal to AuthController to issue tokens
+                    return userDto;
+                }).subscribeOn(Schedulers.boundedElastic()));
+    }
+
+    @Override
+    public Mono<OtpResendResponseDTO> resendOtp(ResendOtpRequestDTO requestDto, String clientIp) {
+        String txId = requestDto.getTransactionId();
+
+        return otpSessionService.checkIpRateLimit(clientIp)
+                // 1. Process Resend atomically in Redis
+                .then(otpSessionService.processResend(txId, generateSecureOtp()))
+                .flatMap(tuple -> {
+
+                    String plainOtp = tuple.getT1();
+                    String userId = tuple.getT2();
+                    Long currentResendCount = tuple.getT3();
+
+                    int remaining = 5 - currentResendCount.intValue(); // Max(5) - Current
+
+                    // 2. Fetch User Profile for contact info
+                    return Mono.fromCallable(() -> getUserProfile(userId))
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .flatMap(userDto -> {
+
+                                UserTokenDataDto tokenData = userDto.getUser();
+                                String mobile = (tokenData != null && tokenData.getPhoneNumber() != null) ?
+                                        tokenData.getPhoneNumber().trim() : "";
+                                String email = (tokenData != null && tokenData.getEmail() != null) ?
+                                        tokenData.getEmail().trim() : "";
+
+                                // 3. THE FAIL-FAST BARRIER
+                                boolean hasMobile = !mobile.isEmpty();
+                                boolean hasEmail = email.contains("@");
+
+                                if (!hasMobile && !hasEmail) {
+                                    log.error("OTP Resend halted for user {}: No registered mobile or email found.", userId);
+                                    return Mono.error(new ResponseStatusException(
+                                            HttpStatus.FORBIDDEN,
+                                            "No registered mobile number or email address found. Please contact fincore support."
+                                    ));
+                                }
+
+                                // 4. DYNAMIC CHANNEL ROUTER
+                                List<String> activeChannels = new java.util.ArrayList<>();
+                                if (hasMobile) activeChannels.add("SMS");
+                                if (hasEmail) activeChannels.add("EMAIL");
+
+                                String fName = tokenData.getFirstName() != null ? tokenData.getFirstName() : "User";
+
+                                // 5. THE SAGA PIPELINE (Kafka Publish -> Rollback on Failure)
+                                return otpKafkaProducer.publishOtpEvent(txId, mobile, email, plainOtp, fName, activeChannels)
+                                        .thenReturn(OtpResendResponseDTO.builder()
+                                                .resendCooldownSeconds(30)
+                                                .resendsRemaining(remaining) // <--- Return exact math
+                                                .build())
+                                        .onErrorResume(error -> {
+                                            log.error("Infrastructure failure during OTP resend for txId={}. Rolling back Redis state.", txId, error);
+                                            // Rollback: Delete the transaction.
+                                            return otpSessionService.rollbackOtpState(txId)
+                                                    .then(Mono.error(new ResponseStatusException(
+                                                            HttpStatus.INTERNAL_SERVER_ERROR,
+                                                            "Unable to dispatch OTP due to system latency. Please try again."
+                                                    )));
+                                        });
+                            });
+                });
+    }
+
+
+    // =========================================================================================
+    // AUTH METHODS
+    // =========================================================================================
 
     /**
      * Fetches role-wise permissions for the given user and transforms them into a menu response.
@@ -3636,7 +3783,7 @@ public class LoginServiceImpl implements LoginService {
     @Override
     public UserDto verifyUserCredentials(UserDto userCredentials, String clientIp) {
 
-        final String userId = userCredentials.getUserId();
+        final String userId = userCredentials.getUserId().toLowerCase();
         final String encryptedPassword = userCredentials.getPassword(); // This is now RSA Encrypted
 
         UserDto result = new UserDto();
@@ -3692,9 +3839,12 @@ public class LoginServiceImpl implements LoginService {
                 // --- MODE: LDAP ---
                 log.info("Processing LDAP Login for user: {}", userId);
                 try {
-                    boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
-                    if (ldapSuccess) {
-                        // Success: Generate Token
+//                    boolean ldapSuccess = adAuthenticationService.authenticate(userId, rawPassword);
+                    // Execute the blocking LDAP call on the isolated thread pool
+                    Boolean ldapSuccess = Mono.fromCallable(() -> adAuthenticationService.authenticate(userId, rawPassword))
+                            .subscribeOn(ldapScheduler) // <-- Use the dedicated pool
+                            .block(); // Block is acceptable here as we are already inside a thread dedicated to the login transaction
+                    if (ldapSuccess != null && ldapSuccess) {
                         handleSuccess(attempt, result, user, userRole);
                     } else {
                         // Failure: Wrong Password -> Count it against limits
@@ -3735,7 +3885,6 @@ public class LoginServiceImpl implements LoginService {
         return result;
     }
 
-
     /**
      * Password-based authentication flow that enforces wrong password limits and updates counters/flags.
      * 1. Increments count on failure.
@@ -3758,7 +3907,7 @@ public class LoginServiceImpl implements LoginService {
             return;
         }
 
-        if (encoder.matches(password, user.getPasswordHash())) {
+        if (passwordEncoder.matches(password, user.getPasswordHash())) {
             UserRoles userRole = userRepository.getUserRole(user.getUserId());
             handleSuccess(loginAttempt, userInfo, user, userRole);
         } else {
@@ -3872,7 +4021,7 @@ public class LoginServiceImpl implements LoginService {
                 return userCredentials;
             }
 
-            String passwordHash = encoder.encode(rawPassword);
+            String passwordHash = passwordEncoder.encode(rawPassword);
             user.setPasswordHash(passwordHash);
             user.setTempPasswordSetAt(Timestamp.valueOf(LocalDateTime.now()));
             userRepository.save(user);
@@ -3895,7 +4044,9 @@ public class LoginServiceImpl implements LoginService {
     }
 
 
-    // ===================================== Helpers ===================================
+    // =========================================================================================
+    // HELPERS
+    // =========================================================================================
 
     /**
      * Initializes the token-visible user data embedded/returned alongside the JWT.
@@ -4044,8 +4195,25 @@ public class LoginServiceImpl implements LoginService {
         userRepository.save(user);
     }
 
-}
 
+    // --- OTP Format Utilities ---
+    private String generateSecureOtp() {
+        SecureRandom random = new SecureRandom();
+        int otp = 100000 + random.nextInt(900000);
+        return String.valueOf(otp);
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) return email;
+        String[] parts = email.split("@");
+        return (parts[0].length() <= 2 ? "**" : parts[0].charAt(0) + "***" + parts[0].charAt(parts[0].length() - 1)) + "@" + parts[1];
+    }
+
+    private String maskMobile(String mobile) {
+        if (mobile == null || mobile.length() < 4) return mobile;
+        return "******" + mobile.substring(mobile.length() - 4);
+    }
+}
 
 
 
@@ -4703,6 +4871,291 @@ public class OtpKafkaProducer {
                 .then();
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+package com.fincore.gateway.Service;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Mono;
+import reactor.util.function.Tuple2;
+import reactor.util.function.Tuples;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * ============================================================================
+ * OTP LIFECYCLE & REDIS STATE ENGINE PLAN
+ * ============================================================================
+ * OTP Validity               : 5 min
+ * Max Wrong Attempts         : 5
+ * Resend Cooldown            : 30 sec
+ * Max Resend Count           : 5
+ * Lock Type                  : OTP Session Lock (NOT AD/LDAP Account Lock)
+ * OTP Regeneration           : New OTP every resend
+ * Previous OTP Valid         : No (Overwritten in Redis)
+ * Rate Limit Scope           : IP Address (To prevent SMS Toll Fraud)
+ * <p>
+ * REDIS KEYS PER TRANSACTION (txId):
+ * 1. OTP_TX:{txId}       -> { "userId": "...", "otpHash": "..." } (TTL: 5m)
+ * 2. OTP_FAILURES:{txId} -> Integer count (TTL: 5m)
+ * 3. OTP_RESENDS:{txId}  -> Integer count (TTL: 5m)
+ * 4. OTP_COOLDOWN:{txId} -> "locked" (TTL: 30s)
+ * 5. RATE_LIMIT:OTP_REQ:IP:{ip} -> Integer count (TTL: 1h)
+ * ============================================================================
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OtpSessionService {
+
+    private static final Duration OTP_VALIDITY = Duration.ofMinutes(5);
+    private static final Duration COOLDOWN = Duration.ofSeconds(30);
+    private static final int MAX_RESENDS = 5;
+    private static final int MAX_FAILURES = 5;
+    private static final int MAX_HOURLY_IP_REQUESTS = 50;
+    private final ReactiveStringRedisTemplate redis;
+    private final PasswordEncoder passwordEncoder;
+    private final ObjectMapper mapper;
+
+    /**
+     * Rate limits OTP requests by IP to prevent API abuse and SMS Toll Fraud.
+     */
+    public Mono<Void> checkIpRateLimit(String clientIp) {
+        String key = "RATE_LIMIT:OTP_REQ:IP:" + clientIp;
+        return redis.opsForValue().increment(key)
+                .flatMap(count -> {
+                    if (count == 1) {
+                        return redis.expire(key, Duration.ofHours(1)).then();
+                    } else if (count > MAX_HOURLY_IP_REQUESTS) {
+                        log.warn("SECURITY ALERT: IP {} exceeded hourly OTP limit.", clientIp);
+                        return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later."));
+                    }
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * Initializes or Updates the OTP state in Redis atomically.
+     */
+    public Mono<Void> saveOtpState(String txId, String userId, String plainOtp, boolean isResend) {
+        String hash = passwordEncoder.encode(plainOtp);
+
+        try {
+            String payload = mapper.writeValueAsString(Map.of("userId", userId, "otpHash", hash));
+            List<Mono<?>> operations = new ArrayList<>();
+
+            // 1. Core Transaction (Overwrites old OTP if resend)
+            operations.add(redis.opsForValue().set("OTP_TX:" + txId, payload, OTP_VALIDITY));
+            // 2. Always reset failures on a fresh OTP dispatch
+            operations.add(redis.opsForValue().set("OTP_FAILURES:" + txId, "0", OTP_VALIDITY));
+
+            if (!isResend) {
+                // First generation: Initialize resend counter
+                operations.add(redis.opsForValue().set("OTP_RESENDS:" + txId, "0", OTP_VALIDITY));
+                // Lock the cooldown on the very first OTP dispatch
+                operations.add(redis.opsForValue().set("OTP_COOLDOWN:" + txId, "locked", COOLDOWN));
+            } else {
+                // Resend: Extend the TTL of the resend counter so it survives the 5 min window refresh
+                operations.add(redis.expire("OTP_RESENDS:" + txId, OTP_VALIDITY));
+            }
+
+            return Mono.when(operations)
+                    .doOnSuccess(v -> log.info("Saved OTP State txId={} for user={} isResend={}", txId, userId, isResend));
+
+        } catch (JacksonException e) {
+            return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to process internal OTP payload"));
+        }
+    }
+
+    /**
+     * Safely executes an OTP Resend, enforcing cooldowns and max limits.
+     * Returns Tuple of (NewPlainOtp, UserId).
+     */
+    public Mono<reactor.util.function.Tuple3<String, String, Long>> processResend(String txId, String newPlainOtp) {
+        String cooldownKey = "OTP_COOLDOWN:" + txId;
+        String resendKey = "OTP_RESENDS:" + txId;
+
+        // 1. Atomic Cooldown Lock (SETNX)
+        return redis.opsForValue().setIfAbsent(cooldownKey, "locked", COOLDOWN)
+                .flatMap(acquired -> {
+                    if (!Boolean.TRUE.equals(acquired)) {
+                        return redis.getExpire(cooldownKey)
+                                .flatMap(ttl -> Mono.error(new ResponseStatusException(
+                                        HttpStatus.TOO_MANY_REQUESTS,
+                                        "Please wait " + ttl.getSeconds() + " seconds before requesting another OTP."
+                                )));
+                    }
+
+                    // 2. Atomic Increment Resends
+                    return redis.opsForValue().increment(resendKey)
+                            .flatMap(resendCount -> {
+                                if (resendCount > MAX_RESENDS) {
+                                    return Mono.error(new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Maximum OTP resend limit exceeded."));
+                                }
+
+                                // 3. Fetch userId, update TX, and return Tuple
+                                return getUserIdFromTx(txId)
+                                        .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Transaction expired.")))
+                                        .flatMap(userId -> saveOtpState(txId, userId, newPlainOtp, true)
+                                                .thenReturn(Tuples.of(newPlainOtp, userId, resendCount)));
+                            });
+                });
+    }
+
+    /**
+     * Verifies the OTP using constant-time cryptographic matching (BCrypt).
+     */
+    public Mono<String> verifyOtp(String txId, String inputOtp) {
+        String txKey = "OTP_TX:" + txId;
+        String failKey = "OTP_FAILURES:" + txId;
+
+        return redis.opsForValue().get(txKey)
+                .switchIfEmpty(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "OTP Session Expired or Invalid Transaction.")))
+                .flatMap(payload -> {
+                    try {
+                        Map<String, String> data = mapper.readValue(payload, new TypeReference<>() {
+                        });
+                        String userId = data.get("userId");
+                        String storedHash = data.get("otpHash");
+
+                        if (passwordEncoder.matches(inputOtp, storedHash)) {
+                            // SUCCESS: Terminate transaction to prevent replay attacks
+                            return redis.delete(txKey).thenReturn(userId);
+                        } else {
+                            //FAILURE: Atomic increment
+                            return redis.opsForValue().increment(failKey)
+                                    .flatMap(failCount -> {
+                                        if (failCount >= MAX_FAILURES) {
+                                            // Enforce Session Lockout (Do NOT lock AD account)
+                                            return redis.delete(txKey)
+                                                    .then(Mono.error(new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Maximum wrong attempts exceeded. Session locked.")));
+                                        }
+                                        return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid OTP. Attempts remaining: " + (MAX_FAILURES - failCount)));
+                                    });
+                        }
+                    } catch (JacksonException e) {
+                        return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Redis payload corruption"));
+                    }
+                });
+    }
+
+    private Mono<String> getUserIdFromTx(String txId) {
+        return redis.opsForValue().get("OTP_TX:" + txId)
+                .flatMap(payload -> {
+                    try {
+                        Map<String, String> map = mapper.readValue(payload, new TypeReference<>() {
+                        });
+                        return Mono.just(map.get("userId"));
+                    } catch (JacksonException e) {
+                        return Mono.error(new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Redis payload corruption"));
+                    }
+                });
+    }
+
+    /**
+     * Compensating transaction: Cleans up the Redis state if Kafka fails,
+     * ensuring the user isn't penalized for our infrastructure issues.
+     */
+    public Mono<Void> rollbackOtpState(String txId) {
+        return Mono.when(
+                redis.delete("OTP_TX:" + txId),
+                redis.delete("OTP_FAILURES:" + txId),
+                redis.delete("OTP_RESENDS:" + txId)
+        ).doOnSuccess(v -> log.info("Successfully rolled back Redis state for txId={}", txId));
+    }
+}
+
+
+
+
+
+
+package com.fincore.gateway.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * Payload returned to the frontend when LDAP succeeds and OTP is sent.
+ * Contains NO sensitive data, only masked hints and the transaction ID.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class OtpInitiatedResponseDTO {
+    private String transactionId;
+    private String maskedMobile;
+    private String maskedEmail;
+    private int expiresInSeconds;
+    private int resendCooldownSeconds;
+    private int resendsRemaining;
+}
+
+
+
+
+
+package com.fincore.gateway.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class OtpResendResponseDTO {
+    private int resendCooldownSeconds;
+    private int resendsRemaining;
+}
+
+
+
+
+package com.fincore.gateway.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class ResendOtpRequestDTO {
+
+    @NotBlank(message = "Transaction ID is required")
+    private String transactionId;
+}
+
+
+
+
+
+
 ============================================================================================================================================
 
 
