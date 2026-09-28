@@ -701,24 +701,10 @@ public class SecurityConfig {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
+//=============================================================================================================================================
 
 package com.fincore.gateway.Controller;
 
-import tools.jackson.core.type.TypeReference;
-import tools.jackson.databind.ObjectMapper;
-import com.fincore.commonutilities.jwt.JwtUtil;
 import com.fincore.commonutilities.util.AesEncryptionUtil;
 import com.fincore.gateway.JwtUtil.HmacJwtUtil;
 import com.fincore.gateway.Service.LaunchService;
@@ -747,6 +733,8 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.util.Arrays;
@@ -754,7 +742,31 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
-
+/**
+ * REST controller for managing authentication workflows in a reactive Spring WebFlux application.
+ *
+ * <p>This controller provides endpoints for:
+ * <ul>
+ *   <li>User login with credential validation</li>
+ *   <li>Token refresh using refresh tokens</li>
+ *   <li>Logout with token invalidation</li>
+ *   <li>Checking current user session status</li>
+ *   <li>Password Update</li>
+ *   <li>Returns public key to client to encrypt login payload with check user</li>
+ * </ul>
+ *
+ * <p>All endpoints return a standardized {@link ApiResponse} structure to ensure consistent
+ * client-side handling. Security is implemented using JWT-based stateless authentication,
+ * integrated with Spring Security's reactive stack.
+ *
+ * <p><b>Note:</b> This controller is designed to work with non-blocking, reactive types
+ * ({@link Mono}
+ *
+ * @author SHUBHANKAR DAS [Emp ID: V1018405]
+ * <a href="mailto:shubhankar.das.cbstcs@sbi.co.in">shubhankar.das.cbstcs@sbi.co.in</a>
+ * @version 1.0.1
+ * @since 2026-05-13
+ */
 @Slf4j
 @RestController
 @RequestMapping("/api/auth")
@@ -795,11 +807,11 @@ public class AuthController {
     public Mono<ApiResponse<VerifyUserDTO>> checkUser(ServerHttpRequest request, @RequestBody Map<String, String> body) {
         final String rawClientIp = LoginUtility.getClientIp(request);
         String userId = body.get("userId");
-        log.info("Check-User info user id: {} , ip : {}", userId, rawClientIp);
+        log.info("Check-User info user id: {} , ip : {}", LoginUtility.sanitizeLog(userId), rawClientIp);
 
         // 1. IP BLOCK CHECK
         if (isIpBlocked(rawClientIp)) {
-            log.warn("Check-User BLOCKED for user: {} from IP: {}", body.get("userId"), rawClientIp);
+            log.warn("Check-User BLOCKED for user: {} from IP: {}", LoginUtility.sanitizeLog(userId), rawClientIp);
             VerifyUserDTO blockedResponse = VerifyUserDTO.builder()
                     .userId(userId)
                     .message("Access denied: Your IP address is blocked.")
@@ -835,7 +847,7 @@ public class AuthController {
     public Mono<ResponseEntity<ApiResponse<?>>> login(
             ServerHttpRequest request, ServerHttpResponse response, @RequestBody @Valid UserDto payload) {
         final String clientIp = LoginUtility.getClientIp(request);
-        log.info("Login request for user: {} from IP: {}", payload.getUserId(), clientIp);
+        log.info("Login request for user: {} from IP: {}", LoginUtility.sanitizeLog(payload.getUserId()), clientIp);
 
         // 1. IP BLOCK CHECK
         if (isIpBlocked(clientIp)) {
@@ -851,7 +863,7 @@ public class AuthController {
                     // CASE 1: INVALID CREDENTIALS (Wrong Password / Locked)
                     // =========================================================
                     if (!user.isValidCredentials()) {
-                        log.warn("Login Failed for user: {}. Reason: {}", payload.getUserId(), user.getMessage());
+                        log.warn("Login Failed for user: {}. Reason: {}", LoginUtility.sanitizeLog(payload.getUserId()), user.getMessage());
 
                         // Build response to show Attempts Left
                         LoginResponseDTO errorResponse = LoginResponseDTO.builder()
@@ -882,19 +894,17 @@ public class AuthController {
                                 .body(ApiResponse.error("Server Config Error", "CONFIG_ERROR")));
                     }
 
-                    // --- LDAP triggers OTP, Password triggers direct JWT ---
-                    // NOTE: If you changed this locally to test OTP on password mode, you can change this IF block.
-                    if (user.getLoginMethod() == Constants.LDAP) {
-                        log.info("Routing user {} to OTP Phase.", user.getUserId());
+                    // =========================================================
+                    // Dynamic Routing based on MFA Flag
+                    // =========================================================
+                    if (user.isOtpRequired()) {
+                        log.info("MFA Enabled: Routing user {} to OTP Phase.", LoginUtility.sanitizeLog(user.getUserId()));
                         return loginService.initiateOtpPhase(user)
                                 .map(otpDto -> ResponseEntity.status(HttpStatus.ACCEPTED)
                                         .body(ApiResponse.<OtpInitiatedResponseDTO>success(otpDto, "OTP Sent to registered contacts.")));
                     } else {
-                        log.info("Routing user {} to Direct Password Phase.", user.getUserId());
+                        log.info("MFA Disabled: Routing user {} to Direct Login.", LoginUtility.sanitizeLog(user.getUserId()));
                         return generateSessionAndTokens(user, response);
-//                        return loginService.initiateOtpPhase(user)
-//                                .map(otpDto -> ResponseEntity.status(HttpStatus.ACCEPTED)
-//                                        .body(ApiResponse.<OtpInitiatedResponseDTO>success(otpDto, "OTP Sent to registered contacts.")));
                     }
                 });
     }
@@ -925,7 +935,7 @@ public class AuthController {
                 .flatMap(claims -> {
                     String userId = claims.getSubject();
                     String userKey = USER_PREFIX + userId;
-                    log.info("Refreshing Token for User: {}", userId);
+                    log.info("Refreshing Token for User: {}", LoginUtility.sanitizeLog(userId));
 
                     // Check Session in Redis
                     return redisTemplate.opsForValue().get(userKey)
@@ -1048,7 +1058,7 @@ public class AuthController {
                         ));
                     }
 
-                    log.info("Logout Processing for User: {} | JTI: {}", userId, incomingJti);
+                    log.info("Logout Processing for User: {} | JTI: {}", LoginUtility.sanitizeLog(userId), LoginUtility.sanitizeLog(incomingJti));
 
                     // 5. Blacklist the Token (Always blacklist the incoming token)
                     return validator.blacklistToken(incomingJti)
@@ -1058,7 +1068,7 @@ public class AuthController {
                                 if (activeJti != null && activeJti.equals(incomingJti)) {
                                     // SCENARIO: Normal Logout. The session in Redis belongs to THIS token.
                                     // Action: Delete it.
-                                    log.info("Session MATCH. Deleting active session for user: {}", userId);
+                                    log.info("Session MATCH. Deleting active session for user: {}", LoginUtility.sanitizeLog(userId));
                                     return validator.clearUserSession(userId)
                                             .then(redisTemplate.delete(AES_KEY_PREFIX + userId))
                                             .then(Mono.just(ResponseEntity.ok(
@@ -1071,7 +1081,7 @@ public class AuthController {
                                     // SCENARIO: Concurrent Login.
                                     // The session in Redis belongs to a NEWER token (on another device/tab).
                                     // Do NOT delete it. Just let the blacklist happen.
-                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", activeJti, incomingJti);
+                                    log.warn("Session MISMATCH or ALREADY GONE. Active JTI: {}. Incoming JTI: {}. Preserving Redis Session.", LoginUtility.sanitizeLog(activeJti), LoginUtility.sanitizeLog(incomingJti));
                                     return Mono.just(ResponseEntity.ok(
                                             ApiResponse.<LoginResponseDTO>success(
                                                     LoginResponseDTO.builder().userId(userId).error("Logged out (Concurrent Session Preserved)").build(),
@@ -1089,13 +1099,212 @@ public class AuthController {
                             )));
                 })
                 .onErrorResume(e -> {
-                    // Safety Net: If anything explodes (Redis down), allow frontend to logout
                     log.error("Logout Unexpected Error", e);
                     return Mono.just(ResponseEntity.ok(
                             ApiResponse.<LoginResponseDTO>success(null, "Logged out (System Error handled)")
                     ));
                 });
     }
+
+
+    @PostMapping(value = "/update-password")
+    public Mono<ApiResponse<UpdatePasswordDTO>> updatePassword(@RequestBody @Valid UpdatePasswordDTO dto) {
+        return Mono.fromCallable(() -> loginService.updatePassword(dto))
+                .subscribeOn(Schedulers.boundedElastic())
+                .map(result -> ApiResponse.success(result, result.getMessage()));
+    }
+
+    @GetMapping("/start-prod")
+    public ResponseEntity<LaunchResponse> getLaunchData() {
+        return ResponseEntity.ok(launchService.getLaunchDetails());
+    }
+
+    // --- NEW OTP ENDPOINTS ---
+
+    @PostMapping(value = "/verify-otp", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<ApiResponse<?>>> verifyOtp(
+            @RequestBody @Valid VerifyOtpRequestDTO requestDto, ServerHttpResponse response) {
+        log.info("OTP Verification for TxId: {}", LoginUtility.sanitizeLog(requestDto.getTransactionId()));
+
+        return loginService.verifyOtpAndGetUser(requestDto)
+                .flatMap(userDto -> generateSessionAndTokens(userDto, response)); // Reuse the extracted JWT generation
+    }
+
+    @PostMapping(value = "/resend-otp", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<ApiResponse<OtpResendResponseDTO>>> resendOtp(
+            @RequestBody @Valid ResendOtpRequestDTO requestDto, ServerHttpRequest request) {
+
+        log.info("OTP Resend for TxId: {}", LoginUtility.sanitizeLog(requestDto.getTransactionId()));
+
+        return loginService.resendOtp(requestDto, LoginUtility.getClientIp(request))
+                .map(responseDto -> ResponseEntity.status(HttpStatus.ACCEPTED)
+                        .body(ApiResponse.success(responseDto, "A new OTP has been dispatched.")));
+    }
+
+    // =================================================================================================
+    //                                           EXTRACTED JWT LOGIC
+    // =================================================================================================
+
+    /**
+     * Generate Session and Tokens after successful logic pass for both /login and /verify-otp
+     */
+    private Mono<ResponseEntity<ApiResponse<?>>> generateSessionAndTokens(UserDto user, ServerHttpResponse response) {
+        log.info("Generating JWTs for user {}.", LoginUtility.sanitizeLog(user.getUserId()));
+        Map<String, Object> claimsMap = mapper.convertValue(
+                user.getUser(),
+                new TypeReference<>() {
+                }
+        );
+        String accessToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), accessTokenTtl, claimsMap);
+
+        Map<String, Object> refreshClaims = Map.of("type", "refresh");
+        String refreshToken = HmacJwtUtil.generate(hmacSecret, user.getUserId(), refreshTokenTtl, refreshClaims);
+
+        String jti = extractClaims(accessToken).getId();
+        response.addCookie(createRefreshTokenCookie(refreshToken));
+
+        // 1. Register JWT Session
+        // 2. Generate new AES key
+        // 3. Fetch Roles
+        return validator.registerUserSession(user.getUserId(), jti)
+                .then(generateAndStoreAesKey(user.getUserId()))
+                .flatMap(aesKey -> Mono.defer(() -> Mono.fromCallable(() -> loginService.fetchRoleWiseData(user.getUserId()))
+                                .subscribeOn(Schedulers.boundedElastic()))
+                        .map(roleData -> {
+                            LoginResponseDTO loginResponse = LoginResponseDTO.builder()
+                                    .userId(user.getUserId())
+                                    .validCredentials(true)
+                                    .accessToken(accessToken)
+                                    .tokenType("Bearer")
+                                    .expiresIn(accessTokenTtl)
+                                    .sub(user.getUserId())
+                                    .jti(jti)
+                                    .roleData(roleData)
+                                    .userStatus(user.getUserStatus())
+                                    .passwordLoginStatus(user.getPasswordLoginStatus())
+                                    .attemptsLeft(null)
+                                    .build();
+
+                            // 4. return AES Key to the HTTP Headers!
+                            return ResponseEntity.ok()
+                                    .header("X-Payload-Key", aesKey) // <--- Key in Header
+                                    .body(ApiResponse.success(loginResponse, "Login successful"));
+                        }));
+    }
+
+    // =================================================================================================
+    //                                              HELPERS
+    // =================================================================================================
+
+    private String sanitizeIp(String rawIp) {
+        if (rawIp == null) return "";
+        String ip = rawIp;
+        if (ip.startsWith("/")) ip = ip.substring(1);
+        int colonIndex = ip.indexOf(':');
+        if (colonIndex != -1) ip = ip.substring(0, colonIndex);
+        return ip;
+    }
+
+    private boolean isIpBlocked(String rawClientIp) {
+        if (blockedIpsConfig == null || blockedIpsConfig.trim().isEmpty()) return false;
+        String cleanIp = sanitizeIp(rawClientIp);
+        List<String> blockedIps = Arrays.asList(blockedIpsConfig.split("\\s*,\\s*"));
+        boolean blocked = blockedIps.contains(cleanIp);
+        if (blocked) {
+            log.warn("Blocked IP Match Found: Raw='{}' -> Clean='{}'", LoginUtility.sanitizeLog(rawClientIp), LoginUtility.sanitizeLog(cleanIp));
+        }
+        return blocked;
+    }
+
+    /**
+     * Creates a secure HttpOnly cookie for the refresh token.
+     * Prevents XSS attacks as JavaScript cannot read this cookie.
+     * <p>
+     * CONFIG NOTE:
+     * - secure(false): Allows HTTP (Localhost). Set to true in PROD with HTTPS.
+     * - sameSite("Lax"): Allows cross-origin navigation in Localhost dev.
+     * - path("/"): Ensures cookie is sent to all auth endpoints.
+     */
+    private ResponseCookie createRefreshTokenCookie(String token) {
+        return ResponseCookie.from("refresh_token", token)
+                .httpOnly(true)
+                .secure(true) // Set to true in PROD
+                .path("/")
+                .maxAge(Duration.ofSeconds(refreshTokenTtl))
+                .sameSite("Strict")
+                .build();
+    }
+
+    /**
+     * Creates an empty cookie to clear the refresh token on logout.
+     */
+    private ResponseCookie createEmptyCookie() {
+        return ResponseCookie.from("refresh_token", "")
+                .httpOnly(true)
+                .secure(true) // Set to true in PROD
+                .path("/")
+                .maxAge(0)
+                .sameSite("Strict")
+                .build();
+    }
+
+    private Claims extractClaims(String token) {
+        byte[] secretBytes = Base64.getDecoder().decode(hmacSecret);
+        return Jwts.parser()
+                .verifyWith(Keys.hmacShaKeyFor(secretBytes))
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    /**
+     * Helper to generate a new AES key if one doesn't exist.
+     */
+    private String generateNewAesKey() {
+        return aesUtil.generateBase64SessionKey();
+    }
+
+    /**
+     * Generates a new AES key and saves it to Redis. Used during Initial Login.
+     */
+    private Mono<String> generateAndStoreAesKey(String userId) {
+        return Mono.fromCallable(this::generateNewAesKey)
+                .flatMap(aesKey -> redisTemplate.opsForValue()
+                        .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
+                        .thenReturn(aesKey)
+                );
+    }
+
+    /**
+     * Fetches the existing AES key, heals it if missing, and extends the TTL. Used during Refresh.
+     */
+    private Mono<String> fetchAndExtendAesKey(String userId) {
+        return redisTemplate.opsForValue().get(AES_KEY_PREFIX + userId)
+                .switchIfEmpty(Mono.defer(() -> {
+                    log.warn("AES key missing/evicted for user {} during refresh. Generating new fallback key.", LoginUtility.sanitizeLog(userId));
+                    return Mono.just(generateNewAesKey());
+                }))
+                .flatMap(aesKey ->
+                        // Extend the TTL for the rolling session
+                        redisTemplate.opsForValue()
+                                .set(AES_KEY_PREFIX + userId, aesKey, Duration.ofSeconds(refreshTokenTtl))
+                                .thenReturn(aesKey)
+                );
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+ //==========================================================================================================================================================
 
 
     @PostMapping(value = "/update-password")
